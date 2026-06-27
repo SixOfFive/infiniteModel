@@ -60,7 +60,15 @@ def _get_tokenizer(target_id: str):
         from transformers import AutoTokenizer
         # trust_remote_code: harmless for the existing models, required for nomic's BERT-style
         # tokenizer (custom tokenization code shipped in the repo).
-        tok = AutoTokenizer.from_pretrained(target_id, trust_remote_code=True)
+        # #devstral-eos: Mistral-Small-3.1-derived tokenizers (Devstral, Ministral) ship a broken
+        # pretokenizer regex; transformers warns "set fix_mistral_regex=True" and WITHOUT it the
+        # prompt mis-tokenizes -> the model can emit EOS (id=2) immediately = 0 output tokens. Pass
+        # the flag when the tokenizer accepts it; fall back cleanly for tokenizers that don't.
+        try:
+            tok = AutoTokenizer.from_pretrained(target_id, trust_remote_code=True,
+                                                fix_mistral_regex=True)
+        except Exception:
+            tok = AutoTokenizer.from_pretrained(target_id, trust_remote_code=True)
         _TOK_CACHE[target_id] = tok
     return tok
 

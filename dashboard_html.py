@@ -506,7 +506,7 @@ async function tick(){
     const _rcOpts=[['1','pipeline'],['2c','TP×2 (CPU)'],['4c','TP×4 (CPU)'],['8c','TP×8 (CPU)']]
       .map(o=>`<option value="${o[0]}"${o[0]===_cur?' selected':''}>${o[1]}</option>`).join('');
     return `<div class="card" style="min-width:250px;cursor:pointer" onclick="openModelModal('${_rc}')" title="click for full details">`
-      +`<div class="k" title="${esc(lm.target||'')}">${esc(name)}${lm.quant&&lm.quant!=='none'?` <small style="color:#8b949e">${esc(lm.quant)}</small>`:``} <small style="color:#8b949e;float:right">&#9432;</small></div>`
+      +`<div class="k" title="${esc(lm.target||'')}">${esc(name)}${lm.quant&&lm.quant!=='none'?` <small style="color:#8b949e">${esc(lm.quant)}</small>`:``}${(lm.cpu_frac||0)>=0.3?` <small style="color:#f85149;font-weight:600" title="${Math.round((lm.cpu_frac||0)*100)}% of this model's weights are on CPU because the GPU pool was full at load — it is CPU-bound and will decode SLOWLY (often <1 tok/s). Not hung. Unload another model or use a smaller quant to get it on GPU.">⚠ CPU ${Math.round((lm.cpu_frac||0)*100)}%</small>`:``} <small style="color:#8b949e;float:right">&#9432;</small></div>`
       +`<div class="v" style="font-size:15px">${gb(lm.size_gb)} GB <small style="color:#8b949e">${lm.params||''} · ${(lm.stages||[]).length} stg</small></div>`
       +`<div class="sub">`
       +`<span title="KV-cache depth of the current/last generation">ctx <b>${kv.toLocaleString()}</b>/${cx.toLocaleString()} (${kvpct}%)</span>`

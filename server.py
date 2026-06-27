@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c114"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c115"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -2673,6 +2673,22 @@ class Engine:
             lm.base, lm.replica_idx = friendly, replica_idx   # data-parallel grouping (#39)
             lm.plan_basis = basis                             # placement basis (#65)
             lm.load_warnings, lm.load_assess = load_warnings, assess   # pre-load guardrail (#76)
+            # #cpu-bound-visibility: the #76 assess warns from ESTIMATES; here we know the ACTUAL
+            # GPU/CPU split (worker-reported gpu_bytes). If the model actually landed heavily on CPU
+            # (the GPU pool was full by load time — the real cause of later multi-model loads crawling
+            # and looking "busy but network-idle"), append a LOUD persistent warning + log it, so a
+            # ~0.1 tok/s CPU-bound model is never mistaken for a hang.
+            _vram_b = sum(s.gpu_bytes for s in stages)
+            _cpu_frac = ((spec.total_weight_bytes - _vram_b) / spec.total_weight_bytes
+                         if spec.total_weight_bytes else 0.0)
+            if _cpu_frac > 0.30:
+                _sev = "SEVERE " if _cpu_frac > 0.6 else ""
+                _wmsg = (f"{_cpu_frac*100:.0f}% of weights on CPU ({_sev}— GPU pool full) -> CPU-bound, "
+                         f"slow generation. Unload a model or use a smaller quant for GPU speed.")
+                if _wmsg not in lm.load_warnings:
+                    lm.load_warnings = list(lm.load_warnings) + [_wmsg]
+                log_activity(f"{_ollama_name(friendly)}: loaded {_cpu_frac*100:.0f}% on CPU — CPU-bound "
+                             f"(slow); GPU pool full. Unload a model or lower quant for full speed.")
             _st0 = (self.loadings.get(reg_key) or {}).get("started")   # #model-detail: load wall-clock
             lm.load_seconds = max(0.0, now - _st0) if _st0 else 0.0
             # speculative decoding: load THIS model's small draft locally on the controller
@@ -4483,6 +4499,11 @@ def build_status() -> dict:
             "size_gb": round(lm.spec.total_weight_bytes / GB, 2),
             "vram_used_gb": round(vram_used / GB, 2),
             "ram_used_gb": round(ram_weights / GB, 2),       # weights resident in RAM (not KV)
+            # #cpu-bound-visibility: ACTUAL fraction of WEIGHTS on CPU (from worker-reported gpu_bytes,
+            # not the pre-load estimate). A high value = the model is CPU-bound and will decode SLOWLY
+            # (CPU layers are ~50-100x a GPU layer) — the dashboard badges it so "slow" isn't read as
+            # "hung/wedged". This is the real cause of a multi-model fleet's later loads crawling.
+            "cpu_frac": round(ram_weights / lm.spec.total_weight_bytes, 3) if lm.spec.total_weight_bytes else 0.0,
             "kv_reserved_gb": round(kv_reserved / GB, 2),    # KV space reserved for the full ctx
             "kv_used_gb": round(kv_used / GB, 2),            # KV actually used so far (kv_pos)
             "loaded_at": _iso(lm.loaded_at),
