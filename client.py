@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c37"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c38"  # version tag only; full changelog -> CHANGELOG.md
 _STREAM_PREFETCH_MAX = 6  # max concurrent per-layer weight fetches during a streaming load
                           # (actual depth K is clamped to free RAM per node; see Shard.from_stream)
 GB = 1024 ** 3
@@ -3141,6 +3141,9 @@ class Worker:
         # #22 inc 3: multimodal embeds staged by a 'mm' frame, consumed by the next prefill
         # for the same (model_id, req_id). Only stage 0 (has_embed) ever populates this.
         self.pending_mm: dict[tuple, tuple] = {}
+        # #distributed-packing Inc 3b: meta skeletons (per model_id) for per-expert MoE fuse-at-pack.
+        # Cached so all N layers of one compile reuse a single from_config build (meta-only, cheap).
+        self._pack_skel: dict = {}
 
     def _build_shard(self, base: str, model_id: str, a: dict) -> Shard:
         import tempfile
@@ -3468,14 +3471,36 @@ class Worker:
                 self.data_server.close()
             self.data_server = None
 
+    def _pack_skeleton(self, base: str, model_id: str):
+        """Build (once, CACHED per model_id) the meta skeleton used to fuse a per-expert MoE checkpoint
+        into the model's fused-3D layout at distributed-pack time (#distributed-packing Inc 3b). Fetches
+        the model config (+ any trust_remote_code .py) the SAME way a cold load does (/modelmeta +
+        /modelcode), then shards.build_skeleton_from_config -> the IDENTICAL skeleton the controller's
+        _quant_scope builds, so the fused+packed unit is bit-identical to a controller-local compile by
+        construction. Cheap to cache (meta-only model, no real tensors); built once for all N layers."""
+        m = self._pack_skel.get(model_id)
+        if m is not None:
+            return m
+        import shards
+        cfg = json.loads(_http_get(f"{base}/modelmeta?model={urllib.parse.quote(model_id)}"))
+        if cfg.get("auto_map"):                  # trust_remote_code model: also fetch its modeling .py
+            with contextlib.suppress(Exception):
+                rc = json.loads(_http_get(f"{base}/modelcode?model={urllib.parse.quote(model_id)}"))
+                if isinstance(rc, dict) and rc:
+                    cfg["__im_remote_code__"] = rc
+        m = shards.build_skeleton_from_config(cfg)
+        self._pack_skel[model_id] = m
+        return m
+
     async def handle_pack(self, msg: dict) -> dict:
-        """#distributed-packing Inc 1b: pack ONE shard-cache unit FOR the controller (offloads the
+        """#distributed-packing Inc 1b/3b: pack ONE shard-cache unit FOR the controller (offloads the
         slow per-layer pack off the controller + uses the fleet's idle CPUs). Fetch the unit's bf16
         from /weights (the SAME stream a load uses -> renamed 'model.*' dict), pack via the SHARED
         shards.pack_unit_tensors (so the result is BIT-IDENTICAL to a controller-local compile by
-        construction), serialize, and POST it back to /pack_result. Dense int4/int8 only for now:
-        the controller sends the EXACT quant scope (lin2d/exp3d from _quant_scope); per-expert MoE
-        fusion (which needs the meta skeleton on the worker) is a later increment, so skel=None."""
+        construction), serialize, and POST it back to /pack_result. Supports DENSE + FUSED-MoE + (Inc
+        3b) PER-EXPERT MoE: when the controller sets `fuse`, build the meta skeleton so
+        pack_unit_tensors fuses per-expert experts.N.* -> fused 3D gate_up_proj/down_proj exactly as
+        the cold load / local compile does. The controller sends the EXACT quant scope (lin2d/exp3d)."""
         import base64
         import shards
         from safetensors.torch import load as st_load, save as st_save
@@ -3485,14 +3510,16 @@ class Worker:
         _l, _e = msg.get("lin2d"), msg.get("exp3d")
         lin2d = set(_l) if _l is not None else None    # None -> pack_unit_tensors name-heuristic
         exp3d = set(_e) if _e is not None else None
+        fuse = bool(msg.get("fuse"))                    # Inc 3b: per-expert MoE -> fuse against skeleton
         qd = {"model": msg["model_id"], "start": int(msg.get("start", 0)),
               "end": int(msg.get("end", 0)), "embed": int(bool(msg.get("embed", 0))),
               "head": int(bool(msg.get("head", 0))), "skip_experts": 0}
         url = f"{base}/weights?{urllib.parse.urlencode(qd)}"
 
         def _work() -> tuple[bytes, dict]:
+            skel = self._pack_skeleton(base, msg["model_id"]) if fuse else None
             raw = st_load(_http_get(url))                       # {model.* : bf16}, same as compile's raw
-            out_sd, mtensors = shards.pack_unit_tensors(raw, lin2d, exp3d, None, quant, gs)
+            out_sd, mtensors = shards.pack_unit_tensors(raw, lin2d, exp3d, skel, quant, gs)
             return st_save(out_sd), mtensors
 
         blob, mtensors = await asyncio.to_thread(_work)

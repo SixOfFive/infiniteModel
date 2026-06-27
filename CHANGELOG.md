@@ -24,6 +24,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 - **Pre-compiled shard cache** — the controller quantizes a model once to `_shards/<quant>/`; loads
   then serve small **pre-packed** int4/int8 layers (skip the bf16 stream + re-quantize). Covers dense,
   fused-3D MoE, and per-expert MoE (Mixtral/OLMoE, fused at compile) — bit-identical to a cold load.
+- **Distributed packing** (exo-inspired) — the per-layer pack fans out across the fleet's idle CPUs:
+  each worker fetches a layer's bf16, packs it with the *shared* packer (and, for per-expert MoE, fuses
+  to 3D against a meta skeleton it rebuilds from the model config), and posts it back. Bit-identical to
+  a single-box compile by construction (the same shared fuse + pack code), proven per-layer by a byte
+  comparison, with automatic local fallback on any worker failure.
 
 ## Models
 - **MoE**: fused + non-fused experts; optional intra-layer offload (attention on GPU, routed experts in

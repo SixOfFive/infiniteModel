@@ -177,6 +177,65 @@ def _has_moe_experts(wm: dict) -> bool:
     return False
 
 
+def _skeleton_from_cfg(cfg):
+    """Build the META model skeleton from an AutoConfig — the SHARED build used by both `_quant_scope`
+    (controller, config from the model dir) and `build_skeleton_from_config` (worker, config from
+    /modelmeta), so both fuse a per-expert MoE into the IDENTICAL fused-3D layout (gate_up_proj /
+    down_proj names + shapes). Meta only (no real weights): from_config under accelerate's
+    init_empty_weights (or torch.device('meta')). Forces eager attention (some remote-code archs abort
+    on sdpa at from_config). The param DTYPE is irrelevant to bit-identity — pack_linear_int4 widens
+    its bf16 input to fp32 before quantizing, and bf16->fp32 is exact regardless of the skeleton dtype."""
+    import torch
+    from transformers import AutoModelForCausalLM
+    try:
+        from accelerate import init_empty_weights
+    except Exception:
+        init_empty_weights = None
+    if (getattr(cfg, "thinker_config", None) is not None
+            or getattr(cfg, "text_config", None) is not None):
+        cfg = cfg.get_text_config()
+    try:
+        cfg._attn_implementation = "eager"   # some remote-code archs abort on sdpa at from_config
+    except Exception:
+        pass
+    ctx = init_empty_weights() if init_empty_weights is not None else torch.device("meta")
+    with ctx:
+        try:
+            return AutoModelForCausalLM.from_config(cfg, trust_remote_code=True,
+                                                    attn_implementation="eager")
+        except TypeError:
+            return AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+
+
+def build_skeleton_from_config(config_dict: dict):
+    """Worker-side META skeleton for distributed per-expert MoE packing (#distributed-packing Inc 3b):
+    build the SAME meta model `_quant_scope` builds on the controller, but from a config DICT (the
+    worker has no model dir — it fetches the config via /modelmeta, with any trust_remote_code .py in
+    `__im_remote_code__`). Writes config (+ remote .py) to a temp dir, AutoConfig, then the shared
+    `_skeleton_from_cfg`. Returns the meta model whose named_parameters drive `_fuse_moe_experts` ->
+    the fused 3D layout the controller compile uses, so a remotely fused+packed unit is bit-identical
+    to a local compile by construction. Pure-ish: temp dir, always cleaned."""
+    import tempfile
+    import contextlib
+    from transformers import AutoConfig
+    cd = dict(config_dict) if isinstance(config_dict, dict) else config_dict
+    _remote = cd.pop("__im_remote_code__", None) if isinstance(cd, dict) else None
+    _trust = bool(_remote) and bool((cd or {}).get("auto_map"))
+    d = tempfile.mkdtemp(prefix="im_pack_cfg_")
+    try:
+        with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(cd, f)
+        if _remote:                                   # ship the model's modeling/configuration .py so
+            for _fn, _src in _remote.items():          # AutoConfig builds the REAL arch (else native
+                with contextlib.suppress(Exception):   # fallback class can mismatch the checkpoint)
+                    with open(os.path.join(d, _fn), "w", encoding="utf-8") as rf:
+                        rf.write(_src)
+        cfg = AutoConfig.from_pretrained(d, trust_remote_code=_trust)
+        return _skeleton_from_cfg(cfg)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _quant_scope(model_dir: str):
     """(linear2d_names, expert3d_names, meta_model): the EXACT weights the WORKER int4/int8-quantizes —
     nn.Linear weights INSIDE decoder layers + fused 3D expert params (gate_up_proj/down_proj) — plus
@@ -186,33 +245,16 @@ def _quant_scope(model_dir: str):
     router gate (Qwen3.6 `Qwen3_5MoeTopKRouter`, Mixtral `MixtralTopKRouter`) that a name heuristic
     ('2D .weight in .layers.') would WRONGLY pack while a cold load leaves it bf16. The meta_model is
     ALSO what `_fuse_moe_experts` needs to fuse a per-expert checkpoint (Mixtral/OLMoE) into the
-    model's expected FUSED 3D layout at compile — identically to the worker's cold load. Names are in
-    the worker's 'model.*' text namespace (== compile `out_name`). Returns None on any build failure
-    -> caller falls back to the name heuristic (dense arches are unaffected; per-expert MoE rejects).
-    Runs in the compile subprocess on beast (has transformers/accelerate + the weights)."""
+    model's expected FUSED 3D layout at compile — identically to the worker's cold load (and to the
+    worker's distributed pack, which builds the same skeleton via `build_skeleton_from_config`). Names
+    are in the worker's 'model.*' text namespace (== compile `out_name`). Returns None on any build
+    failure -> caller falls back to the name heuristic (dense arches are unaffected; per-expert MoE
+    rejects). Runs in the compile subprocess on beast (has transformers/accelerate + the weights)."""
     try:
-        import torch
         from torch import nn
-        from transformers import AutoConfig, AutoModelForCausalLM
-        try:
-            from accelerate import init_empty_weights
-        except Exception:
-            init_empty_weights = None
+        from transformers import AutoConfig
         cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        if (getattr(cfg, "thinker_config", None) is not None
-                or getattr(cfg, "text_config", None) is not None):
-            cfg = cfg.get_text_config()
-        try:
-            cfg._attn_implementation = "eager"   # some remote-code archs abort on sdpa at from_config
-        except Exception:
-            pass
-        ctx = init_empty_weights() if init_empty_weights is not None else torch.device("meta")
-        with ctx:
-            try:
-                model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True,
-                                                         attn_implementation="eager")
-            except TypeError:
-                model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+        model = _skeleton_from_cfg(cfg)
         lin2d, exp3d = set(), set()
         for name, mod in model.named_modules():
             if isinstance(mod, nn.Linear) and ".layers." in name:

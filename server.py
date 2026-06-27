@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c107"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c108"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -4907,13 +4907,18 @@ def build_app() -> FastAPI:
         scope = await asyncio.to_thread(_sh._quant_scope, mdir)   # exact scope (== local compile)
         lin2d = sorted(scope[0]) if scope else None
         exp3d = sorted(scope[1]) if scope else None
+        wm = await asyncio.to_thread(_sh._weight_map, mdir)        # per-expert MoE -> worker must fuse (Inc 3b)
+        _is_moe = bool(await asyncio.to_thread(_sh._has_moe_experts, wm))
+        _moe_fused = any(s.endswith(".gate_up_proj") or s.endswith(".down_proj") for s in wm)
+        _need_skel = _is_moe and not _moe_fused
+        _skel = scope[2] if (scope and _need_skel) else None
         req_id = f"pk-{int(time.time()*1000)}-{layer}"
         unit = f"L{int(layer):04d}.safetensors"
         fut = asyncio.get_event_loop().create_future()
         engine._pack_futures[req_id] = fut
         frame = {"type": "pack", "req_id": req_id, "model_id": tgt, "quant": quant,
                  "group_size": _sh.INT4_GROUP, "unit": unit, "start": int(layer), "end": int(layer) + 1,
-                 "embed": 0, "head": 0, "lin2d": lin2d, "exp3d": exp3d,
+                 "embed": 0, "head": 0, "lin2d": lin2d, "exp3d": exp3d, "fuse": _need_skel,
                  "controller_http_port": ARGS.http_port}
         t0 = time.monotonic()
         try:
@@ -4937,7 +4942,7 @@ def build_app() -> FastAPI:
                 raw = _stload(r.read())
             out_sd, _mt = _sh.pack_unit_tensors(
                 raw, (set(lin2d) if lin2d is not None else None),
-                (set(exp3d) if exp3d is not None else None), None, quant, _sh.INT4_GROUP)
+                (set(exp3d) if exp3d is not None else None), _skel, quant, _sh.INT4_GROUP)
             return _stsave(out_sd)
         local_blob = await asyncio.to_thread(_local)
         identical = (worker_blob == local_blob)
@@ -4979,16 +4984,18 @@ def build_app() -> FastAPI:
         if not mdir:
             return JSONResponse({"error": "model not available on the controller"}, status_code=404)
         wm = await asyncio.to_thread(_sh._weight_map, mdir)
-        # #distributed-packing Inc 3a: DENSE + FUSED-MoE are supported (the worker fetches the fused 3D
-        # experts via /weights skip_experts=0 and pack_unit_tensors packs them by the sent exp3d scope;
-        # skel=None is fine since fused needs no per-expert fusion). PER-EXPERT MoE (Mixtral/OLMoE) still
-        # needs a worker-built skeleton for _fuse_moe_experts (Inc 3b) -> reject, point at /compile_shards.
+        # #distributed-packing Inc 3a/3b: DENSE, FUSED-MoE and PER-EXPERT MoE (Mixtral/OLMoE) are all
+        # supported. Fused-MoE needs no fusion (skel=None). Per-expert MoE (checkpoint has experts.N.*,
+        # but transformers 5.x builds the model FUSED-3D) needs the worker to fuse per-expert->3D via
+        # `_fuse_moe_experts` against a meta skeleton (built from /modelmeta) — we flag `fuse` in the
+        # pack frame so the worker builds it, and pass the local skeleton to the local-fallback pack.
+        # int8 MoE still has no 3D-expert quantizer -> reject (matches /compile_shards).
         _is_moe = bool(await asyncio.to_thread(_sh._has_moe_experts, wm))
         _moe_fused = any(s.endswith(".gate_up_proj") or s.endswith(".down_proj") for s in wm)
-        if _is_moe and not _moe_fused:
-            return JSONResponse({"ok": False, "error": "distributed compile supports DENSE + FUSED-MoE; "
-                                 "per-expert MoE (Mixtral/OLMoE) is Inc 3b — use /compile_shards"},
-                                status_code=400)
+        _need_skel = _is_moe and not _moe_fused          # per-expert checkpoint -> fuse at pack time
+        if _is_moe and quant != "int4":
+            return JSONResponse({"ok": False, "error": "MoE distributed compile supports int4 only "
+                                 "(no int8 3D-expert quantizer) — use int4"}, status_code=400)
         ckey = f"{friendly}::{quant}"
         if ckey in engine.compiling:
             return JSONResponse({"ok": False, "error": f"{_ollama_name(friendly)} {quant} already compiling"},
@@ -5008,6 +5015,10 @@ def build_app() -> FastAPI:
         exp3d = sorted(scope[1]) if scope else None
         _lset = set(lin2d) if lin2d is not None else None
         _eset = set(exp3d) if exp3d is not None else None
+        # Per-expert MoE (Inc 3b): the local-fallback pack must FUSE per-expert->3D too. The skeleton
+        # is scope[2] (the same meta model the worker rebuilds). For dense / already-fused checkpoints
+        # _fuse_moe_experts is a no-op, so passing it unconditionally when per-expert is safe.
+        _skel = scope[2] if (scope and _need_skel) else None
         with open(os.path.join(mdir, "config.json"), encoding="utf-8") as fh:
             tied = bool(json.load(fh).get("tie_word_embeddings", False))
         base_local = f"http://127.0.0.1:{ARGS.http_port}"
@@ -5017,7 +5028,7 @@ def build_app() -> FastAPI:
                    f"&embed={int(embed)}&head={int(head)}&skip_experts=0")
             with _ur.urlopen(url, timeout=1800) as r:
                 raw = _stload(r.read())
-            out_sd, mt = _sh.pack_unit_tensors(raw, _lset, _eset, None, quant, _sh.INT4_GROUP)
+            out_sd, mt = _sh.pack_unit_tensors(raw, _lset, _eset, _skel, quant, _sh.INT4_GROUP)
             return _stsave(out_sd), mt
 
         _ptag = getattr(_sh, "_packer_tag", None)   # tolerate a lagged shards.py on the controller
@@ -5048,7 +5059,8 @@ def build_app() -> FastAPI:
             frame = {"type": "pack", "req_id": req_id, "model_id": tgt, "quant": quant,
                      "group_size": _sh.INT4_GROUP, "unit": f"L{i:04d}.safetensors",
                      "start": i, "end": i + 1, "embed": 0, "head": 0,
-                     "lin2d": lin2d, "exp3d": exp3d, "controller_http_port": ARGS.http_port}
+                     "lin2d": lin2d, "exp3d": exp3d, "fuse": _need_skel,   # Inc 3b: worker fuses per-expert->3D
+                     "controller_http_port": ARGS.http_port}
             try:
                 await link.send(frame)
                 await asyncio.wait_for(fut, timeout=1800)
