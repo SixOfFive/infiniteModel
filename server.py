@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c106"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c107"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -4979,9 +4979,16 @@ def build_app() -> FastAPI:
         if not mdir:
             return JSONResponse({"error": "model not available on the controller"}, status_code=404)
         wm = await asyncio.to_thread(_sh._weight_map, mdir)
-        if await asyncio.to_thread(_sh._has_moe_experts, wm):
-            return JSONResponse({"ok": False, "error": "distributed compile is dense-only for now "
-                                 "(MoE = Inc 3); use /compile_shards"}, status_code=400)
+        # #distributed-packing Inc 3a: DENSE + FUSED-MoE are supported (the worker fetches the fused 3D
+        # experts via /weights skip_experts=0 and pack_unit_tensors packs them by the sent exp3d scope;
+        # skel=None is fine since fused needs no per-expert fusion). PER-EXPERT MoE (Mixtral/OLMoE) still
+        # needs a worker-built skeleton for _fuse_moe_experts (Inc 3b) -> reject, point at /compile_shards.
+        _is_moe = bool(await asyncio.to_thread(_sh._has_moe_experts, wm))
+        _moe_fused = any(s.endswith(".gate_up_proj") or s.endswith(".down_proj") for s in wm)
+        if _is_moe and not _moe_fused:
+            return JSONResponse({"ok": False, "error": "distributed compile supports DENSE + FUSED-MoE; "
+                                 "per-expert MoE (Mixtral/OLMoE) is Inc 3b — use /compile_shards"},
+                                status_code=400)
         ckey = f"{friendly}::{quant}"
         if ckey in engine.compiling:
             return JSONResponse({"ok": False, "error": f"{_ollama_name(friendly)} {quant} already compiling"},
@@ -5013,10 +5020,11 @@ def build_app() -> FastAPI:
             out_sd, mt = _sh.pack_unit_tensors(raw, _lset, _eset, None, quant, _sh.INT4_GROUP)
             return _stsave(out_sd), mt
 
+        _ptag = getattr(_sh, "_packer_tag", None)   # tolerate a lagged shards.py on the controller
         manifest = {"format": 1, "quant": quant, "group_size": _sh.INT4_GROUP, "num_layers": n_layers,
                     "tied": tied, "files": {}, "tensors": {},
-                    "packer_hash": _sh._packer_tag(quant, _sh.INT4_GROUP),  # Inc 4: drift guard
-                    "expert_layout": None}
+                    "packer_hash": (_ptag(quant, _sh.INT4_GROUP) if _ptag else None),  # Inc 4 drift guard
+                    "expert_layout": ("fused3d" if _is_moe else None)}   # Inc 3a: fused-MoE serve-from-cache
         _done = {"n": 0}
 
         def _write(unit: str, blob: bytes, mt: dict) -> None:   # inline (no thread) -> manifest dict race-free
