@@ -258,10 +258,15 @@ DASHBOARD_HTML = """<!doctype html>
         <input id="cfg-auto" type="checkbox"> auto-unload idle models — after 60 min idle, or to make room</label>
       <label class="sub" title="ON (default): a request for a KNOWN but not-resident model auto-loads it (GPU-first placement). OFF: such a request FAILS ('model not loaded') exactly like an unknown model — nothing loads automatically; you load models explicitly.">
         <input id="cfg-autoload" type="checkbox"> auto-load on request — off = requests for non-resident models fail instead of loading</label>
-      <label class="sub" title="Quant an auto-loaded model uses. int4 (default) = smallest: ~1/4 the bf16 memory, fits more nodes, serves pre-packed when a shard cache exists. Falls back to bf16 if int4/int8 can't quantize a given model. Does NOT affect models you load explicitly.">auto-load quant
+      <span class="sub" style="width:100%;color:#8b949e;border-top:1px solid #21262d;padding-top:8px">Auto-load defaults — used by each model's <b>Load</b> button AND by auto-load when a request hits a non-resident model:</span>
+      <label class="sub" title="Quant the Load button + auto-load use. int4 (default) = smallest: ~1/4 the bf16 memory, fits more nodes, serves pre-packed when a shard cache exists. Falls back to bf16 if int4/int8 can't quantize a given model.">quant
         <select id="cfg-aq" style="width:80px"><option value="int4">int4</option><option value="int8">int8</option><option value="none">bf16</option></select></label>
+      <label class="sub" title="Default context length the Load button + auto-load use. 8192 (8k) is a sane working window that keeps KV modest. 0 = the model's native training context.">ctx
+        <input id="cfg-ctx" type="number" min="0" step="1024" style="width:76px"></label>
+      <label class="sub" title="Default placement mode the Load button + auto-load use. auto = GPU-first, fewest nodes (best latency); gpu-spread/distribute/proportional spread across more nodes; single = collapse to one box if it fits.">mode
+        <select id="cfg-mode" style="width:118px"><option value="auto">auto</option><option value="single">single</option><option value="gpu-spread">GPU-spread</option><option value="distribute">distribute</option><option value="spread">spread</option><option value="proportional">proportional</option></select></label>
       <label class="sub" title="ON (default): pack a new model's WEIGHTS into physically-free VRAM, using resident models' reserved-but-unused KV headroom — so a model lands on GPU when VRAM is free instead of spilling weights to CPU. Each model still reserves its own KV. OFF: conservative — reserve every resident model's full-context KV on GPU (weights spill to CPU before a resident model's KV is touched).">
-        <input id="cfg-wf" type="checkbox"> weights-first VRAM — pack weights into free VRAM (use reserved-KV headroom)</label>
+        <input id="cfg-wf" type="checkbox"> weights-first VRAM</label>
       <button class="sec" onclick="saveConfig()">Save</button>
       <span class="sub" id="cfgmsg"></span>
       <button class="sec" onclick="gcCache()" title="delete HF-cache copies of models already migrated to models/ (pure duplicates ~2x disk); cache-only (never-loaded) models are kept" style="margin-left:auto">Reclaim HF cache</button>
@@ -446,11 +451,13 @@ async function tick(){
   document.getElementById('ctl').textContent=
     `${c.hostname} · ${c.os} · v${c.version} · http :${c.http_port} · control :${c.control_port} · data :${c.data_port}`;
   document.getElementById('uptime').textContent=c.uptime_s!=null?`up ${fmtUptime(c.uptime_s)}`:'';
-  const cm=document.getElementById('cfg-max'), ca=document.getElementById('cfg-auto'), cq=document.getElementById('cfg-queue'), cal=document.getElementById('cfg-autoload'), caq=document.getElementById('cfg-aq'), cwf=document.getElementById('cfg-wf');  // don't clobber while editing
+  const cm=document.getElementById('cfg-max'), ca=document.getElementById('cfg-auto'), cq=document.getElementById('cfg-queue'), cal=document.getElementById('cfg-autoload'), caq=document.getElementById('cfg-aq'), cwf=document.getElementById('cfg-wf'), cctx=document.getElementById('cfg-ctx'), cmode=document.getElementById('cfg-mode');  // don't clobber while editing
   if(cm&&document.activeElement!==cm) cm.value=c.max_loaded;
   if(ca&&document.activeElement!==ca) ca.checked=!!c.auto_unload;
   if(cal&&document.activeElement!==cal&&c.auto_load!=null) cal.checked=!!c.auto_load;
   if(caq&&document.activeElement!==caq&&c.autoload_quant!=null) caq.value=c.autoload_quant;
+  if(cctx&&document.activeElement!==cctx&&c.autoload_ctx!=null) cctx.value=c.autoload_ctx;
+  if(cmode&&document.activeElement!==cmode&&c.autoload_mode!=null) cmode.value=c.autoload_mode;
   if(cwf&&document.activeElement!==cwf&&c.vram_weights_first!=null) cwf.checked=!!c.vram_weights_first;
   if(cq&&document.activeElement!==cq&&c.queue_depth!=null) cq.value=c.queue_depth;
   document.getElementById('clock').textContent=new Date().toLocaleTimeString();
@@ -596,8 +603,8 @@ async function tick(){
   // key rides along as m.internal_name. Join the per-model dicts on the internal key so the
   // colon display doesn't break the lookups; op buttons send m.name (resolve accepts it).
   const qmap={}; ((s.disk&&s.disk.models)||[]).forEach(x=>{qmap[x.internal_name||x.name]=x;});
-  // #72: which quant each LOADED model actually loaded with (base/friendly -> 'none'|'int4'|'int8')
-  const loadedQuant={}; ((s.cluster&&s.cluster.loaded_models)||[]).forEach(c=>{loadedQuant[c.base||c.friendly]=c.quant||'none';});
+  // #72: which quant each LOADED model loaded with + its weight memory split (base/friendly -> …)
+  const loadedQuant={}, loadedInfo={}; ((s.cluster&&s.cluster.loaded_models)||[]).forEach(c=>{const k=c.base||c.friendly; loadedQuant[k]=c.quant||'none'; loadedInfo[k]={vram:c.vram_used_gb,ram:c.ram_used_gb};});
   const gMode=(document.getElementById('mode')||{}).value||'auto';   // default for each row's run type
   const _mrows=sortRows(s.models.slice(), modelSort, MODEL_GETTERS).map(m=>{
     const DLING=(m.status==='downloading'||m.status==='pausing'||m.status==='stopping');
@@ -621,28 +628,32 @@ async function tick(){
     const qbtn=(lbl,key)=>{ const v=qg[key]; if(v==null) return '';
       const fit=qf[key]; const style=fit?'':'opacity:.45';
       return `<button class="sec" style="${style}" title="load ${lbl} — ~${v} GB weights, ${fit?'fits the pool':'may NOT fit the pool'}" onclick="doLoadModel('${m.name}','${key}')">${lbl} ~${v}G</button> `; };
+    // compile-cache buttons (kept in BOTH loaded + unloaded states): hide a quant whose cache is already ok.
+    const compileBtns=(cbtn=>cbtn('int4','~1/4 size, fastest future int4 loads')+cbtn('int8','~1/2 size, higher quality than int4'))(
+      (q,desc)=> (m.cached&&m.cached[q]&&m.cached[q].ok) ? ''
+        : `<button class="sec" title="pre-compile the ${q} shard cache on the controller (beast) — ${desc}, no per-worker re-quantize" onclick="doCompileShards('${m.name}','${q}')">Compile ${q}</button> `);
     let actions;
     if(m.status==='ready'){
       if(m.loaded){
-        // #72: show WHICH quant it loaded with (active/green) + the others greyed-disabled; Unload to change.
-        const uq=loadedQuant[ikey]||'none';
-        const lbtn=(lbl,key)=>{ const v=qg[key]; const used=(key===uq);
-          const st=used?'border-color:#3fb950;color:#3fb950;font-weight:600':'opacity:.35';
-          return `<button class="sec" style="${st}"${used?'':' disabled'} title="${used?('loaded with '+lbl):('disabled — unload first to load '+lbl)}">${lbl}${v!=null?' ~'+v+'G':''}</button> `; };
-        actions=lbtn('int4','int4')+lbtn('int8','int8')+lbtn(ndl,'none')
-          +`<button class="sec" onclick="doUnloadModel('${m.name}')" title="unload this model fleet-wide (frees its shards); then a different quant can be loaded">Unload</button>`;
+        // #auto-defaults: ONE row state when loaded — green "loaded <quant>" + its weight memory split
+        // (#72 highlight) + compile buttons + Unload. Change quant by Unload then Load.
+        const uq=loadedQuant[ikey]||'none', li=loadedInfo[ikey]||{};
+        const mem=(li.vram!=null||li.ram!=null)
+          ? `<span class="sub" title="weights on GPU VRAM + spilled to CPU RAM">${gb(li.vram||0)}G vram${(li.ram||0)>0?(' + '+gb(li.ram)+'G ram'):''}</span> ` : '';
+        actions=`<span class="pill" style="border-color:#3fb950;color:#3fb950;font-weight:600" title="loaded with ${uq}">loaded ${uq}</span> `
+          +mem+compileBtns
+          +`<button class="sec" onclick="doUnloadModel('${m.name}')" title="unload this model fleet-wide (frees its shards)">Unload</button>`;
       }
-      else { const rm=rowModes[m.name]||gMode;
-        const o=(v,l)=>`<option value="${v}"${rm===v?' selected':''}>${l}</option>`;
-        actions=`<select class="sec" id="rowmode-${m.name}" title="run type for THIS load — applies to the int4/int8/bf16 buttons on this row" onchange="rowModes['${m.name}']=this.value">`
-          +o('auto','auto')+o('single','single')+o('gpu-spread','GPU-spread')+o('distribute','distribute')+o('spread','spread')+o('proportional','proportional')+o('tp2','TP×2')+o('tp4','TP×4')+`</select> `
-          +qbtn('int4','int4')+qbtn('int8','int8')+qbtn(ndl,'none')
-          // hide a "Compile <quant>" button once that quant is already cached (ok); a broken/incomplete
-          // cache still shows it (to recompile) — and the cache badge above offers click-to-verify.
-          +(cbtn=>cbtn('int4','~1/4 size, fastest future int4 loads')+cbtn('int8','~1/2 size, higher quality than int4'))(
-            (q,desc)=> (m.cached&&m.cached[q]&&m.cached[q].ok) ? ''
-              : `<button class="sec" title="pre-compile the ${q} shard cache on the controller (beast) — ${desc}, no per-worker re-quantize" onclick="doCompileShards('${m.name}','${q}')">Compile ${q}</button> `)
-          +`<button class="sec" onclick="doDelete('${m.name}')">Delete</button>`; }
+      else {
+        // #auto-defaults: ONE Load button that uses the Auto-load defaults section (quant/ctx/mode);
+        // label it with the chosen quant + that quant's estimated weight footprint.
+        const aq=(document.getElementById('cfg-aq')||{}).value||'int4';
+        const av=qg[aq], fit=qf[aq];
+        actions=`<button class="sec" style="${fit===false?'opacity:.6':''}" onclick="doAutoLoad('${m.name}')" `
+            +`title="load with the Auto-load defaults above (quant ${aq}, plus ctx + mode)${av!=null?' — ~'+av+'G weights'+(fit===false?', may NOT fit the pool':''):''}">Load${av!=null?' '+aq+' ~'+av+'G':' '+aq}</button> `
+          +compileBtns
+          +`<button class="sec" onclick="doDelete('${m.name}')">Delete</button>`;
+      }
     }
     else if(DLING){
       const pct = m.dl_pct!=null? m.dl_pct : 0;
@@ -830,10 +841,11 @@ async function saveConfig(){
   const mx=document.getElementById('cfg-max').value, au=document.getElementById('cfg-auto').checked;
   const qd=document.getElementById('cfg-queue').value, al=document.getElementById('cfg-autoload').checked;
   const aq=document.getElementById('cfg-aq').value, wf=document.getElementById('cfg-wf').checked;
+  const cx=document.getElementById('cfg-ctx').value, md=document.getElementById('cfg-mode').value;
   document.getElementById('cfgmsg').textContent='saving…';
   try{
-    const r=await (await fetch(`/config?max_loaded=${encodeURIComponent(mx)}&auto_unload=${au}&queue_depth=${encodeURIComponent(qd)}&auto_load=${al}&autoload_quant=${encodeURIComponent(aq)}&vram_weights_first=${wf}`,{method:'POST'})).json();
-    document.getElementById('cfgmsg').textContent=r.ok?`saved · max ${r.config.max_loaded} · auto-unload ${r.config.auto_unload?'on':'off'} · auto-load ${r.config.auto_load?'on':'off'} · aq ${r.config.autoload_quant} · weights-first ${r.config.vram_weights_first?'on':'off'} · queue ${r.config.queue_depth}`:'error';
+    const r=await (await fetch(`/config?max_loaded=${encodeURIComponent(mx)}&auto_unload=${au}&queue_depth=${encodeURIComponent(qd)}&auto_load=${al}&autoload_quant=${encodeURIComponent(aq)}&autoload_ctx=${encodeURIComponent(cx)}&autoload_mode=${encodeURIComponent(md)}&vram_weights_first=${wf}`,{method:'POST'})).json();
+    document.getElementById('cfgmsg').textContent=r.ok?`saved · max ${r.config.max_loaded} · auto-unload ${r.config.auto_unload?'on':'off'} · auto-load ${r.config.auto_load?'on':'off'} · ${r.config.autoload_quant}/ctx ${r.config.autoload_ctx}/${r.config.autoload_mode} · weights-first ${r.config.vram_weights_first?'on':'off'} · queue ${r.config.queue_depth}`:'error';
   }catch(e){ document.getElementById('cfgmsg').textContent='error: '+e; }
 }
 async function doPreview(){   // #60: GET /plan (no load) -> show placement + the #76 assessment
@@ -907,6 +919,16 @@ async function doUnloadAll(){
     const n=(r.unloaded||[]).length;
     el.textContent = n? `unloaded ${n} model(s): ${r.unloaded.join(', ')}` : 'unloaded (nothing was loaded)';
   }catch(e){ el.textContent='error: '+e; }
+}
+async function doAutoLoad(name){   // #auto-defaults: load using the Auto-load defaults (quant/ctx/mode)
+  const aq=(document.getElementById('cfg-aq')||{}).value||'int4';
+  const cx=(document.getElementById('cfg-ctx')||{}).value||0;
+  const md=(document.getElementById('cfg-mode')||{}).value||'auto';
+  const el=document.getElementById('loadmsg'); el.textContent=`loading ${name} (${aq}, ctx ${cx||'auto'}, ${md})…`;
+  try{
+    const r=await (await fetch(`/load?model=${encodeURIComponent(name)}&quant=${encodeURIComponent(aq)}&ctx=${encodeURIComponent(cx)}&mode=${encodeURIComponent(md)}`,{method:'POST'})).json();
+    el.textContent=r.ok?`loaded ${r.model||name} @ ${r.quant||aq} · ctx ${r.ctx||cx} · ${r.mode||md}`:`error: ${r.error||''}`;
+  }catch(e){ el.textContent='load failed: '+e; }
 }
 async function doLoadModel(name,quant){ const sel=document.getElementById('m');
   // robust against a momentarily-stale <select>: inject the option if absent so .value always

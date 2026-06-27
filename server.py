@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c112"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c113"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -652,6 +652,12 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # request never streams the full bf16 just to serve. int4|int8|none; on int4/int8
                        # failure ensure_loaded falls back ONCE to bf16 ("int4 in almost all cases").
                        "autoload_quant": "int4",
+                       # #auto-defaults: the context length + placement mode an auto-load (and the
+                       # dashboard's per-model Load button) uses. ctx default 8k (a sane working window
+                       # that keeps KV modest); mode 'auto' (GPU-first, fewest nodes). A request with its
+                       # own ctx>0 overrides autoload_ctx. Configurable via /config + the dashboard.
+                       "autoload_ctx": DEFAULT_CTX,
+                       "autoload_mode": "auto",
                        # #vram-weights-first: budget a NEW model's WEIGHTS against PHYSICALLY-free VRAM
                        # (live: total - actually-used), letting them use resident models' RESERVED-but-
                        # unfaulted full-ctx KV headroom — so a model lands on GPU when VRAM is physically
@@ -1921,17 +1927,26 @@ class Engine:
             # model the quantizer can't handle, fall back ONCE to bf16 so the request still succeeds
             # rather than erroring out — "int4 in almost all cases", bf16 for the rest. (CancelledError
             # is a BaseException, not Exception, so a client disconnect still aborts — never retried.)
+            # #auto-defaults: an auto-load uses the SAME configured defaults as the dashboard's per-model
+            # Load button — quant (int4), context (8k), and placement mode — so request-triggered loads
+            # and click-loads behave identically. The request's own ctx (>0) still overrides the default.
             aq = str(ENGINE_CONFIG.get("autoload_quant", "int4") or "none")
-            log_activity(f"{friendly}: auto-load on request (not resident) -> auto placement, "
-                         f"quant={aq}" + (" (CPU-only)" if cpu_only else ""))
+            a_ctx = int(ENGINE_CONFIG.get("autoload_ctx", DEFAULT_CTX) or 0)
+            use_ctx = ctx if (ctx and ctx > 0) else a_ctx
+            a_mode = str(ENGINE_CONFIG.get("autoload_mode", "auto") or "auto")
+            _cons, _pv = LOAD_MODES.get(a_mode, LOAD_MODES["auto"])
+            _spread, _prop = (a_mode == "spread"), (a_mode == "proportional")
+            log_activity(f"{friendly}: auto-load on request (not resident) -> mode={a_mode}, "
+                         f"quant={aq}, ctx={use_ctx or 'train'}" + (" (CPU-only)" if cpu_only else ""))
             try:
-                return await self.load(friendly, ctx, consolidate=True, prefer_vram=True,
-                                       quant=aq, cpu_only=cpu_only)
+                return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
+                                       quant=aq, cpu_only=cpu_only, spread=_spread, proportional=_prop)
             except Exception as e:
                 if aq != "none":
                     log_activity(f"{friendly}: auto-load at {aq} failed ({e!r}) -> retry at bf16")
-                    return await self.load(friendly, ctx, consolidate=True, prefer_vram=True,
-                                           quant="none", cpu_only=cpu_only)
+                    return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
+                                           quant="none", cpu_only=cpu_only, spread=_spread,
+                                           proportional=_prop)
                 raise
         raise ValueError(f"model '{friendly}' is not loaded — load it first")
 
@@ -4525,6 +4540,8 @@ def build_status() -> dict:
             "auto_unload": ENGINE_CONFIG.get("auto_unload", True),
             "auto_load": ENGINE_CONFIG.get("auto_load", True),
             "autoload_quant": ENGINE_CONFIG.get("autoload_quant", "int4"),
+            "autoload_ctx": ENGINE_CONFIG.get("autoload_ctx", DEFAULT_CTX),
+            "autoload_mode": ENGINE_CONFIG.get("autoload_mode", "auto"),
             "vram_weights_first": ENGINE_CONFIG.get("vram_weights_first", True),
             "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH),
         },
@@ -6352,6 +6369,8 @@ def build_app() -> FastAPI:
                          auto_tp_ratio: Optional[float] = None,
                          auto_load: Optional[bool] = None,
                          autoload_quant: Optional[str] = None,
+                         autoload_ctx: Optional[int] = None,
+                         autoload_mode: Optional[str] = None,
                          vram_weights_first: Optional[bool] = None,
                          persist: Optional[str] = None,
                          unpersist: Optional[str] = None) -> JSONResponse:
@@ -6387,6 +6406,12 @@ def build_app() -> FastAPI:
             _aq = str(autoload_quant).lower()
             if _aq in ("int4", "int8", "none"):
                 ENGINE_CONFIG["autoload_quant"] = _aq
+        if autoload_ctx is not None:                      # #auto-defaults: default ctx for auto/click loads
+            ENGINE_CONFIG["autoload_ctx"] = max(0, int(autoload_ctx))
+        if autoload_mode is not None:                     # #auto-defaults: default placement mode
+            _am = str(autoload_mode).lower()
+            if _am in LOAD_MODES:
+                ENGINE_CONFIG["autoload_mode"] = _am
         if vram_weights_first is not None:               # #vram-weights-first: pack weights into free VRAM
             ENGINE_CONFIG["vram_weights_first"] = bool(vram_weights_first)
         save_engine_config()
