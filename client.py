@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c35"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c36"  # version tag only; full changelog -> CHANGELOG.md
 _STREAM_PREFETCH_MAX = 6  # max concurrent per-layer weight fetches during a streaming load
                           # (actual depth K is clamped to free RAM per node; see Shard.from_stream)
 GB = 1024 ** 3
