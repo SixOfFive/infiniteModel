@@ -13,7 +13,14 @@ It speaks **Ollama-, OpenAI-, and Anthropic-compatible** HTTP APIs, so tools you
 (Ollama clients, OpenAI SDKs, Claude Code) can point at the cluster unchanged, plus a live web
 dashboard.
 
+![InfiniteModel dashboard — three models resident across a 12-node fleet](docs/dashboard.png)
+
 > Personal research project — expect rough edges. Hugging Face **safetensors** models only (no GGUF).
+
+> **A note from the author:** I'm fairly new to actually *using* git, so please go easy on me if the
+> history or workflow isn't textbook — I'm still learning the etiquette. I built this for my own
+> homelab and figured there might be demand for something like it out there, so I'm putting it up in
+> case it's useful to someone else. Issues, suggestions, and patient corrections are all welcome.
 
 ---
 
