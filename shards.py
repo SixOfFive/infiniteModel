@@ -81,6 +81,65 @@ def pack_linear_int8(W):
     return qW, scale.to(W.dtype)
 
 
+def pack_unit_tensors(raw: dict, lin2d, exp3d, skel, quant: str = "int4",
+                      group_size: int = INT4_GROUP):
+    """Pack ONE cache unit's raw bf16 tensors (keyed by logical 'model.*' name) into the cache's
+    packed safetensors dict + per-tensor manifest fragments. Returns (out_sd, manifest_tensors)
+    where each manifest_tensors[name] has NO 'file' key (the caller stamps the unit filename).
+
+    The SINGLE shared packer used by BOTH the controller's local compile (compile_shards._write_unit)
+    AND the worker's remote-pack handler (#distributed-packing) — so a remotely-packed unit is
+    BIT-IDENTICAL to a locally-packed one BY CONSTRUCTION (same fuse + same pack), exactly like
+    `_fuse_moe_experts` is shared. Pure: no I/O, no globals. `skel` (the meta model) drives per-expert
+    MoE fusion (None -> no fuse); `lin2d`/`exp3d` are the exact quant scope from `_quant_scope` (None
+    -> name-heuristic fallback, fine for dense arches). int4 packs layer Linears + 3D experts; int8
+    packs layer Linears + lm_head; everything else (norms/embed/biases/router) passes through bf16."""
+    if skel is not None:
+        raw = _fuse_moe_experts(raw, skel)
+    out_sd: dict = {}
+    mtensors: dict = {}
+    for out_name, W in raw.items():
+        if lin2d is not None:
+            # skeleton-exact scope: pack ONLY what the worker quantizes (matches cold load).
+            is_expert3d = (quant == "int4" and W.dim() == 3 and out_name in exp3d)
+            is_layer_lin = (W.dim() == 2 and out_name in lin2d)
+        else:
+            # name-heuristic fallback (skeleton build failed): dense arches have no non-Linear 2D
+            # layer weights, so this still matches; a MoE router gate would over-capture (the worker
+            # m4c32 cache install then fails loud rather than serving a divergent cache).
+            is_expert3d = (quant == "int4" and W.dim() == 3 and ".experts." in out_name
+                           and (out_name.endswith(".gate_up_proj")
+                                or out_name.endswith(".down_proj")))
+            is_layer_lin = W.dim() == 2 and out_name.endswith(".weight") and ".layers." in out_name
+        is_int8_head = quant == "int8" and out_name == "lm_head.weight" and W.dim() == 2
+        if is_expert3d:
+            qw, sc, ze, in_f, ng = pack_linear_int4_3d(W, group_size)
+            out_sd[out_name + ".qweight"] = qw
+            out_sd[out_name + ".scale"] = sc
+            out_sd[out_name + ".zero"] = ze
+            mtensors[out_name] = {"q": True, "is_3d": True,
+                                  "num_experts": int(W.shape[0]), "out": int(W.shape[1]),
+                                  "in_features": in_f, "ng": ng, "group_size": group_size,
+                                  "shape": [int(x) for x in W.shape]}
+        elif is_layer_lin or is_int8_head:
+            if quant == "int4":
+                qw, sc, ze, in_f = pack_linear_int4(W, group_size)
+                out_sd[out_name + ".qweight"] = qw
+                out_sd[out_name + ".scale"] = sc
+                out_sd[out_name + ".zero"] = ze
+                mtensors[out_name] = {"q": True, "in_features": in_f,
+                                      "shape": [int(x) for x in W.shape]}
+            else:   # int8 — per-channel symmetric, no zero point / group
+                qw, sc = pack_linear_int8(W)
+                out_sd[out_name + ".qweight"] = qw
+                out_sd[out_name + ".scale"] = sc
+                mtensors[out_name] = {"q": True, "shape": [int(x) for x in W.shape]}
+        else:
+            out_sd[out_name] = W.contiguous()
+            mtensors[out_name] = {"q": False, "shape": [int(x) for x in W.shape]}
+    return out_sd, mtensors
+
+
 # --- Pre-compiled shard cache (#shard-cache): the controller (beast — fastest CPU/GPU + holds the
 # weights) quantizes a model ONCE to _shards/<quant>/ so loads serve the small pre-quantized tensors
 # instead of streaming the full bf16 + re-quantizing on every worker. The cache is machine-independent
@@ -260,66 +319,15 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
         return o
 
     def _write_unit(unit: str, pairs: list[tuple[str, str]]) -> None:
-        out_sd: dict = {}
-        # Read all of this unit's source tensors to bf16, keyed by their logical 'model.*' name, THEN
-        # fuse a per-expert MoE checkpoint (Mixtral/OLMoE: experts.{N}.{w1,w3,w2}) into the model's
-        # FUSED 3D gate_up_proj/down_proj using the SHARED `_fuse_moe_experts` — the exact transform the
-        # worker cold load applies (gate-then-up cat, stack_match orientation, block_sparse_moe.gate ->
-        # mlp.gate rename) — so the packed cache is bit-identical to a cold load. No-op for dense /
-        # already-fused checkpoints / when the skeleton is unavailable (raw passes through unchanged).
+        # Read this unit's source tensors to bf16 (keyed by logical 'model.*' name), then pack via the
+        # SHARED `pack_unit_tensors` (fuse per-expert MoE + int4/int8 the layer Linears + 3D experts).
+        # Same function the worker remote-pack handler calls -> a remote unit is bit-identical to this.
         raw: dict = {}
         for out_name, src_name in pairs:
             raw[out_name] = _get_bf16(src_name)
-        if _skel is not None:
-            raw = _fuse_moe_experts(raw, _skel)
-        for out_name, W in raw.items():
-            # Which Linears get quantized — matches the worker's per-quant scope EXACTLY:
-            #   int4: every 2D .weight inside a decoder layer; head LEFT bf16 (logits quant-sensitive).
-            #   int8: the same layer Linears AND lm_head (worker quantizes the head at int8).
-            # Everything else (norms, embed, biases) passes through bf16 in both.
-            # FUSED 3D MoE experts (gate_up_proj/down_proj [E,out,in]) -> per-expert int4 pack,
-            # bit-identical to the worker's Packed4Tensor3D. Stored stacked [E,...] + 3D manifest
-            # (num_experts/out/in_features/ng) so the serve-from-cache worker rebuilds the shape.
-            if _lin2d is not None:
-                # skeleton-exact scope: pack ONLY what the worker quantizes (matches cold load).
-                is_expert3d = (quant == "int4" and W.dim() == 3 and out_name in _exp3d)
-                is_layer_lin = (W.dim() == 2 and out_name in _lin2d)
-            else:
-                # name-heuristic fallback (skeleton build failed): dense arches have no non-Linear 2D
-                # layer weights, so this still matches; a MoE router gate would over-capture (the worker
-                # m4c32 cache install then fails loud rather than serving a divergent cache).
-                is_expert3d = (quant == "int4" and W.dim() == 3 and ".experts." in out_name
-                               and (out_name.endswith(".gate_up_proj")
-                                    or out_name.endswith(".down_proj")))
-                is_layer_lin = W.dim() == 2 and out_name.endswith(".weight") and ".layers." in out_name
-            is_int8_head = quant == "int8" and out_name == "lm_head.weight" and W.dim() == 2
-            if is_expert3d:
-                qw, sc, ze, in_f, ng = pack_linear_int4_3d(W, group_size)
-                out_sd[out_name + ".qweight"] = qw
-                out_sd[out_name + ".scale"] = sc
-                out_sd[out_name + ".zero"] = ze
-                manifest["tensors"][out_name] = {"file": unit, "q": True, "is_3d": True,
-                                                 "num_experts": int(W.shape[0]), "out": int(W.shape[1]),
-                                                 "in_features": in_f, "ng": ng, "group_size": group_size,
-                                                 "shape": [int(x) for x in W.shape]}
-            elif is_layer_lin or is_int8_head:
-                if quant == "int4":
-                    qw, sc, ze, in_f = pack_linear_int4(W, group_size)
-                    out_sd[out_name + ".qweight"] = qw
-                    out_sd[out_name + ".scale"] = sc
-                    out_sd[out_name + ".zero"] = ze
-                    manifest["tensors"][out_name] = {"file": unit, "q": True, "in_features": in_f,
-                                                     "shape": [int(x) for x in W.shape]}
-                else:   # int8 — per-channel symmetric, no zero point / group
-                    qw, sc = pack_linear_int8(W)
-                    out_sd[out_name + ".qweight"] = qw
-                    out_sd[out_name + ".scale"] = sc
-                    manifest["tensors"][out_name] = {"file": unit, "q": True,
-                                                     "shape": [int(x) for x in W.shape]}
-            else:
-                out_sd[out_name] = W.contiguous()
-                manifest["tensors"][out_name] = {"file": unit, "q": False,
-                                                 "shape": [int(x) for x in W.shape]}
+        out_sd, mtensors = pack_unit_tensors(raw, _lin2d, _exp3d, _skel, quant, group_size)
+        for out_name, meta in mtensors.items():
+            manifest["tensors"][out_name] = {"file": unit, **meta}
         path = os.path.join(out_dir, unit)
         save_file(out_sd, path)
         manifest["files"][unit] = {"sha256": _sha256_file(path), "bytes": os.path.getsize(path)}
