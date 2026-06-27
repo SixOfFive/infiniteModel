@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c109"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c110"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -4171,6 +4171,17 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     _lb.extend(str(x) for x in msg["logs"])
                     if len(_lb) > NODE_LOGS_MAX:
                         del _lb[:len(_lb) - NODE_LOGS_MAX]
+            elif mtype == "error" and msg.get("req_id") in engine._pack_futures:
+                # #distributed-packing: a worker PACK failed. Resolve its pack future with the error
+                # NOW so the caller (pack_probe / compile_dist _dispatch_layer) fails fast and falls
+                # back to a local pack — instead of blocking on it for the full per-unit timeout.
+                f = engine._pack_futures.get(msg.get("req_id"))
+                if f is not None and not f.done():
+                    f.set_exception(RuntimeError(f"{node.hostname} pack failed: {msg.get('error')}"))
+            elif mtype == "packed":
+                # success ack; the packed unit itself arrives via POST /pack_result (which resolves
+                # the future). Nothing to do here — kept so it isn't mistaken for a load reply.
+                pass
             elif mtype in ("ready", "error"):
                 if link.pending_load and not link.pending_load.done():
                     link.pending_load.set_result(msg)
@@ -5109,6 +5120,8 @@ def build_app() -> FastAPI:
                 raise RuntimeError("no pack result")
             return res["bytes"], res["mtensors"]
 
+        _part: set = set()   # node_ids that have packed >=1 unit via the worker path (live node count)
+
         async def _run():
             try:
                 eb, emt = await asyncio.to_thread(_pack_local, 0, 0, 1, 0)
@@ -5126,6 +5139,13 @@ def build_app() -> FastAPI:
                         unit = f"L{i:04d}.safetensors"
                         try:
                             blob, mt = await _dispatch_layer(node, i)
+                            if node.node_id not in _part:   # first unit from this worker -> live "N nodes" + log
+                                _part.add(node.node_id)
+                                c = engine.compiling.get(ckey)
+                                if c:
+                                    c["stages_ready"] = len(_part)
+                                log_activity(f"compile_dist: {node.hostname} packing "
+                                             f"{_ollama_name(friendly)} {quant} layers")
                         except Exception as exc:   # worker died / no shards.py / timeout -> local fallback
                             log_activity(f"compile_dist {unit} on {node.hostname} failed ({exc!r}) -> local pack")
                             blob, mt = await asyncio.to_thread(_pack_local, i, i + 1, 0, 0)

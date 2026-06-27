@@ -217,6 +217,7 @@ def build_skeleton_from_config(config_dict: dict):
     to a local compile by construction. Pure-ish: temp dir, always cleaned."""
     import tempfile
     import contextlib
+    import shutil
     from transformers import AutoConfig
     cd = dict(config_dict) if isinstance(config_dict, dict) else config_dict
     _remote = cd.pop("__im_remote_code__", None) if isinstance(cd, dict) else None
