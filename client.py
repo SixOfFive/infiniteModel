@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c34"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c35"  # version tag only; full changelog -> CHANGELOG.md
 _STREAM_PREFETCH_MAX = 6  # max concurrent per-layer weight fetches during a streaming load
                           # (actual depth K is clamped to free RAM per node; see Shard.from_stream)
 GB = 1024 ** 3
@@ -512,7 +512,7 @@ def _selected_names(all_names, start: int, end: int, has_embed: bool,
 # clone, so a plain import is safe.
 from wire import (_pack_tensor, _unpack_tensor, _set_keepalive, _tp_hetsplit,   # noqa: F401
                   install_log_tee, drain_new_logs, _fuse_moe_experts,
-                  load_config, gitlab_token, gitlab_file_api)
+                  load_config, repo_raw_url)
 
 
 async def _read_frame(reader: asyncio.StreamReader) -> tuple[dict, bytes, int]:
@@ -3028,14 +3028,12 @@ SELF_UPDATE_POLL_S = 120   # poll GitLab every 2 minutes (fast deploys; idle-gat
 
 
 def _fetch_repo_file(fname: str):
-    # GitLab URL (host/project) from config.json and token from $GITLAB_TOKEN / gitignored
-    # gitlab_token.txt (wire) — no secret baked into source (#public-release). Empty token ->
-    # request fails -> returns None (self-update fails closed; the worker keeps running).
+    # Self-update fetches each file's latest bytes from the PUBLIC GitHub repo's raw endpoint
+    # (repo_raw_url, owner/branch from config.json) — NO auth/token, so no secret is in the source
+    # (#public-release). Any failure -> returns None (fail-closed; the worker keeps running).
     import urllib.request
-    req = urllib.request.Request(gitlab_file_api().format(f=fname),
-                                 headers={"PRIVATE-TOKEN": gitlab_token()})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(repo_raw_url().format(f=fname), timeout=30) as r:
             return r.read()
     except Exception:
         return None

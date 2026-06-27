@@ -41,5 +41,7 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   curl-able fleet logs; idle-gated multi-file self-update.
 
 ## Public release
-- Central `config.json` (all hosts/ports; no addresses baked into code); GitLab self-update token moved
-  to a gitignored file / `$GITLAB_TOKEN`; credentials and internal-only artifacts scrubbed for open source.
+- Central `config.json` (all hosts/ports + the self-update source; no addresses baked into code);
+  credentials and internal-only artifacts scrubbed for open source.
+- **Self-update pulls from the public GitHub repo's raw endpoint** (`update_repo`/`update_branch`) — no
+  token of any kind, on the controller or any worker. `provision_worker.sh` clones from public GitHub.

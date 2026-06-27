@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # InfiniteModel worker provisioner. Idempotent: safe to re-run. Run as the worker's service user
-# (with passwordless sudo). Config via env, with safe internal-LAN defaults:
-#   GITLAB_TOKEN  (REQUIRED) — LAN GitLab read token; NOT stored in the repo (#public-release)
-#   GITLAB_HOST / GITLAB_PROJECT / IM_REPO / RUN_USER — optional overrides
-# e.g.:  GITLAB_TOKEN=<lan-gitlab-read-token> ./provision_worker.sh
+# (with passwordless sudo). Clones the PUBLIC GitHub repo — no token needed. Optional env overrides:
+#   IM_REPO_URL  (default https://github.com/SixOfFive/infiniteModel.git)
+#   IM_REPO / RUN_USER
 set -euo pipefail
 RUN_USER="${RUN_USER:-$(id -un)}"
 REPO="${IM_REPO:-$HOME/infinitemodel}"
-GITLAB_HOST="${GITLAB_HOST:-192.168.15.23}"
-GITLAB_PROJECT="${GITLAB_PROJECT:-sixoffive/infinitemodel}"
-: "${GITLAB_TOKEN:?set GITLAB_TOKEN env var to the LAN GitLab read token (not stored in the repo)}"
-GIT_URL="http://oauth2:${GITLAB_TOKEN}@${GITLAB_HOST}/${GITLAB_PROJECT}.git"
+GIT_URL="${IM_REPO_URL:-https://github.com/SixOfFive/infiniteModel.git}"
 PY="$REPO/.venv/bin/python"
 
 echo "== HOST $(hostname) =="

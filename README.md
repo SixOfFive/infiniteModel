@@ -143,12 +143,12 @@ at `http://<controller>:21434`.
 
 ## Configuration & secrets
 
-- **`config.json`** — cluster hosts/ports (the one place to edit; no addresses are baked into code).
+- **`config.json`** — cluster hosts/ports + self-update source (`update_repo`/`update_branch`); the one
+  place to edit, no addresses baked into code.
 - **`hf_token.txt`** or `$HF_TOKEN` — Hugging Face token for gated/authenticated pulls (gitignored).
-- **`gitlab_token.txt`** or `$GITLAB_TOKEN` — optional read token if you self-update from a private
-  git mirror (gitignored).
 
-No secrets are stored in the source.
+Self-update pulls module sources from the public GitHub repo's raw endpoint — **no token needed**. No
+secrets are stored in the source.
 
 ## License
 

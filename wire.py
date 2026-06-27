@@ -325,19 +325,19 @@ def _fuse_moe_experts(sd: dict, model) -> dict:
 
 
 # --- Central cluster configuration (#public-release) ----------------------------------------------
-# Single source of truth for the cluster's hosts/ports so they are not baked into each module/script.
-# The committed root `config.json` holds the (internal, non-secret) LAN addresses; these built-in
-# defaults are the SAFE FALLBACK so a node that has not yet fetched config.json still runs unchanged.
-# SECRETS ARE NEVER HERE OR IN config.json — the GitLab self-update token comes from the GITLAB_TOKEN
-# env var or the gitignored gitlab_token.txt (see gitlab_token()), so the source is safe to publish.
+# Single source of truth for the cluster's hosts/ports + self-update source, so they are not baked
+# into each module/script. The committed root `config.json` overrides these; the built-in defaults are
+# the SAFE FALLBACK so a node that has not yet fetched config.json still runs unchanged. Self-update
+# pulls from the PUBLIC GitHub repo's raw endpoint — NO auth/token needed — so there are no secrets
+# here or in config.json, and the source is safe to publish.
 _CONFIG_DEFAULTS = {
     "controller_host": "192.168.15.103",
     "http_port": 21434,
     "control_port": 50100,
     "data_port": 50101,
     "worker_data_port": 50200,
-    "gitlab_host": "192.168.15.23",
-    "gitlab_project": "sixoffive/infinitemodel",
+    "update_repo": "SixOfFive/infiniteModel",   # GitHub owner/name for self-update (public, no token)
+    "update_branch": "main",
 }
 _CONFIG_CACHE = None
 
@@ -367,28 +367,11 @@ def load_config() -> dict:
     return cfg
 
 
-def gitlab_token() -> str:
-    """The LAN GitLab read token used for self-update — from the GITLAB_TOKEN env var, else the
-    gitignored gitlab_token.txt next to this module. NEVER hardcoded, so the source is safe to
-    publish. Returns '' if absent (self-update simply no-ops without it)."""
-    import os
-    t = (os.environ.get("GITLAB_TOKEN") or "").strip()
-    if t:
-        return t
-    here = os.path.dirname(os.path.abspath(__file__))
-    try:
-        with open(os.path.join(here, "gitlab_token.txt"), encoding="utf-8") as fh:
-            return fh.read().strip()
-    except Exception:
-        return ""
-
-
-def gitlab_file_api() -> str:
-    """The GitLab raw-file API URL template (…/{f}/raw?ref=main) built from config — used by the
-    self-update to fetch the latest module sources. Host/project come from config.json (no baked-in
-    address)."""
+def repo_raw_url() -> str:
+    """URL TEMPLATE (with a literal `{f}`) for fetching one repo file's raw bytes during self-update.
+    Points at the PUBLIC GitHub repo's raw endpoint — no auth/token needed. Owner/name + branch come
+    from config.json (`update_repo`, `update_branch`); e.g.
+    https://raw.githubusercontent.com/SixOfFive/infiniteModel/main/{f}"""
     cfg = load_config()
-    import urllib.parse
-    proj = urllib.parse.quote(str(cfg["gitlab_project"]), safe="")
-    return (f"http://{cfg['gitlab_host']}/api/v4/projects/"
-            f"{proj}/repository/files/{{f}}/raw?ref=main")
+    return (f"https://raw.githubusercontent.com/{cfg['update_repo']}/"
+            f"{cfg['update_branch']}/{{f}}")

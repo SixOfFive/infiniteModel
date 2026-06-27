@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c96"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c97"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -82,20 +82,18 @@ def print(*args, **kwargs):  # noqa: A001 — intentional builtin shadow for tim
 # --- Self-update: poll GitLab for a newer server.py; when idle (no model loaded),
 # swap it in and exit(42) so the supervisor (server.bat loop on Windows / systemd)
 # relaunches the new code. Workers reconnect automatically. ---
-import wire   # shared: cluster config (load_config) + self-update token/URL — NEVER hardcoded, so the
-             # source is safe to publish. wire.py is a core file present in every checkout and kept in
-             # sync via EXTRA_UPDATE_FILES. Token comes from $GITLAB_TOKEN / gitignored gitlab_token.txt.
-SELF_UPDATE_POLL_S = 120   # poll GitLab every 2 minutes (fast deploys; idle-gated)
+import wire   # shared: cluster config (load_config) + self-update source URL. wire.py is a core file
+             # present in every checkout and kept in sync via EXTRA_UPDATE_FILES.
+SELF_UPDATE_POLL_S = 120   # poll the repo every 2 minutes (fast deploys; idle-gated)
 
 
 def _fetch_repo_file(fname: str):
-    # GitLab URL (host/project) from config.json and token from env/gitignored file (wire) — no secret
-    # baked into source (#public-release). Empty token -> request fails -> returns None (fail-closed).
+    # Self-update fetches each file's latest bytes from the PUBLIC GitHub repo's raw endpoint
+    # (wire.repo_raw_url, owner/branch from config.json) — NO auth/token, so no secret is in the source
+    # (#public-release). Any failure -> returns None (fail-closed; the node keeps running current code).
     import urllib.request
-    req = urllib.request.Request(wire.gitlab_file_api().format(f=fname),
-                                 headers={"PRIVATE-TOKEN": wire.gitlab_token()})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(wire.repo_raw_url().format(f=fname), timeout=30) as r:
             return r.read()
     except Exception:
         return None
