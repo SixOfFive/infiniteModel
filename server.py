@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c99"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c100"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -2193,8 +2193,22 @@ class Engine:
                         continue   # a sibling replica already owns this node (disjoint placement)
                     # cpu_only: plan against RAM ONLY (VRAM=0) so the model never lands in
                     # any GPU's VRAM — the worker is also told device='cpu' below.
-                    free_vram = (0.0 if cpu_only
-                                 else n.free_vram_after_resident_gb(committed.get(n.node_id, 0)))
+                    # GPU budget = the MORE CONSERVATIVE of two views, so the planner never assigns
+                    # more GPU layers than the WORKER can actually place (else the worker spills the
+                    # overflow to CPU -> the "free VRAM but CPU-bound / 600s-timeout" bug):
+                    #   (a) tracked: usable_vram - committed (resident weights + their reserved
+                    #       full-ctx KV + other in-flight loads) — protects a co-resident model's
+                    #       not-yet-faulted KV (#95 coexistence).
+                    #   (b) live: vram_total - vram_used (heartbeat, ALL users incl. a desktop's
+                    #       browser/Discord/etc. on a shared GPU) - other in-flight reservations not
+                    #       yet faulted into vram_used. This is what the worker's mem_get_info sees.
+                    # usable_vram (≈ total - reserve) ignores non-fleet GPU usage, so on a desktop-
+                    # shared card (beast) it over-budgets; capping by live-free spreads layers to a
+                    # genuinely-free GPU node (a headless worker) instead of overloading it -> CPU.
+                    live_free = max(0.0, n.vram_total_gb - n.vram_used_gb
+                                    - _res_vram.get(n.node_id, 0) / GB)
+                    free_vram = (0.0 if cpu_only else min(
+                        n.free_vram_after_resident_gb(committed.get(n.node_id, 0)), live_free))
                     # Reserve a runtime VRAM floor so a thin-headroom GPU node isn't filled to the
                     # brink (decode activations + allocator fragmentation OOM it otherwise, dropping
                     # the stage mid-generation). RAM already keeps RAM_SAFETY_GB; VRAM had none.
@@ -2369,9 +2383,14 @@ class Engine:
                     # exactly the per-node free_vram the planner placed against (lines above). The worker
                     # caps GPU placement at this so it can't grab VRAM reserved for a co-resident model
                     # (a card looks free until the resident model faults its KV). 0 -> stage goes to CPU.
-                    _gpu_budget_gb = (0.0 if cpu_only else max(
-                        0.0, nd.free_vram_after_resident_gb(committed.get(st.node_id, 0))
-                        - PLAN_VRAM_FLOOR_GB))
+                    # Also capped by LIVE free VRAM (vram_total - vram_used, all users incl. a desktop's
+                    # apps on a shared GPU) so the budget matches what the worker's mem_get_info sees —
+                    # same conservative min() as the planner build, so plan and dispatch stay aligned.
+                    _live_free_gb = max(0.0, nd.vram_total_gb - nd.vram_used_gb
+                                        - _res_vram.get(st.node_id, 0) / GB)
+                    _gpu_budget_gb = (0.0 if cpu_only else max(0.0, min(
+                        nd.free_vram_after_resident_gb(committed.get(st.node_id, 0)),
+                        _live_free_gb) - PLAN_VRAM_FLOOR_GB))
                     fut = loop.create_future()
                     link.pending_load = fut
                     futs[st.node_id] = fut
