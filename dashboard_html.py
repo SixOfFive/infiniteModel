@@ -238,6 +238,8 @@ DASHBOARD_HTML = """<!doctype html>
         <input id="cfg-auto" type="checkbox"> auto-unload idle models — after 60 min idle, or to make room</label>
       <label class="sub" title="ON (default): a request for a KNOWN but not-resident model auto-loads it (GPU-first placement). OFF: such a request FAILS ('model not loaded') exactly like an unknown model — nothing loads automatically; you load models explicitly.">
         <input id="cfg-autoload" type="checkbox"> auto-load on request — off = requests for non-resident models fail instead of loading</label>
+      <label class="sub" title="Quant an auto-loaded model uses. int4 (default) = smallest: ~1/4 the bf16 memory, fits more nodes, serves pre-packed when a shard cache exists. Falls back to bf16 if int4/int8 can't quantize a given model. Does NOT affect models you load explicitly.">auto-load quant
+        <select id="cfg-aq" style="width:80px"><option value="int4">int4</option><option value="int8">int8</option><option value="none">bf16</option></select></label>
       <button class="sec" onclick="saveConfig()">Save</button>
       <span class="sub" id="cfgmsg"></span>
       <button class="sec" onclick="gcCache()" title="delete HF-cache copies of models already migrated to models/ (pure duplicates ~2x disk); cache-only (never-loaded) models are kept" style="margin-left:auto">Reclaim HF cache</button>
@@ -422,10 +424,11 @@ async function tick(){
   document.getElementById('ctl').textContent=
     `${c.hostname} · ${c.os} · v${c.version} · http :${c.http_port} · control :${c.control_port} · data :${c.data_port}`;
   document.getElementById('uptime').textContent=c.uptime_s!=null?`up ${fmtUptime(c.uptime_s)}`:'';
-  const cm=document.getElementById('cfg-max'), ca=document.getElementById('cfg-auto'), cq=document.getElementById('cfg-queue'), cal=document.getElementById('cfg-autoload');  // don't clobber while editing
+  const cm=document.getElementById('cfg-max'), ca=document.getElementById('cfg-auto'), cq=document.getElementById('cfg-queue'), cal=document.getElementById('cfg-autoload'), caq=document.getElementById('cfg-aq');  // don't clobber while editing
   if(cm&&document.activeElement!==cm) cm.value=c.max_loaded;
   if(ca&&document.activeElement!==ca) ca.checked=!!c.auto_unload;
   if(cal&&document.activeElement!==cal&&c.auto_load!=null) cal.checked=!!c.auto_load;
+  if(caq&&document.activeElement!==caq&&c.autoload_quant!=null) caq.value=c.autoload_quant;
   if(cq&&document.activeElement!==cq&&c.queue_depth!=null) cq.value=c.queue_depth;
   document.getElementById('clock').textContent=new Date().toLocaleTimeString();
   document.getElementById('c-nodes').textContent=p.nodes;
@@ -798,10 +801,11 @@ async function gcCache(){
 async function saveConfig(){
   const mx=document.getElementById('cfg-max').value, au=document.getElementById('cfg-auto').checked;
   const qd=document.getElementById('cfg-queue').value, al=document.getElementById('cfg-autoload').checked;
+  const aq=document.getElementById('cfg-aq').value;
   document.getElementById('cfgmsg').textContent='saving…';
   try{
-    const r=await (await fetch(`/config?max_loaded=${encodeURIComponent(mx)}&auto_unload=${au}&queue_depth=${encodeURIComponent(qd)}&auto_load=${al}`,{method:'POST'})).json();
-    document.getElementById('cfgmsg').textContent=r.ok?`saved · max ${r.config.max_loaded} · auto-unload ${r.config.auto_unload?'on':'off'} · auto-load ${r.config.auto_load?'on':'off'} · queue ${r.config.queue_depth}`:'error';
+    const r=await (await fetch(`/config?max_loaded=${encodeURIComponent(mx)}&auto_unload=${au}&queue_depth=${encodeURIComponent(qd)}&auto_load=${al}&autoload_quant=${encodeURIComponent(aq)}`,{method:'POST'})).json();
+    document.getElementById('cfgmsg').textContent=r.ok?`saved · max ${r.config.max_loaded} · auto-unload ${r.config.auto_unload?'on':'off'} · auto-load ${r.config.auto_load?'on':'off'} · aq ${r.config.autoload_quant} · queue ${r.config.queue_depth}`:'error';
   }catch(e){ document.getElementById('cfgmsg').textContent='error: '+e; }
 }
 async function doPreview(){   // #60: GET /plan (no load) -> show placement + the #76 assessment

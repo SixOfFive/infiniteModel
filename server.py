@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c98"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c99"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -646,6 +646,12 @@ DEFAULT_QUEUE_DEPTH = 2  # waiters allowed per model beyond the one in the slot 
 ENGINE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine_config.json")
 ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        "queue_depth": DEFAULT_QUEUE_DEPTH,
+                       # #autoload-smallest: quant an AUTO-LOADED (requested-but-not-resident) model
+                       # defaults to — the SMALLEST that fits the common case. int4 is ~1/4 the bf16
+                       # memory, fits more nodes, and serves PRE-PACKED when a shard cache exists, so a
+                       # request never streams the full bf16 just to serve. int4|int8|none; on int4/int8
+                       # failure ensure_loaded falls back ONCE to bf16 ("int4 in almost all cases").
+                       "autoload_quant": "int4",
                        # #77 persistence: models to AUTO-RELOAD on controller startup (survives a
                        # restart/crash/deploy). reg_key -> {"ctx", "quant"}. Workers drop their shards
                        # when the controller link drops, so recovery = re-stream on startup (after the
@@ -1882,10 +1888,25 @@ class Engine:
         if self.updating:   # forced update in progress -> don't reload into a box being torn down
             raise ValueError(f"model '{friendly}' is not loaded — controller is updating, retry shortly")
         if auto_load and ENGINE_CONFIG.get("auto_load", True):
-            log_activity(f"{friendly}: auto-load on request (not resident) -> auto placement"
-                         + (" (CPU-only)" if cpu_only else ""))
-            return await self.load(friendly, ctx, consolidate=True, prefer_vram=True,
-                                   quant="none", cpu_only=cpu_only)
+            # #autoload-smallest: an auto-loaded (requested-but-not-resident) model defaults to the
+            # SMALLEST quant — int4 — so a request never streams the full bf16 just to serve it (int4
+            # is ~1/4 the memory, fits more nodes, and serves PRE-PACKED when a shard cache exists).
+            # Tunable via ENGINE_CONFIG `autoload_quant` (int4|int8|none). If int4/int8 fails for a
+            # model the quantizer can't handle, fall back ONCE to bf16 so the request still succeeds
+            # rather than erroring out — "int4 in almost all cases", bf16 for the rest. (CancelledError
+            # is a BaseException, not Exception, so a client disconnect still aborts — never retried.)
+            aq = str(ENGINE_CONFIG.get("autoload_quant", "int4") or "none")
+            log_activity(f"{friendly}: auto-load on request (not resident) -> auto placement, "
+                         f"quant={aq}" + (" (CPU-only)" if cpu_only else ""))
+            try:
+                return await self.load(friendly, ctx, consolidate=True, prefer_vram=True,
+                                       quant=aq, cpu_only=cpu_only)
+            except Exception as e:
+                if aq != "none":
+                    log_activity(f"{friendly}: auto-load at {aq} failed ({e!r}) -> retry at bf16")
+                    return await self.load(friendly, ctx, consolidate=True, prefer_vram=True,
+                                           quant="none", cpu_only=cpu_only)
+                raise
         raise ValueError(f"model '{friendly}' is not loaded — load it first")
 
     def _reserved_bytes(self, exclude_key: Optional[str] = None) -> tuple[dict, dict]:
@@ -4371,6 +4392,7 @@ def build_status() -> dict:
             "max_loaded": ENGINE_CONFIG.get("max_loaded", MAX_LOADED_MODELS),
             "auto_unload": ENGINE_CONFIG.get("auto_unload", True),
             "auto_load": ENGINE_CONFIG.get("auto_load", True),
+            "autoload_quant": ENGINE_CONFIG.get("autoload_quant", "int4"),
             "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH),
         },
         "pool": {"nodes": len(nodes), "total_gb": round(pool_total, 2),
@@ -5904,6 +5926,7 @@ def build_app() -> FastAPI:
                          auto_tp: Optional[bool] = None,
                          auto_tp_ratio: Optional[float] = None,
                          auto_load: Optional[bool] = None,
+                         autoload_quant: Optional[str] = None,
                          persist: Optional[str] = None,
                          unpersist: Optional[str] = None) -> JSONResponse:
         if persist is not None:                          # #77: keep this model across restarts
@@ -5934,6 +5957,10 @@ def build_app() -> FastAPI:
             ENGINE_CONFIG["auto_tp_ratio"] = max(0.0, float(auto_tp_ratio))
         if auto_load is not None:                        # auto-load a requested model that isn't resident
             ENGINE_CONFIG["auto_load"] = bool(auto_load)
+        if autoload_quant is not None:                   # #autoload-smallest: quant for auto-loads
+            _aq = str(autoload_quant).lower()
+            if _aq in ("int4", "int8", "none"):
+                ENGINE_CONFIG["autoload_quant"] = _aq
         save_engine_config()
         log_activity(f"config: max_loaded={ENGINE_CONFIG['max_loaded']} "
                      f"auto_unload={ENGINE_CONFIG['auto_unload']} "
