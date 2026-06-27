@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c105"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c106"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -5014,7 +5014,9 @@ def build_app() -> FastAPI:
             return _stsave(out_sd), mt
 
         manifest = {"format": 1, "quant": quant, "group_size": _sh.INT4_GROUP, "num_layers": n_layers,
-                    "tied": tied, "files": {}, "tensors": {}, "expert_layout": None}
+                    "tied": tied, "files": {}, "tensors": {},
+                    "packer_hash": _sh._packer_tag(quant, _sh.INT4_GROUP),  # Inc 4: drift guard
+                    "expert_layout": None}
         _done = {"n": 0}
 
         def _write(unit: str, blob: bytes, mt: dict) -> None:   # inline (no thread) -> manifest dict race-free

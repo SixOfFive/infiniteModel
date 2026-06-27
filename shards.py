@@ -27,6 +27,17 @@ from wire import _tp_hetsplit, _fuse_moe_experts   # noqa: F401  (het-TP geometr
 # byte-identical to what the worker quantizes at load time (#shard-cache).
 INT4_GROUP = 128
 
+# #distributed-packing Inc 4: a packer-identity tag stamped into the manifest so a load REJECTS a
+# cache packed by a different packer version (fail-loud on packer/scope drift instead of silently
+# serving divergent weights — also de-risks any future GPU-pack path). Bump PACKER_VERSION whenever
+# the pack MATH changes (not for comments/refactors). A manifest WITHOUT packer_hash is legacy and is
+# grandfathered (accepted) so existing caches keep working.
+PACKER_VERSION = 1
+
+
+def _packer_tag(quant: str, group_size: int) -> str:
+    return f"v{PACKER_VERSION}-g{group_size}-{quant}"
+
 
 def pack_linear_int4(W, group_size: int = INT4_GROUP):
     """Group-wise asymmetric int4 pack of one Linear weight — the SHARED packer for the shard cache.
@@ -277,6 +288,7 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     os.makedirs(out_dir, exist_ok=True)
     manifest: dict = {"format": 1, "quant": quant, "group_size": group_size,
                       "num_layers": n_layers, "tied": tied, "files": {}, "tensors": {},
+                      "packer_hash": _packer_tag(quant, group_size),   # Inc 4: fail-loud on packer drift
                       "expert_layout": ("fused3d" if _moe else None)}   # MoE serve-from-cache (Inc 2)
     _open: dict = {}
 
@@ -385,6 +397,13 @@ def verify_shard_cache(model_dir: str, quant: str) -> tuple[bool, list[str]]:
     exp = int(man.get("num_layers", 0)) + 2
     if len(files) != exp:
         problems.append(f"incomplete: {len(files)} files, expected {exp}")
+    # Inc 4: reject a cache whose packer_hash is PRESENT but doesn't match this packer version (drift).
+    # A MISSING packer_hash is legacy -> grandfathered (accepted) so pre-Inc-4 caches keep working.
+    ph = man.get("packer_hash")
+    if ph is not None:
+        want = _packer_tag(man.get("quant", quant), int(man.get("group_size", INT4_GROUP)))
+        if ph != want:
+            problems.append(f"packer_hash mismatch ({ph} != {want}) — recompile")
     return (len(problems) == 0), problems
 
 
