@@ -1,0 +1,10 @@
+{
+  "_comment": "Central cluster configuration — single source of truth for hosts/ports + the self-update source. Edit here, not in code. No secrets: self-update pulls from the PUBLIC GitHub repo's raw endpoint (update_repo/update_branch), which needs no token.",
+  "controller_host": "192.168.15.103",
+  "http_port": 21434,
+  "control_port": 50100,
+  "data_port": 50101,
+  "worker_data_port": 50200,
+  "update_repo": "SixOfFive/infiniteModel",
+  "update_branch": "main"
+}
