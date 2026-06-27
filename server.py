@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c110"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c111"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -3273,12 +3273,18 @@ class Engine:
                         async for item in self._decode_spec(model, prompt_ids, max_new, spec_k):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _dt = time.monotonic() - _t0
+                                if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
+                                    model.last_tok_s = _ntoks / _dt
                             yield item
                     else:
                         async for item in self._decode_plain(model, prompt_ids, max_new,
                                                              temperature, top_p, mm=mm, mrope=mrope):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _dt = time.monotonic() - _t0
+                                if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
+                                    model.last_tok_s = _ntoks / _dt
                             yield item
                 finally:
                     model.active -= 1
