@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c103"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c104"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -4952,6 +4952,146 @@ def build_app() -> FastAPI:
                              "worker_bytes": len(worker_blob), "local_bytes": len(local_blob),
                              "byte_identical": identical, "tensor_identical": tcmp,
                              "tensors": len(res.get("mtensors") or {})})
+
+    @app.post("/compile_dist")   # #distributed-packing Inc 2: compile a shard cache by fanning unit-packs across workers
+    async def compile_dist(model: str, quant: str = "int4") -> JSONResponse:
+        """Compile a model's pre-quantized shard cache by DISTRIBUTING the per-layer pack across the
+        fleet (exo-inspired): each worker fetches a layer's bf16 from /weights, packs it with the
+        SHARED shards.pack_unit_tensors (bit-identical to a local compile, proven by /pack_probe), and
+        POSTs it back; the controller assembles the cache + manifest. embed/head are packed locally
+        (few units, tied-embedding edge cases); any worker failure falls back to a LOCAL pack of that
+        layer. Runs in the MAIN process (it owns the control links) — safe because the heavy packing is
+        now ON THE WORKERS, not the controller. Dense int4/int8 only (MoE needs the worker skeleton =
+        Inc 3); the proven local /compile_shards stays the path for MoE / single-box."""
+        import hashlib
+        import shards as _sh
+        import urllib.parse as _up
+        import urllib.request as _ur
+        from safetensors.torch import load as _stload, save as _stsave
+        if quant not in ("int4", "int8"):
+            return JSONResponse({"ok": False, "error": "int4|int8 only"}, status_code=400)
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        tgt = MODELS[friendly][0] if friendly in MODELS else friendly
+        mdir = await asyncio.to_thread(_controller_model_dir, tgt)
+        if not mdir:
+            return JSONResponse({"error": "model not available on the controller"}, status_code=404)
+        wm = await asyncio.to_thread(_sh._weight_map, mdir)
+        if await asyncio.to_thread(_sh._has_moe_experts, wm):
+            return JSONResponse({"ok": False, "error": "distributed compile is dense-only for now "
+                                 "(MoE = Inc 3); use /compile_shards"}, status_code=400)
+        ckey = f"{friendly}::{quant}"
+        if ckey in engine.compiling:
+            return JSONResponse({"ok": False, "error": f"{_ollama_name(friendly)} {quant} already compiling"},
+                                status_code=409)
+        n_layers = await asyncio.to_thread(_sh._model_num_layers, mdir)
+        out_dir = os.path.join(_sh._shard_cache_root(mdir), quant)
+        await asyncio.to_thread(os.makedirs, out_dir, True)
+        caps = [n for n in registry.alive_sorted() if n.can_infer and engine.links.get(n.node_id)]
+        engine.compiling[ckey] = {"model": friendly, "display_model": _ollama_name(friendly), "target": tgt,
+                                  "ready": 0, "total": n_layers + 2, "stages_total": max(1, len(caps)),
+                                  "stages_ready": 0, "basis": f"distributed {quant} compile "
+                                  f"({len(caps)} worker(s))", "warnings": [], "started": time.time()}
+        log_activity(f"distributed {quant} compile for {_ollama_name(friendly)} -> "
+                     f"{n_layers} layers across {len(caps)} worker(s)…")
+        scope = await asyncio.to_thread(_sh._quant_scope, mdir)
+        lin2d = sorted(scope[0]) if scope else None
+        exp3d = sorted(scope[1]) if scope else None
+        _lset = set(lin2d) if lin2d is not None else None
+        _eset = set(exp3d) if exp3d is not None else None
+        with open(os.path.join(mdir, "config.json"), encoding="utf-8") as fh:
+            tied = bool(json.load(fh).get("tie_word_embeddings", False))
+        base_local = f"http://127.0.0.1:{ARGS.http_port}"
+
+        def _pack_local(start: int, end: int, embed: int, head: int):
+            url = (f"{base_local}/weights?model={_up.quote(tgt)}&start={start}&end={end}"
+                   f"&embed={int(embed)}&head={int(head)}&skip_experts=0")
+            with _ur.urlopen(url, timeout=1800) as r:
+                raw = _stload(r.read())
+            out_sd, mt = _sh.pack_unit_tensors(raw, _lset, _eset, None, quant, _sh.INT4_GROUP)
+            return _stsave(out_sd), mt
+
+        manifest = {"format": 1, "quant": quant, "group_size": _sh.INT4_GROUP, "num_layers": n_layers,
+                    "tied": tied, "files": {}, "tensors": {}, "expert_layout": None}
+        _done = {"n": 0}
+
+        def _write(unit: str, blob: bytes, mt: dict) -> None:   # inline (no thread) -> manifest dict race-free
+            with open(os.path.join(out_dir, unit), "wb") as f:
+                f.write(blob)
+            manifest["files"][unit] = {"sha256": hashlib.sha256(blob).hexdigest(), "bytes": len(blob)}
+            for name, meta in mt.items():
+                manifest["tensors"][name] = {"file": unit, **meta}
+            _done["n"] += 1
+            c = engine.compiling.get(ckey)
+            if c:
+                c["ready"] = _done["n"]
+
+        async def _dispatch_layer(node, i: int):
+            link = engine.links.get(node.node_id)
+            if link is None:
+                raise RuntimeError(f"no link to {node.hostname}")
+            req_id = f"cd-{int(time.time()*1000)}-{i}-{node.node_id}"
+            fut = asyncio.get_event_loop().create_future()
+            engine._pack_futures[req_id] = fut
+            frame = {"type": "pack", "req_id": req_id, "model_id": tgt, "quant": quant,
+                     "group_size": _sh.INT4_GROUP, "unit": f"L{i:04d}.safetensors",
+                     "start": i, "end": i + 1, "embed": 0, "head": 0,
+                     "lin2d": lin2d, "exp3d": exp3d, "controller_http_port": ARGS.http_port}
+            try:
+                await link.send(frame)
+                await asyncio.wait_for(fut, timeout=1800)
+            finally:
+                engine._pack_futures.pop(req_id, None)
+            res = engine._pack_results.pop(req_id, None)
+            if not res:
+                raise RuntimeError("no pack result")
+            return res["bytes"], res["mtensors"]
+
+        async def _run():
+            try:
+                eb, emt = await asyncio.to_thread(_pack_local, 0, 0, 1, 0)
+                _write("embed.safetensors", eb, emt)
+                q: asyncio.Queue = asyncio.Queue()
+                for i in range(n_layers):
+                    q.put_nowait(i)
+
+                async def _node_loop(node):
+                    while True:
+                        try:
+                            i = q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        unit = f"L{i:04d}.safetensors"
+                        try:
+                            blob, mt = await _dispatch_layer(node, i)
+                        except Exception as exc:   # worker died / no shards.py / timeout -> local fallback
+                            log_activity(f"compile_dist {unit} on {node.hostname} failed ({exc!r}) -> local pack")
+                            blob, mt = await asyncio.to_thread(_pack_local, i, i + 1, 0, 0)
+                        _write(unit, blob, mt)
+
+                if caps:
+                    await asyncio.gather(*[_node_loop(n) for n in caps])
+                else:                              # no workers -> compile fully locally
+                    for i in range(n_layers):
+                        blob, mt = await asyncio.to_thread(_pack_local, i, i + 1, 0, 0)
+                        _write(f"L{i:04d}.safetensors", blob, mt)
+                hb, hmt = await asyncio.to_thread(_pack_local, 0, 0, 0, 1)
+                _write("head.safetensors", hb, hmt)
+                with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                    json.dump(manifest, f)
+                _CACHE_VERIFY_MEMO.pop((mdir, quant), None)   # force a fresh verify on next load
+                log_activity(f"distributed {quant} compile DONE for {_ollama_name(friendly)} "
+                             f"({n_layers} layers, {len(caps)} worker(s))")
+            except Exception as exc:
+                log_activity(f"distributed compile FAILED for {_ollama_name(friendly)}: {exc!r}")
+            finally:
+                engine.compiling.pop(ckey, None)
+
+        asyncio.create_task(_run())
+        return JSONResponse({"ok": True, "model": _ollama_name(friendly), "quant": quant,
+                             "distributed": True, "workers": len(caps), "layers": n_layers})
 
     @app.post("/compile_shards")        # #shard-cache: compile a model's pre-quantized cache on beast
     async def compile_shards_ep(model: str, quant: str = "int4") -> JSONResponse:
