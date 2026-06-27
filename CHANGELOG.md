@@ -42,6 +42,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   replication + data-parallel routing.
 - Robust loads: survive a worker drop mid-load (replan on survivors), free partial shards on failure,
   scaled timeouts, gentler restarts; auto-recover resident models when a worker reconnects.
+- **Idle-pipeline self-heal:** every data-plane hop is fresh-reconnected at each generation's prefill
+  if it has been idle (an idle TCP socket can go silently half-open — the write succeeds but the bytes
+  never arrive — which otherwise stalls the first request after an idle gap until the generation
+  timeout). Both the controller's connection to stage 0 and each worker's next-hop are freshened, so a
+  model that sat loaded-but-unused replies immediately instead of appearing wedged.
 - Observability: placement preview, per-load progress/ETA, fleet CPU/GPU/RAM + throughput + bandwidth,
   curl-able fleet logs; idle-gated multi-file self-update.
 

@@ -47,7 +47,12 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c38"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c116"  # version tag only; full changelog -> CHANGELOG.md
+# #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
+# long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
+# (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
+# so a slow model's multi-second inter-token gaps never trip it. Mirrors the controller's STAGE0_STALE_S.
+STAGE_STALE_S = 5.0
 _STREAM_PREFETCH_MAX = 6  # max concurrent per-layer weight fetches during a streaming load
                           # (actual depth K is clamped to free RAM per node; see Shard.from_stream)
 GB = 1024 ** 3
@@ -3131,6 +3136,7 @@ class Worker:
             self._rss_baseline_gb = 0.0
         self.next_writers: dict[str, asyncio.StreamWriter] = {}  # model_id -> conn to its next stage
         self.next_peer: dict[str, str] = {}                      # model_id -> next-hop label (bandwidth)
+        self._next_last_send: dict[str, float] = {}              # #stage0-stale-reconnect: model_id -> last forward ts
         self.assignments: dict[str, dict] = {}                   # model_id -> load msg (debug/reload)
         self._weight_tmps: dict[str, str] = {}                   # model_id -> temp file backing its mmap
         self.data_server: asyncio.AbstractServer | None = None   # shared data port; bound on first load
@@ -3602,6 +3608,22 @@ class Worker:
               f"{self.next_peer[model_id]} ({next_host}:{next_port})", flush=True)
         return w
 
+    def _freshen_next(self, model_id: str) -> None:
+        """#stage0-stale-reconnect: at a PREFILL, drop a next-hop conn that's been idle past
+        STAGE_STALE_S so the upcoming _send_next lazy-reconnects it FRESH. A reconnect-on-FAILURE
+        (in _send_next) can't catch a SILENTLY half-open idle socket — the write succeeds but the
+        bytes never arrive, so the downstream stage / controller never sees the frame and just
+        waits out GEN_TIMEOUT. Proactively dropping the stale socket here is the cure. Caller gates
+        this on reset=True (prefill) only, so a slow decode's inter-token gaps never trigger it."""
+        last = self._next_last_send.get(model_id, 0.0)
+        if model_id in self.next_writers and (time.time() - last) > STAGE_STALE_S:
+            w = self.next_writers.pop(model_id, None)
+            if w is not None:
+                with contextlib.suppress(Exception):
+                    w.close()
+            print(f"[data] dropping idle next-hop for {model_id} "
+                  f"(stale {time.time() - last:.0f}s) -> will reconnect fresh", flush=True)
+
     async def _send_next(self, model_id: str, hdr: dict, raw: bytes) -> int:
         """Send one frame to this model's next hop, RECONNECTING once if the (possibly
         idle-dead) connection fails. This is what makes a distributed generation survive the
@@ -3610,12 +3632,16 @@ class Worker:
         nxt = self.next_writers.get(model_id)
         if nxt is not None:
             try:
-                return await _write_frame(nxt, hdr, raw)
+                _nb = await _write_frame(nxt, hdr, raw)
+                self._next_last_send[model_id] = time.time()   # #stage0-stale-reconnect freshness clock
+                return _nb
             except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
                 print(f"[data] next-hop send for {model_id} failed ({exc!r}); "
                       f"reconnecting + retrying once", flush=True)
         nxt = await self._reconnect_next(model_id)   # no writer, or the send just died
-        return await _write_frame(nxt, hdr, raw)
+        _nb = await _write_frame(nxt, hdr, raw)
+        self._next_last_send[model_id] = time.time()
+        return _nb
 
     def _run_stage(self, model_id, x, cache_start, reset, all_logits, inject=None,
                    position_ids=None, capture_hidden=False):
@@ -3694,6 +3720,8 @@ class Worker:
                 cache_start = int(hdr.get("cache_position", 0))
                 reset = bool(hdr.get("reset", True))
                 all_logits = bool(hdr.get("all_logits", False))
+                if reset:   # #stage0-stale-reconnect: new generation -> drop a stale (idle) next hop
+                    self._freshen_next(model_id)   # so this prefill's forward rides a fresh socket
                 try:
                     if shard is None:
                         raise RuntimeError(f"no shard for model_id={model_id!r} on this node")

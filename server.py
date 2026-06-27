@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c115"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c116"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -250,6 +250,12 @@ GEN_STALL_S = 240.0     # #gen-stall-watchdog: a model active>0 that has produce
                         # long is WEDGED (dead pipeline hop -> 0 tokens + idle data plane). The
                         # watchdog cancels its in-flight request(s) + reclaims the leaked active slot.
                         # > worst-case legit first-token wait (big CPU prefill) so it never false-fires.
+STAGE0_STALE_S = 5.0    # #stage0-stale-reconnect: if the controller hasn't pushed a frame to a model's
+                        # stage 0 for this long, its stage0_writer may have gone silently half-open while
+                        # idle -> rebuild it FRESH before the next generation's prefill (a connect is ~ms;
+                        # the alternative is a ~600s GEN_TIMEOUT hang the watchdog only papers over). Short
+                        # enough to catch idle-between-requests; only checked at generate START (never
+                        # per decode token), so a slow model's multi-second inter-token gaps never trip it.
 SPEC_K = 4              # speculative decode: draft this many tokens per verify
 
 # --- Per-node tier config (persisted): enable/disable each node's CPU/RAM and
@@ -1226,6 +1232,16 @@ class LoadedModel:
     tp_size: int = 1      # tensor-parallel width (1 = pipeline/single-node); set by _load_tp_locked.
                           # Surfaced on the card + used by #88 /reconfigure (managed-reload to/from TP).
     stage0_writer: Optional[asyncio.StreamWriter] = None  # per-model pipeline conn (controller -> first stage)
+    # #stage0-stale-reconnect: how to RE-dial stage 0 (host, port) — saved at load so the controller can
+    # rebuild a stale/half-open stage0_writer WITHOUT consulting the (mutable) node registry. last_send_ts
+    # = wall-clock of the last frame the controller pushed to stage 0. The controller's stage0_writer is
+    # opened at LOAD then sits IDLE until the first generate; an idle socket can go SILENTLY half-open
+    # (the write SUCCEEDS but bytes never arrive -> no logits -> ~600s GEN_TIMEOUT hang). This is the SAME
+    # failure the workers already fixed for their next-hop by lazy fresh-connecting (client.py _send_next);
+    # the controller's stage0 conn was the one socket still using the discredited pre-open-and-idle pattern.
+    # Freshening it when stale (at generate start) is the cure (see _freshen_stage0).
+    stage0_dial: tuple = ()
+    last_send_ts: float = 0.0
     last_used: float = 0.0                                  # touched on each generate; LRU key (Inc 3)
     # Per-model generation lock (Inc 3b): different models run CONCURRENTLY (each holds its
     # own lock); same-model requests serialize (queue) on it. load/unload hold the engine lock.
@@ -2662,14 +2678,16 @@ class Engine:
                 raise RuntimeError("load failed: no capable nodes left after exclusions")
 
             s0 = node_by_id[stages[0].node_id]
-            stage0_writer = await self._connect_retry(_dial_host(s0.data_host), s0.data_port)
+            _s0_dial = (_dial_host(s0.data_host), s0.data_port)
+            stage0_writer = await self._connect_retry(*_s0_dial)
             tok = await asyncio.to_thread(_get_tokenizer, target_id)
             eos = self._eos_ids(tok)
             now = time.time()
             lm = LoadedModel(
                 reg_key, target_id, spec, ctx, plan,
                 [s.node_id for s in stages], tok, eos, now,
-                quant=quant, stage0_writer=stage0_writer, last_used=now)
+                quant=quant, stage0_writer=stage0_writer, last_used=now,
+                stage0_dial=_s0_dial, last_send_ts=now)   # #stage0-stale-reconnect: how to re-dial + freshness clock
             lm.base, lm.replica_idx = friendly, replica_idx   # data-parallel grouping (#39)
             lm.plan_basis = basis                             # placement basis (#65)
             lm.load_warnings, lm.load_assess = load_warnings, assess   # pre-load guardrail (#76)
@@ -2779,12 +2797,14 @@ class Engine:
                           pool_usable_gb=node.usable_total_gb,
                           required_gb=spec.total_weight_bytes / GB, stages=[stage])
         node.shard_gpu_bytes = gpu_b
-        stage0_writer = await self._connect_retry(_dial_host(node.data_host), node.data_port)
+        _emb_dial = (_dial_host(node.data_host), node.data_port)
+        stage0_writer = await self._connect_retry(*_emb_dial)
         now = time.time()
         lm = LoadedModel(
             reg_key, target_id, spec, spec.max_ctx, plan,
             [node.node_id], tok, set(), now,
-            quant="none", stage0_writer=stage0_writer, last_used=now)
+            quant="none", stage0_writer=stage0_writer, last_used=now,
+            stage0_dial=_emb_dial, last_send_ts=now)
         lm.base, lm.replica_idx = friendly, replica_idx
         lm.plan_basis = "embedding: single-node"
         self.models[reg_key] = lm
@@ -3159,7 +3179,8 @@ class Engine:
                 if _tcard is not None:
                     _tcard["stages_ready"] = _tcard.get("stages_ready", 0) + 1
         # the pipeline is just rank 0; the controller talks only to it
-        stage0_writer = await self._connect_retry(_dial_host(root.data_host), root.data_port)
+        _tp_dial = (_dial_host(root.data_host), root.data_port)
+        stage0_writer = await self._connect_retry(*_tp_dial)
         tok = await asyncio.to_thread(_get_tokenizer, target_id)
         eos = self._eos_ids(tok)
         # (TP models carry no speculative draft — big-model decode is bandwidth-bound.)
@@ -3175,7 +3196,8 @@ class Engine:
         now = time.time()
         lm = LoadedModel(friendly, target_id, spec, ctx, plan,
                          [n.node_id for n in tp_nodes], tok, eos, now,
-                         quant=quant, stage0_writer=stage0_writer, last_used=now)
+                         quant=quant, stage0_writer=stage0_writer, last_used=now,
+                         stage0_dial=_tp_dial, last_send_ts=now)
         lm.plan_basis = tp_basis                          # placement basis (#65)
         lm.tp_size = tp                                    # #88: record TP width for the card + /reconfigure
         self.models[friendly] = lm
@@ -3214,6 +3236,32 @@ class Engine:
             return int(idx[int(torch.multinomial(sp, 1))])
         return int(torch.multinomial(probs, 1))
 
+    async def _freshen_stage0(self, model: LoadedModel, force: bool = False) -> None:
+        """#stage0-stale-reconnect: rebuild model.stage0_writer FRESH if it may be stale. The
+        controller's stage0 conn is opened at LOAD then sits IDLE between requests; an idle socket
+        can go SILENTLY half-open (the write SUCCEEDS but the bytes vanish -> no logits -> ~600s
+        GEN_TIMEOUT hang — the 'loaded but never replies' bug). Reconnecting a fresh socket at
+        generate START (when idle past STAGE0_STALE_S) gives every request a hot, proven path —
+        the SAME lazy-fresh-connect the workers already use for their next hop (client.py
+        _send_next). force=True rebuilds unconditionally (used by _send after a write FAILED).
+        Cheap: a TCP connect is ~ms vs a multi-token generation."""
+        if not model.stage0_dial:
+            return   # no saved dial target (shouldn't happen post-load) -> leave as-is
+        now = time.time()
+        if (not force and model.stage0_writer is not None
+                and (now - model.last_send_ts) <= STAGE0_STALE_S):
+            return   # used recently -> the connection is hot, reuse it (no churn on busy models)
+        old = model.stage0_writer
+        if old is not None:
+            with contextlib.suppress(Exception):
+                old.close()
+        model.stage0_writer = await self._connect_retry(*model.stage0_dial)
+        model.last_send_ts = now
+        with contextlib.suppress(Exception):
+            print(f"[data] freshened stage0 conn for {model.friendly} -> "
+                  f"{model.stage0_dial[0]}:{model.stage0_dial[1]} "
+                  f"({'write failed' if force else 'idle'})", flush=True)
+
     async def _send(self, model: LoadedModel, x, cache_position: int, reset: bool,
                     all_logits: bool = False, mm=None, position_ids=None,
                     capture_hidden: bool = False):
@@ -3223,6 +3271,8 @@ class Engine:
         'mm' frame is sent FIRST with the same req_id so stage 0 splices those embeds into
         its embed output at `positions` before running the layers."""
         if model.stage0_writer is None:
+            await self._freshen_stage0(model, force=True)   # rebuild from saved dial if dropped
+        if model.stage0_writer is None:
             raise RuntimeError("pipeline not connected")
         loop = asyncio.get_event_loop()
         rid = self.next_req()
@@ -3230,14 +3280,15 @@ class Engine:
         fut = loop.create_future()
         self.pending[rid] = fut
         self.pending_model[rid] = model.target_id   # so a head drop fails only this model
-        try:
+
+        async def _flush(w) -> None:
             if mm is not None and reset:
                 positions, embeds = mm
                 emeta, eraw = _pack_tensor(embeds)
-                nbytes = await _write_frame(model.stage0_writer, {
+                nb = await _write_frame(w, {
                     "req_id": rid, "model_id": model.target_id, "kind": "mm",
                     "positions": list(positions), **emeta}, eraw)
-                net_account(self._stage0_id(model), to_node=nbytes)  # controller -> stage0
+                net_account(self._stage0_id(model), to_node=nb)  # controller -> stage0
             hdr = {"req_id": rid, "model_id": model.target_id, "kind": "ids",
                    "cache_position": cache_position,
                    "reset": reset, "all_logits": all_logits, **meta}
@@ -3245,8 +3296,19 @@ class Engine:
                 hdr["position_ids"] = position_ids
             if capture_hidden:   # #P6 speech: ask the head stage for post-norm hidden too
                 hdr["capture_hidden"] = True
-            nbytes = await _write_frame(model.stage0_writer, hdr, raw)
-            net_account(self._stage0_id(model), to_node=nbytes)  # controller -> stage0
+            nb = await _write_frame(w, hdr, raw)
+            net_account(self._stage0_id(model), to_node=nb)  # controller -> stage0
+
+        try:
+            try:
+                await _flush(model.stage0_writer)
+            except (ConnectionError, OSError, asyncio.IncompleteReadError):
+                # stage0 conn died at/mid send -> rebuild FRESH + resend ONCE. The worker keys frames
+                # by model_id and hasn't processed anything on the new socket, so resending the same
+                # req_id is clean (mirrors the worker's reconnect-once-on-failure in _send_next).
+                await self._freshen_stage0(model, force=True)
+                await _flush(model.stage0_writer)
+            model.last_send_ts = time.time()
             return await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
         finally:
             self.pending.pop(rid, None)  # never leak the future
@@ -3321,6 +3383,12 @@ class Engine:
                 model.queued -= 1
                 model.active += 1
                 model.last_token_ts = time.time()   # #gen-stall-watchdog: start the no-progress timer at gen begin
+                # #stage0-stale-reconnect: rebuild a stale (idle-since-last-request) stage0 conn BEFORE
+                # the prefill so this request rides a fresh, proven socket instead of a possibly
+                # half-open one (the 'loaded but never replies' / ~600s hang). No-op when hot (busy
+                # model) or recently sent; under the lock so no concurrent decode is using the writer.
+                with contextlib.suppress(Exception):
+                    await self._freshen_stage0(model)
                 _inflight_start(rec)   # slot acquired: queued -> running (dashboard)
                 try:
                     model.last_used = time.time()
