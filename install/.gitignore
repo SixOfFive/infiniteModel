@@ -1,12 +1,13 @@
-# This folder is committed as a portable, OFFLINE "backup / basis" bundle:
-# the standalone Python runtimes (python/) and the full wheel cache (wheels/)
-# ARE tracked on purpose, so the worker can be rebuilt anywhere with no
-# internet straight from a checkout.
-#
-# Only TARGET-GENERATED, machine-specific build outputs are excluded below —
-# install.bat / install.sh recreate them on each machine, and they must NOT be
-# committed: a venv bakes absolute drive/mount paths (broken if moved), and
-# runtime/ is just python/*.tar.gz unpacked (redundant with the archive).
+# The offline bundle (standalone Python runtimes python/ + the full wheel cache
+# wheels/) is NOT vendored in the public repo — it was ~550 MB. install.sh /
+# install.bat install from PyPI online; for a fully offline build, drop your own
+# wheels/ + python/ here (they are ignored below so they never get committed).
+wheels/
+python/
+
+# TARGET-GENERATED, machine-specific build outputs — install.* recreate them on
+# each machine and they must NOT be committed (a venv bakes absolute paths;
+# runtime/ is just python/*.tar.gz unpacked).
 .venv-win/
 .venv-linux/
 runtime/

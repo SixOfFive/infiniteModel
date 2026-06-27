@@ -1,169 +1,101 @@
 # ∞ InfiniteModel
 
-Split a single LLM across several home machines so you can run a model too big
-for any one box — and make that distributed run as fast as it can honestly go.
+A from-scratch **distributed LLM inference** engine: a single **controller** splits one
+transformer model's layers across a **heterogeneous fleet** of machines (any mix of GPU and
+CPU nodes) over a hand-rolled plain-TCP transport — so you can run a model too big for any one
+box. Built on Hugging Face `transformers` + plain PyTorch (no vLLM/TGI/Ray/`torch.distributed`).
 
-One **controller** machine exposes an **Ollama-compatible API** and a live
-**dashboard**. **Worker** machines connect to it, contribute their RAM, and the
-controller pools that memory to fit the model. As more workers join, the pool
-grows (bigger models) and — where the network allows — speed improves.
+It exposes **Ollama-, OpenAI-, and Anthropic-compatible** HTTP APIs, so existing clients
+(Ollama tooling, OpenAI SDKs, Claude Code) can talk to the cluster unchanged, plus a live
+dashboard.
 
-> **CPU-only fleet** for now (no usable GPUs). The GPU code path exists and
-> degrades gracefully to CPU; nothing here requires CUDA.
+> Personal research project — expect rough edges. Hugging Face **safetensors** models only (no GGUF).
 
-## The engine, honestly
+## Why from-scratch + Hugging Face?
 
-Splitting buys **capacity** or **speed** depending on *how* you split:
+`torch.distributed` / PiPPy / TensorPipe are effectively Unix-only — that's what blocks HF
+distribution on Windows. By rolling our own plain-TCP transport, the **same code runs on Windows
+and Linux**; only the cross-node wire is custom, while per-node compute stays standard `torch`.
+What crosses the wire per token is tiny (~KBs of hidden state), so **1 GbE is not the bottleneck —
+per-token sync latency is.** Use wired links.
 
-- **Pipeline parallel (to FIT):** each node holds a contiguous block of layers.
-  Pools RAM so a big model fits. Runs sequentially — adds capacity, not speed.
-  Always works, any node count, heterogeneous, cross-platform.
-- **Tensor parallel (to go FASTER):** extra nodes shard each stage's matmuls and
-  compute in parallel. Real speedup, **but capped at ~2–4 nodes per stage** before
-  the per-token all-reduce latency dominates — and pure-Python-over-TCP on CPU may
-  not beat the baseline at all. We build it, then **measure** before claiming a win.
-- **Speculative decoding (the reliable CPU speed lever):** a small draft model
-  proposes K tokens; the big pipeline verifies all K in one pass. Cuts the number
-  of expensive forward passes instead of fighting network overhead.
+## How it splits
 
-What crosses the wire per token is tiny (~10 KB hidden state), so **1 GbE
-bandwidth is not the bottleneck — per-token sync latency is.** Use **wired**
-links only; Wi-Fi jitter kills it.
+- **Pipeline parallel (to FIT):** each node holds a contiguous block of layers; pools memory so a
+  big model fits. Always works — any node count, heterogeneous, cross-platform.
+- **Tensor parallel (to go FASTER):** shard each stage's matmuls across nodes (capacity-proportional,
+  GPU+CPU mixed). Real speedup, but capped by per-token all-reduce latency — so it's measured, not assumed.
+- **Speculative decoding (opt-in):** a small draft model proposes K tokens; the pipeline verifies them
+  in one traversal — cuts the network-bound traversals on big/distributed targets.
 
-Why from-scratch + HuggingFace? Because `torch.distributed.rpc` / PiPPy /
-TensorPipe are Unix-only — they're what blocks HF distribution on Windows. By
-rolling our own plain-TCP transport we run the **same code on Windows and Linux**;
-only the cross-node wire is custom, while per-node compute stays standard `torch`.
+## Features
 
-## Roadmap
+- **Quantization:** int4 (group-wise, fused tinygemm GEMM) + int8 (per-channel); serves fp8- and
+  nvfp4-checkpoints by dequantizing at serve time.
+- **Pre-compiled shard cache:** the controller quantizes a model once to `_shards/<quant>/`; loads
+  then stream small **pre-packed** int4/int8 layers instead of bf16 + re-quantize — including **MoE**
+  (fused-3D *and* per-expert Mixtral/OLMoE, fused at compile, bit-identical to a cold load).
+- **MoE:** fused + non-fused experts; optional intra-layer offload (attention on GPU, routed experts in CPU RAM).
+- **Multi-model:** N models resident at once, node-sharing, concurrency + queueing, auto-load/unload.
+- **Multimodal:** distributed vision + audio (Qwen2.5-Omni) — image/audio → text.
+- **Ops:** live dashboard (placement preview, per-load progress, fleet memory/throughput, bandwidth),
+  curl-able fleet logs, idle-gated self-update, RAM/VRAM safety (OOM-clean replans).
 
-| Milestone | What lands | Status |
-|-----------|-----------|--------|
-| **M1**  | Node registry, heartbeat, CPU/RAM reporting, live dashboard | ✅ |
-| **M2a** | RAM-weighted partition planner (`/plan`, `--self-test-plan`) | ✅ |
-| **M2b** | Worker partial model load (owns only its layers; rest stay on `meta`) | ✅ |
-| **M2c** | Networked pipeline generation + full Ollama API | ✅ |
-| **M2d** | Chunk serving (RAM-bound workers, no model on disk) + throughput/traffic metrics | ✅ |
-| **M2e** | Incremental KV-cache decode (prefill-once, O(n) not O(n²)) | ✅ |
-| **M3**  | Speculative decoding — greedy-exact, **opt-in** (`options.speculative=true`) | ✅* |
-| **M4**  | Tensor-parallel within stages (node-scaling speed) → measure vs M2/M3 | ☐ |
-| **M5**  | Dynamic re-plan on join/leave; KV-cache quantization (q8_0) for longer context | ☐ |
+## Architecture
 
-> **\*M3 is implemented and bit-exact** (a draft model on the controller proposes K
-> tokens; the pipeline verifies them in one traversal; KV cache rolls back on
-> mismatch). It's **opt-in and conditional** — and we measured the crossover on a
-> real fleet:
->
-> | Target (5-node CPU fleet) | M2e plain | M3 speculative | Verdict |
-> |---|---|---|---|
-> | 1.5B (+0.5B draft, 2 nodes) | 5.44 tok/s | 2.25 tok/s | plain wins |
-> | **7B (+0.5B draft, 5 nodes)** | **1.08 tok/s** | **1.18 tok/s** | **spec wins ~1.09×** |
->
-> On small targets the per-traversal cost is low, so the local draft's K forward
-> passes + the re-establish traversal dominate. The win appears once the target's
-> per-token pipeline traversal cost outgrows the draft cost (big model / many nodes)
-> and widens from there — exactly the predicted crossover. So spec stays opt-in and
-> never replaces the fast M2e default. (The ONE LAW's "measure before claiming,"
-> realized.)
+```
+            ┌──────────── controller (server.py) ────────────┐
+ client ──▶ │  HTTP API (Ollama / OpenAI / Anthropic) + UI    │
+            │  planner → splits the model into layer stages   │
+            └──────┬────────────────┬────────────────┬────────┘
+           control │           data │ (plain TCP)     │
+                   ▼                ▼                  ▼
+             worker (client.py) … worker … worker            (GPU and/or CPU)
+             layers [0,a)         [a,b)     [b,L)
+```
 
-> **Decode is incremental** (M2e): each stage keeps a per-generation KV cache, so a
-> decode step processes only the new token. Measured on a 5-node CPU fleet: 0.5B went
-> from ~1.6 tok/s (O(n²) repeated-prefill) to ~5.6 tok/s with flat per-token time.
-> Output is bit-identical to HF pure-greedy. Next speed lever is **M3 speculative
-> decoding** (a small draft model proposes K tokens, the pipeline verifies them in one
-> traversal — cuts the network-bound traversals that now dominate).
-
-A node leaving mid-run tears the cluster down and requires a reload — by design;
-membership is frozen at model-load time (no fragile mid-inference re-sharding).
-
-**Weights are chunk-served (M2d).** The controller downloads the full model once
-and serves each worker only its layer tensors (`/weights`); the worker loads them
-straight into RAM. Workers keep **no model on disk**, so the model-size ceiling is
-`min(RAM pool to run it, controller disk to hold it)` — never the smallest worker
-drive. Workers also purge stale model/chunk caches on startup. The dashboard shows
-the largest servable model, live tokens/s + API bytes in/out, and per-node
-network traffic in/out (10 s rolling).
-
-> **Don't run a cleaning worker on the controller box.** A `client.py` started on
-> the controller machine without `--no-clean` will purge the controller's HF cache
-> on startup and wipe every downloaded model. The controller itself never deletes.
-
-**Model store + network metering.** The controller is the single model store and
-**never auto-purges** — download several models, switch between them, and come back
-to an older one without re-downloading. Only models whose weights are actually
-present are reported as *available* (`/api/tags`, `/v1/models`, `/api/show`, and the
-dashboard) — a model that isn't downloaded can't be distributed, so it isn't listed.
-Manage models from the dashboard (or `POST /download?model=` / `POST /delete?model=`
-/ Ollama `/api/pull` + `/api/delete`); deleting a loaded model is refused. **Network
-traffic is metered by the controller itself** — it counts the bytes on its own
-sockets (control plane, the frame to stage 0, the logits from the head, and weight
-serving) rather than trusting client self-reports. Because the data path is a ring
-`controller → stage0 → … → head → controller`, the controller is only physically on
-the first and last hops; mid-pipeline stages exchange hidden states node-to-node,
-off the controller, so during decode they show only their control-plane bytes here.
+The controller plans placement (GPU-first, spill to CPU/RAM; or tensor-parallel), streams each
+stage's weights to its worker (straight into RAM — no temp files), then drives generation across the
+ring `controller → stage0 → … → head → controller`. A node leaving mid-run triggers a clean replan.
 
 ## Quick start
 
-**Controller** (the machine the Ollama API is served from):
+1. **Configure** `config.json` — the single source of truth for hosts/ports (built-in defaults apply if absent):
+   ```json
+   { "controller_host": "10.0.0.5", "http_port": 21434, "control_port": 50100, "data_port": 50101 }
+   ```
+2. **Controller** (the box that holds the weights & serves the API):
+   ```
+   python server.py            # Windows: server.bat
+   ```
+3. **Each worker:**
+   ```
+   ./client.sh --device cpu+gpu          # Linux  (Windows: client.bat)
+   ./client.sh --controller 10.0.0.5     # override the controller if not in config.json
+   ```
+   For a pinned, self-contained install see [`install/`](install/).
+4. **Use it** — open `http://<controller>:21434/` for the dashboard, or point any Ollama/OpenAI/Anthropic client at that URL:
+   ```
+   curl -X POST "http://<controller>:21434/load?model=qwen2.5-0.5b&ctx=2048&quant=int4"
+   curl -X POST  http://<controller>:21434/api/generate \
+        -d '{"model":"qwen2.5-0.5b","prompt":"The capital of France is","stream":false}'
+   ```
+   `load` distributes the model across the fleet; the first request for a model also auto-loads it.
 
-```powershell
-pip install fastapi uvicorn torch transformers safetensors huggingface_hub
-python server.py                 # dashboard + Ollama API :11434, control :50100, data :50101
-```
+## Configuration & secrets
 
-Open the dashboard at `http://<controller>:11434/` — it has a load/unload +
-test-generate panel.
+- **`config.json`** — cluster hosts/ports (the one place to edit; no addresses are baked into code).
+- **`hf_token.txt`** or `$HF_TOKEN` — Hugging Face token for gated/authenticated pulls (gitignored).
+- **`gitlab_token.txt`** or `$GITLAB_TOKEN` — optional read token if you self-update from a private git mirror (gitignored).
 
-**Each worker:**
+No secrets are stored in the source.
 
-```bash
-pip install psutil torch transformers safetensors huggingface_hub  # torch CPU: --index-url https://download.pytorch.org/whl/cpu
-python client.py --controller <controller-ip>
-```
+## Requirements
 
-It registers within ~2 s and appears on the dashboard. Then load a model across
-the pool and use it like any Ollama endpoint:
+Python 3.13, PyTorch 2.12, `transformers` 5.x, `safetensors`, `huggingface_hub`, `psutil`, plus
+`fastapi`/`uvicorn` on the controller (see [`requirements.txt`](requirements.txt)). A CUDA GPU is
+optional — CPU-only nodes work and the GPU path degrades gracefully to CPU.
 
-```bash
-curl -X POST "http://<controller>:11434/load?model=qwen2.5-0.5b&ctx=2048"   # plan + distribute
-curl -X POST http://<controller>:11434/api/generate \
-     -d '{"model":"qwen2.5-0.5b","prompt":"The capital of France is","stream":false}'
-```
+## License
 
-`load` downloads the model on each worker (HF cache) and loads only that node's
-layer slice. The first `/api/generate` for a model also auto-loads it.
-
-### Ollama API surface
-
-`/api/version`, `/api/tags`, `/api/show`, `/api/ps`, `/api/generate`, `/api/chat`
-(streaming NDJSON + non-stream, full duration/eval fields), plus OpenAI-compat
-`/v1/models` and `/v1/chat/completions`. Point existing Ollama tooling at the port.
-
-### Useful flags
-
-```
-server.py  --host 0.0.0.0 --http-port 11434 --control-port 50100 --data-port 50101 --os-reserve-gb 2.0
-           --self-test-plan --fleet 16,8,16,32     # offline planner demo, no cluster needed
-client.py  --controller HOST --control-port 50100 --data-port 50200 --os-reserve-gb 2.0 --name LABEL
-           --self-test-load --model Qwen/Qwen2.5-0.5B-Instruct   # local load/correctness check
-```
-
-## Layout
-
-```
-server.py         controller: registry + planner + control/data plane + Ollama API + dashboard
-client.py         worker: capability probe + registry + partial model load + stage execution
-requirements.txt  dependency notes (install per-role)
-```
-
-## Models
-
-Configured target/draft pairs (draft + target share a tokenizer, as speculative
-decoding requires):
-
-- `qwen2.5-0.5b`, `qwen2.5-1.5b` — fast proof/iteration
-- `qwen2.5-7b` — fits ~3 home boxes' pooled RAM
-- `qwen2.5-coder-32b` — the real ~24 GB+ goal (needs a larger pool)
-
-Edit the `MODELS` map in `server.py` to add more (Llama / Qwen2.5 / Mistral-family
-decoders are supported first).
+[MIT](LICENSE)

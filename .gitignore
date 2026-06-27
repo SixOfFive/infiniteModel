@@ -18,6 +18,10 @@ hf_token.txt
 gitlab_token.txt
 **/gitlab_token.txt
 
+# --- Auto-generated / machine-local (never commit to the public repo) ---
+/CLAUDE.md
+_*_int8.json
+
 # --- Python ---
 __pycache__/
 *.py[cod]
