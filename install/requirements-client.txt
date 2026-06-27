@@ -1,0 +1,13 @@
+# InfiniteModel worker (client.py) dependencies — pinned to the proven fleet
+# versions (see provision_worker.sh). Used by install.bat / install.sh for an
+# OFFLINE install:  pip install --no-index --find-links install/wheels/<os> -r this
+#
+# torch's CPU wheel (torch-2.12.0+cpu-...) is fetched from
+# https://download.pytorch.org/whl/cpu by install/_fetch.py and lives in the
+# same wheels/<os> dir, so `torch==2.12.0` resolves to it offline.
+torch==2.12.0
+transformers==5.12.1
+safetensors==0.8.0
+huggingface_hub==1.19.0
+numpy==2.4.6
+psutil==7.2.2

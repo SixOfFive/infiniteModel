@@ -1,0 +1,1 @@
+{"ok":false,"error":"model needs ~116.9 GB but pool offers 48.5 GB usable - short by ~68.4 GB (add nodes or lower context from 131072) — even ctx 1024 won't fit; the model's weights exceed the usable pool (free memory or use a smaller quant)"}

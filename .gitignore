@@ -1,0 +1,79 @@
+# --- Private working notes — never commit (see CLAUDE.md) ---
+braindump.md
+BRAINDUMP.md
+Braindump.md
+brain_dump.md
+BRAIN_DUMP.md
+Brain_Dump.md
+**/braindump.md
+**/BRAINDUMP.md
+**/Braindump.md
+**/brain_dump.md
+**/BRAIN_DUMP.md
+**/Brain_Dump.md
+
+# --- Secrets — never commit (see CLAUDE.md) ---
+hf_token.txt
+**/hf_token.txt
+gitlab_token.txt
+**/gitlab_token.txt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+
+# --- Model weights / caches (large; pulled from HF cache, never vendored) ---
+models/
+*.gguf
+*.safetensors
+.cache/
+cache/
+hf_cache/
+
+# --- Logs / runtime artifacts ---
+*.log
+# per-deployment runtime state written by the controller (not source)
+node_config.json
+engine_config.json
+net_history.json
+*.json.tmp
+# scratch test/check files
+_dash_check.js
+_nethist_test.*
+# audio/vision e2e test artifacts (synthesized locally, not source)
+*.wav
+test_speech.wav
+vision_diag.log
+speech_resp.json
+tts_api.*
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# #40 bench harness OUTPUT (the harness bench_tp_crossover.py is tracked; its runs are not)
+bench_tp_crossover_*.json
+bench_tp_results.json
+
+# Third-party model reference (downloaded modeling .py for design; not ours)
+_minimax_ref/
+_minimax_load.json
+
+# nvfp4/mtp design scratch (do not commit)
+_nvfp4_mtp_plan.md
+_dashcheck.js
+st_header.json
+_nvfp4_selftest.py
+_nvfp4_meastest.py

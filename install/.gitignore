@@ -1,0 +1,12 @@
+# This folder is committed as a portable, OFFLINE "backup / basis" bundle:
+# the standalone Python runtimes (python/) and the full wheel cache (wheels/)
+# ARE tracked on purpose, so the worker can be rebuilt anywhere with no
+# internet straight from a checkout.
+#
+# Only TARGET-GENERATED, machine-specific build outputs are excluded below —
+# install.bat / install.sh recreate them on each machine, and they must NOT be
+# committed: a venv bakes absolute drive/mount paths (broken if moved), and
+# runtime/ is just python/*.tar.gz unpacked (redundant with the archive).
+.venv-win/
+.venv-linux/
+runtime/

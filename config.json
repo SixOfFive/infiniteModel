@@ -1,0 +1,10 @@
+{
+  "_comment": "Central cluster configuration — single source of truth for hosts/ports. Edit here, not in code. Internal LAN addresses only; NEVER put secrets here (the GitLab self-update token goes in the gitignored gitlab_token.txt or the GITLAB_TOKEN env var).",
+  "controller_host": "192.168.15.103",
+  "http_port": 21434,
+  "control_port": 50100,
+  "data_port": 50101,
+  "worker_data_port": 50200,
+  "gitlab_host": "192.168.15.23",
+  "gitlab_project": "sixoffive/infinitemodel"
+}

@@ -1,0 +1,26 @@
+# InfiniteModel dependencies.
+#
+# Install only what a given machine needs:
+#
+#   Controller (server.py):   pip install fastapi uvicorn
+#   Worker, Milestone 1:      pip install psutil
+#   Worker, Milestone 2+:     pip install psutil torch transformers safetensors huggingface_hub
+#
+# torch is large and its wheels lag new Python releases — install it on the
+# workers only when model execution lands (M2). M1 (registry/dashboard) needs
+# just the controller + psutil stack below.
+
+# --- Controller (server.py) ---
+fastapi
+uvicorn
+
+# --- Worker (client.py) — Milestone 1 ---
+psutil
+
+# --- Worker (client.py) — Milestone 2+ (model loading & execution) ---
+# torch
+# transformers
+# safetensors
+# huggingface_hub
+# einops         # required by some models' trust_remote_code (e.g. nomic-embed-text encoder)
+# nvidia-ml-py   # optional, only for VRAM reporting on CUDA nodes

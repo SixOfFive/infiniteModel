@@ -1,0 +1,6 @@
+# Keep shell scripts LF so they run on the Linux workers (CRLF => bad interpreter).
+*.sh   text eol=lf
+# Windows batch files want CRLF.
+*.bat  text eol=crlf
+# Everything else: normalize to LF in the repo, auto on checkout.
+*      text=auto

@@ -1,0 +1,1 @@
+{"ok":false,"error":"tp v1 (load-full-then-shard) needs the full model (~66.7 GB) to fit each rank; mini05 has 18.3 GB CPU free. (per-rank weight serving is the next step)"}

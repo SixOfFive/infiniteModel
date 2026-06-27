@@ -1,0 +1,1 @@
+{"ok":true,"model":"deepseek-r1-distill-llama-70b","ctx":8192,"mode":"single","quant":"int8","stages":[{"node_id":"n13","hostname":"beast","layer_start":0,"layer_end":80,"num_layers":80,"has_embed":true,"has_head":true,"est_gb":70.19,"usable_gb":124.89,"headroom_gb":54.7,"gpu_gb":12.32}]}
