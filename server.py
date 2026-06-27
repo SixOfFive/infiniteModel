@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c104"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c105"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -4988,7 +4988,7 @@ def build_app() -> FastAPI:
                                 status_code=409)
         n_layers = await asyncio.to_thread(_sh._model_num_layers, mdir)
         out_dir = os.path.join(_sh._shard_cache_root(mdir), quant)
-        await asyncio.to_thread(os.makedirs, out_dir, True)
+        await asyncio.to_thread(lambda: os.makedirs(out_dir, exist_ok=True))
         caps = [n for n in registry.alive_sorted() if n.can_infer and engine.links.get(n.node_id)]
         engine.compiling[ckey] = {"model": friendly, "display_model": _ollama_name(friendly), "target": tgt,
                                   "ready": 0, "total": n_layers + 2, "stages_total": max(1, len(caps)),
