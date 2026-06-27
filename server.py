@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c113"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c114"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -246,6 +246,10 @@ REAPER_INTERVAL_S = 3.0
 GEN_TIMEOUT_S = 600.0   # max wait for ONE token's logits before failing fast. Generous so a slow
                         # CPU big-model prefill/first-token (e.g. 70B int4 on CPU, minutes to first
                         # token) completes instead of tripping a false TimeoutError mid-generation.
+GEN_STALL_S = 240.0     # #gen-stall-watchdog: a model active>0 that has produced NO token for this
+                        # long is WEDGED (dead pipeline hop -> 0 tokens + idle data plane). The
+                        # watchdog cancels its in-flight request(s) + reclaims the leaked active slot.
+                        # > worst-case legit first-token wait (big CPU prefill) so it never false-fires.
 SPEC_K = 4              # speculative decode: draft this many tokens per verify
 
 # --- Per-node tier config (persisted): enable/disable each node's CPU/RAM and
@@ -667,6 +671,9 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # can be VRAM-starved (slower/clamped) rather than guaranteed. Set False to restore
                        # the conservative #95 reservation (weights spill before a resident model's KV).
                        "vram_weights_first": True,
+                       # #gen-stall-watchdog: seconds a model may show active>0 with NO token produced
+                       # before the watchdog declares it wedged and reclaims the slot. 0 disables it.
+                       "gen_stall_s": GEN_STALL_S,
                        # #77 persistence: models to AUTO-RELOAD on controller startup (survives a
                        # restart/crash/deploy). reg_key -> {"ctx", "quant"}. Workers drop their shards
                        # when the controller link drops, so recovery = re-stream on startup (after the
@@ -1242,6 +1249,11 @@ class LoadedModel:
     # around on a single short request. Both 0.0 until the model has decoded at least once.
     last_tok_s: float = 0.0
     ema_tok_s: float = 0.0
+    # #gen-stall-watchdog: wall-clock of the last token this model emitted (any request). The
+    # watchdog flags a model active>0 that hasn't produced a token for gen_stall_s as WEDGED (a
+    # dead pipeline hop -> 0 tokens + idle data plane) and reclaims its leaked active slot. Seeded
+    # at load so a fresh model isn't flagged before its first generate.
+    last_token_ts: float = 0.0
     # Data-parallel replication (#39): `base` is the user-facing model name shared by all
     # copies; `friendly` is the unique registry key (base, then base#1, base#2 ...). Requests
     # for `base` are least-loaded / round-robin routed across its replicas. Each copy is a
@@ -3292,6 +3304,7 @@ class Engine:
                 acquired = True
                 model.queued -= 1
                 model.active += 1
+                model.last_token_ts = time.time()   # #gen-stall-watchdog: start the no-progress timer at gen begin
                 _inflight_start(rec)   # slot acquired: queued -> running (dashboard)
                 try:
                     model.last_used = time.time()
@@ -3310,6 +3323,7 @@ class Engine:
                         async for item in self._decode_spec(model, prompt_ids, max_new, spec_k):
                             if item[0] is not None:
                                 _ntoks += 1
+                                model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 _dt = time.monotonic() - _t0
                                 if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
                                     model.last_tok_s = _ntoks / _dt
@@ -3319,6 +3333,7 @@ class Engine:
                                                              temperature, top_p, mm=mm, mrope=mrope):
                             if item[0] is not None:
                                 _ntoks += 1
+                                model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 _dt = time.monotonic() - _t0
                                 if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
                                     model.last_tok_s = _ntoks / _dt
@@ -4266,6 +4281,58 @@ async def reaper_loop() -> None:
                 engine.invalidate_model(fr, f"node {n.hostname} reaped (heartbeat timeout)")
 
 
+async def gen_stall_watchdog() -> None:
+    """#gen-stall-watchdog: reclaim a model WEDGED on a dead pipeline hop. When an inter-worker hop of
+    a distributed generation dies (idle-socket death / a flaky node), the decode produces 0 tokens with
+    an idle data plane, yet model.active stays >0 — and a disconnecting client can leak it entirely — so
+    the model shows BUSY forever and new requests queue behind a ghost. If a loaded model has active>0
+    but has emitted NO token for GEN_STALL_S, cancel its in-flight request(s), reset its slot/queue
+    counters, and swap in a FRESH per-model lock (an orphaned wedged gen may still 'hold' the old one,
+    which would block every queued/new request). The next request re-flows the pipeline and the worker
+    reconnects the dead hop (#distributed-gen-idle-socket-death). Threshold > worst-case legit
+    first-token wait so a slow big-model prefill is never false-killed."""
+    while True:
+        await asyncio.sleep(20.0)
+        try:
+            stall_s = float(ENGINE_CONFIG.get("gen_stall_s", GEN_STALL_S))
+        except (TypeError, ValueError):
+            stall_s = GEN_STALL_S
+        if stall_s <= 0:
+            continue   # watchdog disabled
+        now = time.time()
+        for key, m in list(engine.models.items()):
+            if getattr(m, "active", 0) <= 0:
+                continue
+            last = getattr(m, "last_token_ts", 0.0) or 0.0
+            if last <= 0 or (now - last) <= stall_s:
+                continue
+            idle = int(now - last)
+            cancelled = 0
+            for r in list(INFLIGHT.values()):
+                try:
+                    rf = resolve_model_name(r.get("model", ""))
+                except Exception:
+                    rf = r.get("model")
+                if rf in (key, getattr(m, "base", "") or key, getattr(m, "friendly", key)):
+                    r["cancel"] = True
+                    t = r.get("task")
+                    if t is not None and not t.done():
+                        with contextlib.suppress(Exception):
+                            t.cancel()
+                    _inflight_release(r)
+                    cancelled += 1
+            old_active = m.active
+            m.active = 0
+            m.queued = 0
+            m.last_tok_s = 0.0
+            m.last_token_ts = now
+            with contextlib.suppress(Exception):
+                m.lock = asyncio.Lock()   # drop a lock an orphaned wedged gen may still hold -> unblock the queue
+            engine._last_load_failure = time.time()   # arm the self-update cool-down (anti-churn after a fault)
+            log_activity(f"gen-stall watchdog: {_ollama_name(key)} wedged — no token for {idle}s "
+                         f"(active {old_active}, cancelled {cancelled} req) — reclaimed slot + reset pipeline lock")
+
+
 # ---------------------------------------------------------------------------
 # Ollama-compatible helpers
 # ---------------------------------------------------------------------------
@@ -4543,6 +4610,7 @@ def build_status() -> dict:
             "autoload_ctx": ENGINE_CONFIG.get("autoload_ctx", DEFAULT_CTX),
             "autoload_mode": ENGINE_CONFIG.get("autoload_mode", "auto"),
             "vram_weights_first": ENGINE_CONFIG.get("vram_weights_first", True),
+            "gen_stall_s": ENGINE_CONFIG.get("gen_stall_s", GEN_STALL_S),
             "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH),
         },
         "pool": {"nodes": len(nodes), "total_gb": round(pool_total, 2),
@@ -4659,6 +4727,7 @@ def build_app() -> FastAPI:
         serve = ctrl.task
         reaper = asyncio.create_task(reaper_loop())
         sampler = asyncio.create_task(metrics_sampler())
+        stall_wd = asyncio.create_task(gen_stall_watchdog())   # #gen-stall-watchdog: reclaim wedged-gen slots
         async def _idle_unload_loop():
             # When auto_unload is on, unload any model idle (no requests) for > IDLE_UNLOAD_S. A
             # model mid-generation refreshes last_used every token (engine.generate), so it never
@@ -6372,6 +6441,7 @@ def build_app() -> FastAPI:
                          autoload_ctx: Optional[int] = None,
                          autoload_mode: Optional[str] = None,
                          vram_weights_first: Optional[bool] = None,
+                         gen_stall_s: Optional[float] = None,
                          persist: Optional[str] = None,
                          unpersist: Optional[str] = None) -> JSONResponse:
         if persist is not None:                          # #77: keep this model across restarts
@@ -6414,6 +6484,8 @@ def build_app() -> FastAPI:
                 ENGINE_CONFIG["autoload_mode"] = _am
         if vram_weights_first is not None:               # #vram-weights-first: pack weights into free VRAM
             ENGINE_CONFIG["vram_weights_first"] = bool(vram_weights_first)
+        if gen_stall_s is not None:                       # #gen-stall-watchdog: wedged-gen reclaim threshold (0=off)
+            ENGINE_CONFIG["gen_stall_s"] = max(0.0, float(gen_stall_s))
         save_engine_config()
         log_activity(f"config: max_loaded={ENGINE_CONFIG['max_loaded']} "
                      f"auto_unload={ENGINE_CONFIG['auto_unload']} "
