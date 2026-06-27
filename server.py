@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c101"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c102"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -1243,6 +1243,14 @@ class LoadedModel:
     # the raw assessment metrics, computed from the placement at load and surfaced on the card.
     load_warnings: list = field(default_factory=list)
     load_assess: dict = field(default_factory=dict)
+    # Lifetime stats for the click-to-expand model-detail modal (#model-detail). load_seconds is
+    # set once at load (wall-clock the distributed shard stream + placement took); the rest are
+    # accumulated per served generation in the generate wrapper.
+    load_seconds: float = 0.0     # how long the load itself took (shards streamed + placed)
+    req_total: int = 0            # generations served over this model's lifetime (connections)
+    tok_in_total: int = 0         # prompt tokens fed across all generations
+    tok_out_total: int = 0        # tokens generated across all generations
+    max_tok_s: float = 0.0        # peak decode tok/s ever observed for this model
 
 
 # ---------------------------------------------------------------------------
@@ -2574,6 +2582,8 @@ class Engine:
             lm.base, lm.replica_idx = friendly, replica_idx   # data-parallel grouping (#39)
             lm.plan_basis = basis                             # placement basis (#65)
             lm.load_warnings, lm.load_assess = load_warnings, assess   # pre-load guardrail (#76)
+            _st0 = (self.loadings.get(reg_key) or {}).get("started")   # #model-detail: load wall-clock
+            lm.load_seconds = max(0.0, now - _st0) if _st0 else 0.0
             # speculative decoding: load THIS model's small draft locally on the controller
             draft_id = MODELS.get(friendly, (target_id, target_id))[1]
             if draft_id and draft_id != target_id:
@@ -3230,6 +3240,11 @@ class Engine:
                             yield item
                 finally:
                     model.active -= 1
+                    # #model-detail lifetime counters (this is the main text-generation path; TP /
+                    # speech paths don't update these). Count every served request + its tokens.
+                    model.req_total += 1
+                    model.tok_in_total += len(prompt_ids)
+                    model.tok_out_total += _ntoks
                     # Record decode throughput once the generation finishes (or is cut
                     # short). Guard on a sane sample (>=1 token, measurable time) so a
                     # zero-token or instant request doesn't poison the read.
@@ -3237,6 +3252,8 @@ class Engine:
                     if _ntoks >= 1 and _dt > 1e-6:
                         ts = _ntoks / _dt
                         model.last_tok_s = ts
+                        if ts > model.max_tok_s:        # peak decode tok/s (#model-detail)
+                            model.max_tok_s = ts
                         # EMA (alpha=0.3): seed on the first sample, then blend.
                         model.ema_tok_s = ts if model.ema_tok_s <= 0.0 else \
                             0.3 * ts + 0.7 * model.ema_tok_s
@@ -4281,6 +4298,10 @@ def build_status() -> dict:
         ram_weights = max(0, lm.spec.total_weight_bytes - vram_used)
         kv_reserved = lm.spec.kv_bytes_per_layer(lm.ctx) * lm.spec.num_layers
         kv_used = lm.spec.kv_bytes_per_layer(lm.kv_pos) * lm.spec.num_layers
+        _arch = (getattr(lm.spec, "arch", "") or "").lower()
+        # best-effort MoE flag for the detail modal: fused/per-expert MoE arches all contain one of
+        # these tokens ('moe' covers olmoe/qwen3*_moe; mixtral/minimax/deepseek_v2,v3 named directly).
+        _is_moe = any(k in _arch for k in ("moe", "mixtral", "minimax", "deepseek_v"))
         return {
             "friendly": lm.friendly, "display_name": _ollama_name(lm.friendly),  # 'qwen3:4b'
             "target": lm.target_id, "ctx": lm.ctx,
@@ -4302,9 +4323,20 @@ def build_status() -> dict:
             "kv_reserved_gb": round(kv_reserved / GB, 2),    # KV space reserved for the full ctx
             "kv_used_gb": round(kv_used / GB, 2),            # KV actually used so far (kv_pos)
             "loaded_at": _iso(lm.loaded_at),
+            "loaded_at_ts": lm.loaded_at,                    # epoch s -> live uptime in the modal
+            "last_used_ts": lm.last_used,                    # epoch s -> "idle for ..." in the modal
             "plan_basis": getattr(lm, "plan_basis", ""),   # placement basis (#65)
             "warnings": getattr(lm, "load_warnings", []),  # pre-load guardrail (#76)
             "speed_tier": (getattr(lm, "load_assess", {}) or {}).get("speed_tier", ""),
+            # --- #model-detail (click-to-expand modal): arch/tags + lifetime stats ---
+            "arch": getattr(lm.spec, "arch", ""),
+            "is_moe": _is_moe,
+            "is_embedding": bool(getattr(lm.spec, "is_embedding", False)),
+            "load_seconds": round(getattr(lm, "load_seconds", 0.0), 1),
+            "req_total": getattr(lm, "req_total", 0),
+            "tok_in_total": getattr(lm, "tok_in_total", 0),
+            "tok_out_total": getattr(lm, "tok_out_total", 0),
+            "max_tok_s": round(getattr(lm, "max_tok_s", 0.0), 2),
             "stages": [s.to_dict() for s in lm.plan.stages],
         }
     loaded = _loaded_dict(primary) if primary else None         # active model (dashboard panel)

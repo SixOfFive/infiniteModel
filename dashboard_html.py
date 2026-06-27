@@ -182,7 +182,27 @@ DASHBOARD_HTML = """<!doctype html>
   .legend { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:middle; }
   .nstat { display:flex; gap:22px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:#8b949e; }
   .nstat b { color:#e6edf3; font-variant-numeric:tabular-nums; font-weight:600; }
+  /* #model-detail: click-a-card modal */
+  #mdlov { position:fixed; inset:0; background:rgba(1,4,9,.7); display:none; z-index:1000;
+           align-items:flex-start; justify-content:center; overflow:auto; padding:40px 16px; }
+  #mdlov.show { display:flex; }
+  #mdlbox { background:#0d1117; border:1px solid #30363d; border-radius:10px; max-width:780px;
+            width:100%; padding:20px 26px; box-shadow:0 14px 50px rgba(0,0,0,.6); }
+  #mdlbox h2 { margin:0; font-size:18px; color:#e6edf3; }
+  #mdlbox h3 { font-size:11px; color:#8b949e; margin:18px 0 4px 0; text-transform:uppercase; letter-spacing:.06em; }
+  #mdlbox .mdlclose { float:right; cursor:pointer; color:#8b949e; font-size:22px; line-height:1; border:none; background:none; }
+  #mdlbox .mdlclose:hover { color:#e6edf3; }
+  #mdlbox .tag { display:inline-block; font-size:11px; padding:1px 8px; border-radius:10px;
+                 background:#21262d; color:#c9d1d9; margin:3px 5px 0 0; border:1px solid #30363d; }
+  #mdlbox .mgrid { display:grid; grid-template-columns:1fr 1fr; gap:0 28px; }
+  #mdlbox .mrow { display:flex; justify-content:space-between; gap:12px; border-bottom:1px solid #21262d; padding:4px 0; font-size:13px; }
+  #mdlbox .mrow b { color:#8b949e; font-weight:normal; }
+  #mdlbox .mrow span { color:#e6edf3; font-variant-numeric:tabular-nums; text-align:right; }
+  #mdlbox table { width:100%; border-collapse:collapse; font-size:12px; margin-top:4px; }
+  #mdlbox th, #mdlbox td { text-align:left; padding:3px 8px; border-bottom:1px solid #21262d; }
+  #mdlbox th { color:#8b949e; font-weight:normal; }
 </style></head><body>
+<div id="mdlov" onclick="if(event.target===this)closeModelModal()"><div id="mdlbox"></div></div>
 <header><h1>∞ InfiniteModel</h1>
   <span class="sub" id="ctl">connecting…</span>
   <span class="sub" style="margin-left:auto"><a href="/bandwidth" style="color:#58a6ff;text-decoration:none" title="full controller↔node + node↔node traffic">Bandwidth →</a></span>
@@ -475,8 +495,8 @@ async function tick(){
     const _cur=lm.is_tp?(String(lm.tp_size)+'c'):'1';
     const _rcOpts=[['1','pipeline'],['2c','TP×2 (CPU)'],['4c','TP×4 (CPU)'],['8c','TP×8 (CPU)']]
       .map(o=>`<option value="${o[0]}"${o[0]===_cur?' selected':''}>${o[1]}</option>`).join('');
-    return `<div class="card" style="min-width:250px">`
-      +`<div class="k" title="${esc(lm.target||'')}">${esc(name)}${lm.quant&&lm.quant!=='none'?` <small style="color:#8b949e">${esc(lm.quant)}</small>`:``}</div>`
+    return `<div class="card" style="min-width:250px;cursor:pointer" onclick="openModelModal('${_rc}')" title="click for full details">`
+      +`<div class="k" title="${esc(lm.target||'')}">${esc(name)}${lm.quant&&lm.quant!=='none'?` <small style="color:#8b949e">${esc(lm.quant)}</small>`:``} <small style="color:#8b949e;float:right">&#9432;</small></div>`
       +`<div class="v" style="font-size:15px">${gb(lm.size_gb)} GB <small style="color:#8b949e">${lm.params||''} · ${(lm.stages||[]).length} stg</small></div>`
       +`<div class="sub">`
       +`<span title="KV-cache depth of the current/last generation">ctx <b>${kv.toLocaleString()}</b>/${cx.toLocaleString()} (${kvpct}%)</span>`
@@ -486,11 +506,11 @@ async function tick(){
       +((lm.warnings||[]).length?`<br><span style="color:#d29922;font-size:11px" title="pre-load guardrail (#76)">⚠ ${lm.warnings.map(esc).join('<br>⚠ ')}</span>`:``)
       +`</div>`
       +`<div style="margin-top:8px"><button class="sec" style="font-size:11px;padding:2px 8px" `
-      +`onclick="doUnloadModel('${lm.base||lm.friendly}')" `
+      +`onclick="event.stopPropagation();doUnloadModel('${lm.base||lm.friendly}')" `
       +`title="unload THIS model only — frees its RAM/VRAM fleet-wide and keeps the other models running (no restart)">Unload</button></div>`
       +`<div style="margin-top:6px;display:flex;gap:4px;align-items:center">`
-      +`<select id="rc-${_rc}" class="sec" style="font-size:11px;padding:2px 4px">${_rcOpts}</select>`
-      +`<button class="sec" style="font-size:11px;padding:2px 8px" onclick="doReconfigure('${_rc}')" `
+      +`<select id="rc-${_rc}" class="sec" style="font-size:11px;padding:2px 4px" onclick="event.stopPropagation()">${_rcOpts}</select>`
+      +`<button class="sec" style="font-size:11px;padding:2px 8px" onclick="event.stopPropagation();doReconfigure('${_rc}')" `
       +`title="switch this model to/from tensor-parallel (managed reload: briefly unavailable, rolls back to pipeline on failure; refused while busy)">Reconfigure</button></div>`
       +`</div>`;
   };
@@ -523,6 +543,7 @@ async function tick(){
   const _cae=document.activeElement;
   if(!(_cae&&_cae.tagName==='SELECT'&&_cae.id&&_cae.id.indexOf('rc-')===0))
     document.getElementById('model-cards').innerHTML=_cards;
+    if(window.__mdl) renderModelModal();   // #model-detail: keep an open detail modal live
   document.getElementById('models').textContent=s.models.filter(m=>m.ready).map(m=>m.name).join(', ')||'none ready';
   document.getElementById('activity').innerHTML=(s.activity||[]).map(a=>{
     const t=new Date(a.t*1000).toLocaleTimeString();
@@ -967,6 +988,74 @@ async function doGen(){
   while(true){ const {done,value}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true});
     let nl; while((nl=buf.indexOf('\\n'))>=0){ const ln=buf.slice(0,nl); buf=buf.slice(nl+1);
       if(!ln.trim()) continue; try{ const o=JSON.parse(ln); if(o.response) out.textContent+=o.response; }catch(e){} } }
+}
+// ---- #model-detail: click-a-card → expanded model details modal ----
+function openModelModal(key){ window.__mdl=key; renderModelModal();
+  document.getElementById('mdlov').classList.add('show'); }
+function closeModelModal(){ window.__mdl=null;
+  document.getElementById('mdlov').classList.remove('show'); }
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModelModal(); });
+function renderModelModal(){
+  const key=window.__mdl; if(!key) return;
+  const lms=(LAST&&LAST.cluster&&LAST.cluster.loaded_models)||[];
+  const lm=lms.find(m=>(m.base||m.friendly)===key)||lms.find(m=>m.friendly===key);
+  const box=document.getElementById('mdlbox');
+  if(!lm){ box.innerHTML='<button class="mdlclose" onclick="closeModelModal()">&times;</button>'
+    +'<h2>model not loaded</h2><div class="sub" style="margin-top:8px">It was unloaded since you opened this.</div>'; return; }
+  const now=Date.now()/1000;
+  const up=lm.loaded_at_ts?fmtUptime(now-lm.loaded_at_ts):'—';
+  const idle=lm.last_used_ts?fmtUptime(now-lm.last_used_ts):'—';
+  const tags=[];
+  tags.push((lm.quant&&lm.quant!=='none')?lm.quant:'bf16');
+  if(lm.arch) tags.push(lm.arch);
+  tags.push(lm.is_moe?'MoE':'dense');
+  tags.push(lm.is_tp?('tensor-parallel ×'+lm.tp_size):'pipeline');
+  if(lm.is_embedding) tags.push('embedding');
+  if((lm.stages||[]).length>1) tags.push(lm.stages.length+' nodes');
+  const hosts=[...new Set((lm.stages||[]).map(s=>s.hostname))].join(', ');
+  const r=(k,v)=>`<div class="mrow"><b>${k}</b><span>${v}</span></div>`;
+  const st=(lm.stages||[]).map(s=>`<tr><td>${esc(s.hostname)}</td><td>${s.layer_start}–${s.layer_end}</td>`
+    +`<td>${s.num_layers}</td><td>${(s.has_embed?'embed ':'')+(s.has_head?'head':'')||'—'}</td>`
+    +`<td>${gb(s.est_gb)}</td><td>${gb(s.gpu_gb)}</td></tr>`).join('');
+  box.innerHTML='<button class="mdlclose" onclick="closeModelModal()">&times;</button>'
+   +`<h2>${esc(lm.display_name||lm.friendly)}</h2>`
+   +(lm.target?`<div class="sub" style="font-size:12px">${esc(lm.target)}</div>`:``)
+   +`<div style="margin:8px 0 2px 0">${tags.map(t=>`<span class="tag">${esc(String(t))}</span>`).join('')}</div>`
+   +`<h3>Status</h3><div class="mgrid">`
+     +r('Loaded for',up)
+     +r('Last used',idle+' ago')
+     +r('Now',(lm.active||0)>0?('serving ×'+lm.active):'idle')
+     +r('Queued',(lm.queued||0))
+     +r('Requests served',(lm.req_total||0).toLocaleString())
+     +r('Load took',lm.load_seconds?fmtUptime(lm.load_seconds):'—')
+   +`</div>`
+   +`<h3>Configuration</h3><div class="mgrid">`
+     +r('Quantization',(lm.quant&&lm.quant!=='none')?lm.quant:'none (bf16)')
+     +r('Architecture',esc(lm.arch||'?'))
+     +r('Type',lm.is_moe?'Mixture-of-Experts':'dense')
+     +r('Parameters',esc(lm.params||'?'))
+     +r('Layers',(lm.num_layers||0))
+     +r('Context (used/max)',(lm.kv_pos||0).toLocaleString()+' / '+(lm.ctx||0).toLocaleString())
+     +r('Layout',lm.is_tp?('tensor-parallel ×'+lm.tp_size):('pipeline ('+(lm.stages||[]).length+' stage)'))
+     +r('Placed on',esc(hosts||'—'))
+   +`</div>`
+   +(lm.plan_basis?`<div class="sub" style="font-size:12px;margin-top:4px">${esc(lm.plan_basis)}</div>`:``)
+   +`<h3>Memory</h3><div class="mgrid">`
+     +r('Weights (total)',gb(lm.size_gb)+' GB')
+     +r('On GPU (VRAM)','<span style="color:#3fb950">'+gb(lm.vram_used_gb)+' GB</span>')
+     +r('On CPU (RAM)','<span style="color:#58a6ff">'+gb(lm.ram_used_gb)+' GB</span>')
+     +r('KV (used/reserved)',gb(lm.kv_used_gb)+' / '+gb(lm.kv_reserved_gb)+' GB')
+   +`</div>`
+   +`<h3>Throughput &amp; tokens</h3><div class="mgrid">`
+     +r('Decode tok/s (live)',(lm.tok_s||0).toFixed(1))
+     +r('Decode tok/s (avg)',(lm.ema_tok_s||0).toFixed(1))
+     +r('Decode tok/s (peak)',(lm.max_tok_s||0).toFixed(1))
+     +r('Tokens in (prompt)',(lm.tok_in_total||0).toLocaleString())
+     +r('Tokens out (gen)',(lm.tok_out_total||0).toLocaleString())
+   +`</div>`
+   +`<h3>Stages (${(lm.stages||[]).length})</h3>`
+   +`<table><tr><th>host</th><th>layers</th><th>#</th><th>role</th><th>est GB</th><th>GPU GB</th></tr>${st}</table>`
+   +((lm.warnings||[]).length?`<h3>Warnings</h3><div style="color:#d29922;font-size:12px">⚠ ${lm.warnings.map(esc).join('<br>⚠ ')}</div>`:``);
 }
 tick(); setInterval(tick,1500);
 </script></body></html>
