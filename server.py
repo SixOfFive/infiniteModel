@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c108"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c109"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -1631,6 +1631,11 @@ class Engine:
         # finishes. A 2nd request for the SAME not-yet-resident model awaits this instead of starting
         # a duplicate load (it "queues" on the in-flight load, then serves the resident copy).
         self._loading_futures: dict[str, asyncio.Future] = {}
+        # reg_key -> the asyncio.Task running the in-flight load (the OWNER's task). A force load
+        # (#stuck-load-override) CANCELS this to evict a wedged load and restart fresh, instead of
+        # racing a 2nd load onto the same nodes. Set by the owner in _load_impl, popped in load()'s
+        # finally alongside the card/reservation/future.
+        self._loading_tasks: dict[str, asyncio.Task] = {}
         # FORCED-UPDATE in progress: set by /update while it unloads + swaps code + restarts. Blocks
         # auto-load so a client request can't reload a model into the box we're tearing down (the
         # auto-load-during-update race). Cleared naturally by the restart (fresh process).
@@ -1964,6 +1969,7 @@ class Engine:
             if _own["v"]:
                 self._reservations.pop(rk, None)
                 self.loadings.pop(rk, None)
+                self._loading_tasks.pop(rk, None)   # owner's task done -> drop the cancel handle
                 _f = self._loading_futures.pop(rk, None)   # wake any same-model requests queued on us
                 if _f is not None and not _f.done():
                     _f.set_result(self.models.get(rk))
@@ -1990,6 +1996,27 @@ class Engine:
             # model they're equal; for a replica (#39) reg_key is "base#i" and exclude_nodes
             # holds the nodes its siblings already occupy (disjoint placement).
             reg_key = reg_key or friendly
+            # FORCE OVERRIDE (#stuck-load-override): a force load while ANOTHER load of this key is in
+            # flight means "that one is wedged — kill it and restart". CANCEL the in-flight owner's task
+            # and AWAIT its unwind (the cancelled owner's finally frees its partial shards + reservation
+            # + card + future), so we then proceed as a clean fresh load (becoming the new owner below).
+            # Without this, force just raced a 2nd load onto the same nodes. We drop the lock while the
+            # cancelled load tears down (it needs the lock to free shards), then re-acquire — same
+            # pattern as the same-model dedup wait. force=False never does this (it queues instead).
+            if force:
+                _old = self._loading_tasks.get(reg_key)
+                if _old is not None and _old is not asyncio.current_task() and not _old.done():
+                    log_activity(f"{friendly}: force override — cancelling the wedged in-flight load "
+                                 f"and restarting")
+                    _old.cancel()
+                    self.lock.release()
+                    _held = False
+                    try:
+                        with contextlib.suppress(BaseException):
+                            await _old
+                    finally:
+                        await self.lock.acquire()
+                        _held = True
             # Register the progress card IMMEDIATELY — before any interleavable await — so "is a load
             # in progress?" is answerable under self.lock for the WHOLE load (the unload-all teardown
             # checks self.loadings to refuse mid-load: the TOCTOU fix). Enriched with real shard/stage
@@ -2005,6 +2032,7 @@ class Engine:
                     "basis": "planning…", "warnings": [], "started": time.time()}
                 if _own is not None:
                     _own["v"] = True
+                    self._loading_tasks[reg_key] = asyncio.current_task()   # cancel handle for force override
             from transformers import AutoTokenizer
             spec = resolve_spec(friendly)
             if spec is None:
@@ -2493,9 +2521,19 @@ class Engine:
                     results = await asyncio.gather(
                         *[asyncio.wait_for(f, timeout=load_timeout) for f in futs.values()],
                         return_exceptions=True)
-                finally:
+                except asyncio.CancelledError:
+                    # #stuck-load-override: a force load (or shutdown) cancelled us mid-stream. Re-acquire
+                    # the lock and free any shards that DID build on workers, so the cancelled load leaves
+                    # nothing resident on the fleet, then re-raise so cleanup (card/reservation) proceeds.
                     await self.lock.acquire()
                     _held = True
+                    with contextlib.suppress(Exception):
+                        await self._free_partial_stages(target_id, futs.keys(), node_by_id)
+                    raise
+                finally:
+                    if not _held:
+                        await self.lock.acquire()
+                        _held = True
                 incapable: list[str] = []
                 oomed: list[str] = []
                 dropped: list[str] = []   # #99: nodes whose link dropped this attempt (replan on survivors)
@@ -5227,7 +5265,11 @@ def build_app() -> FastAPI:
     async def load(model: str, ctx: int = 0, mode: str = "auto",
                    consolidate: bool = True, quant: str = "none", tp: int = 1,
                    replicas: int = 1, cpu_only: bool = False,
-                   moe_offload: bool = False) -> JSONResponse:
+                   moe_offload: bool = False, force: bool = False) -> JSONResponse:
+        # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
+        # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
+        # it. Also reloads an already-resident copy (skips the idempotent no-op). Without force, a
+        # concurrent same-model request still queues on the in-flight load as before.
         # ctx=0 (default) => the model's native training context (config.json).
         # `mode` chooses HOW the model is placed (maps to consolidate, prefer_vram):
         #   auto       (T, T) GPU-VRAM-first, fewest nodes — best decode latency [default]
@@ -5264,7 +5306,7 @@ def build_app() -> FastAPI:
                                    quant=quant, tp=tp, cpu_only=cpu_only,
                                    spread=(mode == "spread"),
                                    proportional=(mode == "proportional"),
-                                   moe_offload=moe_offload)
+                                   moe_offload=moe_offload, force=force)
             return JSONResponse({"ok": True, "model": lm.friendly, "ctx": lm.ctx,
                                  "mode": (("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp))
                                          if tp > 1 else mode, "quant": quant,
@@ -5294,6 +5336,32 @@ def build_app() -> FastAPI:
         log_activity(f"cancelled request id={id} ({rec.get('model')}, {rec.get('ip')})")
         return JSONResponse({"ok": True, "cancelled": id,
                              "model": rec.get("model"), "ip": rec.get("ip")})
+
+    @app.post("/cancel_load")      # #stuck-load-override: kill a wedged in-flight MODEL LOAD (0%-forever)
+    async def cancel_load(model: str = "") -> JSONResponse:
+        """Cancel an in-flight (possibly wedged) model LOAD — the manual escape hatch for a load stuck
+        at 0%. model='' cancels EVERY in-flight load. Cancelling the load task frees any partial shards
+        it already built (the load's CancelledError cleanup), emptying it out so a fresh load can run."""
+        friendly = ""
+        if model:
+            try:
+                friendly = resolve_model_name(model)
+            except ValueError:
+                friendly = model
+        cancelled = []
+        for rk, t in list(engine._loading_tasks.items()):
+            base = rk.split("#", 1)[0]
+            if friendly and rk != friendly and base != friendly:
+                continue
+            if t is not None and not t.done():
+                with contextlib.suppress(Exception):
+                    t.cancel()
+                cancelled.append(rk)
+        if not cancelled:
+            return JSONResponse({"ok": False, "error": "no in-flight load"
+                                 + (f" for '{model}'" if model else "")}, status_code=404)
+        log_activity(f"cancelled in-flight load(s): {', '.join(cancelled)}")
+        return JSONResponse({"ok": True, "cancelled": cancelled})
 
     @app.post("/unload")
     async def unload(model: str = "") -> JSONResponse:

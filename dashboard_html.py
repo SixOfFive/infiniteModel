@@ -525,7 +525,11 @@ async function tick(){
       +(ld.started?`<br><span class="sub" style="font-size:11px" title="start time · elapsed · estimated time remaining (from progress)">&#9201; ${new Date(ld.started*1000).toLocaleTimeString()} · ${fmtUptime(ld.elapsed_s||0)} elapsed${ld.eta_s!=null?` · ~${fmtUptime(ld.eta_s)} left`:` · ETA…`}</span>`:``)
       +(ld.basis?`<br><span class="sub" style="font-size:11px">${esc(ld.basis)}</span>`:``)
       +((ld.warnings||[]).length?`<br><span style="color:#d29922;font-size:11px">⚠ ${ld.warnings.map(esc).join('<br>⚠ ')}</span>`:``)
-      +`</div></div>`;
+      +`</div>`
+      +(compile?``:`<div style="margin-top:8px"><button class="sec" style="font-size:11px;padding:2px 8px;border-color:#f85149;color:#f85149" `
+        +`onclick="doCancelLoad('${esc(ld.model||ld.display_model||'')}')" `
+        +`title="cancel this load — kill it and free any partial shards (use if it is stuck at 0%); then re-Load to restart">✕ cancel load</button></div>`)
+      +`</div>`;
   };
   let _cards=lms.map(_mcard).join('')
     + lds.map(x=>_loadcard(x,false)).join('')
@@ -912,6 +916,13 @@ async function doUnloadModel(name){   // #72: per-model unload (frees its shards
   try{ const r=await (await fetch('/unload?model='+encodeURIComponent(name),{method:'POST'})).json();
     el.textContent=r.ok?('unloaded '+((r.unloaded||[]).join(', ')||name)):('error: '+(r.error||'')); }
   catch(e){ el.textContent='unload failed: '+e; }
+}
+async function doCancelLoad(name){   // #stuck-load-override: kill a wedged in-flight load (0%-forever)
+  if(!confirm('Cancel the in-flight load of '+name+'?\\n\\nKills it and frees any partial shards. Use this if the load is stuck at 0%. Re-Load it afterward to restart.')) return;
+  const el=document.getElementById('loadmsg'); el.textContent='cancelling load '+name+'…';
+  try{ const r=await (await fetch('/cancel_load?model='+encodeURIComponent(name),{method:'POST'})).json();
+    el.textContent=r.ok?('cancelled load: '+((r.cancelled||[]).join(', ')||name)+' — re-Load to restart'):('error: '+(r.error||'')); }
+  catch(e){ el.textContent='cancel failed: '+e; }
 }
 async function doCompileShards(name, quant){   // #shard-cache: pre-quantize on the controller (beast)
   const el=document.getElementById('loadmsg');
