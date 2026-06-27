@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c111"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c112"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -652,6 +652,15 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # request never streams the full bf16 just to serve. int4|int8|none; on int4/int8
                        # failure ensure_loaded falls back ONCE to bf16 ("int4 in almost all cases").
                        "autoload_quant": "int4",
+                       # #vram-weights-first: budget a NEW model's WEIGHTS against PHYSICALLY-free VRAM
+                       # (live: total - actually-used), letting them use resident models' RESERVED-but-
+                       # unfaulted full-ctx KV headroom — so a model lands on GPU when VRAM is physically
+                       # free, instead of spilling weights to CPU because another model's reserved KV
+                       # "owns" that VRAM. Each model still reserves its OWN KV. Trade-off: if multiple
+                       # coexisting models all grow long contexts at once, a resident model's KV growth
+                       # can be VRAM-starved (slower/clamped) rather than guaranteed. Set False to restore
+                       # the conservative #95 reservation (weights spill before a resident model's KV).
+                       "vram_weights_first": True,
                        # #77 persistence: models to AUTO-RELOAD on controller startup (survives a
                        # restart/crash/deploy). reg_key -> {"ctx", "quant"}. Workers drop their shards
                        # when the controller link drops, so recovery = re-stream on startup (after the
@@ -2224,6 +2233,7 @@ class Engine:
                 _res_ram, _res_vram = self._reserved_bytes(exclude_key=reg_key)
                 for _nid, _vb in _res_vram.items():
                     committed[_nid] = committed.get(_nid, 0) + _vb
+                _vram_weights_first = bool(ENGINE_CONFIG.get("vram_weights_first", True))
                 node_by_id = {}
                 mems = []
                 for n in registry.alive_sorted():
@@ -2247,8 +2257,17 @@ class Engine:
                     # genuinely-free GPU node (a headless worker) instead of overloading it -> CPU.
                     live_free = max(0.0, n.vram_total_gb - n.vram_used_gb
                                     - _res_vram.get(n.node_id, 0) / GB)
-                    free_vram = (0.0 if cpu_only else min(
-                        n.free_vram_after_resident_gb(committed.get(n.node_id, 0)), live_free))
+                    # #vram-weights-first: budget weights against PHYSICALLY-free VRAM (live_free already
+                    # excludes resident weights + actually-faulted KV + other in-flight loads), so a new
+                    # model uses resident models' reserved-but-unused KV headroom instead of spilling its
+                    # weights to CPU. Off -> the conservative #95 view (also subtract reserved full-ctx KV).
+                    if cpu_only:
+                        free_vram = 0.0
+                    elif _vram_weights_first:
+                        free_vram = live_free
+                    else:
+                        free_vram = min(
+                            n.free_vram_after_resident_gb(committed.get(n.node_id, 0)), live_free)
                     # Reserve a runtime VRAM floor so a thin-headroom GPU node isn't filled to the
                     # brink (decode activations + allocator fragmentation OOM it otherwise, dropping
                     # the stage mid-generation). RAM already keeps RAM_SAFETY_GB; VRAM had none.
@@ -2418,19 +2437,22 @@ class Engine:
                     nd.stage = i
                     nd.layer_start, nd.layer_end = st.layer_start, st.layer_end
                     nd.load_state = "loading"     # red on the dashboard until this shard reports ready
-                    # #95 coexistence: this stage's committed-aware GPU budget — free VRAM AFTER the
-                    # resident models' weights + reserved KV (`committed`), minus the plan floor. Mirrors
-                    # exactly the per-node free_vram the planner placed against (lines above). The worker
-                    # caps GPU placement at this so it can't grab VRAM reserved for a co-resident model
-                    # (a card looks free until the resident model faults its KV). 0 -> stage goes to CPU.
-                    # Also capped by LIVE free VRAM (vram_total - vram_used, all users incl. a desktop's
-                    # apps on a shared GPU) so the budget matches what the worker's mem_get_info sees —
-                    # same conservative min() as the planner build, so plan and dispatch stay aligned.
+                    # This stage's GPU budget — MUST mirror the planner's per-node free_vram (lines above)
+                    # or the worker re-clamps the weights the planner placed on GPU back to CPU (the spill
+                    # bug). LIVE free VRAM = vram_total - vram_used (all users incl. a desktop's apps on a
+                    # shared GPU) - other in-flight loads, matching the worker's mem_get_info. 0 -> CPU.
+                    # #vram-weights-first: budget against live-free (use resident models' reserved-but-
+                    # unfaulted KV headroom); off -> the conservative #95 min() (also subtract reserved KV).
                     _live_free_gb = max(0.0, nd.vram_total_gb - nd.vram_used_gb
                                         - _res_vram.get(st.node_id, 0) / GB)
-                    _gpu_budget_gb = (0.0 if cpu_only else max(0.0, min(
-                        nd.free_vram_after_resident_gb(committed.get(st.node_id, 0)),
-                        _live_free_gb) - PLAN_VRAM_FLOOR_GB))
+                    if cpu_only:
+                        _gpu_budget_gb = 0.0
+                    elif _vram_weights_first:
+                        _gpu_budget_gb = max(0.0, _live_free_gb - PLAN_VRAM_FLOOR_GB)
+                    else:
+                        _gpu_budget_gb = max(0.0, min(
+                            nd.free_vram_after_resident_gb(committed.get(st.node_id, 0)),
+                            _live_free_gb) - PLAN_VRAM_FLOOR_GB)
                     fut = loop.create_future()
                     link.pending_load = fut
                     futs[st.node_id] = fut
@@ -4503,6 +4525,7 @@ def build_status() -> dict:
             "auto_unload": ENGINE_CONFIG.get("auto_unload", True),
             "auto_load": ENGINE_CONFIG.get("auto_load", True),
             "autoload_quant": ENGINE_CONFIG.get("autoload_quant", "int4"),
+            "vram_weights_first": ENGINE_CONFIG.get("vram_weights_first", True),
             "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH),
         },
         "pool": {"nodes": len(nodes), "total_gb": round(pool_total, 2),
@@ -6329,6 +6352,7 @@ def build_app() -> FastAPI:
                          auto_tp_ratio: Optional[float] = None,
                          auto_load: Optional[bool] = None,
                          autoload_quant: Optional[str] = None,
+                         vram_weights_first: Optional[bool] = None,
                          persist: Optional[str] = None,
                          unpersist: Optional[str] = None) -> JSONResponse:
         if persist is not None:                          # #77: keep this model across restarts
@@ -6363,6 +6387,8 @@ def build_app() -> FastAPI:
             _aq = str(autoload_quant).lower()
             if _aq in ("int4", "int8", "none"):
                 ENGINE_CONFIG["autoload_quant"] = _aq
+        if vram_weights_first is not None:               # #vram-weights-first: pack weights into free VRAM
+            ENGINE_CONFIG["vram_weights_first"] = bool(vram_weights_first)
         save_engine_config()
         log_activity(f"config: max_loaded={ENGINE_CONFIG['max_loaded']} "
                      f"auto_unload={ENGINE_CONFIG['auto_unload']} "
