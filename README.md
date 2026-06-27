@@ -157,6 +157,13 @@ at `http://<controller>:21434`.
 Self-update pulls module sources from the public GitHub repo's raw endpoint — **no token needed**. No
 secrets are stored in the source.
 
+## Acknowledgments
+
+Inspired in spirit by [exo](https://github.com/exo-explore/exo) and the broader idea of pooling the
+everyday machines you already own to run models no single one could hold. InfiniteModel is an
+independent, from-scratch implementation — its own plain-TCP pipeline/tensor-parallel transport,
+planner, and quantization, no exo code — but exo helped convince me this was worth building.
+
 ## License
 
 [MIT](LICENSE)
