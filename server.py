@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c102"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c103"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -1623,6 +1623,10 @@ class Engine:
         # over-provision a node — allocation is serialized ("as if one after the other") even though
         # the streaming overlaps. Cleared when the load finalizes into self.models (or fails).
         self._reservations: dict[str, dict] = {}
+        # #distributed-packing: in-flight remote-pack requests. req_id -> Future (resolved by the
+        # worker's POST /pack_result) and req_id -> {"bytes", "mtensors", ...} the received unit.
+        self._pack_futures: dict[str, asyncio.Future] = {}
+        self._pack_results: dict[str, dict] = {}
         # SAME-MODEL load dedup: reg_key -> Future resolved when an in-flight load of that key
         # finishes. A 2nd request for the SAME not-yet-resident model awaits this instead of starting
         # a duplicate load (it "queues" on the in-flight load, then serves the resident copy).
@@ -4857,6 +4861,97 @@ def build_app() -> FastAPI:
             return JSONResponse({"error": "model not downloaded"}, status_code=404)
         ok, problems = await asyncio.to_thread(verify_shard_cache, d, quant)
         return JSONResponse({"ok": ok, "problems": problems, "quant": quant})
+
+    @app.post("/pack_result")   # #distributed-packing: a worker returns a packed shard-cache unit
+    async def pack_result(req: Request, req_id: str = "", unit: str = "",
+                          model_id: str = "", quant: str = "int4") -> JSONResponse:
+        body = await req.body()
+        mt = {}
+        h = req.headers.get("x-manifest")
+        if h:
+            with contextlib.suppress(Exception):
+                import base64
+                mt = json.loads(base64.b64decode(h).decode())
+        engine._pack_results[req_id] = {"unit": unit, "model_id": model_id, "quant": quant,
+                                        "bytes": body, "mtensors": mt}
+        f = engine._pack_futures.get(req_id)
+        if f is not None and not f.done():
+            f.set_result(req_id)
+        return JSONResponse({"ok": True, "req_id": req_id, "bytes": len(body)})
+
+    @app.post("/pack_probe")    # #distributed-packing Inc 1b: dispatch ONE unit to a worker, byte-check vs local
+    async def pack_probe(model: str, node: str = "", layer: int = 0, quant: str = "int4") -> JSONResponse:
+        """Offload-pack ONE decoder-layer unit on a worker and prove the result is BIT-IDENTICAL to a
+        local compile (the gate before fanning the whole compile out across the fleet). Dense int4/int8."""
+        import shards as _sh
+        import urllib.parse as _up
+        import urllib.request as _ur
+        from safetensors.torch import load as _stload, save as _stsave
+        if quant not in ("int4", "int8"):
+            return JSONResponse({"ok": False, "error": "int4|int8 only"}, status_code=400)
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        tgt = MODELS[friendly][0] if friendly in MODELS else friendly
+        mdir = await asyncio.to_thread(_controller_model_dir, tgt)
+        if not mdir:
+            return JSONResponse({"error": "model not available on the controller"}, status_code=404)
+        cand = [n for n in registry.alive_sorted() if n.can_infer and (not node or n.hostname == node)]
+        if not cand:
+            return JSONResponse({"ok": False, "error": f"no alive worker matching node='{node}'"}, status_code=404)
+        nd = cand[0]
+        link = engine.links.get(nd.node_id)
+        if link is None:
+            return JSONResponse({"ok": False, "error": f"no control link to {nd.hostname}"}, status_code=503)
+        scope = await asyncio.to_thread(_sh._quant_scope, mdir)   # exact scope (== local compile)
+        lin2d = sorted(scope[0]) if scope else None
+        exp3d = sorted(scope[1]) if scope else None
+        req_id = f"pk-{int(time.time()*1000)}-{layer}"
+        unit = f"L{int(layer):04d}.safetensors"
+        fut = asyncio.get_event_loop().create_future()
+        engine._pack_futures[req_id] = fut
+        frame = {"type": "pack", "req_id": req_id, "model_id": tgt, "quant": quant,
+                 "group_size": _sh.INT4_GROUP, "unit": unit, "start": int(layer), "end": int(layer) + 1,
+                 "embed": 0, "head": 0, "lin2d": lin2d, "exp3d": exp3d,
+                 "controller_http_port": ARGS.http_port}
+        t0 = time.monotonic()
+        try:
+            await link.send(frame)
+            await asyncio.wait_for(fut, timeout=600)
+        except Exception as exc:
+            engine._pack_futures.pop(req_id, None)
+            return JSONResponse({"ok": False, "error": f"remote pack failed: {exc!r}"}, status_code=504)
+        finally:
+            engine._pack_futures.pop(req_id, None)
+        res = engine._pack_results.pop(req_id, None)
+        if not res:
+            return JSONResponse({"ok": False, "error": "no pack result received"}, status_code=504)
+        remote_ms = round((time.monotonic() - t0) * 1000)
+        worker_blob = res["bytes"]
+
+        def _local():   # reference pack of the SAME unit (our own /weights -> identical bytes -> identical pack)
+            url = (f"http://127.0.0.1:{ARGS.http_port}/weights?model={_up.quote(tgt)}"
+                   f"&start={int(layer)}&end={int(layer)+1}&embed=0&head=0&skip_experts=0")
+            with _ur.urlopen(url, timeout=600) as r:
+                raw = _stload(r.read())
+            out_sd, _mt = _sh.pack_unit_tensors(
+                raw, (set(lin2d) if lin2d is not None else None),
+                (set(exp3d) if exp3d is not None else None), None, quant, _sh.INT4_GROUP)
+            return _stsave(out_sd)
+        local_blob = await asyncio.to_thread(_local)
+        identical = (worker_blob == local_blob)
+        tcmp = identical
+        if not identical:           # robust fallback: metadata order can differ, compare tensors
+            import torch as _t
+            wsd, lsd = _stload(worker_blob), _stload(local_blob)
+            tcmp = (set(wsd) == set(lsd)) and all(_t.equal(wsd[k], lsd[k]) for k in wsd)
+        log_activity(f"pack_probe {_ollama_name(friendly)} {unit} on {nd.hostname}: "
+                     f"byte_identical={identical} tensor_identical={tcmp} ({remote_ms} ms)")
+        return JSONResponse({"ok": True, "node": nd.hostname, "unit": unit, "remote_ms": remote_ms,
+                             "worker_bytes": len(worker_blob), "local_bytes": len(local_blob),
+                             "byte_identical": identical, "tensor_identical": tcmp,
+                             "tensors": len(res.get("mtensors") or {})})
 
     @app.post("/compile_shards")        # #shard-cache: compile a model's pre-quantized cache on beast
     async def compile_shards_ep(model: str, quant: str = "int4") -> JSONResponse:

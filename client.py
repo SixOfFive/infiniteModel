@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c36"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c37"  # version tag only; full changelog -> CHANGELOG.md
 _STREAM_PREFETCH_MAX = 6  # max concurrent per-layer weight fetches during a streaming load
                           # (actual depth K is clamped to free RAM per node; see Shard.from_stream)
 GB = 1024 ** 3
@@ -561,6 +561,19 @@ def _http_get(url: str, timeout: float = 7200) -> bytes:   # #100: a huge shard 
         data = r.read()
     NET["in"] += len(data)
     return data
+
+
+def _http_post(url: str, data: bytes, headers: dict | None = None, timeout: float = 7200) -> bytes:
+    """POST a binary body (e.g. a remotely-packed shard-cache unit -> controller /pack_result,
+    #distributed-packing). Counts the upload as outbound traffic."""
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = r.read()
+    NET["out"] += len(data)
+    return out
 
 
 def _http_get_to_file(url: str, path: str, timeout: float = 7200) -> int:   # #100: match _http_get ceiling
@@ -3041,7 +3054,9 @@ def _fetch_repo_file(fname: str):
 
 # Extra repo files (besides client.py) to keep in sync on self-update. A client+server SHARED
 # module (wire.py) is listed in BOTH client.py + server.py.
-EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json"]   # config synced like a module
+EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py"]   # config + shared packer
+# (#distributed-packing) synced like a module — shards.pack_unit_tensors is the shared packer the
+# remote-pack handler calls, so a worker-packed cache unit is bit-identical to a controller-compiled one.
 
 
 def _self_update_check(fname: str, is_idle) -> None:
@@ -3453,6 +3468,42 @@ class Worker:
                 self.data_server.close()
             self.data_server = None
 
+    async def handle_pack(self, msg: dict) -> dict:
+        """#distributed-packing Inc 1b: pack ONE shard-cache unit FOR the controller (offloads the
+        slow per-layer pack off the controller + uses the fleet's idle CPUs). Fetch the unit's bf16
+        from /weights (the SAME stream a load uses -> renamed 'model.*' dict), pack via the SHARED
+        shards.pack_unit_tensors (so the result is BIT-IDENTICAL to a controller-local compile by
+        construction), serialize, and POST it back to /pack_result. Dense int4/int8 only for now:
+        the controller sends the EXACT quant scope (lin2d/exp3d from _quant_scope); per-expert MoE
+        fusion (which needs the meta skeleton on the worker) is a later increment, so skel=None."""
+        import base64
+        import shards
+        from safetensors.torch import load as st_load, save as st_save
+        base = f"http://{self.args.controller}:{msg['controller_http_port']}"
+        quant = msg.get("quant", "int4")
+        gs = int(msg.get("group_size", shards.INT4_GROUP))
+        _l, _e = msg.get("lin2d"), msg.get("exp3d")
+        lin2d = set(_l) if _l is not None else None    # None -> pack_unit_tensors name-heuristic
+        exp3d = set(_e) if _e is not None else None
+        qd = {"model": msg["model_id"], "start": int(msg.get("start", 0)),
+              "end": int(msg.get("end", 0)), "embed": int(bool(msg.get("embed", 0))),
+              "head": int(bool(msg.get("head", 0))), "skip_experts": 0}
+        url = f"{base}/weights?{urllib.parse.urlencode(qd)}"
+
+        def _work() -> tuple[bytes, dict]:
+            raw = st_load(_http_get(url))                       # {model.* : bf16}, same as compile's raw
+            out_sd, mtensors = shards.pack_unit_tensors(raw, lin2d, exp3d, None, quant, gs)
+            return st_save(out_sd), mtensors
+
+        blob, mtensors = await asyncio.to_thread(_work)
+        hdr = base64.b64encode(json.dumps(mtensors).encode()).decode()
+        purl = (f"{base}/pack_result?req_id={urllib.parse.quote(str(msg['req_id']))}"
+                f"&unit={urllib.parse.quote(str(msg['unit']))}"
+                f"&model_id={urllib.parse.quote(str(msg['model_id']))}&quant={quant}")
+        await asyncio.to_thread(_http_post, purl, blob, {"X-Manifest": hdr})
+        return {"req_id": msg.get("req_id"), "unit": msg.get("unit"),
+                "bytes": len(blob), "tensors": len(mtensors)}
+
     async def handle_unload(self, model_id: str | None = None) -> None:
         """Per-model unload when model_id is given; otherwise a FULL teardown of every model
         (what the controller sends today, and what the session does on disconnect)."""
@@ -3809,6 +3860,16 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     except Exception as exc:
                         await reply({"type": "error", "node_id": node_id, "error": repr(exc)})
                         print(f"[load] FAILED: {exc!r}")
+                elif mtype == "pack":      # #distributed-packing: pack a shard-cache unit for the controller
+                    try:
+                        info = await worker.handle_pack(msg)
+                        await reply({"type": "packed", "node_id": node_id, **info})
+                        print(f"[pack] {msg.get('unit')} -> {info['bytes']/1e6:.1f} MB "
+                              f"({info['tensors']} tensors)")
+                    except Exception as exc:
+                        await reply({"type": "error", "node_id": node_id,
+                                     "req_id": msg.get("req_id"), "error": repr(exc)})
+                        print(f"[pack] FAILED: {exc!r}")
                 elif mtype == "unload":
                     await worker.handle_unload(msg.get("model_id"))
                     await reply({"type": "unloaded", "node_id": node_id,
