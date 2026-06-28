@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c124"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c125"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -3800,11 +3800,20 @@ class Engine:
                 row[ntok:] = float("-inf")
             return row
 
-        a0, h_prev = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
-                                      capture_pre_norm=True)
-        a0 = a0[0, -1]
-        h_prev = h_prev[:, -1:, :]
-        cur = len(prompt_ids)
+        from transformers import DynamicCache
+        # Prefill the MAIN model: per-position logits + PRE-norm hidden for the whole prompt.
+        ml, h_pre = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
+                                     all_logits=True, capture_pre_norm=True)
+        P = len(prompt_ids)
+        a0 = ml[0, P - 1]                     # logits predicting the token at position P
+        h_prev = h_pre[:, P - 1:P, :]         # trunk hidden at position P-1
+        # Prefill the MTP layer's OWN KV over the prompt so decode drafts attend the right context.
+        mtp_kv = DynamicCache()
+        if P >= 2:
+            await asyncio.to_thread(mtp_core.mtp_prefill, head, h_pre[:, 0:P - 1, :],
+                                    torch.tensor([prompt_ids[1:P]], dtype=torch.long), mtp_kv)
+        mtp_len = P - 1                        # MTP-seq positions consumed so far (invariant: == cur-1)
+        cur = P
         model.kv_pos = cur
         produced = 0
         while produced < max_new:
@@ -3818,8 +3827,9 @@ class Engine:
             yield t, None
             if produced >= max_new:
                 return
-            # MTP drafts the next-next token from the trunk hidden + the token we just emitted.
-            draft_row = await asyncio.to_thread(mtp_core.mtp_draft_one, head, h_prev, t, cur)
+            # Draft t_{cur+1}: consume t into the MTP cache (attends the prefilled + prior context).
+            draft_row = await asyncio.to_thread(mtp_core.mtp_step, head, mtp_kv, h_prev, t, mtp_len)
+            mtp_len += 1
             d = int(_mask(draft_row).argmax())
             # verify [t, d] in one traversal; capture per-position logits + pre-norm hidden.
             V, H = await self._send(model, torch.tensor([[t, d]], dtype=torch.long), cur, False,
@@ -3840,6 +3850,9 @@ class Engine:
             yield second, None
             if produced >= max_new:
                 return
+            # Commit `second` to the MTP cache (h_cur=H[0,0]) so subsequent drafts see it.
+            await asyncio.to_thread(mtp_core.mtp_step, head, mtp_kv, H[:, 0:1, :], second, mtp_len)
+            mtp_len += 1
             if refeed:                                   # re-establish a0/h by feeding the real token
                 a0t, h_t = await self._send(model, torch.tensor([[second]], dtype=torch.long),
                                             cur + 1, False, capture_pre_norm=True)

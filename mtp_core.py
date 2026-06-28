@@ -131,14 +131,33 @@ def _project(head, trunk_hidden, next_token_ids):
     return head.fc(torch.cat([head.enorm(e), head.hnorm(th)], dim=-1))
 
 
-def mtp_draft_one(head, trunk_hidden, token_id: int, position: int = 0):
-    """Single-token draft for decode (#91 _decode_spec_mtp): given the main model's trunk hidden
-    h_i (pre-final-norm, [1,1,H]) and the just-sampled token t_{i+1}, return the MTP head's logit
-    row [V] predicting t_{i+2}. One token through the MTP layer (a 1-token sequence attends only
-    itself, so the rotary position is immaterial); the caller masks to the text vocab + argmaxes."""
+def mtp_prefill(head, trunk_hidden, next_token_ids, kv):
+    """Fill the MTP layer's OWN KV cache over the prompt (#91 _decode_spec_mtp). The MTP layer is a
+    real transformer layer whose self-attention needs prior context — drafting with an empty cache
+    collapses acceptance (the contextless draft is wrong). Consumes MTP-seq positions 0..S-1
+    (token t_{j+1} with hidden h_j), leaving `kv` ready for decode-time mtp_step at position S.
+    trunk_hidden [1,S,H] = h_0..h_{S-1}; next_token_ids [1,S] = t_1..t_S; rotary/cache pos = index."""
+    torch = head.torch
+    with torch.inference_mode():
+        x = _project(head, trunk_hidden, next_token_ids)
+        S = x.shape[1]
+        pos = torch.arange(0, S, device=head.device).unsqueeze(0)
+        cos, sin = head.rotary(x, pos)
+        pe = (cos.to(head.dtype), sin.to(head.dtype))
+        causal = torch.triu(torch.full((S, S), float("-inf"), dtype=head.dtype,
+                                       device=head.device), diagonal=1).view(1, 1, S, S)
+        cache_position = torch.arange(0, S, device=head.device)
+        head.layer(x, position_embeddings=pe, attention_mask=causal, position_ids=pos,
+                   past_key_values=kv, cache_position=cache_position)
+
+
+def mtp_step(head, kv, trunk_hidden, token_id: int, position: int):
+    """One incremental MTP draft into the persistent cache `kv` (#91): consume token t at MTP-seq
+    `position` with the trunk hidden h_prev, attending to all cached prior positions; return the
+    logit row [V] predicting the next-next token. `position` == current cache length (the new slot);
+    a lone decode query attends every cached key, so attention_mask=None is correct."""
     torch = head.torch
     import torch.nn.functional as F
-    from transformers import DynamicCache
     with torch.inference_mode():
         th = trunk_hidden.to(device=head.device, dtype=head.dtype)
         tk = torch.tensor([[int(token_id)]], device=head.device)
@@ -147,8 +166,9 @@ def mtp_draft_one(head, trunk_hidden, token_id: int, position: int = 0):
         pos = torch.tensor([[int(position)]], device=head.device)
         cos, sin = head.rotary(x, pos)
         pe = (cos.to(head.dtype), sin.to(head.dtype))
-        o = head.layer(x, position_embeddings=pe, attention_mask=None,
-                       position_ids=pos, past_key_values=DynamicCache())
+        cache_position = torch.tensor([int(position)], device=head.device)
+        o = head.layer(x, position_embeddings=pe, attention_mask=None, position_ids=pos,
+                       past_key_values=kv, cache_position=cache_position)
         if isinstance(o, tuple):
             o = o[0]
         return F.linear(head.mnorm(o), head.lmhead_w)[0, -1].float().cpu()
