@@ -22,16 +22,23 @@ import sys
 import subprocess
 
 
-def _ensure_gguf_pkg() -> None:
-    """transformers' GGUF loader needs the `gguf` package to parse the file. Auto-install it on
-    demand (the m4c84 worker pattern) so a controller env that has torch+transformers but not the
-    optional `gguf` extra can still convert without a manual pip step on the (SSH-less) box."""
+def _ensure_deps() -> None:
+    """transformers' GGUF loader needs `gguf` (to parse the file) AND `accelerate` (it loads via the
+    low-memory/device_map path). Auto-install whatever's missing on demand (the m4c84 worker pattern)
+    so a controller env with torch+transformers but not these optional extras can still convert
+    without a manual pip step on the (SSH-less) box."""
+    need = []
     try:
         import gguf  # noqa: F401
-        return
     except Exception:
-        print("[gguf-convert] `gguf` package missing — installing", flush=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "gguf"], check=False)
+        need.append("gguf")
+    try:
+        import accelerate  # noqa: F401
+    except Exception:
+        need.append("accelerate")
+    if need:
+        print(f"[gguf-convert] installing missing deps: {', '.join(need)}", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", *need], check=False)
 
 
 def main() -> int:
@@ -50,7 +57,7 @@ def main() -> int:
               "(e.g. a *-Q4_K_M.gguf that isn't split into NNNNN-of-NNNNN parts)", file=sys.stderr)
         return 3
 
-    _ensure_gguf_pkg()
+    _ensure_deps()
     import torch
     from huggingface_hub import hf_hub_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
