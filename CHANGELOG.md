@@ -70,12 +70,13 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   `cache_start + q`, but SDPA takes the real kv-dim from the cache (`past + q`); they desync — and
   crash with "expanded size N must match M" — when a generation reclaimed by the gen-stall watchdog
   (or a disconnecting client) leaves an UNCANCELLABLE forward running in a thread that keeps mutating
-  the shared cache. Three layers now make this impossible: (1) forwards on a shard are SERIALIZED (a
-  non-blocking per-shard guard — a racing new forward fails fast and the controller re-prefills,
-  rather than concurrently corrupting the cache); (2) a new sequence (`cache_start == 0`)
-  unconditionally rebuilds the cache; (3) a decode/verify frame RECONCILES the cache to exactly
-  `cache_start` (crop an over-long stale cache; fail fast on an unrecoverable mismatch) before any
-  layer runs. A reclaimed generation can no longer corrupt the next one.
+  the shared cache concurrently with a fresh forward. Two layers make this impossible: (1) forwards on
+  a shard are SERIALIZED (a non-blocking per-shard guard — a racing new forward fails fast and the
+  controller re-prefills, rather than concurrently corrupting the cache; lazily initialized so
+  cache-served shards are covered); (2) a new sequence (`cache_start == 0`) unconditionally rebuilds
+  the cache. A reclaimed generation can no longer corrupt the next one. (A defensive per-decode KV
+  length "reconcile" was tried and reverted — `DynamicCache.get_seq_length()` inspects layer 0, which a
+  mid/tail pipeline stage doesn't own, so it false-tripped on every multi-stage decode.)
 - **Wedged-gen auto-recovery:** a distributed generation whose mid-pipeline hop dies never gets an
   error frame upstream (the data chain is one-way), so it used to sit ACTIVE at 0 tok/s until the
   600s timeout and needed a manual client restart. Two fixes: the gen-stall watchdog now (a) cancels
