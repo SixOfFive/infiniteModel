@@ -119,8 +119,16 @@ def _save_tokenizer(src_dir: str, gguf_file: str, repo_id: str, dst: str, token)
         try:
             tok = make()
             tok.save_pretrained(dst)
-            AutoTokenizer.from_pretrained(dst)   # VERIFY: reloads with no slow->fast step needed
-            print(f"[gguf-convert] tokenizer: {why} (verified reload)", flush=True)
+            # CRITICAL: the controller is a long-running process that cached "sentencepiece/tiktoken
+            # unavailable" at startup (this subprocess pip-installed them AFTER), so it can NOT convert
+            # a slow tokenizer to fast at serve time. Require a fast `tokenizer.json` (loads purely via
+            # the `tokenizers` Rust lib, which transformers always has) so the serve-time load needs no
+            # conversion deps. A slow-only save would "verify" HERE (this subprocess has the deps) yet
+            # fail on the controller — reject it so we fall through to the base repo's native fast one.
+            if not os.path.exists(os.path.join(dst, "tokenizer.json")):
+                raise RuntimeError("save produced no fast tokenizer.json (slow-only tokenizer)")
+            AutoTokenizer.from_pretrained(dst)   # sanity: reloads
+            print(f"[gguf-convert] tokenizer: {why} (fast tokenizer.json, verified)", flush=True)
             return True
         except Exception as exc:
             print(f"[gguf-convert] tokenizer via {why} failed: {exc!r}", flush=True)
