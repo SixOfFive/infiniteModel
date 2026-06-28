@@ -81,3 +81,6 @@ _dashcheck.js
 st_header.json
 _nvfp4_selftest.py
 _nvfp4_meastest.py
+
+# scratch curl/test outputs (underscore-prefixed)
+_*.json
