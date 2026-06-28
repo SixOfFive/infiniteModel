@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c123"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c124"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -1807,6 +1807,8 @@ class Engine:
                 with contextlib.suppress(Exception):
                     m.stage0_writer.close()
             self._unload_draft(m)   # free this model's controller-local draft
+        if getattr(self, "_mtp_heads", None):
+            self._mtp_heads.clear()   # #91 free all controller-resident MTP heads
         self.models.clear()
         for fut in self.pending.values():
             if not fut.done():
@@ -3425,8 +3427,23 @@ class Engine:
                     # Multimodal (mm) forces PLAIN decode: the controller-side draft model has
                     # no image embeds, so speculative would diverge — only the full pipeline
                     # gets the spliced vision tokens at prefill.
+                    # #91 MTP: when speculative+greedy is requested but there's no separate draft
+                    # model, fall through to the checkpoint's own MTP (nextn) self-draft if it has one.
+                    mtp_head = None
+                    if (speculative and greedy and mm is None and model.draft_model is None):
+                        with contextlib.suppress(Exception):
+                            mtp_head = await self._ensure_mtp_head(model)
                     if speculative and model.draft_model is not None and greedy and mm is None:
                         async for item in self._decode_spec(model, prompt_ids, max_new, spec_k):
+                            if item[0] is not None:
+                                _ntoks += 1
+                                model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
+                                _dt = time.monotonic() - _t0
+                                if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
+                                    model.last_tok_s = _ntoks / _dt
+                            yield item
+                    elif mtp_head is not None:
+                        async for item in self._decode_spec_mtp(model, prompt_ids, max_new, mtp_head):
                             if item[0] is not None:
                                 _ntoks += 1
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
@@ -3723,6 +3740,116 @@ class Engine:
             cur += m + 1
         yield None, "length"
 
+    # -- MTP (nextn) self-speculation (#91) — the checkpoint's own draft head -------------------
+    async def _ensure_mtp_head(self, model: LoadedModel):
+        """Lazily build + cache the controller-resident MTP head for a model whose checkpoint ships
+        one (mtp_num_hidden_layers>0). Returns the head or None (no MTP / load failed). The head is
+        SMALL (embed + 1 layer + lm_head, a few GB) — NEVER the full model (see
+        never-full-load-on-controller-box). First speculative request pays the one-time build."""
+        if not hasattr(self, "_mtp_heads"):
+            self._mtp_heads = {}
+        if model.friendly in self._mtp_heads:
+            return self._mtp_heads[model.friendly]
+        d = await asyncio.to_thread(_controller_model_dir, model.target_id)
+
+        def _has_mtp() -> bool:
+            try:
+                with open(os.path.join(d, "config.json"), encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                tc = cfg.get("text_config", cfg)
+                return int(tc.get("mtp_num_hidden_layers", 0) or 0) > 0
+            except Exception:
+                return False
+
+        if not await asyncio.to_thread(_has_mtp):
+            self._mtp_heads[model.friendly] = None    # negative-cache: don't re-check every request
+            return None
+        try:
+            import mtp_core
+            head = await asyncio.to_thread(mtp_core.load_mtp_head, d, "cpu")
+        except Exception as exc:
+            log_activity(f"{model.friendly}: MTP head load failed ({exc!r}) — plain decode")
+            self._mtp_heads[model.friendly] = None
+            return None
+        self._mtp_heads[model.friendly] = head
+        log_activity(f"{model.friendly}: MTP self-speculation head ready (K=1)")
+        return head
+
+    async def _decode_spec_mtp(self, model, prompt_ids, max_new, head):
+        """#91 MTP self-speculative greedy decode. Each round: the main model's next token t comes
+        from the verified context; the MTP head drafts ONE more token d (the next-next) from the
+        trunk hidden + t; we verify [t, d] in ONE pipeline traversal (all_logits + capture_pre_norm)
+        and accept d iff it equals the target's greedy — so every emitted token is identical to
+        plain greedy (bit-exact). On accept the next state comes free from the verify pass (2 tokens
+        / 1 traversal); on reject we emit the target's correct token and re-feed it (2 tokens / 2
+        traversals). At ~84% accept that's ~1.7x fewer traversals == ~1.7x decode speedup."""
+        import mtp_core
+        import torch
+        if not prompt_ids:
+            yield None, "stop"
+            return
+        eos = model.eos_ids
+        try:
+            ntok = len(model.tokenizer)
+        except Exception:
+            ntok = 0
+
+        def _mask(row):
+            if ntok and ntok < int(row.shape[-1]):
+                row = row.clone()
+                row[ntok:] = float("-inf")
+            return row
+
+        a0, h_prev = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
+                                      capture_pre_norm=True)
+        a0 = a0[0, -1]
+        h_prev = h_prev[:, -1:, :]
+        cur = len(prompt_ids)
+        model.kv_pos = cur
+        produced = 0
+        while produced < max_new:
+            if model.friendly not in self.models or model.stage0_writer is None:
+                raise RuntimeError("pipeline went down mid-generation")
+            t = int(_mask(a0).argmax())
+            produced += 1
+            if t in eos:
+                yield None, "stop"
+                return
+            yield t, None
+            if produced >= max_new:
+                return
+            # MTP drafts the next-next token from the trunk hidden + the token we just emitted.
+            draft_row = await asyncio.to_thread(mtp_core.mtp_draft_one, head, h_prev, t, cur)
+            d = int(_mask(draft_row).argmax())
+            # verify [t, d] in one traversal; capture per-position logits + pre-norm hidden.
+            V, H = await self._send(model, torch.tensor([[t, d]], dtype=torch.long), cur, False,
+                                    all_logits=True, capture_pre_norm=True)
+            tgt1 = int(_mask(V[0, 0]).argmax())          # target greedy for position cur+1
+            if d == tgt1:                                # accept: next state is free from the verify
+                second = d
+                next_a0, next_h, refeed = V[0, 1], H[:, 1:2, :], False
+            else:                                        # reject: emit target's token, drop wrong d
+                second = tgt1
+                await self._crop(model, cur + 1)
+                next_a0 = next_h = None
+                refeed = True
+            produced += 1
+            if second in eos:
+                yield None, "stop"
+                return
+            yield second, None
+            if produced >= max_new:
+                return
+            if refeed:                                   # re-establish a0/h by feeding the real token
+                a0t, h_t = await self._send(model, torch.tensor([[second]], dtype=torch.long),
+                                            cur + 1, False, capture_pre_norm=True)
+                a0, h_prev = a0t[0, -1], h_t[:, -1:, :]
+            else:
+                a0, h_prev = next_a0, next_h
+            cur += 2
+            model.kv_pos = cur
+        yield None, "length"
+
     async def reconfigure(self, friendly: str, tp: int, ctx: int, quant: str,
                           consolidate: bool, prefer_vram: bool, cpu_only: bool) -> LoadedModel:
         """#88 managed reload: switch a RESIDENT model to/from tensor-parallel (or change its TP
@@ -3808,6 +3935,8 @@ class Engine:
             with contextlib.suppress(Exception):
                 m.stage0_writer.close()
         self._unload_draft(m)        # free this model's controller-local draft
+        if getattr(self, "_mtp_heads", None):
+            self._mtp_heads.pop(friendly, None)   # #91 free the controller-resident MTP head
         self.models.pop(friendly, None)
         _release_ram()
         print(f"[unload] evicted {friendly} ({reason})")

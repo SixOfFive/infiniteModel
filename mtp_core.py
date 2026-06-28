@@ -131,6 +131,29 @@ def _project(head, trunk_hidden, next_token_ids):
     return head.fc(torch.cat([head.enorm(e), head.hnorm(th)], dim=-1))
 
 
+def mtp_draft_one(head, trunk_hidden, token_id: int, position: int = 0):
+    """Single-token draft for decode (#91 _decode_spec_mtp): given the main model's trunk hidden
+    h_i (pre-final-norm, [1,1,H]) and the just-sampled token t_{i+1}, return the MTP head's logit
+    row [V] predicting t_{i+2}. One token through the MTP layer (a 1-token sequence attends only
+    itself, so the rotary position is immaterial); the caller masks to the text vocab + argmaxes."""
+    torch = head.torch
+    import torch.nn.functional as F
+    from transformers import DynamicCache
+    with torch.inference_mode():
+        th = trunk_hidden.to(device=head.device, dtype=head.dtype)
+        tk = torch.tensor([[int(token_id)]], device=head.device)
+        e = F.embedding(tk, head.embed_w)
+        x = head.fc(torch.cat([head.enorm(e), head.hnorm(th)], dim=-1))
+        pos = torch.tensor([[int(position)]], device=head.device)
+        cos, sin = head.rotary(x, pos)
+        pe = (cos.to(head.dtype), sin.to(head.dtype))
+        o = head.layer(x, position_embeddings=pe, attention_mask=None,
+                       position_ids=pos, past_key_values=DynamicCache())
+        if isinstance(o, tuple):
+            o = o[0]
+        return F.linear(head.mnorm(o), head.lmhead_w)[0, -1].float().cpu()
+
+
 def mtp_forward_seq(head, trunk_hidden, next_token_ids, position_offset: int = 1):
     """Parallel teacher-forced forward over a sequence (acceptance probe).
     trunk_hidden [1,S,H] (pre-final-norm hidden at positions 0..S-1),
