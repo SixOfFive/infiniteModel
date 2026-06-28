@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c126"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c127"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -3764,15 +3764,28 @@ class Engine:
         if not await asyncio.to_thread(_has_mtp):
             self._mtp_heads[model.friendly] = None    # negative-cache: don't re-check every request
             return None
+        import mtp_core
+        # Prefer the GPU: the MTP layer is a 256-expert MoE whose per-step forward must be << one
+        # pipeline traversal or the draft overhead eats the speculation win. Best-effort with a CPU
+        # fallback (the GPU may be full of the model's own shard). torch may be absent on a pure
+        # controller, so import lazily.
+        head = None
         try:
-            import mtp_core
-            head = await asyncio.to_thread(mtp_core.load_mtp_head, d, "cpu")
-        except Exception as exc:
-            log_activity(f"{model.friendly}: MTP head load failed ({exc!r}) — plain decode")
-            self._mtp_heads[model.friendly] = None
-            return None
-        self._mtp_heads[model.friendly] = head
-        log_activity(f"{model.friendly}: MTP self-speculation head ready (K=1)")
+            import torch as _t
+            devs = (["cuda:0"] if _t.cuda.is_available() else []) + ["cpu"]
+        except Exception:
+            devs = ["cpu"]
+        for dev in devs:
+            try:
+                head = await asyncio.to_thread(mtp_core.load_mtp_head, d, dev)
+                log_activity(f"{model.friendly}: MTP self-speculation head ready on {dev} (K=1)")
+                break
+            except Exception as exc:
+                log_activity(f"{model.friendly}: MTP head load on {dev} failed ({exc!r})")
+                with contextlib.suppress(Exception):
+                    import torch as _t2
+                    _t2.cuda.empty_cache()
+        self._mtp_heads[model.friendly] = head    # None => negative-cache (plain decode)
         return head
 
     async def _decode_spec_mtp(self, model, prompt_ids, max_new, head):
@@ -3816,52 +3829,65 @@ class Engine:
         cur = P
         model.kv_pos = cur
         produced = 0
-        while produced < max_new:
-            if model.friendly not in self.models or model.stage0_writer is None:
-                raise RuntimeError("pipeline went down mid-generation")
-            t = int(_mask(a0).argmax())
-            produced += 1
-            if t in eos:
-                yield None, "stop"
-                return
-            yield t, None
-            if produced >= max_new:
-                return
-            # Draft t_{cur+1}: consume t into the MTP cache (attends the prefilled + prior context).
-            draft_row = await asyncio.to_thread(mtp_core.mtp_step, head, mtp_kv, h_prev, t, mtp_len)
-            mtp_len += 1
-            d = int(_mask(draft_row).argmax())
-            # verify [t, d] in one traversal; capture per-position logits + pre-norm hidden.
-            V, H = await self._send(model, torch.tensor([[t, d]], dtype=torch.long), cur, False,
-                                    all_logits=True, capture_pre_norm=True)
-            tgt1 = int(_mask(V[0, 0]).argmax())          # target greedy for position cur+1
-            if d == tgt1:                                # accept: next state is free from the verify
-                second = d
-                next_a0, next_h, refeed = V[0, 1], H[:, 1:2, :], False
-            else:                                        # reject: emit target's token, drop wrong d
-                second = tgt1
-                await self._crop(model, cur + 1)
-                next_a0 = next_h = None
-                refeed = True
-            produced += 1
-            if second in eos:
-                yield None, "stop"
-                return
-            yield second, None
-            if produced >= max_new:
-                return
-            # Commit `second` to the MTP cache (h_cur=H[0,0]) so subsequent drafts see it.
-            await asyncio.to_thread(mtp_core.mtp_step, head, mtp_kv, H[:, 0:1, :], second, mtp_len)
-            mtp_len += 1
-            if refeed:                                   # re-establish a0/h by feeding the real token
-                a0t, h_t = await self._send(model, torch.tensor([[second]], dtype=torch.long),
-                                            cur + 1, False, capture_pre_norm=True)
-                a0, h_prev = a0t[0, -1], h_t[:, -1:, :]
-            else:
-                a0, h_prev = next_a0, next_h
-            cur += 2
-            model.kv_pos = cur
-        yield None, "length"
+        accepts = rejects = 0
+        _dbg = []                              # first rounds: (cur, t, d, tgt1, accepted) for tracing
+        try:
+            while produced < max_new:
+                if model.friendly not in self.models or model.stage0_writer is None:
+                    raise RuntimeError("pipeline went down mid-generation")
+                t = int(_mask(a0).argmax())
+                produced += 1
+                if t in eos:
+                    yield None, "stop"
+                    return
+                yield t, None
+                if produced >= max_new:
+                    return
+                # Draft t_{cur+1}: consume t into the MTP cache (attends prefilled + prior context).
+                draft_row = await asyncio.to_thread(mtp_core.mtp_step, head, mtp_kv, h_prev, t, mtp_len)
+                mtp_len += 1
+                d = int(_mask(draft_row).argmax())
+                # verify [t, d] in one traversal; capture per-position logits + pre-norm hidden.
+                V, H = await self._send(model, torch.tensor([[t, d]], dtype=torch.long), cur, False,
+                                        all_logits=True, capture_pre_norm=True)
+                tgt1 = int(_mask(V[0, 0]).argmax())      # target greedy for position cur+1
+                if d == tgt1:                            # accept: next state is free from the verify
+                    accepts += 1
+                    second = d
+                    next_a0, next_h, refeed = V[0, 1], H[:, 1:2, :], False
+                else:                                    # reject: emit target token, drop wrong d
+                    rejects += 1
+                    second = tgt1
+                    await self._crop(model, cur + 1)
+                    next_a0 = next_h = None
+                    refeed = True
+                if len(_dbg) < 8:
+                    _dbg.append((cur, t, d, tgt1, d == tgt1))
+                produced += 1
+                if second in eos:
+                    yield None, "stop"
+                    return
+                yield second, None
+                if produced >= max_new:
+                    return
+                # Commit `second` to the MTP cache (h_cur=H[0,0]) so subsequent drafts see it.
+                await asyncio.to_thread(mtp_core.mtp_step, head, mtp_kv, H[:, 0:1, :], second, mtp_len)
+                mtp_len += 1
+                if refeed:                               # re-establish a0/h by feeding the real token
+                    a0t, h_t = await self._send(model, torch.tensor([[second]], dtype=torch.long),
+                                                cur + 1, False, capture_pre_norm=True)
+                    a0, h_prev = a0t[0, -1], h_t[:, -1:, :]
+                else:
+                    a0, h_prev = next_a0, next_h
+                cur += 2
+                model.kv_pos = cur
+            yield None, "length"
+        finally:
+            with contextlib.suppress(Exception):
+                tot = accepts + rejects
+                log_activity(f"[mtp] {model.friendly}: {accepts}/{tot} drafts accepted"
+                             + (f" ({round(100 * accepts / tot)}%)" if tot else "")
+                             + f"; first rounds (cur,t,d,tgt1,ok)={_dbg}")
 
     async def reconfigure(self, friendly: str, tp: int, ctx: int, quant: str,
                           consolidate: bool, prefer_vram: bool, cpu_only: bool) -> LoadedModel:
@@ -5995,12 +6021,11 @@ def build_app() -> FastAPI:
             m = engine.models.get(friendly) or engine._pick_replica(friendly)
             if m is None or getattr(m, "stage0_writer", None) is None:
                 return {"error": f"{friendly} is not loaded distributed — load it first"}
-            if not hasattr(engine, "_mtp_heads"):
-                engine._mtp_heads = {}
-            head = engine._mtp_heads.get(friendly)
-            if head is None or fresh:
-                head = await asyncio.to_thread(_mc.load_mtp_head, d, "cpu")
-                engine._mtp_heads[friendly] = head
+            if fresh and getattr(engine, "_mtp_heads", None):
+                engine._mtp_heads.pop(friendly, None)
+            head = await engine._ensure_mtp_head(m)   # GPU-preferring, shared with decode
+            if head is None:
+                return {"error": f"no MTP head for {friendly} (mtp_num_hidden_layers==0 or load failed)"}
             import torch
             p = prompt or ("The capital of France is Paris. The capital of Japan is Tokyo. "
                            "The capital of Italy is Rome. The capital of Canada is Ottawa. "
