@@ -52,6 +52,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   replication + data-parallel routing.
 - Robust loads: survive a worker drop mid-load (replan on survivors), free partial shards on failure,
   scaled timeouts, gentler restarts; auto-recover resident models when a worker reconnects.
+- **Stale-KV self-heal:** a worker stage ALWAYS rebuilds its KV cache when a frame starts a new
+  sequence (`cache_start == 0`), not only when the controller flags a reset. A generation reclaimed by
+  the gen-stall watchdog (or a disconnecting client) is cancelled on the controller, but the worker's
+  forward runs in an uncancellable thread and still finishes — leaving a stale KV cache behind. The
+  next request's prefill arrives at position 0 and now unconditionally starts fresh, so a reclaimed
+  generation can never corrupt the following one's attention mask ("expanded size N must match M").
 - **Idle-pipeline self-heal:** every data-plane hop is fresh-reconnected at each generation's prefill
   if it has been idle (an idle TCP socket can go silently half-open — the write succeeds but the bytes
   never arrive — which otherwise stalls the first request after an idle gap until the generation

@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c117"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c135"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2888,7 +2888,16 @@ class Shard:
         Returns hidden states, or — on the last stage — logits for just the last
         position, or for ALL positions when all_logits=True (speculative verify)."""
         torch = self.torch
-        if reset or self.kv is None:
+        # #kv-reset-on-seqstart: ALWAYS rebuild the cache when this frame starts a new sequence
+        # (cache_start == 0), not only when the controller flags reset. A cancelled / gen-stall-
+        # watchdog-reclaimed generation can leave a STALE KV cache on this stage: the controller
+        # dropped the request, but our forward runs in a thread that can't be cancelled, so it
+        # still finishes and populates self.kv. The next request's prefill arrives at position 0;
+        # if `reset` were ever out of sync with cache_start we'd append to that stale KV and the
+        # attention mask (q vs cache_start+q) would mismatch ("expanded size N must match M").
+        # Treating position 0 as an unconditional fresh start makes stale KV impossible to reuse —
+        # cache_start==0 is ONLY ever a sequence start (decode/verify always send cache_start>0).
+        if reset or self.kv is None or cache_start == 0:
             from transformers import DynamicCache
             # Hybrid arch: a config-typed cache pre-creates the right per-layer slot
             # (conv+recurrent for linear-attn layers, KV for full-attn) so the
