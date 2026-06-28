@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c117"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c118"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -250,6 +250,10 @@ GEN_STALL_S = 240.0     # #gen-stall-watchdog: a model active>0 that has produce
                         # long is WEDGED (dead pipeline hop -> 0 tokens + idle data plane). The
                         # watchdog cancels its in-flight request(s) + reclaims the leaked active slot.
                         # > worst-case legit first-token wait (big CPU prefill) so it never false-fires.
+REQUEUE_GRACE_S = 12.0  # #stage0-stale-reconnect: when a head's return data-conn closes, wait this
+                        # long before dooming the requests it was serving — a head that just FRESHENED
+                        # its return socket (drop+reconnect at prefill) re-delivers their logits on the
+                        # new conn within its stage compute; only a genuinely dead head stays pending.
 STAGE0_STALE_S = 5.0    # #stage0-stale-reconnect: if the controller hasn't pushed a frame to a model's
                         # stage 0 for this long, its stage0_writer may have gone silently half-open while
                         # idle -> rebuild it FRESH before the next generation's prefill (a connect is ~ms;
@@ -1740,18 +1744,33 @@ class Engine:
         except Exception as exc:  # pragma: no cover
             print(f"[data] listener error: {exc!r}")
         finally:
-            # A dead data connection dooms only the requests for the model(s) THIS
-            # connection was serving — fail just those (not every model's), so an
-            # unrelated model's concurrent generations survive one head's hiccup.
-            doomed = [rid for rid, f in self.pending.items()
-                      if not f.done() and self.pending_model.get(rid) in served]
-            for rid in doomed:
-                fut = self.pending.pop(rid, None)
-                self.pending_model.pop(rid, None)
-                if fut is not None and not fut.done():
-                    fut.set_exception(ConnectionError("data connection closed"))
+            # A dead data connection dooms only the requests for the model(s) THIS connection was
+            # serving — fail just those (not every model's), so an unrelated model's concurrent
+            # generations survive one head's hiccup.
+            # #stage0-stale-reconnect: a head node now FRESHENS its return conn at each prefill (it
+            # drops the possibly-idle-half-open socket + reconnects), so a return-conn close is
+            # usually a RECONNECT, not a death — and the request's logits are about to arrive on the
+            # NEW conn. Dooming synchronously here killed exactly that request ("data connection
+            # closed" right after an idle gap). So GRACE it: snapshot the in-flight reqs this conn
+            # served, then doom only those STILL pending after REQUEUE_GRACE_S. A reconnect delivers
+            # within the head stage's compute (well under the grace) -> future resolves -> skipped;
+            # a genuinely dead head still fails fast (grace << gen-stall watchdog / GEN_TIMEOUT).
+            at_close = [rid for rid, f in self.pending.items()
+                        if not f.done() and self.pending_model.get(rid) in served]
             with contextlib.suppress(Exception):
                 writer.close()
+            if at_close:
+                async def _grace_doom(rids):
+                    await asyncio.sleep(REQUEUE_GRACE_S)
+                    for rid in rids:
+                        fut = self.pending.get(rid)
+                        if fut is not None and not fut.done():
+                            self.pending.pop(rid, None)
+                            self.pending_model.pop(rid, None)
+                            fut.set_exception(ConnectionError(
+                                "data connection closed (head did not re-deliver within grace)"))
+                with contextlib.suppress(Exception):
+                    asyncio.create_task(_grace_doom(at_close))
 
     async def _connect_retry(self, host: str, port: int, timeout: float = 30) -> asyncio.StreamWriter:
         deadline = time.time() + timeout
