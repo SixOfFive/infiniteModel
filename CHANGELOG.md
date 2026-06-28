@@ -83,7 +83,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   the REAL streaming body-pump task (the cancel handle had been the route task, which returns
   immediately for a streaming response → the cancel was a no-op), and (b) fails the model's leaked
   controller-side pending futures so the orphaned `_send` returns at once. The model reclaims its slot
-  and unblocks the queue on its own.
+  and unblocks the queue on its own. (Hardened after an adversarial audit: the freed orphan's `finally`
+  decrement is floored at 0 so it can't drive `active` negative after the watchdog zeroed it; and the
+  leaked-future fail is skipped for data-parallel *replicated* models — `pending` is keyed by target_id,
+  shared across replicas, so a blanket fail would also kill a healthy sibling's request, which instead
+  relies on the per-request cancel.) Verified live: `/cancel` aborts a streaming gen at 6/400 tokens and
+  the slot frees + the model serves again immediately (the same handle the watchdog uses).
 - **Idle-pipeline self-heal:** every data-plane hop is fresh-reconnected at each generation's prefill
   if it has been idle (an idle TCP socket can go silently half-open — the write succeeds but the bytes
   never arrive — which otherwise stalls the first request after an idle gap until the generation

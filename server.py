@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c145"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c146"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -3549,7 +3549,10 @@ class Engine:
                                     model.last_tok_s = _ntoks / _dt
                             yield item
                 finally:
-                    model.active -= 1
+                    # max(0, ...): the gen-stall watchdog may have already zeroed model.active when it
+                    # reclaimed THIS (now-unblocked) wedged gen — without the floor the double-decrement
+                    # drives active negative, skewing _pick_replica routing + the dashboard counts.
+                    model.active = max(0, model.active - 1)
                     # #model-detail lifetime counters (this is the main text-generation path; TP /
                     # speech paths don't update these). Count every served request + its tokens.
                     model.req_total += 1
@@ -4722,13 +4725,23 @@ async def gen_stall_watchdog() -> None:
             # cancel above only helps if the task handle is live; this frees it regardless.
             _tid = getattr(m, "target_id", None)
             _failed = 0
-            for _rid, _f in list(getattr(engine, "pending", {}).items()):
-                if engine.pending_model.get(_rid) == _tid and not _f.done():
-                    with contextlib.suppress(Exception):
-                        _f.set_exception(ConnectionError("gen-stall watchdog reclaim"))
-                    engine.pending.pop(_rid, None)
-                    engine.pending_model.pop(_rid, None)
-                    _failed += 1
+            # SKIP when the model is data-parallel REPLICATED: engine.pending_model is keyed by
+            # target_id, which every replica of a base shares, so failing by target_id would also
+            # ConnectionError a HEALTHY sibling replica's in-flight request. Replicas instead rely on
+            # the per-request task cancel above (rec["task"]) + the GEN_TIMEOUT fallback. Single-copy
+            # models (the common case) get the fast future-fail.
+            _base = getattr(m, "base", None) or key
+            _replicated = False
+            with contextlib.suppress(Exception):
+                _replicated = engine.replica_count(_base) > 1
+            if not _replicated:
+                for _rid, _f in list(getattr(engine, "pending", {}).items()):
+                    if engine.pending_model.get(_rid) == _tid and not _f.done():
+                        with contextlib.suppress(Exception):
+                            _f.set_exception(ConnectionError("gen-stall watchdog reclaim"))
+                        engine.pending.pop(_rid, None)
+                        engine.pending_model.pop(_rid, None)
+                        _failed += 1
             with contextlib.suppress(Exception):
                 m.lock = asyncio.Lock()   # drop a lock an orphaned wedged gen may still hold -> unblock the queue
             engine._last_load_failure = time.time()   # arm the self-update cool-down (anti-churn after a fault)
