@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c128"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c129"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -5289,15 +5289,34 @@ def build_app() -> FastAPI:
             # (spreads across the fleet) in a confirm() BEFORE the load commits. Fires only when the
             # co-located stage's RAM leaves < 2x the controller reserve free on that box.
             if cons and mode != "proportional":
+                # (1) controller-box RAM overload: a heavy shard on the co-located worker that ALSO
+                # serves the whole stream -> OOM-drop risk (the beast minimax crash).
                 for s in p.stages:
                     nd = node_by_id.get(s.node_id)
                     if nd is not None and nd.data_host in _LOCAL_IPS:
                         if s.est_gb > (nd.eff_ram_gb - 2 * CONTROLLER_RAM_RESERVE_GB):
-                            d["overload"] = {"node": nd.hostname, "mode": mode,
-                                             "suggest": "proportional",
+                            d["overload"] = {"reason": "controller_ram", "node": nd.hostname,
+                                             "mode": mode, "suggest": "proportional",
                                              "stage_gb": round(s.est_gb, 1),
                                              "node_ram_gb": round(nd.eff_ram_gb, 1)}
                         break
+                # (2) #103: GPU oversubscribe -> CPU spill. auto/single consolidate onto the fewest
+                # nodes, so a model bigger than that subset's free VRAM spills to CPU (slow) EVEN WHEN
+                # other GPUs in the fleet sit idle. If proportional would put materially more weight on
+                # GPU (fleet free-VRAM clearly exceeds the chosen subset's), suggest it BEFORE loading.
+                if "overload" not in d and pv:
+                    model_gb = spec.total_weight_bytes / GB
+                    auto_gpu = sum(node_by_id[s.node_id].eff_vram_gb for s in p.stages
+                                   if s.node_id in node_by_id and node_by_id[s.node_id].eff_vram_gb > 0)
+                    fleet_gpu = sum(n.eff_vram_gb for n in registry.alive_sorted()
+                                    if n.eff_vram_gb > 0)
+                    on_cpu = model_gb - auto_gpu
+                    if on_cpu > 2.0 and fleet_gpu > auto_gpu + 2.0:
+                        d["overload"] = {"reason": "gpu_spill", "mode": mode, "suggest": "proportional",
+                                         "model_gb": round(model_gb, 1),
+                                         "auto_gpu_gb": round(auto_gpu, 1),
+                                         "fleet_gpu_gb": round(fleet_gpu, 1),
+                                         "on_cpu_gb": round(max(0.0, on_cpu), 1)}
         return JSONResponse(d)
 
     @app.get("/shard_status")           # #shard-cache: which quants are pre-compiled per model

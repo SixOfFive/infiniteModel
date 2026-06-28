@@ -893,7 +893,16 @@ async function doLoad(quant,mode){
     try{
       const pv=await (await fetch(`/plan?model=${encodeURIComponent(m)}&ctx=${ctx}&mode=${mode}&quant=${q}`)).json();
       if(pv && pv.overload){ const o=pv.overload;
-        if(confirm(`Heads-up: "${o.mode}" mode would put ~${o.stage_gb} GB on ${o.node} — the controller box (${o.node_ram_gb} GB RAM) — which also has to serve the whole model stream, so it may run out of memory and drop mid-load.\n\nSwitch to "${o.suggest}" mode? It spreads the layers across the whole fleet.\n\nOK = use ${o.suggest}    ·    Cancel = keep ${o.mode}`)){ mode=o.suggest; }
+        // #103: two overload reasons -> phrase each. gpu_spill = auto/single oversubscribe one box's
+        // VRAM and spill to CPU while other GPUs sit idle; controller_ram = heavy shard on the box
+        // that also serves the stream (OOM-drop). Both offer to switch to proportional pre-load.
+        let msg;
+        if(o.reason==='gpu_spill'){
+          msg=`Heads-up: "${o.mode}" mode keeps only ~${o.auto_gpu_gb} GB of this ${o.model_gb} GB model on GPU — about ${o.on_cpu_gb} GB would spill to CPU (slow decode), even though the fleet has ~${o.fleet_gpu_gb} GB of GPU free.\n\nSwitch to "${o.suggest}" mode? It spreads the model across every GPU in the fleet.\n\nOK = use ${o.suggest}    ·    Cancel = keep ${o.mode}`;
+        } else {
+          msg=`Heads-up: "${o.mode}" mode would put ~${o.stage_gb} GB on ${o.node} — the controller box (${o.node_ram_gb} GB RAM) — which also has to serve the whole model stream, so it may run out of memory and drop mid-load.\n\nSwitch to "${o.suggest}" mode? It spreads the layers across the whole fleet.\n\nOK = use ${o.suggest}    ·    Cancel = keep ${o.mode}`;
+        }
+        if(confirm(msg)){ mode=o.suggest; }
       }
     }catch(e){ /* plan pre-check is best-effort */ }
   }
