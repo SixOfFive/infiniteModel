@@ -272,8 +272,8 @@ DASHBOARD_HTML = """<!doctype html>
         <input id="cfg-queue" type="number" min="0" style="width:64px"></label>
       <label class="sub" title="OFF (default): loaded models stay resident FOREVER — a request never unloads a model, and a new load that doesn't fit simply fails (unload one first). ON: a model idle (no requests) for 60 min is auto-unloaded, and an idle model (never one actively serving) may be evicted LRU-first to make room for a new load.">
         <input id="cfg-auto" type="checkbox"> auto-unload idle models — after 60 min idle, or to make room</label>
-      <label class="sub" title="ON (default): a request for a KNOWN but not-resident model auto-loads it (GPU-first placement). OFF: such a request FAILS ('model not loaded') exactly like an unknown model — nothing loads automatically; you load models explicitly.">
-        <input id="cfg-autoload" type="checkbox"> auto-load on request — off = requests for non-resident models fail instead of loading</label>
+      <label class="sub" title="A request for a KNOWN but not-resident model auto-loads it (GPU-first placement, using the Auto-load defaults below) instead of failing.">
+        <input id="cfg-autoload" type="checkbox"> auto-load on request</label>
       <span class="sub" style="width:100%;color:#8b949e;border-top:1px solid #21262d;padding-top:8px">Auto-load defaults — used by each model's <b>Load</b> button AND by auto-load when a request hits a non-resident model:</span>
       <label class="sub" title="Quant the Load button + auto-load use. int4 (default) = smallest: ~1/4 the bf16 memory, fits more nodes, serves pre-packed when a shard cache exists. Falls back to bf16 if int4/int8 can't quantize a given model.">quant
         <select id="cfg-aq" style="width:80px"><option value="int4">int4</option><option value="int8">int8</option><option value="none">bf16</option></select></label>
