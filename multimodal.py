@@ -39,6 +39,7 @@ _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Dependency injection: controller model-dir resolver (no back-import of server)
 # ---------------------------------------------------------------------------
 _MODEL_DIR_FN = None
+_LOCAL_DIR_FN = None
 
 
 def set_model_dir_resolver(fn):
@@ -46,6 +47,15 @@ def set_model_dir_resolver(fn):
     below can resolve a model's on-disk weights dir WITHOUT importing server (no import cycle)."""
     global _MODEL_DIR_FN
     _MODEL_DIR_FN = fn
+
+
+def set_local_dir_resolver(fn):
+    """server.py injects ``_local_model_dir`` — returns a model's on-disk dir IF already present,
+    without downloading/converting. Used by _get_tokenizer to load the tokenizer from the local dir
+    (which always carries a usable tokenizer.json, incl. GGUF-normalized models) rather than the HF
+    repo id (a GGUF-only repo has no tokenizer.json -> from_pretrained would need sentencepiece)."""
+    global _LOCAL_DIR_FN
+    _LOCAL_DIR_FN = fn
 
 
 _TOK_CACHE: dict = {}   # target_id -> tokenizer; the build is slow (minutes) for big
@@ -57,18 +67,42 @@ def _get_tokenizer(target_id: str):
     every RELOAD of the same model (ctx change, dirty re-plan, unload+reload) instant."""
     tok = _TOK_CACHE.get(target_id)
     if tok is None:
+        import os
         from transformers import AutoTokenizer
+        # Source order: prefer the LOCAL model dir if it already holds a tokenizer (a GGUF-normalized
+        # model — and any downloaded model — saves tokenizer.json there), because the HF repo id may
+        # have no usable tokenizer (a GGUF-only repo ships .gguf, so from_pretrained(repo) would try to
+        # build a slow tokenizer and fail without sentencepiece/tiktoken). Fall back to the repo id.
+        sources = []
+        if _LOCAL_DIR_FN is not None:
+            try:
+                d = _LOCAL_DIR_FN(target_id)
+                if d and (os.path.exists(os.path.join(d, "tokenizer.json"))
+                          or os.path.exists(os.path.join(d, "tokenizer_config.json"))):
+                    sources.append(d)
+            except Exception:
+                pass
+        sources.append(target_id)
         # trust_remote_code: harmless for the existing models, required for nomic's BERT-style
         # tokenizer (custom tokenization code shipped in the repo).
         # #devstral-eos: Mistral-Small-3.1-derived tokenizers (Devstral, Ministral) ship a broken
         # pretokenizer regex; transformers warns "set fix_mistral_regex=True" and WITHOUT it the
         # prompt mis-tokenizes -> the model can emit EOS (id=2) immediately = 0 output tokens. Pass
         # the flag when the tokenizer accepts it; fall back cleanly for tokenizers that don't.
-        try:
-            tok = AutoTokenizer.from_pretrained(target_id, trust_remote_code=True,
-                                                fix_mistral_regex=True)
-        except Exception:
-            tok = AutoTokenizer.from_pretrained(target_id, trust_remote_code=True)
+        last = None
+        for src in sources:
+            for _kw in (dict(trust_remote_code=True, fix_mistral_regex=True),
+                        dict(trust_remote_code=True)):
+                try:
+                    tok = AutoTokenizer.from_pretrained(src, **_kw)
+                    break
+                except Exception as exc:
+                    last = exc
+                    tok = None
+            if tok is not None:
+                break
+        if tok is None:
+            raise last if last is not None else RuntimeError(f"no tokenizer for {target_id}")
         _TOK_CACHE[target_id] = tok
     return tok
 

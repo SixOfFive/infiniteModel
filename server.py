@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c143"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c144"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -1407,6 +1407,12 @@ from multimodal import (_get_tokenizer, _get_processor, _decode_image, _collect_
                         _VISION_CACHE, _VISION_MAT, _AUDIO_CACHE, _AUDIO_MAT,
                         _OPENAI_VOICE_MAP)   # noqa: E402,F401
 multimodal.set_model_dir_resolver(_controller_model_dir)
+# Non-triggering local-dir lookup for the tokenizer loader: a model normalized from GGUF (and any
+# downloaded model) has its tokenizer saved under models/<name>/, while the HF repo id may have NO
+# usable tokenizer (a GGUF-only repo ships .gguf, not tokenizer.json). _local_model_dir returns the
+# present dir WITHOUT downloading/converting (unlike _controller_model_dir), so a metadata-path
+# tokenizer call can't trigger a heavy conversion.
+multimodal.set_local_dir_resolver(_local_model_dir)
 
 
 def _encode_images(target_id: str, images: list) -> dict:
