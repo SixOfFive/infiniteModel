@@ -167,11 +167,31 @@ def mtp_step(head, kv, trunk_hidden, token_id: int, position: int):
         cos, sin = head.rotary(x, pos)
         pe = (cos.to(head.dtype), sin.to(head.dtype))
         cache_position = torch.tensor([int(position)], device=head.device)
-        o = head.layer(x, position_embeddings=pe, attention_mask=None, position_ids=pos,
+        # Explicit all-zeros (attend-everything) additive mask [1,1,1,pos+1]: a lone decode query is
+        # causal-valid against every cached key, but a None mask can default to self-only and starve
+        # the MTP layer of its context (the bug that collapsed accept to ~0).
+        total = int(position) + 1
+        mask = torch.zeros((1, 1, 1, total), dtype=head.dtype, device=head.device)
+        o = head.layer(x, position_embeddings=pe, attention_mask=mask, position_ids=pos,
                        past_key_values=kv, cache_position=cache_position)
         if isinstance(o, tuple):
             o = o[0]
         return F.linear(head.mnorm(o), head.lmhead_w)[0, -1].float().cpu()
+
+
+def mtp_incremental_drafts(head, trunk_hidden, next_token_ids):
+    """DIAGNOSTIC (#91): run the MTP head INCREMENTALLY (mtp_step with a growing KV, exactly like
+    decode) over a sequence and return the per-position argmax draft tokens. Should match
+    mtp_forward_seq (the proven parallel path) position-for-position — if it doesn't, the
+    incremental KV/attention path is broken (the decode-time bug)."""
+    from transformers import DynamicCache
+    kv = DynamicCache()
+    S = int(next_token_ids.shape[1])
+    preds = []
+    for j in range(S):
+        row = mtp_step(head, kv, trunk_hidden[:, j:j + 1, :], int(next_token_ids[0, j]), j)
+        preds.append(int(row.argmax()))
+    return preds
 
 
 def mtp_forward_seq(head, trunk_hidden, next_token_ids, position_offset: int = 1):

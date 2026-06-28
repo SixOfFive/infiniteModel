@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c125"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c126"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -6037,10 +6037,21 @@ def build_app() -> FastAPI:
                     out[f"off{off}"] = {"acc_vs_greedy": round(ag / max(1, n), 3),
                                         "acc_vs_actual": round(aa / max(1, n), 3), "n": n,
                                         "examples": ex}
+                # DIAGNOSTIC: incremental (decode-path) drafts vs the proven parallel forward_seq.
+                # If these disagree, the KV/attention path mtp_step uses at decode time is broken.
+                inc = _mc.mtp_incremental_drafts(head, th, nxt)         # [S-1] argmax tokens
+                par = _mc.mtp_forward_seq(head, th, nxt, position_offset=0)[0].float().argmax(-1)
+                n = S - 2
+                same_par = sum(1 for i in range(S - 1) if inc[i] == int(par[i]))
+                inc_vs_greedy = sum(1 for i in range(n) if inc[i] == int(main_greedy[i + 1]))
+                out["incremental"] = {
+                    "matches_parallel": round(same_par / max(1, S - 1), 3),
+                    "acc_vs_greedy": round(inc_vs_greedy / max(1, n), 3), "n": n}
                 return out
 
             out = await asyncio.to_thread(_compute)
-            best = max(out, key=lambda k: out[k]["acc_vs_greedy"])
+            best = max((k for k in out if k.startswith("off")),
+                       key=lambda k: out[k]["acc_vs_greedy"])
             return {"ok": True, "model": friendly, "S": S, "best": best,
                     "summary": {k: {kk: vv for kk, vv in v.items() if kk != "examples"}
                                 for k, v in out.items()},
