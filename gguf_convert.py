@@ -36,6 +36,22 @@ def _ensure_deps() -> None:
         import accelerate  # noqa: F401
     except Exception:
         need.append("accelerate")
+    # Building the model's tokenizer from a GGUF (then saving it as a FAST tokenizer.json so the
+    # controller loads it without a slow->fast conversion at serve time) needs sentencepiece/tiktoken,
+    # and sentencepiece's converter needs protobuf. Without these the save leaves only a slow tokenizer
+    # and the LATER load fails ("need sentencepiece or tiktoken to convert a slow tokenizer to a fast one").
+    try:
+        import sentencepiece  # noqa: F401
+    except Exception:
+        need.append("sentencepiece")
+    try:
+        import tiktoken  # noqa: F401
+    except Exception:
+        need.append("tiktoken")
+    try:
+        import google.protobuf  # noqa: F401
+    except Exception:
+        need.append("protobuf")
     if need:
         print(f"[gguf-convert] installing missing deps: {', '.join(need)}", flush=True)
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", *need], check=False)
