@@ -280,7 +280,7 @@ DASHBOARD_HTML = """<!doctype html>
       <label class="sub" title="Default context length the Load button + auto-load use. 8192 (8k) is a sane working window that keeps KV modest. 0 = the model's native training context.">ctx
         <input id="cfg-ctx" type="number" min="0" step="1024" style="width:76px"></label>
       <label class="sub" title="Default placement mode the Load button + auto-load use. auto = GPU-first, fewest nodes (best latency); gpu-spread/distribute/proportional spread across more nodes; single = collapse to one box if it fits.">mode
-        <select id="cfg-mode" style="width:118px"><option value="auto">auto</option><option value="single">single</option><option value="gpu-spread">GPU-spread</option><option value="distribute">distribute</option><option value="spread">spread</option><option value="proportional">proportional</option></select></label>
+        <select id="cfg-mode" style="width:118px"><option value="auto">auto</option><option value="single">single</option><option value="gpu-spread">GPU-spread</option><option value="all-gpu">all-GPU</option><option value="distribute">distribute</option><option value="spread">spread</option><option value="proportional">proportional</option></select></label>
       <label class="sub" title="ON (default): pack a new model's WEIGHTS into physically-free VRAM, using resident models' reserved-but-unused KV headroom — so a model lands on GPU when VRAM is free instead of spilling weights to CPU. Each model still reserves its own KV. OFF: conservative — reserve every resident model's full-context KV on GPU (weights spill to CPU before a resident model's KV is touched).">
         <input id="cfg-wf" type="checkbox"> weights-first VRAM</label>
       <button class="sec" onclick="saveConfig()">Save</button>
@@ -300,6 +300,7 @@ DASHBOARD_HTML = """<!doctype html>
           <option value="auto" selected>auto — GPU-first, fewest nodes</option>
           <option value="single">single box — fewest nodes (one box if it fits)</option>
           <option value="gpu-spread">all GPUs — fill VRAM, spill to CPU</option>
+          <option value="all-gpu">all GPUs — every GPU, no CPU spill</option>
           <option value="distribute">distribute — split across whole fleet</option>
           <option value="spread">spread — a stage on EVERY node (incl. tiny ones)</option>
           <option value="proportional">proportional — every node, share ∝ capacity (big int4 MoE)</option>

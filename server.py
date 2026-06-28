@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c135"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c136"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -575,6 +575,9 @@ LOAD_MODES: dict[str, tuple] = {
     "auto":       (True,  True),   # GPU-VRAM-first, fewest nodes (default; best latency)
     "single":     (True,  False),  # fewest nodes by RAM+VRAM (collapses to one box if it fits)
     "gpu-spread": (False, True),   # fill every GPU's VRAM, spill across nodes
+    "all-gpu":    (False, False),  # #all-gpu: a stage on EVERY GPU, NOTHING on CPU (proportional
+    #                                across the GPU subset). prefer_vram off so it doesn't spill;
+    #                                gpu_spread=(mode=="all-gpu") flips the GPU-only filter on.
     "distribute": (False, False),  # spread across the WHOLE fleet (CPUs + GPUs)
     "spread":     (False, False),  # like distribute, but FORCE a stage on every capable node
     "proportional": (False, False),  # #78: layers across EVERY capable node PROPORTIONAL to its
@@ -1968,14 +1971,15 @@ class Engine:
         return cands[i]
 
     def _fit_ctx(self, spec, mems, ctx: int, consolidate: bool, prefer_vram: bool,
-                 floor: int, spread: bool = False, proportional: bool = False):
+                 floor: int, spread: bool = False, proportional: bool = False,
+                 gpu_spread: bool = False):
         """Binary-search the largest context in [floor, ctx] whose pipeline plan fits `mems`.
         Used when a load won't fit at the requested ctx and there's nothing to evict — trading
         context for fit instead of OOMing. Returns (ctx_used, plan); plan.ok is False only when
         not even `floor` tokens fit (weights alone exceed the pool)."""
         floor = min(floor, ctx)
         pf = plan_pipeline(spec, mems, floor, consolidate=consolidate, prefer_vram=prefer_vram,
-                           spread=spread, proportional=proportional)
+                           spread=spread, proportional=proportional, gpu_spread=gpu_spread)
         if not pf.ok:
             return floor, pf                      # even the floor doesn't fit -> caller raises
         best_ctx, best_plan = floor, pf
@@ -1983,7 +1987,7 @@ class Engine:
         while lo <= hi:
             mid = (lo + hi) // 2
             p = plan_pipeline(spec, mems, mid, consolidate=consolidate, prefer_vram=prefer_vram,
-                              spread=spread, proportional=proportional)
+                              spread=spread, proportional=proportional, gpu_spread=gpu_spread)
             if p.ok:
                 best_ctx, best_plan = mid, p
                 lo = mid + 1
@@ -1992,7 +1996,7 @@ class Engine:
         aligned = max(floor, (best_ctx // 512) * 512)   # tidy number; a smaller ctx still fits
         if aligned != best_ctx:
             pa = plan_pipeline(spec, mems, aligned, consolidate=consolidate, prefer_vram=prefer_vram,
-                               spread=spread, proportional=proportional)
+                               spread=spread, proportional=proportional, gpu_spread=gpu_spread)
             if pa.ok:
                 return aligned, pa
         return best_ctx, best_plan
@@ -2030,17 +2034,19 @@ class Engine:
             a_mode = str(ENGINE_CONFIG.get("autoload_mode", "auto") or "auto")
             _cons, _pv = LOAD_MODES.get(a_mode, LOAD_MODES["auto"])
             _spread, _prop = (a_mode == "spread"), (a_mode == "proportional")
+            _gpus = (a_mode == "all-gpu")
             log_activity(f"{friendly}: auto-load on request (not resident) -> mode={a_mode}, "
                          f"quant={aq}, ctx={use_ctx or 'train'}" + (" (CPU-only)" if cpu_only else ""))
             try:
                 return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
-                                       quant=aq, cpu_only=cpu_only, spread=_spread, proportional=_prop)
+                                       quant=aq, cpu_only=cpu_only, spread=_spread,
+                                       proportional=_prop, gpu_spread=_gpus)
             except Exception as e:
                 if aq != "none":
                     log_activity(f"{friendly}: auto-load at {aq} failed ({e!r}) -> retry at bf16")
                     return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
                                            quant="none", cpu_only=cpu_only, spread=_spread,
-                                           proportional=_prop)
+                                           proportional=_prop, gpu_spread=_gpus)
                 raise
         raise ValueError(f"model '{friendly}' is not loaded — load it first")
 
@@ -2064,7 +2070,8 @@ class Engine:
                    cpu_only: bool = False, reg_key: Optional[str] = None,
                    exclude_nodes: Optional[set] = None, replica_idx: int = 0,
                    spread: bool = False, proportional: bool = False,
-                   force: bool = False, moe_offload: bool = False) -> LoadedModel:
+                   force: bool = False, moe_offload: bool = False,
+                   gpu_spread: bool = False) -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -2082,7 +2089,7 @@ class Engine:
                                          cpu_only=cpu_only, reg_key=reg_key,
                                          exclude_nodes=exclude_nodes, replica_idx=replica_idx,
                                          spread=spread, proportional=proportional, force=force,
-                                         moe_offload=moe_offload, _own=_own)
+                                         moe_offload=moe_offload, gpu_spread=gpu_spread, _own=_own)
         finally:
             if _own["v"]:
                 self._reservations.pop(rk, None)
@@ -2098,6 +2105,7 @@ class Engine:
                    exclude_nodes: Optional[set] = None, replica_idx: int = 0,
                    spread: bool = False, proportional: bool = False,
                    force: bool = False, moe_offload: bool = False,
+                   gpu_spread: bool = False,
                    _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
@@ -2416,8 +2424,10 @@ class Engine:
                     raise RuntimeError("no capable worker nodes connected "
                                        "(all missing inference deps, or both tiers disabled)")
                 pv_eff = prefer_vram and not cpu_only
+                gpu_spread_eff = gpu_spread and not cpu_only   # all-GPU is meaningless under cpu_only
                 plan = plan_pipeline(spec, mems, ctx, consolidate=consolidate, prefer_vram=pv_eff,
-                                     spread=spread, proportional=proportional)
+                                     spread=spread, proportional=proportional,
+                                     gpu_spread=gpu_spread_eff)
                 if not plan.ok:
                     victim = self._lru_evictable() if auto_unload else None
                     if victim is not None:
@@ -2428,7 +2438,8 @@ class Engine:
                     # alongside the weights, instead of over-committing into an OOM (user policy).
                     fit_ctx, fplan = self._fit_ctx(spec, mems, ctx, consolidate, pv_eff,
                                                    CTX_AUTOFIT_FLOOR, spread=spread,
-                                                   proportional=proportional)
+                                                   proportional=proportional,
+                                                   gpu_spread=gpu_spread_eff)
                     if fplan.ok and fit_ctx < ctx:
                         log_activity(f"{friendly}: ctx {ctx} won't fit the pool alongside the "
                                      f"weights — auto-fitting ctx -> {fit_ctx} to avoid OOM")
@@ -2463,7 +2474,7 @@ class Engine:
                 if cap and cap < ctx:
                     rplan = plan_pipeline(spec, mems, cap, consolidate=consolidate,
                                           prefer_vram=pv_eff, spread=spread,
-                                          proportional=proportional)
+                                          proportional=proportional, gpu_spread=gpu_spread_eff)
                     if rplan.ok:
                         log_activity(f"{friendly}: ctx {ctx} {capreason} — auto-capping ctx -> {cap} "
                                      f"(pass an explicit ctx to override)")
@@ -2501,7 +2512,8 @@ class Engine:
                 total_shards = (sum(max(0, s.layer_end - s.layer_start) for s in stages)
                                 + (1 if any(s.has_embed for s in stages) else 0)
                                 + (1 if any(s.has_head for s in stages) else 0))
-                basis = _describe_plan(stages, node_by_id, cpu_only, pv_eff, quant)
+                basis = _describe_plan(stages, node_by_id, cpu_only, pv_eff, quant,
+                                       gpu_spread=gpu_spread_eff)
                 log_activity(f"{friendly}: plan basis → {basis}")
                 log_activity(f"{friendly}: handing out {total_shards} shard(s) across "
                              f"{n_stages} node(s) -> " + ", ".join(
@@ -5326,10 +5338,12 @@ def build_app() -> FastAPI:
             node_by_id[n.node_id] = n
         p = plan_pipeline(spec, mems, ctx_len=ctx, consolidate=cons, prefer_vram=pv,
                           spread=(mode == "spread"),
-                          proportional=(mode == "proportional"))
+                          proportional=(mode == "proportional"),
+                          gpu_spread=(mode == "all-gpu"))
         d = p.to_dict()
         if p.ok:   # #60/#76: surface the basis + pre-load assessment so a Preview matches the load
-            d["basis"] = _describe_plan(p.stages, node_by_id, False, pv, quant)
+            d["basis"] = _describe_plan(p.stages, node_by_id, False, pv, quant,
+                                        gpu_spread=(mode == "all-gpu"))
             d["assess"] = _assess_placement(spec, ctx, mems, p.stages)
             # #78 guardrail: a CONSOLIDATING mode (auto/single) can pile a heavy shard onto the
             # controller's co-located worker, which must ALSO serve the whole stream -> it OOM-drops
@@ -5784,6 +5798,7 @@ def build_app() -> FastAPI:
         #   auto       (T, T) GPU-VRAM-first, fewest nodes — best decode latency [default]
         #   single     (T, F) fewest nodes by total RAM+VRAM — collapses to one box if it fits
         #   gpu-spread (F, T) fill every GPU's VRAM, spill across nodes
+        #   all-gpu    (F, F) a stage on EVERY GPU, NOTHING on CPU (proportional across the GPUs)
         #   distribute (F, F) spread across the WHOLE fleet (CPUs + GPUs)
         #   spread     (F, F) FORCE a stage on every capable node (incl. tiny ones)
         #   proportional (F, F) layers across EVERY capable node PROPORTIONAL to its capacity
@@ -5815,6 +5830,7 @@ def build_app() -> FastAPI:
                                    quant=quant, tp=tp, cpu_only=cpu_only,
                                    spread=(mode == "spread"),
                                    proportional=(mode == "proportional"),
+                                   gpu_spread=(mode == "all-gpu"),
                                    moe_offload=moe_offload, force=force)
             return JSONResponse({"ok": True, "model": lm.friendly, "ctx": lm.ctx,
                                  "mode": (("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp))

@@ -325,7 +325,7 @@ def _plan_vram_first(spec: ModelSpec, nodes: list[NodeMem], ctx_len: int) -> Pla
 
 
 def _describe_plan(stages, node_by_id: dict, cpu_only: bool, prefer_vram: bool,
-                   quant: str) -> str:
+                   quant: str, gpu_spread: bool = False) -> str:
     """One-line, human-readable BASIS for a placement plan (#65): the strategy the planner
     actually used (auto GPU-first / CPU-only RAM / RAM-first), the shape (single node vs a
     distributed pipeline across N), and each stage's target tier + layer count. Surfaced in
@@ -336,6 +336,8 @@ def _describe_plan(stages, node_by_id: dict, cpu_only: bool, prefer_vram: bool,
     n = len(stages)
     if cpu_only:
         strat = "CPU-only (RAM, no VRAM)"
+    elif gpu_spread:
+        strat = "all-GPU (every GPU, no CPU spill)"
     elif prefer_vram:
         strat = "auto / GPU-first (fill VRAM, spill to RAM)"
     else:
@@ -429,7 +431,7 @@ def _assess_placement(spec: ModelSpec, ctx: int, mems: list, stages: list,
 def plan_pipeline(spec: ModelSpec, nodes: list[NodeMem], ctx_len: int = DEFAULT_CTX,
                   consolidate: bool = False, prefer_vram: bool = False,
                   vram_first: bool = False, spread: bool = False,
-                  proportional: bool = False) -> PlanResult:
+                  proportional: bool = False, gpu_spread: bool = False) -> PlanResult:
     """Assign contiguous layer ranges across nodes proportional to usable memory.
     nodes[0] is stage 0 (embedding); the last node carries the final norm + LM head.
 
@@ -450,7 +452,20 @@ def plan_pipeline(spec: ModelSpec, nodes: list[NodeMem], ctx_len: int = DEFAULT_
     slow nodes), this keeps the split capacity-weighted AND fills the pool. Intended for a
     model too big for the GPU-first subset — e.g. MiniMax-M2 int4 across the whole fleet.
     Nodes are ordered biggest-capacity-first so the heaviest contiguous ranges + the embed
-    (stage 0) and LM-head (last stage) land on the strongest boxes."""
+    (stage 0) and LM-head (last stage) land on the strongest boxes.
+
+    gpu_spread=True (#all-gpu) is the "use EVERY GPU, nothing on CPU" mode: drop all CPU-only
+    nodes, then lay the model out PROPORTIONALLY across the GPU subset so every GPU carries at
+    least one layer (capacity-weighted — the biggest GPU still does the bulk). Unlike the
+    `gpu-spread` mode (prefer_vram, which fills the biggest GPUs and spills the overflow to CPU),
+    this never touches CPU RAM and guarantees a stage on each GPU. The trade-off is more pipeline
+    hops (each adds per-token decode latency); its win is using all VRAM to avoid a CPU spill and
+    to share prefill compute across cards. Fails cleanly if the model doesn't fit GPU VRAM alone."""
+    if gpu_spread:
+        nodes = [n for n in nodes if n.vram_bytes > 0]   # GPU nodes only — no CPU spill
+        # Force the proportional (every-node, capacity-weighted) layout over the GPU subset and
+        # disable the GPU-first-then-spill / fewest-nodes paths so the model spreads across cards.
+        proportional, prefer_vram, consolidate = True, False, False
     if prefer_vram and any(n.vram_bytes > 0 for n in nodes):
         return _plan_vram_first(spec, nodes, ctx_len)
     if consolidate and nodes:
@@ -471,7 +486,8 @@ def plan_pipeline(spec: ModelSpec, nodes: list[NodeMem], ctx_len: int = DEFAULT_
     base = PlanResult(ok=False, model=spec.name, ctx_len=ctx_len, num_layers=L,
                       pool_usable_gb=pool_usable / GB, required_gb=required / GB)
     if not nodes:
-        base.error = "no nodes connected"
+        base.error = ("no GPU nodes available for all-GPU placement (every connected worker is "
+                      "CPU-only — use a CPU-capable mode)") if gpu_spread else "no nodes connected"
         return base
 
     if spread and len(nodes) > 2:

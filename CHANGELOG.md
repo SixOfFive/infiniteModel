@@ -23,7 +23,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 - **int4** (group-wise asymmetric, fused tinygemm GEMM) and **int8** (per-channel) load-time quant;
   serve-time dequant of **fp8** and **nvfp4** checkpoints.
 - GPU-first placement that always fits (spill to CPU/RAM), full-context KV pre-reservation, coexistence
-  budgets, and OOM-safe replans (cgroup caps, honest transient accounting).
+  budgets, and OOM-safe replans (cgroup caps, honest transient accounting). Placement MODES: `auto`
+  (GPU-first, fewest nodes — best decode latency), `single`, `gpu-spread` (fill every GPU then spill to
+  CPU), **`all-gpu`** (a stage on EVERY GPU, NOTHING on CPU — proportional across the GPU subset so each
+  card carries >=1 layer; fails cleanly if the model won't fit GPU VRAM alone), `distribute`, `spread`,
+  and `proportional`. `all-gpu` trades extra pipeline hops (per-token decode latency) for using all VRAM
+  to avoid a CPU spill and to share prefill compute across cards.
 - **Pre-compiled shard cache** — the controller quantizes a model once to `_shards/<quant>/`; loads
   then serve small **pre-packed** int4/int8 layers (skip the bf16 stream + re-quantize). Covers dense,
   fused-3D MoE, per-expert MoE fused at compile (Mixtral/OLMoE), and **non-fused per-expert MoE**
