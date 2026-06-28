@@ -1,0 +1,85 @@
+"""Standalone GGUF -> HF safetensors converter.
+
+GGUF (llama.cpp's format) packs weights in k-quant / i-quant block layouts that the GGML
+tensor library runs — not transformers/PyTorch. Rather than port those kernels (huge, and
+pointless: we already have a fast int4 path), InfiniteModel NORMALIZES a GGUF model to a
+standard HuggingFace safetensors checkpoint ONCE at add/download time. After that it is an
+ordinary model in the system: chunk-streamed to workers, int4/int8 shard-cached, and run on the
+distributed pipeline — no GGUF awareness anywhere downstream. This mirrors how fp8/nvfp4 source
+checkpoints are handled (dequantize to bf16, then re-quantize to our int4 for serving).
+
+Run as a SUBPROCESS by the controller (model_store.convert_gguf_to_model_dir) so a big
+`from_pretrained` (which fully materializes the model in RAM) can OOM the SUBPROCESS without
+taking down the controller box it co-hosts. Usage:
+
+    python gguf_convert.py <repo_id> <gguf_file> <dst_dir>
+
+The HF token (if any) is read from the HF_TOKEN env var (never a CLI arg — process listings leak
+args). Prints a final ``GGUF_CONVERT_OK <dst_dir>`` line on success; exits non-zero on failure.
+"""
+import os
+import sys
+import subprocess
+
+
+def _ensure_gguf_pkg() -> None:
+    """transformers' GGUF loader needs the `gguf` package to parse the file. Auto-install it on
+    demand (the m4c84 worker pattern) so a controller env that has torch+transformers but not the
+    optional `gguf` extra can still convert without a manual pip step on the (SSH-less) box."""
+    try:
+        import gguf  # noqa: F401
+        return
+    except Exception:
+        print("[gguf-convert] `gguf` package missing — installing", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "gguf"], check=False)
+
+
+def main() -> int:
+    if len(sys.argv) < 4:
+        print("usage: gguf_convert.py <repo_id> <gguf_file> <dst_dir>", file=sys.stderr)
+        return 2
+    repo_id, gguf_file, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+    # A split GGUF (model-00001-of-00003.gguf) can't be loaded from a single part by transformers'
+    # reader — reject early with guidance rather than producing a half-converted model.
+    base = os.path.basename(gguf_file).lower()
+    import re as _re
+    if _re.search(r"-\d{5}-of-\d{5}\.gguf$", base):
+        print("[gguf-convert] split/sharded GGUF is not supported — pick a single-file quant "
+              "(e.g. a *-Q4_K_M.gguf that isn't split into NNNNN-of-NNNNN parts)", file=sys.stderr)
+        return 3
+
+    _ensure_gguf_pkg()
+    import torch
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    kw = {"token": token} if token else {}
+    print(f"[gguf-convert] downloading {gguf_file} from {repo_id}", flush=True)
+    path = hf_hub_download(repo_id, gguf_file, **kw)
+    src_dir, fn = os.path.dirname(path), os.path.basename(path)
+
+    print(f"[gguf-convert] dequantizing {fn} -> bf16 (transformers GGUF loader)", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(src_dir, gguf_file=fn, dtype=torch.bfloat16)
+    # transformers may dequantize to fp32 regardless of dtype on some versions; force bf16 so the
+    # saved checkpoint is the size our planner/streamer expects (we re-quantize to int4 anyway).
+    model = model.to(torch.bfloat16)
+    try:
+        tok = AutoTokenizer.from_pretrained(src_dir, gguf_file=fn)
+    except Exception as exc:   # some GGUFs carry a tokenizer the HF converter can't rebuild
+        print(f"[gguf-convert] WARNING tokenizer rebuild failed ({exc!r}) — saving model only",
+              flush=True)
+        tok = None
+
+    os.makedirs(dst, exist_ok=True)
+    print(f"[gguf-convert] saving safetensors -> {dst}", flush=True)
+    model.save_pretrained(dst, safe_serialization=True)
+    if tok is not None:
+        tok.save_pretrained(dst)
+    print(f"GGUF_CONVERT_OK {dst}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

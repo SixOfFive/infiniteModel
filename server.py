@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c136"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c137"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -104,6 +104,7 @@ def _fetch_repo_file(fname: str):
 EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py", "shards.py",
                                  "formats.py", "multimodal.py", "graphs.py", "model_store.py",
                                  "mtp_core.py",   # #91 MTP head forward (controller-only import)
+                                 "gguf_convert.py",  # GGUF->safetensors converter (subprocess)
                                  "config.json"]   # central cluster config — synced like a module
 
 
@@ -292,10 +293,17 @@ def save_node_config() -> None:
 # like the built-ins (list, download, load). Spec is built from config.json on demand.
 CUSTOM_MODELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_models.json")
 CUSTOM_MODELS: dict[str, str] = {}
+# GGUF-sourced models: HF target (repo) -> the chosen single .gguf filename. A model in here has no
+# safetensors upstream; its weights are normalized to safetensors ONCE at acquisition (model_store.
+# convert_gguf_to_model_dir) and it behaves like any other model thereafter. Persisted separately so
+# the existing custom_models.json format (friendly->repo) is untouched. Keyed by the TARGET repo
+# because that's what _controller_model_dir (the acquisition point) receives.
+GGUF_MODELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_gguf.json")
+GGUF_FILES: dict[str, str] = {}
 
 
 def load_custom_models() -> None:
-    global CUSTOM_MODELS
+    global CUSTOM_MODELS, GGUF_FILES
     try:
         with open(CUSTOM_MODELS_PATH, encoding="utf-8") as fh:
             CUSTOM_MODELS = json.load(fh)
@@ -303,9 +311,17 @@ def load_custom_models() -> None:
         CUSTOM_MODELS = {}
     for friendly, hf in CUSTOM_MODELS.items():
         MODELS.setdefault(friendly, (hf, hf))   # draft = target (no speculative)
+    try:
+        with open(GGUF_MODELS_PATH, encoding="utf-8") as fh:
+            GGUF_FILES = json.load(fh)
+    except Exception:
+        GGUF_FILES = {}
 
 
 def save_custom_models() -> None:
+    with contextlib.suppress(Exception):
+        with open(GGUF_MODELS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(GGUF_FILES, fh, indent=2)   # keep the GGUF source map in lockstep
     try:
         with open(CUSTOM_MODELS_PATH, "w", encoding="utf-8") as fh:
             json.dump(CUSTOM_MODELS, fh, indent=2)
@@ -1045,8 +1061,13 @@ from model_store import (MODELS_DIR, _safe_name, _dir_has_model, _controller_mod
                          _display_weight_bytes, _friendly_from_hf, _normalize_model_request,
                          _spec_from_config, _hf_total_bytes, _hf_cache_bytes, model_ready,
                          _READY_CACHE, _invalidate_ready_cache, _purge_hf_cache,
-                         gc_redundant_cache, delete_model_cache)   # noqa: E402,F401
+                         gc_redundant_cache, delete_model_cache,
+                         convert_gguf_to_model_dir)   # noqa: E402,F401
 model_store.set_hf_token_provider(lambda: HF_TOKEN)
+# GGUF source lookup: a target (HF repo) in GGUF_FILES is normalized to safetensors at acquisition
+# instead of pulled as safetensors. Set after GGUF_FILES is populated by load_custom_models() too,
+# but the lambda reads the live dict so registering at import is fine.
+model_store.set_gguf_provider(lambda repo: GGUF_FILES.get(repo))
 
 
 def _pull_repo_interruptible(friendly: str, repo_id: str):
@@ -6806,6 +6827,18 @@ def build_app() -> FastAPI:
             poller = asyncio.create_task(_poll())
             halted = None
             try:
+                # GGUF source: no safetensors to pull. Normalize the .gguf to a safetensors checkpoint
+                # in a SUBPROCESS (download + dequant + save), then it's an ordinary model. Pause/stop
+                # don't apply (it's a one-shot subprocess), so skip the interruptible pull entirely.
+                if target in GGUF_FILES:
+                    log_activity(f"download {friendly}: GGUF -> safetensors conversion (subprocess)")
+                    await asyncio.to_thread(_controller_model_dir, target)   # triggers convert_gguf_to_model_dir
+                    if DOWNLOAD_EPOCH.get(friendly) != epoch:
+                        return
+                    _invalidate_ready_cache(target)
+                    print(f"[model] converted GGUF {friendly} ({target} :: {GGUF_FILES[target]})")
+                    log_activity(f"download {friendly}: complete (GGUF normalized)")
+                    return
                 # Interruptible per-file pull -> 'done' | 'paused' | 'stopped'.
                 result = await asyncio.to_thread(_pull_repo_interruptible, friendly, target)
                 # If a clear (or a fresh start) bumped the epoch while we were pulling, THIS
@@ -6948,7 +6981,7 @@ def build_app() -> FastAPI:
         return JSONResponse({"ok": True, "removed": removed, "freed_gb": round(freed / GB, 2)})
 
     @app.post("/add_model")          # dashboard: register + download ANY Hugging Face id
-    async def add_model(model: str, name: str = "") -> JSONResponse:
+    async def add_model(model: str, name: str = "", gguf_file: str = "") -> JSONResponse:
         # `name` (optional): override the client-facing model name instead of deriving it from
         # the HF id. Lets a precision-suffixed repo (e.g. ModelCloud/MiniMax-M2-BF16) be served
         # under a clean, quant-agnostic name (e.g. minimax-m2) — quant is a load-time choice, so
@@ -6969,14 +7002,27 @@ def build_app() -> FastAPI:
             return JSONResponse({"ok": False,
                                  "error": "name must be lowercase [a-z0-9._-] (':' allowed as the size separator)"},
                                 status_code=400)
+        # GGUF source (optional): the repo ships weights only as a llama.cpp .gguf — record which
+        # single-file quant to use, so acquisition normalizes it to safetensors (subprocess) instead
+        # of pulling safetensors that don't exist. Keyed by the HF repo (== the target id).
+        gf = (gguf_file or "").strip()
+        if gf and not gf.lower().endswith(".gguf"):
+            return JSONResponse({"ok": False,
+                                 "error": "gguf_file must be a single .gguf filename in the repo"},
+                                status_code=400)
         if friendly not in MODELS:
             MODELS[friendly] = (hf, hf)          # draft = target (no speculative)
             CUSTOM_MODELS[friendly] = hf
+            if gf:
+                GGUF_FILES[hf] = gf              # mark this target as GGUF-sourced
             save_custom_models()
-            log_activity(f"added model {friendly} ({hf})")
+            log_activity(f"added model {friendly} ({hf})" + (f" [GGUF {gf}]" if gf else ""))
+        elif gf and GGUF_FILES.get(hf) != gf:
+            GGUF_FILES[hf] = gf                  # update the chosen quant for an already-registered repo
+            save_custom_models()
         r = await _start_download(friendly)
         return JSONResponse({"ok": True, "friendly": friendly, "target": hf,
-                             "status": r.get("status")})
+                             "gguf_file": gf or None, "status": r.get("status")})
 
     @app.post("/delete")             # dashboard: delete a model from controller
     async def delete_model(model: str) -> JSONResponse:
@@ -7004,6 +7050,8 @@ def build_app() -> FastAPI:
                                 "model (built-ins can't be forgotten)"}, status_code=400)
         hf = CUSTOM_MODELS.pop(friendly, None)
         MODELS.pop(friendly, None)
+        if hf and not any(v == hf for v in CUSTOM_MODELS.values()):
+            GGUF_FILES.pop(hf, None)   # last registry entry for this repo gone -> drop its GGUF mark
         save_custom_models()
         print(f"[model] forgot registry entry {friendly} ({hf}) — weight files KEPT", flush=True)
         return JSONResponse({"ok": True, "forgot": friendly, "hf": hf, "files_kept": True})

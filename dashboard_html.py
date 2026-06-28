@@ -325,6 +325,9 @@ DASHBOARD_HTML = """<!doctype html>
       <span class="sub">add a model:</span>
       <input id="addhf" placeholder="Hugging Face id, e.g. deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
              style="flex:1; min-width:320px" onkeydown="if(event.key==='Enter')addModel()">
+      <input id="addgguf" placeholder="optional: file.gguf (GGUF-only repo)"
+             title="Only for a repo that ships weights as a single llama.cpp .gguf instead of safetensors. Enter the exact .gguf filename (one quant). It is dequantized to safetensors once, then runs like any model."
+             style="width:230px" onkeydown="if(event.key==='Enter')addModel()">
       <button class="sec" onclick="addModel()" title="register + download any Hugging Face model id; it then appears in the list to load">Add &amp; download</button>
       <span class="sub" id="addmsg"></span>
     </div>
@@ -1037,12 +1040,16 @@ async function doClear(name){
 async function addModel(){
   const el=document.getElementById('addmsg');
   const hf=document.getElementById('addhf').value.trim();
+  const gg=document.getElementById('addgguf').value.trim();   // optional .gguf filename (GGUF-only repo)
   if(!hf || hf.indexOf('/')<0){ el.textContent='enter a HF id like org/name'; return; }
-  el.textContent='adding + downloading…';
+  if(gg && !gg.toLowerCase().endsWith('.gguf')){ el.textContent='gguf file must end in .gguf'; return; }
+  el.textContent=gg?'adding + converting GGUF…':'adding + downloading…';
   try{
-    const r=await (await fetch('/add_model?model='+encodeURIComponent(hf),{method:'POST'})).json();
-    if(r.ok){ el.textContent='added '+r.friendly+' — '+(r.status||'downloading')+' (appears in the list below)';
-      document.getElementById('addhf').value=''; }   // the model <select> now re-syncs itself every render
+    let url='/add_model?model='+encodeURIComponent(hf);
+    if(gg) url+='&gguf_file='+encodeURIComponent(gg);
+    const r=await (await fetch(url,{method:'POST'})).json();
+    if(r.ok){ el.textContent='added '+r.friendly+' — '+(r.status||'downloading')+(gg?' (GGUF→safetensors)':'')+' (appears in the list below)';
+      document.getElementById('addhf').value=''; document.getElementById('addgguf').value=''; }
     else el.textContent='error: '+(r.error||'failed');
   }catch(e){ el.textContent='error: '+e; }
 }

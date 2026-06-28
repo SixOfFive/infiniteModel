@@ -46,6 +46,15 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   comparison, with automatic local fallback on any worker failure.
 
 ## Models
+- **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
+  standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
+  bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8
+  shard-cached, and run on the distributed pipeline with no GGUF awareness downstream (same idea as the
+  fp8/nvfp4 source path). The heavy `from_pretrained` runs in a **subprocess** (`gguf_convert.py`) so it
+  can OOM without taking down the controller box it co-hosts. Add via `/add_model?...&gguf_file=<one
+  quant>.gguf` or the dashboard's optional GGUF field. Covers the architectures the GGUF loader supports
+  (Llama/Qwen2/Mistral/Gemma/…); single-file quants only (split `NNNNN-of-NNNNN.gguf` is rejected with
+  guidance); one quant per repo. Unlocks the large pool of GGUF-only community models.
 - **MoE**: fused + non-fused experts; optional intra-layer offload (attention on GPU, routed experts in
   CPU RAM). Loaded + validated across Mixtral, OLMoE, Qwen3-MoE / Qwen3.6-A3B, MiniMax-M2.
 - **Multimodal**: distributed vision + audio (Qwen2.5-Omni) — image/audio → text, 3D mRoPE positions.

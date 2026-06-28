@@ -43,6 +43,8 @@ import os
 import re
 import shutil
 import struct
+import subprocess
+import sys
 import time
 from typing import Optional
 
@@ -71,6 +73,52 @@ def set_hf_token_provider(fn) -> None:
     below read the live token WITHOUT importing server (no import cycle)."""
     global _HF_TOKEN_FN
     _HF_TOKEN_FN = fn
+
+
+# GGUF source registry: a model whose weights ship ONLY as a llama.cpp .gguf file is normalized to
+# safetensors once (see convert_gguf_to_model_dir). server.py injects a lookup so _controller_model_dir
+# can recognize a GGUF target (the model_id == HF repo) and route it to conversion instead of the
+# safetensors snapshot path. Returns the chosen .gguf filename for a GGUF model_id, else None.
+_GGUF_FN = lambda _model_id: None   # noqa: E731
+
+
+def set_gguf_provider(fn) -> None:
+    """server.py injects ``lambda repo: GGUF_FILES.get(repo)`` so the acquisition path knows which
+    targets are GGUF-sourced (and which quant file to fetch) WITHOUT importing server."""
+    global _GGUF_FN
+    _GGUF_FN = fn
+
+
+def convert_gguf_to_model_dir(repo_id: str, gguf_file: str, model_id: str) -> str:
+    """Normalize a GGUF model to a standard safetensors checkpoint under models/<name>/, ONCE.
+    Idempotent: returns the existing dir if already converted. The heavy from_pretrained (which
+    fully materializes the model in RAM) runs in a SUBPROCESS (gguf_convert.py) so it can OOM
+    without taking down the controller box it co-hosts (the #never-full-load-on-controller lesson).
+    After this, the model is an ordinary safetensors model — streamed, int4/int8-cached, and run
+    on the pipeline with no GGUF awareness anywhere downstream."""
+    local = os.path.join(MODELS_DIR, _safe_name(model_id))
+    if _dir_has_model(local):
+        return local
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gguf_convert.py")
+    if not os.path.exists(script):
+        raise RuntimeError("gguf_convert.py not present on this node — self-update may not have synced it yet")
+    env = dict(os.environ)
+    _tok = _HF_TOKEN_FN()
+    if _tok:
+        env["HF_TOKEN"] = _tok          # pass via env, never argv (process listings leak args)
+    os.makedirs(local, exist_ok=True)
+    print(f"[model] GGUF -> safetensors: {repo_id} :: {gguf_file} (subprocess)", flush=True)
+    proc = subprocess.run([sys.executable, script, repo_id, gguf_file, local],
+                          env=env, capture_output=True, text=True)
+    tail = (proc.stderr or proc.stdout or "")[-800:]
+    if proc.returncode != 0 or not _dir_has_model(local):
+        # leave a clean slate so a retry isn't blocked by a half-written dir
+        with contextlib.suppress(Exception):
+            if not _dir_has_model(local):
+                shutil.rmtree(local, ignore_errors=True)
+        raise RuntimeError(f"GGUF conversion failed ({repo_id} :: {gguf_file}): {tail}")
+    print(f"[model] GGUF conversion complete -> {local}", flush=True)
+    return local
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +157,11 @@ def _controller_model_dir(model_id: str) -> str:
     local = os.path.join(MODELS_DIR, _safe_name(model_id))
     if _dir_has_model(local):
         return local
+    # GGUF-sourced model: there are no safetensors to pull — normalize the .gguf to a safetensors
+    # checkpoint into `local` (subprocess), then it's an ordinary model from here on.
+    _gf = _GGUF_FN(model_id)
+    if _gf:
+        return convert_gguf_to_model_dir(model_id, _gf, model_id)
     from huggingface_hub import snapshot_download
     patterns = ["*.safetensors", "*.json"]
     src = None
