@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c143"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c145"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2937,25 +2937,12 @@ class Shard:
             # Gated-DeltaNet layers can store/read state instead of IndexError-ing on
             # an empty generic cache. Reused across prefill + every decode step.
             self.kv = DynamicCache(config=self.cfg) if self._hybrid else DynamicCache()
-        else:
-            # #kv-reconcile: the causal mask below is sized for kv-dim = cache_start + q, but SDPA
-            # takes the REAL kv-dim from self.kv (past + q). They must satisfy len(self.kv)==cache_start.
-            # A lost/dropped spec-decode crop frame (fire-and-forget, suppressed) or any drift breaks
-            # that and SDPA dies ("expanded size N must match M"). Reconcile BEFORE any layer runs:
-            # an over-long cache is cropped back to cache_start; an unrecoverable mismatch (too short,
-            # or hybrid recurrent state that can't be cropped) fails fast so the controller re-prefills
-            # instead of crashing the worker. In sync (the common decode step) this is one int compare.
-            try:
-                _have = int(self.kv.get_seq_length())
-            except Exception:
-                _have = cache_start          # can't introspect -> trust the caller (prior behaviour)
-            if _have != cache_start:
-                if (not self._hybrid) and _have > cache_start >= 0:
-                    self.kv.crop(cache_start)   # stale over-long KV -> truncate to the expected depth
-                else:
-                    raise RuntimeError(
-                        f"KV desync: cache has {_have} entries but frame expects cache_start="
-                        f"{cache_start} (hybrid={self._hybrid}) — re-prefill required")
+        # NOTE: a defensive "reconcile self.kv length to cache_start" was tried here but MISFIRES on
+        # multi-stage shards — DynamicCache.get_seq_length() inspects layer 0, which a mid/tail stage
+        # (e.g. layers 24-48) doesn't own, so it reports 0 and a length check falsely trips on every
+        # decode. The per-shard forward lock (see forward()) is the actual fix for the concurrent
+        # orphaned-forward KV/mask desync crash; the cache_start==0 rebuild above covers sequence
+        # starts. Stale-KV from a lost spec-decode crop frame is a separate, speculative-only edge.
         with torch.inference_mode():
             if self.uniform_device is not None:
                 return self._forward_uniform(x, cache_start, all_logits, inject, position_ids,
