@@ -362,12 +362,35 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
                       # (the worker install reads tensor shapes, not this), but kept accurate. (#119)
                       "expert_layout": (("per_expert" if _moe_per_expert else "fused3d") if _moe else None)}
     _open: dict = {}
+    _hdr: dict = {}   # fn -> {tensor_name: data_offset_start} (safetensors header), cached per shard
 
     def _get(src_name: str):
         fn = wm[src_name]
         if fn not in _open:
             _open[fn] = safe_open(fn, framework="pt")
         return _open[fn].get_tensor(src_name)
+
+    def _disk_key(src_name: str):
+        # (#119) (shard_file, byte-offset) so a unit's reads sort into ASCENDING on-disk order. The OS
+        # then reads each shard SEQUENTIALLY (readahead kicks in) instead of seeking once per tensor —
+        # on a spinning weights drive that turns ~49 MB/s random reads into ~150+ MB/s sequential. The
+        # win is large for many-tiny-tensor MoE layers (e.g. MiniMax-M2's 768 per-expert Linears, where
+        # read dominates: ~150 s/layer read vs ~7 s pack). Pure read-order change -> output bit-identical.
+        fn = wm[src_name]
+        h = _hdr.get(fn)
+        if h is None:
+            h = {}
+            try:
+                with open(fn, "rb") as f:
+                    hlen = int.from_bytes(f.read(8), "little")
+                    meta = json.loads(f.read(hlen))
+                for k, v in meta.items():
+                    if k != "__metadata__" and isinstance(v, dict) and v.get("data_offsets"):
+                        h[k] = int(v["data_offsets"][0])
+            except Exception:
+                h = {}
+            _hdr[fn] = h
+        return (fn, h.get(src_name, 0))
 
     def _get_bf16(src_name: str):
         """The source weight as bf16 — DEQUANTIZED for a quantized checkpoint exactly like the
@@ -406,7 +429,7 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
         # SHARED `pack_unit_tensors` (fuse per-expert MoE + int4/int8 the layer Linears + 3D experts).
         # Same function the worker remote-pack handler calls -> a remote unit is bit-identical to this.
         raw: dict = {}
-        for out_name, src_name in pairs:
+        for out_name, src_name in sorted(pairs, key=lambda p: _disk_key(p[1])):   # (#119) sequential reads
             raw[out_name] = _get_bf16(src_name)
         out_sd, mtensors = pack_unit_tensors(raw, _lin2d, _exp3d, _skel, quant, group_size)
         for out_name, meta in mtensors.items():

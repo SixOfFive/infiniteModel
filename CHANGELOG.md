@@ -28,6 +28,9 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   then serve small **pre-packed** int4/int8 layers (skip the bf16 stream + re-quantize). Covers dense,
   fused-3D MoE, per-expert MoE fused at compile (Mixtral/OLMoE), and **non-fused per-expert MoE**
   (MiniMax-M2 — experts stay 2D Linears, int4-packed individually) — bit-identical to a cold load.
+  Each cache unit's source tensors are read in **on-disk offset order** so a spinning weights drive
+  reads sequentially (readahead) instead of seeking per tensor — large win for many-tiny-tensor MoE
+  layers (read dominates compile time: e.g. MiniMax-M2 ~150 s read vs ~7 s pack per layer).
 - **Distributed packing** (exo-inspired) — the per-layer pack fans out across the fleet's idle CPUs:
   each worker fetches a layer's bf16, packs it with the *shared* packer (and, for per-expert MoE, fuses
   to 3D against a meta skeleton it rebuilds from the model config), and posts it back. Bit-identical to
