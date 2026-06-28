@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c120"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c121"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -5769,7 +5769,8 @@ def build_app() -> FastAPI:
             return JSONResponse(json.load(fh))
 
     @app.get("/mtp_probe")
-    async def mtp_probe(model: str = "qwen3.6-35b-a3b") -> JSONResponse:
+    async def mtp_probe(model: str = "qwen3.6-35b-a3b", mode: str = "dump",
+                        prompt: str = "") -> JSONResponse:
         # #91 Increment 1a (discovery): the checkpoint ships an MTP (nextn) head but the installed
         # transformers DROPS it (_keys_to_ignore_on_load_unexpected=[r"^mtp.*"]) — no class to build
         # or run it. To reimplement the MTP forward for self-speculative decoding we first need the
@@ -5831,7 +5832,34 @@ def build_app() -> FastAPI:
                 "shared_head_candidates": _meta(shared),
             }
 
+        def _run() -> dict:
+            # #91 Increment 1 (probe): run the offline MTP correctness/acceptance probe (mtp_probe.py)
+            # as an isolated subprocess on this box (it loads the FULL model on CPU — heavy; run it with
+            # nothing else resident). Pull the freshest mtp_probe.py from the public repo first so the
+            # probe forward can be iterated WITHOUT a controller restart (raw cache lag aside).
+            import subprocess
+            import sys as _sys
+            here = os.path.dirname(os.path.abspath(__file__))
+            ppath = os.path.join(here, "mtp_probe.py")
+            with contextlib.suppress(Exception):
+                remote = _fetch_repo_file("mtp_probe.py")
+                if remote and len(remote) > 50:
+                    with open(ppath, "wb") as fh:
+                        fh.write(remote)
+            cmd = [_sys.executable, ppath, d] + ([prompt] if prompt else [])
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=1500, cwd=here)
+            out = p.stdout or ""
+            result = None
+            for line in out.splitlines():
+                if line.startswith("RESULT "):
+                    with contextlib.suppress(Exception):
+                        result = json.loads(line[len("RESULT "):])
+            return {"returncode": p.returncode, "result": result,
+                    "stdout_tail": out[-4000:], "stderr_tail": (p.stderr or "")[-2000:]}
+
         try:
+            if mode == "run":
+                return JSONResponse(await asyncio.to_thread(_run))
             return JSONResponse(await asyncio.to_thread(_dump))
         except Exception as exc:
             return JSONResponse({"error": repr(exc)}, status_code=500)
