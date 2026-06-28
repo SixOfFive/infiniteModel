@@ -115,6 +115,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   NOT attempt a full model build, so natively-registered archs the worker hand-builds via a special path
   (e.g. Qwen2.5-Omni) still pass; trust_remote_code models (auto_map) pass through too (the worker fetches
   their .py via `/modelcode`), so no known-good model is rejected.
+- **Fast dead-hop recovery:** a mid-pipeline hop dying *during* a generation used to leave the request
+  blocked until the gen-stall watchdog (~240s) or GEN_TIMEOUT (~600s) reclaimed it — the one-way data
+  chain delivers no upstream error frame. Now, when a worker's forward to its next hop fails even after
+  its own reconnect-retry (a genuine transport death — gated strictly on connection-type exceptions so a
+  stage *compute* error never trips it), the worker pushes an unsolicited `hop_error` control frame up
+  its (separate) control link; the controller fails ONLY that request's pending future at once
+  (idempotent, replica-precise by `req_id`), reclaiming the slot in well under a second. The send reuses
+  the control writer's lock+framing so it can't corrupt a heartbeat, doesn't double-decrement `active`
+  (the resumed generate() does that), and resets `last_token_ts` so the watchdog doesn't double-act —
+  falling back to the watchdog only if the control link is mid-reconnect.
 - **Idle-pipeline self-heal:** every data-plane hop is fresh-reconnected at each generation's prefill
   if it has been idle (an idle TCP socket can go silently half-open — the write succeeds but the bytes
   never arrive — which otherwise stalls the first request after an idle gap until the generation
