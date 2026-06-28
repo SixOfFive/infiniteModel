@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c141"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c143"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2895,13 +2895,18 @@ class Shard:
         # fails FAST (the controller re-prefills) rather than blocking a thread-pool slot for the
         # orphan's full (possibly minutes-long CPU prefill) runtime. Uncontended on the normal path
         # (a model's forwards are sequential via the controller's per-model lock).
-        if not self._fwd_lock.acquire(blocking=False):
+        # Lazily ensure the lock exists — a Shard built via a path that doesn't run the full __init__
+        # (cached/skeleton install) would otherwise AttributeError here and break ALL generation.
+        lock = getattr(self, "_fwd_lock", None)
+        if lock is None:
+            lock = self._fwd_lock = threading.Lock()
+        if not lock.acquire(blocking=False):
             raise RuntimeError("shard busy with a prior (orphaned) forward — re-prefill required")
         try:
             return self._forward_impl(x, cache_start, reset, all_logits, inject,
                                       position_ids, capture_hidden, capture_pre_norm)
         finally:
-            self._fwd_lock.release()
+            lock.release()
 
     def _forward_impl(self, x, cache_start: int = 0, reset: bool = True,
                       all_logits: bool = False, inject=None, position_ids=None,
