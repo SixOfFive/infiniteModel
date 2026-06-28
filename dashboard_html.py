@@ -878,6 +878,7 @@ async function doPreview(){   // #60: GET /plan (no load) -> show placement + th
   const mode=document.getElementById('mode').value, q=document.getElementById('q').value||'none';
   const box=document.getElementById('previewbox');
   if(!m){ box.textContent='pick a model first'; return; }
+  const _lm=document.getElementById('loadmsg'); if(_lm) _lm.textContent='';  // clear stale load/error msg above the preview
   box.textContent='previewing…';
   try{
     const r=await (await fetch(`/plan?model=${encodeURIComponent(m)}&ctx=${ctx}&quant=${q}&mode=${encodeURIComponent(mode)}`)).json();
@@ -926,21 +927,21 @@ async function doLoad(quant,mode){
   try{ const r=await (await fetch(`/load?model=${encodeURIComponent(m)}&ctx=${ctx}&mode=${mode}&quant=${q}`+(tp>1?`&tp=${tp}`:''),{method:'POST'})).json();
     if(r.ok){ const warn=(r.warnings||[]).length?`<br><span style="color:#d29922" title="pre-load guardrail (#76)">⚠ ${r.warnings.map(esc).join('<br>⚠ ')}</span>`:'';
       document.getElementById('loadmsg').innerHTML=`loaded (${esc(r.mode)}${r.quant&&r.quant!=='none'?'/'+esc(r.quant):''}) across ${(r.stages||[]).length} stage(s) @ ctx ${r.ctx}: ${(r.stages||[]).map(s=>esc(s.hostname)).join(' → ')}`+warn;
-    } else { document.getElementById('loadmsg').textContent=`error: ${r.error}`; }
+    } else { document.getElementById('loadmsg').textContent=`error: ${r.error||'failed'}`; }
   }catch(e){ document.getElementById('loadmsg').textContent='error: '+e; }
 }
 async function doRestart(){
   if(!confirm('RESTART THE WHOLE FLEET?\\n\\nSignals every worker to restart, then restarts the controller. Any in-flight load is ABORTED. All processes relaunch clean (supervisor) on the current code.')) return;
   const el=document.getElementById('loadmsg'); el.textContent='restarting fleet…';
   try{ const r=await (await fetch('/restart',{method:'POST'})).json();
-    el.textContent=r.ok?`restart: signaled ${r.worker_count} worker(s); controller relaunching…`:`error: ${r.error}`;
+    el.textContent=r.ok?`restart: signaled ${r.worker_count} worker(s); controller relaunching…`:`error: ${r.error||'failed'}`;
   }catch(e){ el.textContent='restart sent — controller dropped the connection (relaunching), reload the page in a few seconds'; }
 }
 async function doUpdate(){
   if(!confirm('UPDATE + RESTART NOW?\\n\\nForced (does NOT wait for idle): unloads ALL models, tells every worker to free its RAM, pulls the latest code from GitLab, swaps it in, and relaunches. Auto-load is blocked during the swap so a client request cannot reload a model mid-update. Any in-flight request is aborted.')) return;
   const el=document.getElementById('loadmsg'); el.textContent='updating: unloading + freeing worker RAM + pulling code…';
   try{ const r=await (await fetch('/update',{method:'POST'})).json();
-    el.textContent=r.ok?`update: unloaded ${(r.unloaded||[]).length} model(s), freed ${r.workers_freed} worker(s); controller relaunching on new code…`:`error: ${r.error}`;
+    el.textContent=r.ok?`update: unloaded ${(r.unloaded||[]).length} model(s), freed ${r.workers_freed} worker(s); controller relaunching on new code…`:`error: ${r.error||'failed'}`;
   }catch(e){ el.textContent='update sent — controller dropped the connection (relaunching on new code), reload the page in ~20s'; }
 }
 async function doUnloadAll(){
@@ -987,7 +988,7 @@ async function doCompileShards(name, quant){   // #shard-cache: pre-quantize on 
   const el=document.getElementById('loadmsg');
   el.textContent='compiling '+quant+' shard cache for '+name+'… (progress on the loading card; can take minutes for big models)';
   try{ const r=await (await fetch(`/compile_shards?model=${encodeURIComponent(name)}&quant=${encodeURIComponent(quant)}`,{method:'POST'})).json();
-    el.textContent=r.ok?`compiled ${quant} shard cache for ${name}: ${r.files} files, ${r.size_gb} GB`:`compile error: ${r.error}`;
+    el.textContent=r.ok?`compiled ${quant} shard cache for ${name}: ${r.files} files, ${r.size_gb} GB`:`compile error: ${r.error||'failed'}`;
   }catch(e){ el.textContent='compile error: '+e; }
 }
 async function doVerifyShards(name, quant){   // #shard-cache: full sha256 integrity check + fix/fail popup
