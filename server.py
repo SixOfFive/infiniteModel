@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c127"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c128"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -824,6 +824,19 @@ def _release_ram() -> None:
         import sys
         if sys.platform.startswith("linux"):       # return freed arena to the OS (Windows
             ctypes.CDLL("libc.so.6").malloc_trim(0)  # frees large tensor blocks on its own)
+
+
+def _free_mtp_cuda() -> None:
+    """#91: a controller-resident MTP head loaded on cuda:0 keeps its ~few-GB VRAM in the torch
+    caching allocator after the Python object is dropped — only empty_cache() hands it back. Without
+    this the freed head fouls the controller-box GPU (qwen3:4b couldn't load, qwen2.5:14b spilled to
+    CPU). Best-effort; torch may be absent on a pure controller."""
+    import gc
+    gc.collect()
+    with contextlib.suppress(Exception):
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # Model specs + the layer-placement planner (incl. the #76 pre-load guardrail) live in placement.py
@@ -1809,6 +1822,7 @@ class Engine:
             self._unload_draft(m)   # free this model's controller-local draft
         if getattr(self, "_mtp_heads", None):
             self._mtp_heads.clear()   # #91 free all controller-resident MTP heads
+            _free_mtp_cuda()          # the GPU head's VRAM isn't released until empty_cache()
         self.models.clear()
         for fut in self.pending.values():
             if not fut.done():
@@ -3757,7 +3771,21 @@ class Engine:
                 with open(os.path.join(d, "config.json"), encoding="utf-8") as fh:
                     cfg = json.load(fh)
                 tc = cfg.get("text_config", cfg)
-                return int(tc.get("mtp_num_hidden_layers", 0) or 0) > 0
+                if int(tc.get("mtp_num_hidden_layers", 0) or 0) <= 0:
+                    return False
+                # #91 (a): the 2-token spec VERIFY is NOT bit-exact on HYBRID linear-attention
+                # (Gated-DeltaNet) layers — a q>1 decode chunk diverges from sequential q=1 steps
+                # (chunked vs recurrent kernels), so accepted drafts follow a slightly-different
+                # trajectory than plain greedy. Gate MTP off for hybrid checkpoints unless explicitly
+                # allowed (mtp_allow_hybrid) — qwen3.6 is hybrid, so MTP self-spec is OFF by default.
+                lt = tc.get("layer_types") or []
+                if (any("linear" in str(x) for x in lt)
+                        and not ENGINE_CONFIG.get("mtp_allow_hybrid", False)):
+                    with contextlib.suppress(Exception):
+                        log_activity(f"{model.friendly}: MTP self-spec OFF (hybrid linear-attn; q>1 "
+                                     f"verify not bit-exact). Set config mtp_allow_hybrid=1 to override.")
+                    return False
+                return True
             except Exception:
                 return False
 
@@ -3974,8 +4002,8 @@ class Engine:
             with contextlib.suppress(Exception):
                 m.stage0_writer.close()
         self._unload_draft(m)        # free this model's controller-local draft
-        if getattr(self, "_mtp_heads", None):
-            self._mtp_heads.pop(friendly, None)   # #91 free the controller-resident MTP head
+        if getattr(self, "_mtp_heads", None) and self._mtp_heads.pop(friendly, None) is not None:
+            _free_mtp_cuda()          # #91 release the GPU head's VRAM (empty_cache); else it leaks
         self.models.pop(friendly, None)
         _release_ram()
         print(f"[unload] evicted {friendly} ({reason})")
@@ -6084,6 +6112,45 @@ def build_app() -> FastAPI:
                     "load_missing": head.load_missing[:10],
                     "load_unexpected": head.load_unexpected[:10]}
 
+        async def _qcheck() -> dict:
+            # #91 (b) diagnostic: does a q=2 DECODE chunk (what the spec verify sends) produce the same
+            # per-position logits as two sequential q=1 decodes? On qwen3.6's HYBRID Gated-DeltaNet this
+            # is the suspected source of the verify divergence. Isolates WHERE: pos0 (first chunk token)
+            # vs pos1 (chunked-continuation token). pos0 mismatch => prefill->decode handoff / first
+            # chunk position bug (fixable); pos1-only => chunked-vs-recurrent linear-attn (fundamental).
+            import torch
+            m = engine.models.get(friendly) or engine._pick_replica(friendly)
+            if m is None or getattr(m, "stage0_writer", None) is None:
+                return {"error": f"{friendly} is not loaded distributed — load it first"}
+            p = prompt or "The capital of France is Paris. The capital of Japan is"
+            ids = m.tokenizer(p, return_tensors="pt").input_ids
+            P = int(ids.shape[1])
+
+            async with m.lock:
+                prelog = await engine._send(m, ids, 0, True)            # prefill -> KV @ P
+                a = int(prelog[0, -1].float().argmax())
+                lb0, hb0 = await engine._send(m, torch.tensor([[a]], dtype=torch.long), P, False,
+                                              all_logits=True, capture_pre_norm=True)
+                b = int(lb0[0, 0].float().argmax())
+                lb1, hb1 = await engine._send(m, torch.tensor([[b]], dtype=torch.long), P + 1, False,
+                                              all_logits=True, capture_pre_norm=True)
+                await engine._crop(m, P)
+                la, ha = await engine._send(m, torch.tensor([[a, b]], dtype=torch.long), P, False,
+                                            all_logits=True, capture_pre_norm=True)
+                await engine._crop(m, 0)
+
+            def _cmp(x, y) -> dict:
+                xf, yf = x.float(), y.float()
+                return {"max_abs": round(float((xf - yf).abs().max()), 4),
+                        "argmax_eq": int(xf.argmax()) == int(yf.argmax()),
+                        "argmax_chunk": int(xf.argmax()), "argmax_seq": int(yf.argmax())}
+
+            return {"ok": True, "P": P, "a": a, "b": b,
+                    "pos0_logits": _cmp(la[0, 0], lb0[0, 0]),
+                    "pos1_logits": _cmp(la[0, 1], lb1[0, 0]),
+                    "pos0_hidden_max_abs": round(float((ha[0, 0].float() - hb0[0, 0].float()).abs().max()), 4),
+                    "pos1_hidden_max_abs": round(float((ha[0, 1].float() - hb1[0, 0].float()).abs().max()), 4)}
+
         try:
             if mode == "run":
                 # DISABLED (m4c122): the original run-mode loaded the FULL model on this co-hosted
@@ -6094,6 +6161,8 @@ def build_app() -> FastAPI:
                                     status_code=400)
             if mode == "dprobe":
                 return JSONResponse(await _dprobe())
+            if mode == "qcheck":
+                return JSONResponse(await _qcheck())
             return JSONResponse(await asyncio.to_thread(_dump))
         except Exception as exc:
             import traceback
