@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c119"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c120"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -5767,6 +5767,74 @@ def build_app() -> FastAPI:
         d = await asyncio.to_thread(_controller_model_dir, target)
         with open(os.path.join(d, "config.json"), encoding="utf-8") as fh:
             return JSONResponse(json.load(fh))
+
+    @app.get("/mtp_probe")
+    async def mtp_probe(model: str = "qwen3.6-35b-a3b") -> JSONResponse:
+        # #91 Increment 1a (discovery): the checkpoint ships an MTP (nextn) head but the installed
+        # transformers DROPS it (_keys_to_ignore_on_load_unexpected=[r"^mtp.*"]) — no class to build
+        # or run it. To reimplement the MTP forward for self-speculative decoding we first need the
+        # EXACT module structure: which mtp.* tensors exist, their shapes/dtypes, and the embed /
+        # lm_head / final-norm key names the MTP head shares. Reads the safetensors index only (no
+        # model load). Returns a top-level prefix histogram + every mtp.* tensor + the shared-head
+        # tensors so the hand-built module matches the checkpoint exactly.
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        target = MODELS[friendly][0] if friendly in MODELS else friendly
+        d = await asyncio.to_thread(_controller_model_dir, target)
+
+        def _dump() -> dict:
+            from safetensors import safe_open
+            idx = os.path.join(d, "model.safetensors.index.json")
+            if os.path.exists(idx):
+                with open(idx, encoding="utf-8") as fh:
+                    wm = json.load(fh)["weight_map"]      # tensor_name -> shard filename
+            else:                                          # single-file checkpoint
+                wm = {}
+                single = os.path.join(d, "model.safetensors")
+                if os.path.exists(single):
+                    with safe_open(single, framework="pt") as sf:
+                        wm = {k: "model.safetensors" for k in sf.keys()}
+            keys = sorted(wm)
+            # prefix histogram (first two dotted segments) so the nesting is visible at a glance
+            hist: dict = {}
+            for k in keys:
+                parts = k.split(".")
+                pref = ".".join(parts[:2]) if len(parts) > 1 else parts[0]
+                hist[pref] = hist.get(pref, 0) + 1
+            # resolve shape/dtype for a set of keys, opening each shard once
+            def _meta(want: list) -> dict:
+                want = [k for k in want if k in wm]
+                by_file: dict = {}
+                for k in want:
+                    by_file.setdefault(wm[k], []).append(k)
+                out: dict = {}
+                for fn, ks in by_file.items():
+                    with safe_open(os.path.join(d, fn), framework="pt") as sf:
+                        for k in ks:
+                            sl = sf.get_slice(k)
+                            try:
+                                dt = sl.get_dtype()
+                            except Exception:
+                                dt = "?"
+                            out[k] = {"shape": list(sl.get_shape()), "dtype": str(dt), "file": fn}
+                return out
+            mtp_keys = [k for k in keys if k == "mtp" or k.startswith("mtp.")]
+            # the shared head + embedding the MTP module reuses (names vary by multimodal nesting)
+            shared = [k for k in keys if any(s in k for s in (
+                "embed_tokens", "lm_head", "language_model.norm", ".model.norm.", )) or k.endswith("model.norm.weight")]
+            return {
+                "model": friendly, "target": target, "n_tensors": len(keys),
+                "prefix_histogram": dict(sorted(hist.items())),
+                "mtp": _meta(mtp_keys),
+                "shared_head_candidates": _meta(shared),
+            }
+
+        try:
+            return JSONResponse(await asyncio.to_thread(_dump))
+        except Exception as exc:
+            return JSONResponse({"error": repr(exc)}, status_code=500)
 
     @app.get("/modelcode")
     async def modelcode(model: str) -> JSONResponse:
