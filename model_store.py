@@ -110,13 +110,16 @@ def convert_gguf_to_model_dir(repo_id: str, gguf_file: str, model_id: str) -> st
     print(f"[model] GGUF -> safetensors: {repo_id} :: {gguf_file} (subprocess)", flush=True)
     proc = subprocess.run([sys.executable, script, repo_id, gguf_file, local],
                           env=env, capture_output=True, text=True)
-    tail = (proc.stderr or proc.stdout or "")[-800:]
-    if proc.returncode != 0 or not _dir_has_model(local):
-        # leave a clean slate so a retry isn't blocked by a half-written dir
-        with contextlib.suppress(Exception):
-            if not _dir_has_model(local):
-                shutil.rmtree(local, ignore_errors=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-800:]
+        # a failed convert can leave a model dir with no usable tokenizer — wipe it so it isn't
+        # mistaken for a complete model (and so a retry starts clean), regardless of _dir_has_model.
+        shutil.rmtree(local, ignore_errors=True)
         raise RuntimeError(f"GGUF conversion failed ({repo_id} :: {gguf_file}): {tail}")
+    # surface the converter's own progress lines (dep installs, which tokenizer path won) on success
+    for _ln in (proc.stdout or "").splitlines()[-6:]:
+        if _ln.strip():
+            print(f"[gguf] {_ln.rstrip()}", flush=True)
     print(f"[model] GGUF conversion complete -> {local}", flush=True)
     return local
 

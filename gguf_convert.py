@@ -88,20 +88,57 @@ def main() -> int:
     # transformers may dequantize to fp32 regardless of dtype on some versions; force bf16 so the
     # saved checkpoint is the size our planner/streamer expects (we re-quantize to int4 anyway).
     model = model.to(torch.bfloat16)
-    try:
-        tok = AutoTokenizer.from_pretrained(src_dir, gguf_file=fn)
-    except Exception as exc:   # some GGUFs carry a tokenizer the HF converter can't rebuild
-        print(f"[gguf-convert] WARNING tokenizer rebuild failed ({exc!r}) — saving model only",
-              flush=True)
-        tok = None
 
     os.makedirs(dst, exist_ok=True)
     print(f"[gguf-convert] saving safetensors -> {dst}", flush=True)
     model.save_pretrained(dst, safe_serialization=True)
-    if tok is not None:
-        tok.save_pretrained(dst)
+
+    if not _save_tokenizer(src_dir, fn, repo_id, dst, token):
+        print("[gguf-convert] ERROR: could not produce a serve-loadable tokenizer "
+              "(GGUF-embedded slow tokenizer needs sentencepiece/tiktoken to convert, and the base "
+              "repo had none) — model saved but unusable; aborting", file=sys.stderr)
+        return 4
+
     print(f"GGUF_CONVERT_OK {dst}", flush=True)
     return 0
+
+
+def _save_tokenizer(src_dir: str, gguf_file: str, repo_id: str, dst: str, token) -> bool:
+    """Produce a tokenizer in `dst` that the controller can load at SERVE time WITHOUT a slow->fast
+    conversion (which needs sentencepiece/tiktoken — C/Rust extensions that may have no wheel on a
+    bleeding-edge Python). Strategy, each VERIFIED by reloading from `dst`:
+      1) the GGUF-embedded tokenizer (works when the slow->fast deps are installable), then
+      2) the base model's native (already-fast) tokenizer — most GGUF repos are '<base>-GGUF', and the
+         base repo ships a fast tokenizer.json that loads with no extra deps.
+    Returns True if a reload-verified tokenizer was saved."""
+    import re
+    import shutil
+    from transformers import AutoTokenizer
+
+    def _try(make, why) -> bool:
+        try:
+            tok = make()
+            tok.save_pretrained(dst)
+            AutoTokenizer.from_pretrained(dst)   # VERIFY: reloads with no slow->fast step needed
+            print(f"[gguf-convert] tokenizer: {why} (verified reload)", flush=True)
+            return True
+        except Exception as exc:
+            print(f"[gguf-convert] tokenizer via {why} failed: {exc!r}", flush=True)
+            # wipe a partial/slow-only tokenizer so the next attempt (or the load) isn't fooled
+            for f in os.listdir(dst):
+                if "token" in f.lower() or f in ("vocab.json", "merges.txt", "special_tokens_map.json"):
+                    with __import__("contextlib").suppress(Exception):
+                        os.remove(os.path.join(dst, f))
+            return False
+
+    kw = {"token": token} if token else {}
+    if _try(lambda: AutoTokenizer.from_pretrained(src_dir, gguf_file=gguf_file), "GGUF-embedded"):
+        return True
+    base = re.sub(r"[-_.]?gguf$", "", repo_id, flags=re.I)
+    if base and base != repo_id:
+        if _try(lambda: AutoTokenizer.from_pretrained(base, **kw), f"base repo {base}"):
+            return True
+    return False
 
 
 if __name__ == "__main__":
