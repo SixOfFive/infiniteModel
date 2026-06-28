@@ -2878,7 +2878,7 @@ class Shard:
 
     def forward(self, x, cache_start: int = 0, reset: bool = True,
                 all_logits: bool = False, inject=None, position_ids=None,
-                capture_hidden: bool = False):
+                capture_hidden: bool = False, capture_pre_norm: bool = False):
         """Run this stage's layers with an incremental KV cache (M2e).
         x = token ids (first stage) or hidden states (mid stage), covering the
         `q` positions starting at absolute position `cache_start`. `reset` starts
@@ -2898,7 +2898,7 @@ class Shard:
         with torch.inference_mode():
             if self.uniform_device is not None:
                 return self._forward_uniform(x, cache_start, all_logits, inject, position_ids,
-                                             capture_hidden)
+                                             capture_hidden, capture_pre_norm)
             h = self.embed(x.to(self.embed_device)) if self.has_embed else x
             if inject is not None and self.has_embed:
                 h = self._splice_mm(h, inject)
@@ -2964,13 +2964,20 @@ class Shard:
                 nh = self.norm(h)
                 sel = nh if all_logits else nh[:, -1:, :]   # verify needs every position
                 logits = self.head(sel).to(self.cpu)
+                if capture_pre_norm:
+                    # #91 MTP: return the PRE-final-norm trunk hidden (what the checkpoint's MTP
+                    # head consumes via pre_fc_norm_hidden) — distinct from capture_hidden's
+                    # POST-norm hidden (speech). Same position slice as the logits.
+                    hsel = h if all_logits else h[:, -1:, :]
+                    return logits, hsel.to(self.cpu)
                 if capture_hidden:
                     return logits, nh.to(self.cpu)
                 return logits
             return h.to(self.cpu)
 
     def _forward_uniform(self, x, cache_start: int, all_logits: bool, inject=None,
-                         position_ids=None, capture_hidden: bool = False):
+                         position_ids=None, capture_hidden: bool = False,
+                         capture_pre_norm: bool = False):
         """Single-device fast path (see _finalize_placement). Everything — embed,
         every layer, norm/head, rotary — lives on self.uniform_device, so cos/sin,
         positions, cache_position and (for prefill only) the causal mask are built
@@ -3019,6 +3026,9 @@ class Shard:
             nh = self.norm(h)
             sel = nh if all_logits else nh[:, -1:, :]
             logits = self.head(sel).to(self.cpu)
+            if capture_pre_norm:   # #91 MTP: PRE-final-norm trunk hidden (see general path)
+                hsel = h if all_logits else h[:, -1:, :]
+                return logits, hsel.to(self.cpu)
             if capture_hidden:
                 return logits, nh.to(self.cpu)
             return logits
@@ -3730,7 +3740,7 @@ class Worker:
         return _nb
 
     def _run_stage(self, model_id, x, cache_start, reset, all_logits, inject=None,
-                   position_ids=None, capture_hidden=False):
+                   position_ids=None, capture_hidden=False, capture_pre_norm=False):
         # TP rank 0 drives the group: broadcast this forward's input to the peers (who run
         # their sharded forward in lockstep), then run ours, all-reducing via the mesh hooks.
         if self._tp is not None and self._tp.rank == 0 and model_id == self._tp_model_id:
@@ -3746,9 +3756,9 @@ class Worker:
                     (x.detach().to("cpu"), int(cache_start), bool(reset), bool(all_logits),
                      inject, position_ids)))
                 return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
-                                                     position_ids, capture_hidden)
+                                                     position_ids, capture_hidden, capture_pre_norm)
         return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
-                                             position_ids, capture_hidden)
+                                             position_ids, capture_hidden, capture_pre_norm)
 
     async def _data_inbound(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
@@ -3828,11 +3838,14 @@ class Worker:
                     # the header down the chain so the LAST stage (has_head) returns the
                     # post-norm hidden alongside the logits in a two-tensor result frame.
                     capture_hidden = bool(hdr.get("capture_hidden", False))
+                    # #91 MTP: capture_pre_norm rides the same chain as capture_hidden but the head
+                    # returns the PRE-final-norm trunk hidden (what the MTP head consumes).
+                    capture_pre_norm = bool(hdr.get("capture_pre_norm", False))
                     out = await asyncio.to_thread(self._run_stage, model_id, x, cache_start,
                                                   reset, all_logits, inject, position_ids,
-                                                  capture_hidden)
+                                                  capture_hidden, capture_pre_norm)
                     kind = "logits" if shard.has_head else "hidden"
-                    if capture_hidden and shard.has_head and isinstance(out, tuple):
+                    if (capture_hidden or capture_pre_norm) and shard.has_head and isinstance(out, tuple):
                         logits_t, hidden_t = out
                         lmeta, lraw = _pack_tensor(logits_t)
                         hmeta, hraw = _pack_tensor(hidden_t)
@@ -3854,6 +3867,8 @@ class Worker:
                         # propagate the capture flag to the next stage so it reaches the head stage
                         if capture_hidden and not shard.has_head:
                             ohdr["capture_hidden"] = True
+                        if capture_pre_norm and not shard.has_head:   # #91 MTP
+                            ohdr["capture_pre_norm"] = True
                         _tx = await self._send_next(model_id, ohdr, oraw)
                         _net_peer(self.next_peer.get(model_id, "?"), tx=_tx)   # to next stage / controller
                 except Exception as exc:  # stage failed -> tell the controller, fast

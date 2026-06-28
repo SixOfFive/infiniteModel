@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c122"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c123"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -103,6 +103,7 @@ def _fetch_repo_file(fname: str):
 # modules go here; a client+server SHARED module (wire.py) is listed in BOTH server.py + client.py.
 EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py", "shards.py",
                                  "formats.py", "multimodal.py", "graphs.py", "model_store.py",
+                                 "mtp_core.py",   # #91 MTP head forward (controller-only import)
                                  "config.json"]   # central cluster config — synced like a module
 
 
@@ -3283,7 +3284,7 @@ class Engine:
 
     async def _send(self, model: LoadedModel, x, cache_position: int, reset: bool,
                     all_logits: bool = False, mm=None, position_ids=None,
-                    capture_hidden: bool = False):
+                    capture_hidden: bool = False, capture_pre_norm: bool = False):
         """Push one frame (token ids) through `model`'s pipeline and return last-stage
         logits — last position only, or every position when all_logits=True (verify).
         mm = (positions, embeds_tensor) (#22 inc 3): on a prefill (reset), a companion
@@ -3315,6 +3316,8 @@ class Engine:
                 hdr["position_ids"] = position_ids
             if capture_hidden:   # #P6 speech: ask the head stage for post-norm hidden too
                 hdr["capture_hidden"] = True
+            if capture_pre_norm:   # #91 MTP: ask the head stage for the PRE-final-norm trunk hidden
+                hdr["capture_pre_norm"] = True
             nb = await _write_frame(w, hdr, raw)
             net_account(self._stage0_id(model), to_node=nb)  # controller -> stage0
 
@@ -5770,7 +5773,7 @@ def build_app() -> FastAPI:
 
     @app.get("/mtp_probe")
     async def mtp_probe(model: str = "qwen3.6-35b-a3b", mode: str = "dump",
-                        prompt: str = "") -> JSONResponse:
+                        prompt: str = "", fresh: int = 0) -> JSONResponse:
         # #91 Increment 1a (discovery): the checkpoint ships an MTP (nextn) head but the installed
         # transformers DROPS it (_keys_to_ignore_on_load_unexpected=[r"^mtp.*"]) — no class to build
         # or run it. To reimplement the MTP forward for self-speculative decoding we first need the
@@ -5832,20 +5835,92 @@ def build_app() -> FastAPI:
                 "shared_head_candidates": _meta(shared),
             }
 
+        async def _dprobe() -> dict:
+            # #91 Increment 2 (distributed-hidden probe): with the model loaded DISTRIBUTED, run a
+            # prefill that returns the pre-final-norm trunk hidden (capture_pre_norm), then run the
+            # small controller-resident MTP head over the sequence and measure how often its drafted
+            # token matches the pipeline's own greedy continuation. NEVER loads the full model here
+            # (see never-full-load-on-controller-box) — only the ~few-GB MTP head.
+            import importlib
+            here = os.path.dirname(os.path.abspath(__file__))
+            with contextlib.suppress(Exception):    # iterate the MTP forward w/o a controller restart
+                remote = _fetch_repo_file("mtp_core.py")
+                if remote and len(remote) > 80:
+                    with open(os.path.join(here, "mtp_core.py"), "wb") as fh:
+                        fh.write(remote)
+            import mtp_core as _mc
+            importlib.reload(_mc)
+            m = engine.models.get(friendly) or engine._pick_replica(friendly)
+            if m is None or getattr(m, "stage0_writer", None) is None:
+                return {"error": f"{friendly} is not loaded distributed — load it first"}
+            if not hasattr(engine, "_mtp_heads"):
+                engine._mtp_heads = {}
+            head = engine._mtp_heads.get(friendly)
+            if head is None or fresh:
+                head = await asyncio.to_thread(_mc.load_mtp_head, d, "cpu")
+                engine._mtp_heads[friendly] = head
+            import torch
+            p = prompt or ("The capital of France is Paris. The capital of Japan is Tokyo. "
+                           "The capital of Italy is Rome. The capital of Canada is Ottawa. "
+                           "The capital of Germany is")
+            ids = m.tokenizer(p, return_tensors="pt").input_ids
+            S = int(ids.shape[1])
+            if S < 4:
+                return {"error": "prompt too short"}
+            # prefill on the distributed pipeline; capture per-position logits + pre-norm hidden.
+            async with m.lock:
+                logits, h_pre = await engine._send(m, ids, 0, True, all_logits=True,
+                                                   capture_pre_norm=True)
+                await engine._crop(m, 0)   # reset the probe's KV so it can't pollute a later gen
+
+            def _compute() -> dict:
+                th = h_pre[:, 0:S - 1]
+                nxt = ids[:, 1:S]
+                main_greedy = logits[0].float().argmax(-1)   # main_greedy[j] predicts token j+1
+                actual = ids[0]
+                out = {}
+                for off in (0, 1):
+                    ml = _mc.mtp_forward_seq(head, th, nxt, position_offset=off)
+                    mtp_pred = ml[0].float().argmax(-1)       # mtp_pred[i] predicts token i+2
+                    n = S - 2
+                    ag = aa = 0
+                    ex = []
+                    for i in range(n):
+                        mp = int(mtp_pred[i]); tg = int(main_greedy[i + 1]); ta = int(actual[i + 2])
+                        ag += (mp == tg); aa += (mp == ta)
+                        if len(ex) < 8:
+                            ex.append({"i": i, "mtp": mp, "greedy": tg, "actual": ta,
+                                       "mtp_tok": m.tokenizer.decode([mp]),
+                                       "greedy_tok": m.tokenizer.decode([tg])})
+                    out[f"off{off}"] = {"acc_vs_greedy": round(ag / max(1, n), 3),
+                                        "acc_vs_actual": round(aa / max(1, n), 3), "n": n,
+                                        "examples": ex}
+                return out
+
+            out = await asyncio.to_thread(_compute)
+            best = max(out, key=lambda k: out[k]["acc_vs_greedy"])
+            return {"ok": True, "model": friendly, "S": S, "best": best,
+                    "summary": {k: {kk: vv for kk, vv in v.items() if kk != "examples"}
+                                for k, v in out.items()},
+                    "examples": out[best]["examples"],
+                    "load_missing": head.load_missing[:10],
+                    "load_unexpected": head.load_unexpected[:10]}
+
         try:
             if mode == "run":
-                # DISABLED (m4c122): the original run-mode loaded the FULL model on this box via a
-                # subprocess to probe MTP acceptance — but this box CO-HOSTS the controller, and the
-                # 67GB load OOM-crashed the controller. Never load a full big model here. MTP
-                # acceptance is now validated against the DISTRIBUTED pipeline's hidden states
-                # (capture_pre_norm) with only the small MTP module resident on the controller.
-                return JSONResponse({"error": "mode=run disabled — loading the full model on the "
-                                     "controller box crashed the controller (co-hosted). Use the "
-                                     "distributed-hidden MTP probe instead (Increment 2)."},
+                # DISABLED (m4c122): the original run-mode loaded the FULL model on this co-hosted
+                # controller box and OOM-crashed the controller. Use mode=dprobe (distributed hidden +
+                # small MTP head) instead. See never-full-load-on-controller-box.
+                return JSONResponse({"error": "mode=run disabled (crashed the co-hosted controller). "
+                                     "Use mode=dprobe — distributed hidden + small MTP head."},
                                     status_code=400)
+            if mode == "dprobe":
+                return JSONResponse(await _dprobe())
             return JSONResponse(await asyncio.to_thread(_dump))
         except Exception as exc:
-            return JSONResponse({"error": repr(exc)}, status_code=500)
+            import traceback
+            return JSONResponse({"error": repr(exc), "tb": traceback.format_exc()[-1500:]},
+                                status_code=500)
 
     @app.get("/modelcode")
     async def modelcode(model: str) -> JSONResponse:
