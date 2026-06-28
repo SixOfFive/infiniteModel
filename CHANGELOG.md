@@ -49,6 +49,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   model that sat loaded-but-unused replies immediately instead of appearing wedged.
 - Observability: placement preview, per-load progress/ETA, fleet CPU/GPU/RAM + throughput + bandwidth,
   curl-able fleet logs; idle-gated multi-file self-update.
+- **TP mesh keepalive:** the tensor-parallel all-reduce mesh used to work for one generation then
+  stall ("peer rank stalled or closed") after a short idle gap between requests — an idle mesh socket
+  going silently half-open. Rank 0 now pings the peers (a tiny round-trip that keeps both directions
+  warm) whenever the mesh has been idle a few seconds, so TP stays alive across idle periods instead
+  of needing a reload after the first request.
 
 ## Public release
 - Central `config.json` (all hosts/ports + the self-update source; no addresses baked into code);

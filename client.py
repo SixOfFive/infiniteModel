@@ -47,12 +47,18 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c116"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c117"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
 # so a slow model's multi-second inter-token gaps never trip it. Mirrors the controller's STAGE0_STALE_S.
 STAGE_STALE_S = 5.0
+# #tp-mesh-keepalive: rank 0 pings the TP peers if no forward has crossed the mesh for this long, so
+# the lockstep all-reduce sockets never sit idle long enough to go silently half-open (the failure
+# that surfaced as "tp all-reduce failed — peer rank stalled" after an idle gap between requests).
+# Well under the observed idle-death window (a fresh mesh died within ~24s idle); only fires when the
+# model is idle (a busy model keeps its own mesh warm via real forwards).
+TP_KEEPALIVE_S = 6.0
 _STREAM_PREFETCH_MAX = 6  # max concurrent per-layer weight fetches during a streaming load
                           # (actual depth K is clamped to free RAM per node; see Shard.from_stream)
 GB = 1024 ** 3
@@ -1606,6 +1612,14 @@ def _tp_make_structure_(model, rank: int, tp_size: int, cfg, weights=None) -> No
         _tp_set_head_counts_(a, nh, nkv, tp_size, qh, kvh)
 
 
+# #tp-mesh-keepalive: sentinel broadcast payload that means "this is a liveness ping, not a forward
+# input". A real forward input is a pickled tuple (starts with the pickle opcode b'\x80'), so this
+# fixed marker can never collide with one. rank 0 sends it during IDLE gaps + reads a 1-byte ack from
+# each peer; that round-trip keeps BOTH directions of every mesh socket warm so an idle connection
+# can't go silently half-open (the bytes-vanish failure that breaks the lockstep mesh until reload).
+_TP_PING = b"\x00__tp_ping__"
+
+
 class _TPAllReduce:
     """Root-based sum-all-reduce over blocking TCP among a TP group's `tp_size` ranks. Rank 0
     binds and accepts the peers; ranks 1..N-1 connect to it. Called INSIDE the (sync) forward via
@@ -1714,6 +1728,30 @@ class _TPAllReduce:
         """peer: block for the next forward's input from rank 0. b'' means 'stop'."""
         n = self._struct.unpack("!I", self._recvn(self.root, 4))[0]
         return self._recvn(self.root, n) if n else b""
+
+    def keepalive(self) -> bool:
+        """#tp-mesh-keepalive (rank 0): send a ping to every peer + read its 1-byte ack. The
+        round-trip keeps BOTH directions of each idle mesh socket warm (prevents the silent
+        half-open that breaks the lockstep) AND detects a dead/gone peer early. Returns False on
+        any peer timeout/close so the caller can flag the mesh broken before a real forward does.
+        MUST be called holding the same lock that guards forward all-reduces (never interleave)."""
+        if self.N <= 1 or self.rank != 0:
+            return True
+        try:
+            hdr = self._struct.pack("!I", len(_TP_PING))
+            for c in self.peers:
+                c.sendall(hdr + _TP_PING)
+            for c in self.peers:
+                if self._recvn(c, 1) != b"\x01":
+                    return False
+            return True
+        except (socket.timeout, TimeoutError, OSError):
+            return False
+
+    def ack_ping(self) -> None:
+        """#tp-mesh-keepalive (peer): reply to rank 0's liveness ping (1 byte)."""
+        if self.root is not None:
+            self.root.sendall(b"\x01")
 
     def close(self) -> None:
         for s in list(self.peers) + ([self.root] if self.root else []):
@@ -3144,6 +3182,12 @@ class Worker:
         self._tp_thread = None       # follower loop thread (peer ranks, tp_rank>0)
         self._tp_stop = False
         self._tp_model_id = None     # model_id currently in TP mode, if any
+        # #tp-mesh-keepalive: serialize ALL rank-0 mesh socket use (the broadcast+all-reduce of a
+        # forward, and the idle keepalive ping) so they never interleave + corrupt the byte stream.
+        self._tp_lock = threading.Lock()
+        self._tp_last_fwd = 0.0      # monotonic-ish wall ts of rank 0's last mesh forward (warmth clock)
+        self._tp_ka_thread = None    # rank-0 keepalive thread handle
+        self._tp_broken = False      # set when a keepalive ping finds the mesh dead -> surfaced/served
         # #22 inc 3: multimodal embeds staged by a 'mm' frame, consumed by the next prefill
         # for the same (model_id, req_id). Only stage 0 (has_embed) ever populates this.
         self.pending_mm: dict[tuple, tuple] = {}
@@ -3368,6 +3412,13 @@ class Worker:
                 # label the next hop for the bandwidth page: "controller" (last stage) or the
                 # next worker's IP. a.get("next_host") is None on the last stage -> controller.
                 self.next_peer[model_id] = "controller" if not a.get("next_host") else str(next_host)
+                # #tp-mesh-keepalive: if THIS load made us TP rank 0, start the idle-ping keepalive
+                # thread so the lockstep mesh sockets never sit idle long enough to half-open.
+                if self._tp is not None and getattr(self._tp, "rank", 1) == 0:
+                    self._tp_stop = False
+                    self._tp_last_fwd = time.time()
+                    self._tp_ka_thread = threading.Thread(target=self._tp_keepalive_loop, daemon=True)
+                    self._tp_ka_thread.start()
             return {"loaded_params": shard.loaded_params,
                     "loaded_bytes": shard.loaded_bytes,
                     "gpu_bytes": getattr(shard, "gpu_bytes", 0),
@@ -3397,6 +3448,10 @@ class Worker:
                 break
             if not payload or self._tp_stop:
                 break
+            if payload == _TP_PING:   # #tp-mesh-keepalive: liveness ping from rank 0 -> ack + wait
+                with contextlib.suppress(Exception):
+                    self._tp.ack_ping()
+                continue
             try:
                 data = pickle.loads(payload)
                 # tuple grew over versions: 4 (base) -> 5 (+inject) -> 6 (+position_ids);
@@ -3414,6 +3469,35 @@ class Worker:
                 print(f"[tp-follow] forward error: {exc!r}")
                 break
 
+    def _tp_keepalive_loop(self) -> None:
+        """#tp-mesh-keepalive (rank 0): while the TP model is resident, ping the peers whenever the
+        mesh has been idle for TP_KEEPALIVE_S so the lockstep sockets never sit idle long enough to
+        go silently half-open (the 'peer rank stalled' break after an idle gap between requests). A
+        real forward stamps _tp_last_fwd, so a busy model skips the ping. Runs under _tp_lock so it
+        can't interleave with a forward's broadcast/all-reduce. On a failed ping the mesh is dead;
+        flag it (served on the heartbeat) and stop — the model needs a reload either way."""
+        while not self._tp_stop:
+            time.sleep(min(TP_KEEPALIVE_S, 2.0))
+            tp = self._tp
+            if self._tp_stop or tp is None or getattr(tp, "rank", 1) != 0:
+                return
+            if time.time() - self._tp_last_fwd < TP_KEEPALIVE_S:
+                continue   # a recent forward already kept the mesh warm
+            ok = True
+            if self._tp_lock.acquire(timeout=TP_KEEPALIVE_S):
+                try:
+                    if self._tp is not None and not self._tp_stop:
+                        ok = self._tp.keepalive()
+                        if ok:
+                            self._tp_last_fwd = time.time()
+                finally:
+                    self._tp_lock.release()
+            if not ok:
+                self._tp_broken = True
+                print("[tp-keepalive] mesh ping FAILED — a peer is unreachable; "
+                      "TP mesh is down, model needs a reload", flush=True)
+                return
+
     def _teardown_tp(self) -> None:
         """Tear down the all-reduce mesh (TP is a single-model mode). Caller joins the thread."""
         if self._tp is not None:
@@ -3425,6 +3509,8 @@ class Worker:
                 self._tp.close()
         self._tp = None
         self._tp_model_id = None
+        self._tp_ka_thread = None
+        self._tp_broken = False
 
     def _maybe_self_restart_if_stuck(self) -> None:
         """After going fully idle (no shards), if this process still holds far more RAM than its
@@ -3649,10 +3735,18 @@ class Worker:
         # their sharded forward in lockstep), then run ours, all-reducing via the mesh hooks.
         if self._tp is not None and self._tp.rank == 0 and model_id == self._tp_model_id:
             import pickle
-            # include inject + position_ids so peers (replicated embeddings + rotary) match
-            self._tp.broadcast(pickle.dumps(
-                (x.detach().to("cpu"), int(cache_start), bool(reset), bool(all_logits),
-                 inject, position_ids)))
+            # #tp-mesh-keepalive: hold the mesh lock across the WHOLE forward (broadcast + every
+            # hook all-reduce) so the idle keepalive ping can never interleave + corrupt the byte
+            # stream. Stamp the warmth clock so the keepalive thread skips a ping right after a real
+            # forward (a busy model keeps its own mesh warm).
+            with self._tp_lock:
+                self._tp_last_fwd = time.time()
+                # include inject + position_ids so peers (replicated embeddings + rotary) match
+                self._tp.broadcast(pickle.dumps(
+                    (x.detach().to("cpu"), int(cache_start), bool(reset), bool(all_logits),
+                     inject, position_ids)))
+                return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
+                                                     position_ids, capture_hidden)
         return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
                                              position_ids, capture_hidden)
 
