@@ -1,0 +1,40 @@
+# Model test status
+
+Tracks which registered models have been **validated** on this fleet and to what depth. Update this as
+new tests run. (Seeded from session testing + decision history; correct any miscategorized rows.)
+
+**Legend**
+- ✅ **Fully tested** — loads **and** produces coherent output, validated end-to-end (quant/path noted).
+- 🟡 **Partially tested** — a capability is proven, but not full end-to-end, or there's a known caveat.
+- ⬜ **Unverified** — registered but not validated here (no recent test evidence).
+
+| Model | Status | Validated (quant / path) | Notes |
+|---|---|---|---|
+| `qwen3:4b` | ✅ | int4, bf16 — load + generate | Primary always-resident model; default test load is `int4 ctx=8192 auto`. |
+| `qwen2.5:0.5b` | ✅ | int4 (shard-cache serve) — generate | Dense; serve-from-cache validated (gens "Paris"). |
+| `qwen2.5:1.5b` | ✅ | bf16 + TP — generate | Used to validate TP mesh keepalive (tp2, gens over long idle). |
+| `qwen2.5:7b` | ✅ | int4, bf16 — generate | int4 fused tinygemm ~21 tok/s; TP tested. |
+| `qwen2.5:14b` (`-instruct`) | ✅ | bf16, int4 — load + generate | Coexistence + gen-stall watchdog validated (400-tok gen). |
+| `ministral-3:14b` | ✅ | load + generate | #117 fixed prefill hang (beast→theocomp hop); replies correctly. |
+| `devstral-small-2:24b` | ✅ | load + generate | #83/#89 fixed Mistral3 garbage + immediate-EOS; generates. |
+| `deepseek-r1-distill-llama:70b` | ✅ | int4 — generate | Dense Llama; int4 decode tok/s re-measured (#73). |
+| `mixtral:8x7b` | ✅ | int4 — load + generate; **int4 shard cache** | Fused-3D MoE (per-expert ckpt fused at build); non-fused-compile validated. |
+| `olmoe:1b-7b` | ✅ | int4 — load + generate; **int4 shard cache** | Per-expert ckpt fused to 3D; serve-from-cache gens "Paris". |
+| `qwen3.6-35b-a3b` | ✅ (text) | int4 — load + generate; **int4 shard cache** (cached==cold) | qwen3_5_moe hybrid (Gated-DeltaNet). MTP self-spec investigated → not viable (#91). Multimodal path untested. |
+| `qwen2.5-omni:7b` | ✅ | distributed multimodal — image+audio→text, speech-out | #22/#35/#36/#37 (vision, audio-in, Talker/token2wav speech-out). |
+| `nomic-embed-text` | ✅ | embeddings (`/api/embed`) | Encoder, not a causal-LM (#81). |
+| `nvfp4-moe-e2e` (`nm-testing/nvfp4_moe-e2e`) | ✅ | int4 (from nvfp4 source) — **compile + serve-from-cache + generate** | Qwen3-MoE 128-expert per-expert nvfp4 (16.86 GB) → 15.98 GB int4 cache → gens coherently. Validated the per-expert nvfp4 MoE compile fix (m4c132). |
+| `qwen3.6-27b-nvfp4` | 🟡 | nvfp4→bf16 serve-dequant loader (#90); dense nvfp4→int4 cache | Dense hybrid + multimodal. Loader landed; **generation not re-confirmed** this session. |
+| `minimax-m2-bf16` | 🟡 | int4 **compile fix proven** (gate clears, packs correctly) | Non-fused per-expert MoE (#119). **Never loaded/generated end-to-end** — CPU-bound/unusable here (<0.3 tok/s, 110 GB int4 vs 33.6 GB fleet VRAM); full compile+load deferred. |
+| `qwythos:9b-abliterated` | 🟡 | load (#111) | qwen3_5; brought into the system; generation not re-confirmed here. |
+| `qwen2.5-coder:32b` | ⬜ | — | Registered; not validated this session. |
+| `nemotron:70b` | ⬜ | — | Registered; not validated this session. |
+| `kimi-dev:72b` | ⬜ | — | Registered; not validated this session. |
+| `coneml-348m-alpha-polish900` | ⬜ | — | Custom small model; not validated here. |
+
+## How to update
+When a model is tested, set its row to ✅/🟡, note the **quant + path** (e.g. `int4 serve-from-cache`,
+`bf16 distributed`, `embeddings`) and a one-line evidence note. "Fully tested" requires an actual
+**load + coherent generation** (or the model's equivalent output, e.g. embeddings), not just a
+successful load or compile. Keep the legend honest — a compiled int4 shard cache alone is 🟡 until a
+cache-backed load generates correctly.
