@@ -48,7 +48,9 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   timeout). Both the controller's connection to stage 0 and each worker's next-hop are freshened, so a
   model that sat loaded-but-unused replies immediately instead of appearing wedged.
 - Observability: placement preview, per-load progress/ETA, fleet CPU/GPU/RAM + throughput + bandwidth,
-  curl-able fleet logs; idle-gated multi-file self-update.
+  curl-able fleet logs; idle-gated multi-file self-update. A managed reload (reconfigure to/from
+  tensor-parallel) shows live layer progress on its own card (folded in from the in-flight load) rather
+  than a progress-less "re-streaming weights" placeholder beside a duplicate load card.
 - **TP mesh keepalive:** the tensor-parallel all-reduce mesh used to work for one generation then
   stall ("peer rank stalled or closed") after a short idle gap between requests — an idle mesh socket
   going silently half-open. Rank 0 now pings the peers (a tiny round-trip that keeps both directions

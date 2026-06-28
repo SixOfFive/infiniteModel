@@ -541,15 +541,24 @@ async function tick(){
         +`title="cancel this load — kill it and free any partial shards (use if it is stuck at 0%); then re-Load to restart">✕ cancel load</button></div>`)
       +`</div>`;
   };
-  let _cards=lms.map(_mcard).join('')
-    + lds.map(x=>_loadcard(x,false)).join('')
-    + cmps.map(x=>_loadcard(x,true)).join('');
   const rc=s.cluster.reconfiguring;   // #88: keep a card visible during a managed reload (to/from TP)
+  const rcName=rc?(rc.model||''):null;
+  // #reconfigure-progress: a managed reload sets BOTH the reconfiguring marker AND a normal in-flight
+  // load card (which carries ready/total + stages + ETA). Render ONE card — the reconfigure card with
+  // that progress folded in — and SKIP the model's duplicate amber load card, so the operator sees a
+  // single "reconfiguring X: a→b · NN% · r/t shards" instead of a progress-less purple card next to it.
+  let _cards=lms.map(_mcard).join('')
+    + lds.filter(l=>!rcName||(l.display_model||l.model)!==rcName).map(x=>_loadcard(x,false)).join('')
+    + cmps.map(x=>_loadcard(x,true)).join('');
   if(rc){
+    const rl=(lds||[]).find(l=>(l.display_model||l.model)===rcName)||{};   // its in-flight load card
+    const pct=rl.total?Math.round(100*(rl.ready||0)/rl.total):0;
     _cards+=`<div class="card" style="min-width:250px;border-color:#a371f7">`
       +`<div class="k"><span style="color:#a371f7">reconfiguring ${esc(rc.model||'')}</span></div>`
-      +`<div class="v" style="font-size:15px">${esc(rc.from||'')} → ${esc(rc.to||'')}</div>`
-      +`<div class="sub">managed reload — re-streaming weights</div></div>`;
+      +`<div class="v" style="font-size:15px">${esc(rc.from||'')} → ${esc(rc.to||'')}${rl.total?` · ${pct}%`:``}</div>`
+      +`<div class="sub">${rl.total?`${rl.ready||0}/${rl.total} shards${rl.stages_total?` · ${rl.stages_ready||0}/${rl.stages_total} nodes`:``}`:`managed reload — preparing…`}`
+      +(rl.started?`<br><span class="sub" style="font-size:11px" title="elapsed · estimated time remaining">&#9201; ${fmtUptime(rl.elapsed_s||0)} elapsed${rl.eta_s!=null?` · ~${fmtUptime(rl.eta_s)} left`:` · ETA…`}</span>`:``)
+      +`</div></div>`;
   }
   // don't clobber a card's reconfigure <select> mid-choice: the poll re-renders the cards and would
   // reset the dropdown to the model's CURRENT layout (pipeline) before the user can hit Reconfigure.
