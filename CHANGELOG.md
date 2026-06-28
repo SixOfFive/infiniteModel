@@ -46,6 +46,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   comparison, with automatic local fallback on any worker failure.
 
 ## Models
+- **Model aliases shown in the UI**: a registry alias (e.g. `qwen2.5:14b` → `qwen2.5:14b-instruct`,
+  via `MODEL_ALIASES`) is now surfaced as an "alias: …" line under the model's primary name — in the
+  models list, each loaded-model card, and the model detail modal — so it's obvious which alternate
+  names resolve to a given model. (`_aliases_for` reverse-maps `MODEL_ALIASES`; rendered in Ollama
+  `family:size` form.)
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8

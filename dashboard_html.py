@@ -527,6 +527,7 @@ async function tick(){
       .map(o=>`<option value="${o[0]}"${o[0]===_cur?' selected':''}>${o[1]}</option>`).join('');
     return `<div class="card" style="min-width:250px;cursor:pointer" onclick="openModelModal('${_rc}')" title="click for full details">`
       +`<div class="k" title="${esc(lm.target||'')}">${esc(name)}${lm.quant&&lm.quant!=='none'?` <small style="color:#8b949e">${esc(lm.quant)}</small>`:``}${(lm.cpu_frac||0)>=0.3?` <small style="color:#f85149;font-weight:600" title="${Math.round((lm.cpu_frac||0)*100)}% of this model's weights are on CPU because the GPU pool was full at load — it is CPU-bound and will decode SLOWLY (often <1 tok/s). Not hung. Unload another model or use a smaller quant to get it on GPU.">⚠ CPU ${Math.round((lm.cpu_frac||0)*100)}%</small>`:``} <small style="color:#8b949e;float:right">&#9432;</small></div>`
+      +((lm.aliases&&lm.aliases.length)?`<div class="sub" style="font-size:11px;color:#8b949e;margin-top:-2px" title="other names that resolve to this model">alias: ${lm.aliases.map(esc).join(', ')}</div>`:``)
       +`<div class="v" style="font-size:15px">${gb(lm.size_gb)} GB <small style="color:#8b949e">${lm.params||''} · ${(lm.stages||[]).length} stg</small></div>`
       +`<div class="sub">`
       +`<span title="KV-cache depth of the current/last generation">ctx <b>${kv.toLocaleString()}</b>/${cx.toLocaleString()} (${kvpct}%)</span>`
@@ -708,7 +709,8 @@ async function tick(){
       (m.dl_error?` <button class="sec" title="delete cached + partial files" onclick="doClear('${m.name}')">Clear</button>`+
         `<div class="sub" style="color:#f85149;max-width:340px;white-space:normal">${m.dl_error.replace(/</g,'&lt;')}</div>`:'');
     const cx=q.default_ctx?` · <span class="sub" title="native/default context (loads at this when ctx=0)">${ctxFmt(q.default_ctx)} ctx</span>`:'';
-    return `<tr><td>${m.name}</td><td class="num">${m.size_gb!=null?m.size_gb+' GB':'–'}${cx}</td><td>${badge}</td><td>${actions}</td></tr>`;
+    const aliasLine=(m.aliases&&m.aliases.length)?`<div class="sub" style="font-size:11px;color:#8b949e" title="other names that resolve to this model">alias: ${m.aliases.map(esc).join(', ')}</div>`:'';
+    return `<tr><td>${m.name}${aliasLine}</td><td class="num">${m.size_gb!=null?m.size_gb+' GB':'–'}${cx}</td><td>${badge}</td><td>${actions}</td></tr>`;
   }).join('');
   // don't clobber a row's run-type <select> mid-choice (the 1.5s refresh would close it)
   const _ae=document.activeElement;
@@ -1124,6 +1126,7 @@ function renderModelModal(){
     +`<td>${gb(s.est_gb)}</td><td>${gb(s.gpu_gb)}</td></tr>`).join('');
   box.innerHTML='<button class="mdlclose" onclick="closeModelModal()">&times;</button>'
    +`<h2>${esc(lm.display_name||lm.friendly)}</h2>`
+   +((lm.aliases&&lm.aliases.length)?`<div class="sub" style="font-size:12px;color:#8b949e;margin-top:-4px" title="other names that resolve to this model">alias: ${lm.aliases.map(esc).join(', ')}</div>`:``)
    +(lm.target?`<div class="sub" style="font-size:12px">${esc(lm.target)}</div>`:``)
    +`<div style="margin:8px 0 2px 0">${tags.map(t=>`<span class="tag">${esc(String(t))}</span>`).join('')}</div>`
    +`<h3>Status</h3><div class="mgrid">`

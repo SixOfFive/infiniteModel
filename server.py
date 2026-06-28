@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c146"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c147"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -913,6 +913,14 @@ _CFG_SPEC_CACHE: dict = {}   # hf_id -> ModelSpec built from its downloaded conf
 MODEL_ALIASES: dict[str, str] = {
     "qwen2.5-14b": "qwen2.5-14b-instruct",   # 'qwen2.5:14b' <-> 'qwen2.5:14b-instruct'
 }
+
+
+def _aliases_for(friendly: str) -> list:
+    """Reverse of MODEL_ALIASES: the display-form alias(es) that resolve to this registry key, so the
+    dashboard can show them under the model's primary name (e.g. 'qwen2.5:14b-instruct' lists alias
+    'qwen2.5:14b'). Rendered in the Ollama 'family:size' form via _ollama_name (resolved at call time)."""
+    return [_ollama_name(a) for a, canon in MODEL_ALIASES.items()
+            if canon == friendly and a != friendly]
 
 
 def resolve_spec(model: str) -> Optional[ModelSpec]:
@@ -4883,6 +4891,7 @@ def build_status() -> dict:
         _is_moe = any(k in _arch for k in ("moe", "mixtral", "minimax", "deepseek_v"))
         return {
             "friendly": lm.friendly, "display_name": _ollama_name(lm.friendly),  # 'qwen3:4b'
+            "aliases": _aliases_for(lm.base or lm.friendly),  # display-form alias(es) -> shown under the name
             "target": lm.target_id, "ctx": lm.ctx,
             "base": lm.base or lm.friendly, "replica_idx": lm.replica_idx,  # data-parallel (#39)
             "active": lm.active, "queued": lm.queued,   # per-replica live load (#39 routing)
@@ -5112,6 +5121,9 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
              "target": tgt, "draft": draft, "ready": ready,
              "status": status, "loaded": loaded,
              "size_gb": round(size_bytes / GB, 2) if size_bytes else None}
+    _al = _aliases_for(name)
+    if _al:                          # show alias(es) under the primary name in the dashboard
+        entry["aliases"] = _al
     if loaded:                                   # live request queue depth (Inc 4)
         lm = engine.models[name]
         entry["active"] = lm.active              # currently generating (0/1)
