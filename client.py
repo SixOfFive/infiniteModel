@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c149"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c150"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -3315,6 +3315,13 @@ class Worker:
         # #distributed-packing Inc 3b: meta skeletons (per model_id) for per-expert MoE fuse-at-pack.
         # Cached so all N layers of one compile reuse a single from_config build (meta-only, cheap).
         self._pack_skel: dict = {}
+        # #hop-recovery: the live control-link send helper (session()'s `reply`, wlock+_enc framed)
+        # so the data plane can push an unsolicited hop_error to the controller when a next-hop send
+        # dies mid-generation. Bound after register, cleared on disconnect. Same event loop as
+        # _data_inbound/_send_next (the forward compute is the only thing offloaded to a thread), so a
+        # plain await is safe — no cross-thread queue needed.
+        self._ctrl_send = None       # Optional[Callable[[dict], Awaitable[None]]]
+        self._node_id: str = ""      # our registered node id (stamped onto the hop_error frame)
 
     def _build_shard(self, base: str, model_id: str, a: dict) -> Shard:
         import tempfile
@@ -3986,6 +3993,27 @@ class Worker:
                     import traceback
                     tb = traceback.format_exc()
                     print(f"[data] stage error: {exc!r}\n{tb}")
+                    # #hop-recovery: a CONNECTION-type exc here means _send_next re-raised AFTER its own
+                    # reconnect-once already failed (client _send_next) — i.e. the next-hop worker is
+                    # genuinely DEAD, not a transient the idle-socket freshen heals. A real stage COMPUTE
+                    # failure raises a model exception (RuntimeError/etc.), never one of these. The data
+                    # chain is one-way, so an error frame can't reach the controller over the dead hop;
+                    # push an UNSOLICITED hop_error up the (separate) control link so the controller fails
+                    # THIS rid's pending future at once instead of waiting out GEN_TIMEOUT (~600s) / the
+                    # gen-stall watchdog (~240s). Best-effort: skipped if the control link is mid-reconnect
+                    # (the watchdog still backstops). Sent via session's `reply` (wlock+_enc) so it never
+                    # interleaves a heartbeat.
+                    if isinstance(exc, (ConnectionError, OSError, asyncio.IncompleteReadError,
+                                        asyncio.TimeoutError)) and self._ctrl_send is not None:
+                        with contextlib.suppress(Exception):
+                            await self._ctrl_send({
+                                "type": "hop_error", "node_id": self._node_id,
+                                "model_id": model_id, "req_id": hdr.get("req_id"),
+                                "stage": self.assignments.get(model_id, {}).get("stage"),
+                                "next_host": self.next_peer.get(model_id),
+                                "error": repr(exc)})
+                        print(f"[data] next-hop for {model_id} died -> signalled controller hop_error "
+                              f"(req {hdr.get('req_id')}, next={self.next_peer.get(model_id)})", flush=True)
                     # surface the deepest FILE:line frames (skip caret-only lines) to the controller.
                     # Route the error through _send_next so it RECONNECTS the next hop first — else a
                     # downstream-conn failure would report the error over the SAME dead socket and be
@@ -4114,6 +4142,12 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                 writer.write(_enc(obj))
                 await writer.drain()
 
+        # #hop-recovery: expose the (wlock+_enc framed) control sender to the data plane so a dead
+        # next-hop forward can push an unsolicited hop_error to the controller. Cleared in finally so a
+        # stale closure from a dropped session is never used after reconnect.
+        worker._ctrl_send = reply
+        worker._node_id = node_id
+
         async def command_loop() -> None:
             while True:
                 line2 = await reader.readline()
@@ -4190,6 +4224,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
             if exc:
                 raise exc  # surfaces heartbeat-send failure -> reconnect
     finally:
+        worker._ctrl_send = None   # #hop-recovery: drop the dead session's control sender
         await worker.handle_unload()
         with contextlib.suppress(Exception):
             writer.close()

@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c149"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c150"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -4721,6 +4721,34 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 # success ack; the packed unit itself arrives via POST /pack_result (which resolves
                 # the future). Nothing to do here — kept so it isn't mistaken for a load reply.
                 pass
+            elif mtype == "hop_error":
+                # #hop-recovery: a worker's forward to its NEXT pipeline hop died mid-generation (the
+                # data chain is one-way, so no error frame can reach us over the dead hop). Fail ONLY
+                # this rid's in-flight pending future NOW so the blocked _send wait_for(fut,
+                # GEN_TIMEOUT ~600s) returns immediately, instead of waiting it (or the gen-stall
+                # watchdog ~240s) out. FULLY IDEMPOTENT: the rid may already be resolved by a logits
+                # frame or the watchdog -> pop + not-done check makes that a no-op. Keyed STRICTLY by
+                # the failed frame's rid, so a healthy concurrent/sibling-replica request is untouched.
+                # We do NOT decrement model.active here: failing the future synchronously resumes the
+                # live generate(), whose finally does model.active = max(0, active-1); decrementing here
+                # too would double-count. We only reset last_token_ts so the watchdog doesn't double-act.
+                _rid = msg.get("req_id")
+                _fr = engine.pending_friendly.get(_rid)
+                _f = engine.pending.pop(_rid, None)
+                engine.pending_model.pop(_rid, None)
+                engine.pending_friendly.pop(_rid, None)
+                if _f is not None and not _f.done():
+                    _nh = msg.get("next_host") or "?"
+                    _st = msg.get("stage")
+                    with contextlib.suppress(Exception):
+                        _f.set_exception(ConnectionError(
+                            f"mid-pipeline hop {_nh} died (stage {_st}) — reload/retry"))
+                    _m = engine.models.get(_fr) if _fr else None
+                    if _m is not None:
+                        _m.last_token_ts = time.time()   # don't let the watchdog double-act on this gen
+                    log_activity(f"hop_error: {_ollama_name(_fr or msg.get('model_id') or '?')} "
+                                 f"stage {_st} next-hop {_nh} died ({node.hostname}) — failed req "
+                                 f"{_rid} fast (slot reclaimed)")
             elif mtype in ("ready", "error"):
                 _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":
