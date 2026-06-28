@@ -66,12 +66,23 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   replication + data-parallel routing.
 - Robust loads: survive a worker drop mid-load (replan on survivors), free partial shards on failure,
   scaled timeouts, gentler restarts; auto-recover resident models when a worker reconnects.
-- **Stale-KV self-heal:** a worker stage ALWAYS rebuilds its KV cache when a frame starts a new
-  sequence (`cache_start == 0`), not only when the controller flags a reset. A generation reclaimed by
-  the gen-stall watchdog (or a disconnecting client) is cancelled on the controller, but the worker's
-  forward runs in an uncancellable thread and still finishes — leaving a stale KV cache behind. The
-  next request's prefill arrives at position 0 and now unconditionally starts fresh, so a reclaimed
-  generation can never corrupt the following one's attention mask ("expanded size N must match M").
+- **Stale-KV self-heal + crash-proof attention:** a worker stage's causal mask is sized for
+  `cache_start + q`, but SDPA takes the real kv-dim from the cache (`past + q`); they desync — and
+  crash with "expanded size N must match M" — when a generation reclaimed by the gen-stall watchdog
+  (or a disconnecting client) leaves an UNCANCELLABLE forward running in a thread that keeps mutating
+  the shared cache. Three layers now make this impossible: (1) forwards on a shard are SERIALIZED (a
+  non-blocking per-shard guard — a racing new forward fails fast and the controller re-prefills,
+  rather than concurrently corrupting the cache); (2) a new sequence (`cache_start == 0`)
+  unconditionally rebuilds the cache; (3) a decode/verify frame RECONCILES the cache to exactly
+  `cache_start` (crop an over-long stale cache; fail fast on an unrecoverable mismatch) before any
+  layer runs. A reclaimed generation can no longer corrupt the next one.
+- **Wedged-gen auto-recovery:** a distributed generation whose mid-pipeline hop dies never gets an
+  error frame upstream (the data chain is one-way), so it used to sit ACTIVE at 0 tok/s until the
+  600s timeout and needed a manual client restart. Two fixes: the gen-stall watchdog now (a) cancels
+  the REAL streaming body-pump task (the cancel handle had been the route task, which returns
+  immediately for a streaming response → the cancel was a no-op), and (b) fails the model's leaked
+  controller-side pending futures so the orphaned `_send` returns at once. The model reclaims its slot
+  and unblocks the queue on its own.
 - **Idle-pipeline self-heal:** every data-plane hop is fresh-reconnected at each generation's prefill
   if it has been idle (an idle TCP socket can go silently half-open — the write succeeds but the bytes
   never arrive — which otherwise stalls the first request after an idle gap until the generation

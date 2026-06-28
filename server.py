@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c140"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c141"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -4709,6 +4709,20 @@ async def gen_stall_watchdog() -> None:
             m.queued = 0
             m.last_tok_s = 0.0
             m.last_token_ts = now
+            # #recovery: a mid-pipeline hop death never delivers an error frame upstream (the data
+            # chain is one-way), so the orphaned generate() is blocked in _send's wait_for(fut,
+            # GEN_TIMEOUT). Fail this model's leaked controller-side pending futures NOW so _send
+            # returns immediately (ConnectionError) instead of hanging the coroutine for ~600s — the
+            # cancel above only helps if the task handle is live; this frees it regardless.
+            _tid = getattr(m, "target_id", None)
+            _failed = 0
+            for _rid, _f in list(getattr(engine, "pending", {}).items()):
+                if engine.pending_model.get(_rid) == _tid and not _f.done():
+                    with contextlib.suppress(Exception):
+                        _f.set_exception(ConnectionError("gen-stall watchdog reclaim"))
+                    engine.pending.pop(_rid, None)
+                    engine.pending_model.pop(_rid, None)
+                    _failed += 1
             with contextlib.suppress(Exception):
                 m.lock = asyncio.Lock()   # drop a lock an orphaned wedged gen may still hold -> unblock the queue
             engine._last_load_failure = time.time()   # arm the self-update cool-down (anti-churn after a fault)
@@ -8182,6 +8196,14 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         friendly = P["friendly"]; ids = P["ids"]; tok = P["tok"]
         max_new = P["max_new"]; temperature = P["temperature"]; top_p = P["top_p"]
         speculative = P["speculative"]; spec_k = P["spec_k"]
+        # #recovery: re-capture THIS body-pump task as the cancel handle. _inflight_admit captured the
+        # route-handler task, but a streaming response RETURNS that task immediately and the real
+        # generation runs here in the StreamingResponse body task — so the gen-stall watchdog's (and
+        # /cancel's) rec["task"].cancel() would otherwise be a no-op against an already-finished task,
+        # leaving the wedged generate() holding the lock + a leaked pending future until GEN_TIMEOUT.
+        if rec is not None:
+            with contextlib.suppress(Exception):
+                rec["task"] = asyncio.current_task()
         produced: list[int] = []
         prev = ""
         try:
@@ -8544,6 +8566,11 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
     async def gen_raw():
         """Yield (text_piece, done_reason_or_None) — incremental, multibyte-safe,
         WITH the literal <tool_call>/<think> markup preserved for downstream parsing."""
+        # #recovery: re-capture the real body-pump task (streaming returns the route task early) so the
+        # gen-stall watchdog / /cancel can actually abort a wedged Claude-Code generation. See run().
+        if rec is not None:
+            with contextlib.suppress(Exception):
+                rec["task"] = asyncio.current_task()
         produced: list[int] = []
         prev = ""
         try:

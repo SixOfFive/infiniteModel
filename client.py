@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c135"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c141"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1970,6 +1970,15 @@ class Shard:
                 mods += [self.norm, self.head]
             self.loaded_bytes = sum(self._mod_bytes(m) for m in mods if m is not None)
         self.kv = None  # per-generation KV cache (DynamicCache), reset on reset=True
+        # #fwd-serialize: forwards on ONE shard mutate the single shared self.kv. Normally a model's
+        # forwards are strictly sequential (the controller's per-model lock + awaiting each result),
+        # so this is uncontended. The exception is an ORPHANED forward: when the controller reclaims a
+        # wedged gen (gen-stall watchdog / client disconnect), the worker's forward keeps running in an
+        # uncancellable thread and a fresh request can spawn a SECOND forward on the same shard — both
+        # mutate self.kv concurrently, desyncing the KV length from the causal mask -> the SDPA
+        # "expanded size N must match M" crash. A non-blocking acquire makes the new forward fail FAST
+        # (controller re-prefills) instead of racing the orphan, and never blocks a thread-pool slot.
+        self._fwd_lock = threading.Lock()
         # rotary_emb stays on CPU; cos/sin are computed there and moved per-device.
         self.cpu = torch.device("cpu")
         self._place_modules(device, gpu_mem_gb)
@@ -2879,7 +2888,26 @@ class Shard:
     def forward(self, x, cache_start: int = 0, reset: bool = True,
                 all_logits: bool = False, inject=None, position_ids=None,
                 capture_hidden: bool = False, capture_pre_norm: bool = False):
-        """Run this stage's layers with an incremental KV cache (M2e).
+        # #fwd-serialize: serialize forwards on this shard so a still-running ORPHANED forward (from a
+        # reclaimed/disconnected gen — the worker thread can't be cancelled) can't concurrently mutate
+        # the shared self.kv underneath a fresh forward, which desyncs the KV length from the causal
+        # mask -> the SDPA "expanded size N must match M" crash. Non-blocking: a racing new forward
+        # fails FAST (the controller re-prefills) rather than blocking a thread-pool slot for the
+        # orphan's full (possibly minutes-long CPU prefill) runtime. Uncontended on the normal path
+        # (a model's forwards are sequential via the controller's per-model lock).
+        if not self._fwd_lock.acquire(blocking=False):
+            raise RuntimeError("shard busy with a prior (orphaned) forward — re-prefill required")
+        try:
+            return self._forward_impl(x, cache_start, reset, all_logits, inject,
+                                      position_ids, capture_hidden, capture_pre_norm)
+        finally:
+            self._fwd_lock.release()
+
+    def _forward_impl(self, x, cache_start: int = 0, reset: bool = True,
+                      all_logits: bool = False, inject=None, position_ids=None,
+                      capture_hidden: bool = False, capture_pre_norm: bool = False):
+        """Run this stage's layers with an incremental KV cache (M2e). Always called holding
+        self._fwd_lock (see forward()).
         x = token ids (first stage) or hidden states (mid stage), covering the
         `q` positions starting at absolute position `cache_start`. `reset` starts
         a fresh cache (prefill); otherwise the cached prior KV is reused (decode).
@@ -2904,6 +2932,25 @@ class Shard:
             # Gated-DeltaNet layers can store/read state instead of IndexError-ing on
             # an empty generic cache. Reused across prefill + every decode step.
             self.kv = DynamicCache(config=self.cfg) if self._hybrid else DynamicCache()
+        else:
+            # #kv-reconcile: the causal mask below is sized for kv-dim = cache_start + q, but SDPA
+            # takes the REAL kv-dim from self.kv (past + q). They must satisfy len(self.kv)==cache_start.
+            # A lost/dropped spec-decode crop frame (fire-and-forget, suppressed) or any drift breaks
+            # that and SDPA dies ("expanded size N must match M"). Reconcile BEFORE any layer runs:
+            # an over-long cache is cropped back to cache_start; an unrecoverable mismatch (too short,
+            # or hybrid recurrent state that can't be cropped) fails fast so the controller re-prefills
+            # instead of crashing the worker. In sync (the common decode step) this is one int compare.
+            try:
+                _have = int(self.kv.get_seq_length())
+            except Exception:
+                _have = cache_start          # can't introspect -> trust the caller (prior behaviour)
+            if _have != cache_start:
+                if (not self._hybrid) and _have > cache_start >= 0:
+                    self.kv.crop(cache_start)   # stale over-long KV -> truncate to the expected depth
+                else:
+                    raise RuntimeError(
+                        f"KV desync: cache has {_have} entries but frame expects cache_start="
+                        f"{cache_start} (hybrid={self._hybrid}) — re-prefill required")
         with torch.inference_mode():
             if self.uniform_device is not None:
                 return self._forward_uniform(x, cache_start, all_logits, inject, position_ids,
