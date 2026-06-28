@@ -14,7 +14,10 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 - **Tensor parallelism** within a stage — capacity-proportional, GPU+CPU mixed meshes, KV-head
   replication; in-place reconfigure between pipeline and TP.
 - **Speculative decoding** (opt-in, greedy-exact) — draft proposes K tokens, the pipeline verifies in
-  one traversal; wins on big/distributed targets (measured).
+  one traversal; wins on big/distributed targets (measured). A checkpoint-MTP (nextn) *self*-draft
+  for Qwen3.6 was built and the forward validated (~84-88% accept), but shelved: the hybrid
+  Gated-DeltaNet trunk can't roll back its recurrent state on reject (not bit-exact) and a 2-token
+  verify costs ~2x on the compute-bound GPU pipeline (no wall-clock win). Code kept, gated off.
 
 ## Memory, quantization & the shard cache
 - **int4** (group-wise asymmetric, fused tinygemm GEMM) and **int8** (per-channel) load-time quant;

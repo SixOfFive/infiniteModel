@@ -3823,7 +3823,17 @@ class Engine:
         and accept d iff it equals the target's greedy — so every emitted token is identical to
         plain greedy (bit-exact). On accept the next state comes free from the verify pass (2 tokens
         / 1 traversal); on reject we emit the target's correct token and re-feed it (2 tokens / 2
-        traversals). At ~84% accept that's ~1.7x fewer traversals == ~1.7x decode speedup."""
+        traversals).
+
+        #91 CLOSED — NOT VIABLE on this fleet (kept gated off; see _has_mtp). The MTP forward is
+        VALIDATED (~84-88% draft accept, perfect state-dict match), but two findings kill the win:
+          (1) NO SPEEDUP on the compute-bound 2-stage GPU pipeline — a q=2 verify chunk costs ~2x a
+              single token (measured x0.96), so fewer traversals != faster wall-clock here.
+          (2) NOT BIT-EXACT on the HYBRID Gated-DeltaNet trunk — _crop (KV truncate) cannot roll back
+              the linear-attention recurrent state on reject, and a q>1 chunk diverges from sequential
+              q=1 steps (chunked vs recurrent kernels). qcheck saw pos0 logits diverge max_abs 9.125.
+        Reviving it needs conv/recurrent state snapshot+restore around the verify AND a pipeline where
+        a 2-token chunk is sub-linear. Left intact (validated, reusable) rather than deleted."""
         import mtp_core
         import torch
         if not prompt_ids:
