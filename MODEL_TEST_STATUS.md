@@ -25,9 +25,9 @@ new tests run. (Seeded from session testing + decision history; correct any misc
 | `nomic-embed-text` | ✅ | embeddings (`/api/embed`) | Encoder, not a causal-LM (#81). |
 | `nvfp4-moe-e2e` (`nm-testing/nvfp4_moe-e2e`) | ✅ | int4 (from nvfp4 source) — **compile + serve-from-cache + generate** | Qwen3-MoE 128-expert per-expert nvfp4 (16.86 GB) → 15.98 GB int4 cache → gens coherently. Validated the per-expert nvfp4 MoE compile fix (m4c132). |
 | `qwen2.5-0.5b-gguf` (`Qwen/Qwen2.5-0.5B-Instruct-GGUF`, `q4_k_m`) | ✅ | **GGUF → safetensors normalize** → int4 — load + generate | Validates GGUF ingestion (m4c137–m4c144): `.gguf` dequantized to a safetensors checkpoint at add-time, then served as an ordinary int4 model (gens "France's capital is Paris."). |
-| `qwen3.6-27b-nvfp4` | 🟡 | nvfp4→bf16 serve-dequant loader (#90); dense nvfp4→int4 cache | Dense hybrid + multimodal. Loader landed; **generation not re-confirmed** this session. |
+| `qwen3.6-27b-nvfp4` | ✅ (text) | int4 (from nvfp4 source) — load + **generate** | Reasoning model (emits `<think>`). Loaded int4 auto (CPU-spilled alongside resident models) + **coherent gen confirmed** (m4c149: "The capital of France is Paris."). Multimodal path untested. |
 | `minimax-m2-bf16` | 🟡 | int4 **compile fix proven** (gate clears, packs correctly) | Non-fused per-expert MoE (#119). **Never loaded/generated end-to-end** — CPU-bound/unusable here (<0.3 tok/s, 110 GB int4 vs 33.6 GB fleet VRAM); full compile+load deferred. |
-| `qwythos:9b-abliterated` | 🟡 | load (#111) | qwen3_5; brought into the system; generation not re-confirmed here. |
+| `qwythos:9b-abliterated` | ✅ | int4 — load + **generate** | qwen3_5; loaded int4 auto (ctx 16384) + **coherent gen confirmed** (m4c149: "The capital of France is Paris."). |
 | `qwen2.5-coder:32b` | ⬜ | — | Registered; not validated this session. |
 | `nemotron:70b` | ⬜ | — | Registered; not validated this session. |
 | `kimi-dev:72b` | ⬜ | — | Registered; not validated this session. |
