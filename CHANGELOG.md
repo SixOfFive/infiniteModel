@@ -26,7 +26,8 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   budgets, and OOM-safe replans (cgroup caps, honest transient accounting).
 - **Pre-compiled shard cache** — the controller quantizes a model once to `_shards/<quant>/`; loads
   then serve small **pre-packed** int4/int8 layers (skip the bf16 stream + re-quantize). Covers dense,
-  fused-3D MoE, and per-expert MoE (Mixtral/OLMoE, fused at compile) — bit-identical to a cold load.
+  fused-3D MoE, per-expert MoE fused at compile (Mixtral/OLMoE), and **non-fused per-expert MoE**
+  (MiniMax-M2 — experts stay 2D Linears, int4-packed individually) — bit-identical to a cold load.
 - **Distributed packing** (exo-inspired) — the per-layer pack fans out across the fleet's idle CPUs:
   each worker fetches a layer's bf16, packs it with the *shared* packer (and, for per-expert MoE, fuses
   to 3D against a meta skeleton it rebuilds from the model config), and posts it back. Bit-identical to

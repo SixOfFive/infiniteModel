@@ -198,6 +198,22 @@ def _skeleton_from_cfg(cfg):
         cfg._attn_implementation = "eager"   # some remote-code archs abort on sdpa at from_config
     except Exception:
         pass
+    # transformers 5.x LlamaRotaryEmbedding reads cfg.rope_parameters["rope_type"] in __init__; a
+    # 4.x-era remote-code config (e.g. MiniMax-M2) leaves it None -> from_config raises 'NoneType' is
+    # not subscriptable and the skeleton FAILS to build, which made per-expert MoE compile wrongly
+    # report "no fused-3D skeleton". Synthesize it from the legacy rope_theta/rope_scaling — the SAME
+    # fix the worker load applies (client.py _Shard build) so the meta skeleton builds identically.
+    # Structure-only (the cache packs Linear weights, not rotary buffers) so any valid rope value is
+    # fine; gated on `is None` so native configs (which populate it) are untouched. (#119)
+    if getattr(cfg, "rope_parameters", None) is None:
+        _rs = getattr(cfg, "rope_scaling", None)
+        _rp = dict(_rs) if isinstance(_rs, dict) else {}
+        _rp.setdefault("rope_type", _rp.get("type", "default"))
+        _rp.setdefault("rope_theta", float(getattr(cfg, "rope_theta", 10000.0)))
+        try:
+            cfg.rope_parameters = _rp
+        except Exception:
+            pass
     ctx = init_empty_weights() if init_empty_weights is not None else torch.device("meta")
     with ctx:
         try:
@@ -305,14 +321,23 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     # build failed; dense arches fall back to the name heuristic, per-expert MoE rejects (can't fuse).
     _scope = _quant_scope(model_dir)
     _lin2d, _exp3d, _skel = _scope if _scope else (None, None, None)
-    # MoE compile (shard-cache Inc 2): FUSED 3D experts at int4 ARE supported — both already-fused
-    # checkpoints (Qwen3.6) and per-expert checkpoints (Mixtral/OLMoE), the latter fused on the fly via
-    # the SHARED `_fuse_moe_experts` (== the worker cold load) so the cache is bit-identical by
-    # construction. Still rejected with a CLEAR message (never a silent wrong cache): int8 MoE (no worker
-    # int8 3D-expert quant), fp8/nvfp4-source MoE (no 3D serve-dequant), and per-expert MoE when the
-    # fused-3D skeleton couldn't be built (then there is no expected layout to fuse into).
+    # MoE compile (shard-cache Inc 2/#119): int4 MoE is supported in THREE layouts, all bit-identical
+    # to the cold load by construction —
+    #   * FUSED checkpoint (Qwen3.6): 3D gate_up_proj/down_proj already in the weights.
+    #   * PER-EXPERT checkpoint the BUILD FUSES to 3D (Mixtral/OLMoE): `_fuse_moe_experts` stacks the
+    #     experts into the skeleton's 3D params (== the worker cold load), so `_exp3d` is non-empty.
+    #   * PER-EXPERT checkpoint the build KEEPS per-expert (MiniMax-M2): the model holds an `experts`
+    #     ModuleList of 2D Linears, so the skeleton-exact `_lin2d` already lists each expert Linear and
+    #     `pack_unit_tensors` int4-packs them as 2D — exactly what _quantize_experts4_streamed_nonfused
+    #     produces at load. `_fuse_moe_experts` is a no-op here (no 3D targets in the skeleton).
+    # Still rejected with a CLEAR message (never a silent wrong cache): int8 MoE (no worker int8
+    # 3D-expert quant), fp8/nvfp4-source MoE (no 3D serve-dequant), and ANY per-expert MoE whose
+    # skeleton failed to build (then we have neither a fused-3D layout to fuse into nor a per-expert
+    # Linear scope to pack — can't guarantee the cache matches a cold load).
     _moe = _has_moe_experts(wm)
     _moe_fused = any(s.endswith(".gate_up_proj") or s.endswith(".down_proj") for s in wm)
+    _skel_expert_lins = (_lin2d is not None and any(".experts." in n for n in _lin2d))
+    _moe_per_expert = _moe and not _moe_fused and not _exp3d and _skel_expert_lins
     if _moe:
         if quant != "int4":
             raise ValueError("MoE shard-cache compile supports int4 only "
@@ -320,9 +345,10 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
         if fp8_block is not None or nvfp4_group is not None:
             raise ValueError("fp8/nvfp4-source MoE shard compile not yet supported "
                              "(no 3D serve-dequant path)")
-        if not _moe_fused and (_skel is None or not _exp3d):
-            raise ValueError("per-expert MoE shard compile needs a fused-3D model skeleton to fuse "
-                             "into, which failed to build — cannot produce a correct cache")
+        if not _moe_fused and not _exp3d and not _moe_per_expert:
+            raise ValueError("per-expert MoE shard compile needs the model skeleton (it failed to "
+                             "build — no fused-3D layout to fuse into nor per-expert scope to pack); "
+                             "cannot produce a correct cache")
     n_layers = _model_num_layers(model_dir)
     with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
         tied = bool(json.load(fh).get("tie_word_embeddings", False))
@@ -332,7 +358,9 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     manifest: dict = {"format": 1, "quant": quant, "group_size": group_size,
                       "num_layers": n_layers, "tied": tied, "files": {}, "tensors": {},
                       "packer_hash": _packer_tag(quant, group_size),   # Inc 4: fail-loud on packer drift
-                      "expert_layout": ("fused3d" if _moe else None)}   # MoE serve-from-cache (Inc 2)
+                      # MoE serve-from-cache: fused-3D experts vs per-expert 2D Linears (M2). Informational
+                      # (the worker install reads tensor shapes, not this), but kept accurate. (#119)
+                      "expert_layout": (("per_expert" if _moe_per_expert else "fused3d") if _moe else None)}
     _open: dict = {}
 
     def _get(src_name: str):
