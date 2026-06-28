@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c145"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c149"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2012,6 +2012,29 @@ class Shard:
             return 0
         return 2 * int(ctx) * nkv * hd * 2
 
+    def _kv_layer_mask(self) -> list:
+        """#7: per-OWNED-layer bool — True = a layer that holds a growing full-ctx KV cache.
+        For a hybrid linear-attention arch (cfg.layer_types: interleaved Gated-DeltaNet vs
+        full-attention, e.g. qwen3-next / qwen3.6) ONLY the 'full_attention' layers grow a KV;
+        the linear-attn layers keep a small fixed recurrent state (treated as ~0 here). For
+        every dense/standard model (no layer_types) ALL True -> bit-identical to the old
+        uniform reservation. CONSERVATIVE on any uncertainty (missing/short layer_types,
+        out-of-range index, parse error): default a layer to True so we never under-reserve
+        and risk decode OOM. owned layer i = global layer self.layer_start + i."""
+        n = len(self.owned_layers)
+        lt = getattr(self.cfg, "layer_types", None)
+        if not getattr(self, "_hybrid", False) or not lt:
+            return [True] * n
+        base = int(getattr(self, "layer_start", 0) or 0)
+        mask = []
+        for i in range(n):
+            gi = base + i
+            try:
+                mask.append(lt[gi] == "full_attention")
+            except Exception:
+                mask.append(True)   # unknown -> reserve full KV (never under-reserve)
+        return mask
+
     def _place_modules(self, device: str, gpu_mem_gb: float, ctx: int = 0,
                        gpu_budget_gb: float = -1.0) -> None:
         """Assign embed / each owned layer / norm+head to CPU or GPU and move them.
@@ -2061,6 +2084,10 @@ class Shard:
             free = min(int(free), int(gpu_budget_gb * GB))
         GPU_SAFETY = int(0.4 * GB)
         kv_per_layer = self._kv_bytes_per_layer(ctx)
+        # #7: only full-attention layers grow a full-ctx KV; hybrid linear-attn layers don't.
+        # kv_lyr[i] = the KV bytes owned layer i actually reserves (kv_per_layer or 0). For a
+        # dense model this is kv_per_layer for every layer (unchanged). Mirrors kv_reserve_probe.
+        kv_lyr = [kv_per_layer if h else 0 for h in self._kv_layer_mask()]
         live_free = max(0, int(free) - GPU_SAFETY)
         nlyr = len(self.owned_layers)
         # #moe-offload: when enabled, a MoE layer that can't fit GPU whole is SPLIT — attention+norms
@@ -2073,7 +2100,7 @@ class Shard:
         moe_blocks = ([_find_moe_block(l) for l in self.owned_layers]
                       if moe_off else [(None, None)] * nlyr)
         self.layer_split = [False] * nlyr
-        whole_need = self.loaded_bytes + kv_per_layer * nlyr
+        whole_need = self.loaded_bytes + sum(kv_lyr)
         whole = ((mode in ("gpu", "cuda") and whole_need <= live_free)
                  or (mode == "auto" and whole_need < free * 0.85))
         if whole:
@@ -2102,12 +2129,12 @@ class Shard:
                 _blk = moe_blocks[i][1]
                 if moe_off and _blk is not None:
                     mixer_b = self._mod_bytes(l) - self._mod_bytes(_blk)
-                    if fits(mixer_b, kv_per_layer):
+                    if fits(mixer_b, kv_lyr[i]):
                         self.layer_devices.append(gpu)   # attention->GPU, experts stay CPU (split)
                         self.layer_split[i] = True
                     else:
                         self.layer_devices.append(cpu)   # mixer didn't fit -> whole layer to CPU
-                elif fits(self._mod_bytes(l), kv_per_layer):
+                elif fits(self._mod_bytes(l), kv_lyr[i]):
                     self.layer_devices.append(gpu)
                 else:
                     self.layer_devices.append(cpu)
@@ -2862,9 +2889,15 @@ class Shard:
         if ctx <= 0 or n_kv <= 0 or head_dim <= 0:
             return
         per_layer = 2 * int(ctx) * n_kv * head_dim * 2   # k+v, bf16 = 2 bytes/elem
+        # #7: a hybrid arch's linear-attn (Gated-DeltaNet) layers grow no full-ctx KV — only its
+        # full-attention layers do. Reserve per_layer on the KV-holding layers only (all of them
+        # for a dense model). _kv_layer_mask is conservative (unknown -> True) so we never
+        # under-reserve and risk decode OOM.
+        kv_mask = self._kv_layer_mask()
         by_dev: dict = {}
-        for d in self.layer_devices:
-            by_dev[d] = by_dev.get(d, 0) + per_layer
+        for d, holds_kv in zip(self.layer_devices, kv_mask):
+            if holds_kv:
+                by_dev[d] = by_dev.get(d, 0) + per_layer
         held = []
         try:
             for dev, nbytes in by_dev.items():
@@ -3134,11 +3167,24 @@ def _assemble_sd(tensors: dict, start: int, end: int, has_embed: bool,
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Self-update: poll GitLab for a newer copy of THIS file; when idle, swap it in
+# Self-update: poll GitHub for a newer copy of THIS file; when idle, swap it in
 # and exit(42) so the supervisor (systemd Restart=always on Linux / the .bat loop
 # on Windows) relaunches the new code. Idle-gated so a running model is never cut.
 # ---------------------------------------------------------------------------
-SELF_UPDATE_POLL_S = 120   # poll GitLab every 2 minutes (fast deploys; idle-gated)
+SELF_UPDATE_POLL_S = 120   # poll GitHub every 2 minutes (fast deploys; idle-gated)
+SELF_UPDATE_FETCH_TRIES = 4      # #3: bounded retry per file within a cycle (CDN propagation lag on a
+SELF_UPDATE_FETCH_BACKOFF_S = 8  # freshly-added module 404s on raw.githubusercontent until it syncs)
+
+
+def _extract_version(blob: bytes) -> str:
+    # #4: regex the `VERSION = "0.2-m4cNNN"` constant out of a fetched client.py/server.py so the
+    # self-updater restarts ONLY on a real VERSION bump, not on any byte diff (doc/comment commits).
+    import re
+    try:
+        m = re.search(rb'^VERSION\s*=\s*["\']([^"\']+)["\']', blob, re.MULTILINE)
+        return m.group(1).decode("utf-8", "replace") if m else ""
+    except Exception:
+        return ""
 
 
 def _fetch_repo_file(fname: str):
@@ -3162,14 +3208,24 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py"]   # conf
 
 def _self_update_check(fname: str, is_idle) -> None:
     """Multi-file self-update: fetch the primary file + EXTRA_UPDATE_FILES, and if ANY changed
-    (and we're idle) swap ALL changed files together, then restart. Abort the whole cycle if
-    ANY file fails to fetch, so the on-disk module set never goes half-updated/inconsistent."""
+    (and we're idle) stage ALL changed files together. RESTART only when the fetched primary-file
+    VERSION differs from the running VERSION (#4: a same-VERSION doc/comment commit must NOT bounce
+    the worker). Each fetch is bounded-retried with backoff so a CDN-propagation 404 on a freshly-
+    added file (#3) gets time to sync; if a file STILL won't fetch, abort THIS cycle (never apply a
+    half-updated set) and retry next poll."""
     here = os.path.dirname(os.path.abspath(__file__))
     files = [fname] + [f for f in EXTRA_UPDATE_FILES if f != fname]
     fetched: dict = {}
     for fn in files:
-        remote = _fetch_repo_file(fn)
-        if remote is None or len(remote) < 5:    # fetch failed / empty -> abort (stay consistent)
+        remote = None
+        for attempt in range(SELF_UPDATE_FETCH_TRIES):   # #3: retry — give the raw CDN time to propagate
+            remote = _fetch_repo_file(fn)
+            if remote is not None and len(remote) >= 5:
+                break
+            if attempt + 1 < SELF_UPDATE_FETCH_TRIES:
+                time.sleep(SELF_UPDATE_FETCH_BACKOFF_S * (attempt + 1))  # runs in a thread; safe to block
+        if remote is None or len(remote) < 5:    # still failing -> abort THIS cycle (stay consistent)
+            print(f"[update] {fn} not fetchable (404/transient on raw CDN) - aborting cycle, retry next poll")
             return
         fetched[fn] = remote
     changed = []
@@ -3187,15 +3243,22 @@ def _self_update_check(fname: str, is_idle) -> None:
     if not changed:
         return
     if not is_idle():
-        print(f"[update] {changed} newer on GitLab - deferring (build in progress)")
+        print(f"[update] {changed} newer on repo - deferring (build in progress)")
         return
-    print(f"[update] {changed} newer on GitLab - swapping in + restarting")
+    # #4: only RESTART on a VERSION bump in the primary file. Stage same-VERSION content changes to disk
+    # (atomic, picked up on the next natural restart) but don't bounce the worker for a doc/comment commit.
+    remote_ver = _extract_version(fetched.get(fname, b""))
+    version_bumped = bool(remote_ver) and remote_ver != VERSION
     for fn in changed:                           # write all .new first, then atomic-replace each
         path = os.path.join(here, fn)
         tmp = path + ".new"
         with open(tmp, "wb") as fh:
             fh.write(fetched[fn])
         os.replace(tmp, path)
+    if not version_bumped:
+        print(f"[update] {changed} staged on disk (VERSION {VERSION} unchanged) - NOT restarting (#4)")
+        return
+    print(f"[update] {changed} newer on repo (VERSION {VERSION} -> {remote_ver or '?'}) - restarting")
     os._exit(42)                                 # supervisor relaunches on the new code
 
 
@@ -4061,7 +4124,10 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                 if mtype == "load":
                     try:
                         info = await worker.handle_load(msg)
-                        await reply({"type": "ready", "node_id": node_id, **info})
+                        # #1: echo model_id so the controller resolves THIS model's load future
+                        # (a single shared future cross-resolved on a co-loaded node).
+                        await reply({"type": "ready", "node_id": node_id,
+                                     "model_id": msg.get("model_id"), **info})
                         if msg.get("kind") == "embedding":   # no layer range — whole encoder on one node
                             print(f"[load] embedding {msg.get('model_id')} "
                                   f"({info['loaded_bytes']/GB:.2f} GB)")
@@ -4070,7 +4136,8 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                                   f"layers {msg['layer_start']}-{msg['layer_end']} "
                                   f"({info['loaded_bytes']/GB:.2f} GB, RAM-only)")
                     except Exception as exc:
-                        await reply({"type": "error", "node_id": node_id, "error": repr(exc)})
+                        await reply({"type": "error", "node_id": node_id,
+                                     "model_id": msg.get("model_id"), "error": repr(exc)})  # #1: echo model_id
                         print(f"[load] FAILED: {exc!r}")
                 elif mtype == "pack":      # #distributed-packing: pack a shard-cache unit for the controller
                     try:

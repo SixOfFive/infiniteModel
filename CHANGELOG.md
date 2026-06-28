@@ -21,7 +21,14 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 
 ## Memory, quantization & the shard cache
 - **int4** (group-wise asymmetric, fused tinygemm GEMM) and **int8** (per-channel) load-time quant;
-  serve-time dequant of **fp8** and **nvfp4** checkpoints.
+  serve-time dequant of **fp8** and **nvfp4** checkpoints. Selecting **int8 on a MoE auto-downgrades to
+  int4** (with a loud log line): the int8 path only quantizes 2D Linears, so a MoE's fused-3D routed
+  experts would otherwise stay bf16 → a near-bf16 footprint (OOM/CPU-spill); int4 packs the experts.
+- **Hybrid models reserve KV only on their attention layers:** a Gated-DeltaNet hybrid (qwen3-next /
+  qwen3.6) grows a full-context KV only on its `full_attention` layers (the linear-attn layers keep a
+  small fixed recurrent state). KV reservation — both the GPU placement budget and the pre-alloc probe,
+  which mirror each other — now charges full-ctx KV only on the KV-holding layers, so more of a hybrid
+  fits per card. Conservative (an unknown layer reserves full KV); dense models are bit-identical.
 - GPU-first placement that always fits (spill to CPU/RAM), full-context KV pre-reservation, coexistence
   budgets, and OOM-safe replans (cgroup caps, honest transient accounting). Placement MODES: `auto`
   (GPU-first, fewest nodes — best decode latency), `single`, `gpu-spread` (fill every GPU then spill to
@@ -89,11 +96,25 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   immediately for a streaming response → the cancel was a no-op), and (b) fails the model's leaked
   controller-side pending futures so the orphaned `_send` returns at once. The model reclaims its slot
   and unblocks the queue on its own. (Hardened after an adversarial audit: the freed orphan's `finally`
-  decrement is floored at 0 so it can't drive `active` negative after the watchdog zeroed it; and the
-  leaked-future fail is skipped for data-parallel *replicated* models — `pending` is keyed by target_id,
-  shared across replicas, so a blanket fail would also kill a healthy sibling's request, which instead
-  relies on the per-request cancel.) Verified live: `/cancel` aborts a streaming gen at 6/400 tokens and
-  the slot frees + the model serves again immediately (the same handle the watchdog uses).
+  decrement is floored at 0 so it can't drive `active` negative after the watchdog zeroed it.) Verified
+  live: `/cancel` aborts a streaming gen at 6/400 tokens and the slot frees + the model serves again
+  immediately (the same handle the watchdog uses). Recovery is **replica-precise**: a parallel
+  `pending_friendly` map keys each in-flight request by the UNIQUE replica it was routed to (not the
+  `target_id` every replica of a base SHARES), so both the watchdog AND `invalidate_model` (a node
+  leaving mid-pipeline) fail ONLY the dead replica's leaked futures and never a healthy sibling's — so
+  a data-parallel model's stalled request now gets the same fast future-fail as a single-copy one
+  instead of hanging out the ~600s timeout (this supersedes the earlier replicated-SKIP).
+- **Concurrent-load isolation:** each control link keys its in-flight load/unload futures by model_id
+  (a dict) instead of one shared future, and the worker echoes model_id in its ready/error reply. Two
+  models loading onto stages of the SAME node concurrently no longer cross-resolve each other's load
+  (which mis-counted VRAM / reported "ready" early and hung the loser to its multi-minute timeout); a
+  sole-pending fallback keeps an old worker build working through a rolling deploy.
+- **Early architecture guard:** an exotic/unsupported model now fails at load-plan time with a clean
+  "unsupported architecture 'X'" instead of a cryptic meta-tensor crash deep in the streamed worker
+  build. The controller checks the config RESOLVES via `AutoConfig` (a registered model_type) — it does
+  NOT attempt a full model build, so natively-registered archs the worker hand-builds via a special path
+  (e.g. Qwen2.5-Omni) still pass; trust_remote_code models (auto_map) pass through too (the worker fetches
+  their .py via `/modelcode`), so no known-good model is rejected.
 - **Idle-pipeline self-heal:** every data-plane hop is fresh-reconnected at each generation's prefill
   if it has been idle (an idle TCP socket can go silently half-open — the write succeeds but the bytes
   never arrive — which otherwise stalls the first request after an idle gap until the generation
@@ -117,3 +138,10 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   credentials and internal-only artifacts scrubbed for open source.
 - **Self-update pulls from the public GitHub repo's raw endpoint** (`update_repo`/`update_branch`) — no
   token of any kind, on the controller or any worker. `provision_worker.sh` clones from public GitHub.
+- **Deploy guardrails:** each self-update file fetch is bounded-retried with backoff, so a freshly-added
+  module that hasn't propagated on the raw CDN yet gets time to sync instead of aborting the whole cycle
+  and leaving the fleet under-deployed (the apply stays atomic — all files or none). The auto-RESTART is
+  gated on a **VERSION bump** in the primary file: a same-VERSION doc/comment commit stages to disk
+  WITHOUT bouncing the fleet, so a casual push no longer reboots the cluster. The forced dashboard
+  "Update + restart" always restarts regardless. (Stale "GitLab" self-update wording corrected to GitHub
+  throughout.)

@@ -2,7 +2,7 @@
 REM ===========================================================================
 REM  InfiniteModel WORKER (Windows)  ->  connects to the BEAST controller
 REM
-REM  Pure supervisor loop. client.py SELF-UPDATES from GitLab (writes the new
+REM  Pure supervisor loop. client.py SELF-UPDATES from GitHub (writes the new
 REM  code, then exits with code 42); this loop relaunches it on the new file.
 REM
 REM  There is deliberately NO `git pull` in here: a .bat that git-resets itself

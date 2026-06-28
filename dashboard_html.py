@@ -317,7 +317,7 @@ DASHBOARD_HTML = """<!doctype html>
       <button onclick="doLoad()">Load</button>
       <button class="sec" onclick="doUnloadAll()" title="unload EVERY model from every node — drops all shards fleet-wide, frees their RAM/VRAM, and clears the controller's draft state. Reversible (reload from the list).">Unload all</button>
       <button class="sec" onclick="doRestart()" title="RESTART the whole fleet: signal every worker to restart, then restart the controller. ABORTS any in-flight load (use when a load is wedged with no other way out) and relaunches every process clean (supervisor) on the current code.">Restart fleet</button>
-      <button class="sec" onclick="doUpdate()" title="UPDATE + restart NOW (forced — does NOT wait for idle): unloads all models, tells every worker to free its RAM, pulls the latest code from GitLab, swaps it in, and relaunches. Auto-load is blocked during the swap so a client request can't reload a model into the box being torn down. Use this to deploy.">Update + restart</button>
+      <button class="sec" onclick="doUpdate()" title="UPDATE + restart NOW (forced — does NOT wait for idle): unloads all models, tells every worker to free its RAM, pulls the latest code from GitHub, swaps it in, and relaunches. Auto-load is blocked during the swap so a client request can't reload a model into the box being torn down. Use this to deploy.">Update + restart</button>
       <span class="sub" id="loadmsg"></span>
     </div>
     <div id="previewbox" class="sub" style="margin-top:8px"></div>
@@ -944,7 +944,7 @@ async function doRestart(){
   }catch(e){ el.textContent='restart sent — controller dropped the connection (relaunching), reload the page in a few seconds'; }
 }
 async function doUpdate(){
-  if(!confirm('UPDATE + RESTART NOW?\\n\\nForced (does NOT wait for idle): unloads ALL models, tells every worker to free its RAM, pulls the latest code from GitLab, swaps it in, and relaunches. Auto-load is blocked during the swap so a client request cannot reload a model mid-update. Any in-flight request is aborted.')) return;
+  if(!confirm('UPDATE + RESTART NOW?\\n\\nForced (does NOT wait for idle): unloads ALL models, tells every worker to free its RAM, pulls the latest code from GitHub, swaps it in, and relaunches. Auto-load is blocked during the swap so a client request cannot reload a model mid-update. Any in-flight request is aborted.')) return;
   const el=document.getElementById('loadmsg'); el.textContent='updating: unloading + freeing worker RAM + pulling code…';
   try{ const r=await (await fetch('/update',{method:'POST'})).json();
     el.textContent=r.ok?`update: unloaded ${(r.unloaded||[]).length} model(s), freed ${r.workers_freed} worker(s); controller relaunching on new code…`:`error: ${r.error||'failed'}`;

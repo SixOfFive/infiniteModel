@@ -285,6 +285,41 @@ def _quant_scope(model_dir: str):
         return None
 
 
+def validate_arch_supported(model_dir: str) -> None:
+    """Raise a clean ValueError if transformers cannot build this model's architecture (#6/#127):
+    an unknown model_type / unresolvable `architectures` with NO trust_remote_code. Run EARLY (at
+    load-plan time, before any stage is dispatched) so an exotic/unsupported arch fails LEGIBLY
+    instead of as a cryptic meta-tensor crash deep in the streamed worker build. Conservative — it
+    mirrors the worker's ACTUAL build path, so anything that passes here loads fine:
+      * a trust_remote_code model (config has `auto_map`, e.g. MiniMax-M2) builds its REAL arch from
+        the .py the worker fetches via /modelcode -> PASS THROUGH (the .py may not be local yet, so a
+        build attempt could false-reject).
+      * a native model (no auto_map) must RESOLVE to a transformers-registered config — we check that
+        AutoConfig.from_pretrained succeeds and reject ONLY when it genuinely can't resolve the arch.
+        We deliberately do NOT attempt a full model BUILD here: some natively-registered archs (e.g.
+        Qwen2.5-Omni) are hand-built by the worker via a special path and a generic AutoModel build
+        would FALSE-fail them — config resolution is the correct, conservative discriminator for "is
+        this an architecture transformers even knows about".
+    Reads config.json only (no weights) — controller-safe."""
+    try:
+        with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+            cfg_d = json.load(fh) or {}
+    except Exception:
+        return   # no readable config yet (e.g. GGUF mid-normalize) -> let the existing path handle it
+    if cfg_d.get("auto_map"):
+        return   # trust_remote_code: the worker fetches the .py + builds the real arch (don't reject)
+    mt = cfg_d.get("model_type") or "?"
+    archs = cfg_d.get("architectures") or []
+    try:
+        from transformers import AutoConfig
+        AutoConfig.from_pretrained(model_dir, trust_remote_code=True)   # resolves IFF the model_type is
+    except Exception as exc:                                            # registered (or remote-coded)
+        raise ValueError(
+            f"unsupported architecture '{archs[0] if archs else mt}' (model_type={mt!r}) — "
+            "transformers cannot resolve it (no registered model_type / no trust_remote_code). "
+            f"[{type(exc).__name__}: {exc}]") from exc
+
+
 def _sha256_file(path: str) -> str:
     import hashlib
     h = hashlib.sha256()

@@ -4,7 +4,7 @@ REM  InfiniteModel CONTROLLER  ->  run on BEAST
 REM  Ollama keeps :11434; InfiniteModel's Ollama-compatible API is on :21434.
 REM  Dashboard:  http://192.168.15.103:21434/   (control :50100, data :50101)
 REM
-REM  Pure supervisor loop. server.py SELF-UPDATES from GitLab (writes the new
+REM  Pure supervisor loop. server.py SELF-UPDATES from GitHub (writes the new
 REM  code, then exits with code 42); this loop relaunches it on the new file.
 REM
 REM  There is deliberately NO `git pull` in here: a .bat that git-resets itself

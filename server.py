@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c148"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c149"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -79,12 +79,25 @@ def print(*args, **kwargs):  # noqa: A001 — intentional builtin shadow for tim
     _builtins.print(time.strftime("[%Y-%m-%d %H:%M:%S]"), *args, **kwargs)
 
 
-# --- Self-update: poll GitLab for a newer server.py; when idle (no model loaded),
+# --- Self-update: poll GitHub for a newer server.py; when idle (no model loaded),
 # swap it in and exit(42) so the supervisor (server.bat loop on Windows / systemd)
 # relaunches the new code. Workers reconnect automatically. ---
 import wire   # shared: cluster config (load_config) + self-update source URL. wire.py is a core file
              # present in every checkout and kept in sync via EXTRA_UPDATE_FILES.
 SELF_UPDATE_POLL_S = 120   # poll the repo every 2 minutes (fast deploys; idle-gated)
+SELF_UPDATE_FETCH_TRIES = 4      # #3: bounded retry per file within a cycle (CDN propagation lag on a
+SELF_UPDATE_FETCH_BACKOFF_S = 8  # freshly-added module 404s on raw.githubusercontent until it syncs)
+
+
+def _extract_version(blob: bytes) -> str:
+    # #4: regex the `VERSION = "0.2-m4cNNN"` constant out of a fetched server.py/client.py so the
+    # self-updater restarts ONLY on a real VERSION bump, not on any byte diff (doc/comment commits).
+    import re
+    try:
+        m = re.search(rb'^VERSION\s*=\s*["\']([^"\']+)["\']', blob, re.MULTILINE)
+        return m.group(1).decode("utf-8", "replace") if m else ""
+    except Exception:
+        return ""
 
 
 def _fetch_repo_file(fname: str):
@@ -110,16 +123,26 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py",
 
 def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
     """Multi-file self-update: fetch the primary file + EXTRA_UPDATE_FILES, and if ANY changed
-    (and we're idle, OR force=True) swap ALL changed files together, then restart. Abort the whole
-    cycle if ANY file fails to fetch, so the on-disk module set never goes half-updated/inconsistent.
-    force=True is the dashboard/API 'Update' button: swap NOW without waiting for idle (the caller
-    has already unloaded models + told workers to free RAM)."""
+    (and we're idle, OR force=True) stage ALL changed files together. RESTART only when the fetched
+    primary-file VERSION differs from the running VERSION (#4: a same-VERSION doc/comment commit must
+    NOT bounce the fleet) — a forced update always restarts. Each fetch is bounded-retried with
+    backoff so a CDN-propagation 404 on a freshly-added file (#3) gets time to sync; if a file STILL
+    won't fetch, abort THIS cycle (never apply a half-updated set) and retry next poll. force=True is
+    the dashboard/API 'Update' button: swap NOW without waiting for idle (the caller has already
+    unloaded models + told workers to free RAM)."""
     here = os.path.dirname(os.path.abspath(__file__))
     files = [fname] + [f for f in EXTRA_UPDATE_FILES if f != fname]
     fetched: dict = {}
     for fn in files:
-        remote = _fetch_repo_file(fn)
-        if remote is None or len(remote) < 5:    # fetch failed / empty -> abort (stay consistent)
+        remote = None
+        for attempt in range(SELF_UPDATE_FETCH_TRIES):   # #3: retry — give the raw CDN time to propagate
+            remote = _fetch_repo_file(fn)
+            if remote is not None and len(remote) >= 5:
+                break
+            if attempt + 1 < SELF_UPDATE_FETCH_TRIES:
+                time.sleep(SELF_UPDATE_FETCH_BACKOFF_S * (attempt + 1))  # runs in a thread; safe to block
+        if remote is None or len(remote) < 5:    # still failing -> abort THIS cycle (stay consistent)
+            print(f"[update] {fn} not fetchable (404/transient on raw CDN) - aborting cycle, retry next poll")
             return
         fetched[fn] = remote
     changed = []
@@ -137,15 +160,22 @@ def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
     if not changed:
         return
     if not force and not is_idle():
-        print(f"[update] {changed} newer on GitLab - deferring (load/download/encode in progress)")
+        print(f"[update] {changed} newer on repo - deferring (load/download/encode in progress)")
         return
-    print(f"[update] {changed} newer on GitLab - swapping in + restarting")
+    # #4: only RESTART on a VERSION bump in the primary file. Stage same-VERSION content changes to disk
+    # (atomic, picked up on the next natural restart) but don't bounce the fleet for a doc/comment commit.
+    remote_ver = _extract_version(fetched.get(fname, b""))
+    version_bumped = bool(remote_ver) and remote_ver != VERSION
     for fn in changed:                           # write all .new first, then atomic-replace each
         path = os.path.join(here, fn)
         tmp = path + ".new"
         with open(tmp, "wb") as fh:
             fh.write(fetched[fn])
         os.replace(tmp, path)
+    if not force and not version_bumped:
+        print(f"[update] {changed} staged on disk (VERSION {VERSION} unchanged) - NOT restarting (#4)")
+        return
+    print(f"[update] {changed} newer on repo (VERSION {VERSION} -> {remote_ver or '?'}) - restarting")
     os._exit(42)                                 # supervisor relaunches on the new code
 
 
@@ -1243,7 +1273,7 @@ from shards import (_weight_map, _text_prefix, _head_key, _plan_weight_stream,
                     _build_weight_tp_blob, _fp8_dequant_part_bytes,
                     _nvfp4_dequant_part_bytes,
                     compile_shards, verify_shard_cache, shard_cache_status,
-                    cache_unit_path)   # noqa: E402,F401
+                    cache_unit_path, validate_arch_supported)   # noqa: E402,F401
 
 
 # #shard-cache Inc 2 (serve-from-cache): a compiled int4 cache is served byte-for-byte as PRE-PACKED
@@ -1284,8 +1314,11 @@ class ControlLink:
     node_id: str
     writer: asyncio.StreamWriter
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    pending_load: Optional[asyncio.Future] = None
-    pending_unload: Optional[asyncio.Future] = None
+    # #1: in-flight loads/unloads keyed by model_id — a single Future cross-resolved when
+    # two models load onto the SAME node concurrently (B's reply popped A's future). Keyed by
+    # model_id (target_id); unload-all (no model_id in the frame) keys under None.
+    pending_loads: dict = field(default_factory=dict)    # model_id -> asyncio.Future
+    pending_unloads: dict = field(default_factory=dict)  # model_id (or None) -> asyncio.Future
 
     async def send(self, obj: dict) -> None:
         async with self.lock:
@@ -1714,6 +1747,11 @@ class Engine:
         self.pending: dict[int, asyncio.Future] = {}
         self.pending_model: dict[int, str] = {}   # req_id -> model target_id (so a dropped
         #   data connection fails ONLY its own models' requests, not every model's)
+        # #5 replica-precise recovery: req_id -> the UNIQUE replica registry key (friendly) the
+        # request was routed to. pending_model alone is target_id, which all replicas of a base
+        # SHARE, so it can't tell a dead replica's in-flight request from a healthy sibling's. This
+        # map lets invalidate_model + the gen-stall watchdog fail ONLY the dead replica's futures.
+        self.pending_friendly: dict[int, str] = {}
         self.data_server: Optional[asyncio.AbstractServer] = None
         self.req_counter = 0
         # The engine lock guards ATOMIC mutation of engine state (self.models, self.loadings, node
@@ -1803,6 +1841,7 @@ class Engine:
                 fut = self.pending.pop(rid, None) if rid is not None else None
                 if rid is not None:
                     self.pending_model.pop(rid, None)
+                    self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
                 if hdr.get("kind") == "error":
                     if fut and not fut.done():
                         fut.set_exception(RuntimeError(hdr.get("error", "stage error")))
@@ -1847,6 +1886,7 @@ class Engine:
                         if fut is not None and not fut.done():
                             self.pending.pop(rid, None)
                             self.pending_model.pop(rid, None)
+                            self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
                             fut.set_exception(ConnectionError(
                                 "data connection closed (head did not re-deliver within grace)"))
                 with contextlib.suppress(Exception):
@@ -1896,6 +1936,7 @@ class Engine:
                 fut.set_exception(RuntimeError("pipeline invalidated"))
         self.pending.clear()
         self.pending_model.clear()
+        self.pending_friendly.clear()   # #5 keep replica map in lockstep
         _release_ram()              # actually hand the freed draft RAM back (gc cycles + OS)
 
     def invalidate_model(self, friendly: str, reason: str) -> None:
@@ -1908,6 +1949,19 @@ class Engine:
         if m is None:
             return
         print(f"[!] {friendly} invalidated: {reason} (reload required)")
+        # #5 replica-precise recovery: a node that LEFT/was reaped serves exactly THIS replica (the
+        # caller filtered by node_id in m.stage_node_ids). Its in-flight generate() is blocked in
+        # _send's wait_for(fut, GEN_TIMEOUT ~600s) with no upstream error frame, so fail this
+        # replica's leaked pending futures NOW. Match on pending_friendly (the routed replica's
+        # UNIQUE key), NOT pending_model (target_id is SHARED across replicas), so a healthy sibling
+        # replica's in-flight request is left untouched.
+        for _rid in [r for r, fr in list(self.pending_friendly.items()) if fr == friendly]:
+            _f = self.pending.pop(_rid, None)
+            self.pending_model.pop(_rid, None)
+            self.pending_friendly.pop(_rid, None)
+            if _f is not None and not _f.done():
+                with contextlib.suppress(Exception):
+                    _f.set_exception(ConnectionError(f"{friendly} replica invalidated: {reason}"))
         hosts = [s.hostname for s in m.plan.stages]
         # Non-graceful eviction (a node holding a shard died) — surface WHY on the dashboard.
         # This path used to be console-only, so a model that vanished on a node OOM/drop just
@@ -2210,6 +2264,12 @@ class Engine:
             # controller is the model source: download the full model once so the
             # /weights endpoint can serve each worker only its slice.
             model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+            # EARLY ARCH GUARD (#6/#127): reject an exotic/unbuildable architecture HERE — before any
+            # stage is dispatched — so it fails with a legible "unsupported architecture 'X'" instead
+            # of a cryptic meta-tensor crash deep in the streamed worker build. Conservative: runs the
+            # SAME meta skeleton the worker builds; trust_remote_code models pass through (the worker
+            # fetches their .py via /modelcode). No-op if there's no readable config yet.
+            await asyncio.to_thread(validate_arch_supported, model_dir)
             # ctx<=0 => use the model's native training context (config.json).
             ctx_was_auto = ctx <= 0          # #76: only auto-cap an AUTO ctx, never an explicit one
             if ctx <= 0:
@@ -2610,7 +2670,7 @@ class Engine:
                             nd.free_vram_after_resident_gb(committed.get(st.node_id, 0)),
                             _live_free_gb) - PLAN_VRAM_FLOOR_GB)
                     fut = loop.create_future()
-                    link.pending_load = fut
+                    link.pending_loads[target_id] = fut   # #1: key by model so a co-node load can't pop us
                     futs[st.node_id] = fut
                     await link.send({
                         "type": "load", "model_id": target_id,
@@ -2881,7 +2941,7 @@ class Engine:
             raise RuntimeError(f"no control link to {node.node_id}")
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
-        link.pending_load = fut
+        link.pending_loads[target_id] = fut   # #1: key by model (co-node loads race)
         await link.send({
             "type": "load", "kind": "embedding", "model_id": target_id,
             "controller_http_port": ARGS.http_port,
@@ -3248,7 +3308,7 @@ class Engine:
             if rank == 0:
                 msg["next_host"], msg["next_port"] = None, ARGS.data_port  # -> controller
             fut = loop.create_future()
-            link.pending_load = fut
+            link.pending_loads[target_id] = fut   # #1: key by model (co-node loads race)
             futs[n.node_id] = fut
             await link.send(msg)
         async def _abort_cleanup():
@@ -3393,6 +3453,7 @@ class Engine:
         fut = loop.create_future()
         self.pending[rid] = fut
         self.pending_model[rid] = model.target_id   # so a head drop fails only this model
+        self.pending_friendly[rid] = model.friendly   # #5 routed REPLICA key -> replica-precise recovery
 
         async def _flush(w) -> None:
             if mm is not None and reset:
@@ -3428,6 +3489,7 @@ class Engine:
         finally:
             self.pending.pop(rid, None)  # never leak the future
             self.pending_model.pop(rid, None)
+            self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
 
     async def _crop(self, model: LoadedModel, length: int) -> None:
         """Tell every stage of `model` to truncate its KV cache to `length` (spec rollback).
@@ -4088,7 +4150,7 @@ class Engine:
             link = self.links.get(nid)
             if link:
                 fut = loop.create_future()
-                link.pending_unload = fut
+                link.pending_unloads[m.target_id] = fut   # #1: key by model (worker echoes model_id)
                 with contextlib.suppress(Exception):
                     await link.send({"type": "unload", "model_id": m.target_id})
                     await asyncio.wait_for(fut, timeout=10)  # confirm teardown
@@ -4118,7 +4180,7 @@ class Engine:
             link = self.links.get(nid)
             if link:
                 fut = loop.create_future()
-                link.pending_unload = fut
+                link.pending_unloads[None] = fut   # #1: unload-all sends no model_id -> worker echoes None
                 with contextlib.suppress(Exception):
                     await link.send({"type": "unload"})
                     await asyncio.wait_for(fut, timeout=10)  # confirm teardown
@@ -4563,6 +4625,25 @@ async def _resilient_serve(host: Optional[str], port: int, handler, name: str) -
 # Control plane (bidirectional: heartbeats/responses in, commands out)
 # ---------------------------------------------------------------------------
 
+def _resolve_pending(d: dict, msg: dict, peer_host: str = "?") -> None:
+    """#1: resolve an in-flight load/unload future by model_id (pops the matching future).
+    Old worker builds that don't echo model_id fall back to the sole pending future (the
+    common case during a rolling deploy); ambiguous (>1 pending, no model_id) -> log + ignore."""
+    if msg.get("req_id") is not None:
+        return   # #1: a pack/compile frame (keyed by req_id in _pack_futures) — never a load/unload reply
+    mid = msg.get("model_id")
+    fut = d.pop(mid, None)
+    if fut is None:                      # missing/None model_id (old build) -> sole-pending fallback
+        if len(d) == 1:
+            fut = d.pop(next(iter(d)))
+        elif len(d) > 1:
+            print(f"[!] {peer_host}: {msg.get('type')} reply with no model_id and "
+                  f"{len(d)} pending — cannot disambiguate; ignored")
+            return
+    if fut is not None and not fut.done():
+        fut.set_result(msg)
+
+
 async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     peer = writer.get_extra_info("peername")
     peer_host = peer[0] if peer else "?"
@@ -4641,11 +4722,9 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 # the future). Nothing to do here — kept so it isn't mistaken for a load reply.
                 pass
             elif mtype in ("ready", "error"):
-                if link.pending_load and not link.pending_load.done():
-                    link.pending_load.set_result(msg)
+                _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":
-                if link.pending_unload and not link.pending_unload.done():
-                    link.pending_unload.set_result(msg)
+                _resolve_pending(link.pending_unloads, msg, peer_host)
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     except json.JSONDecodeError as exc:
@@ -4659,10 +4738,14 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             # that future now — otherwise the orchestrator blocks on it for the full
             # 900s timeout (a worker dying mid-load would hang the whole load).
             if link is not None:
-                for fut in (link.pending_load, link.pending_unload):
-                    if fut is not None and not fut.done():
-                        fut.set_exception(ConnectionError(
-                            f"{node.hostname} disconnected mid-operation"))
+                # #1: fail EVERY in-flight load/unload on this link (dict keyed by model_id) so
+                # none block on the full multi-minute timeout when a worker drops mid-operation.
+                for _d in (link.pending_loads, link.pending_unloads):
+                    for fut in list(_d.values()):
+                        if fut is not None and not fut.done():
+                            fut.set_exception(ConnectionError(
+                                f"{node.hostname} disconnected mid-operation"))
+                    _d.clear()
             for fr in [fr for fr, m in engine.models.items()
                        if node.node_id in m.stage_node_ids]:
                 engine.invalidate_model(fr, f"node {node.node_id} ({node.hostname}) left")
@@ -4731,25 +4814,24 @@ async def gen_stall_watchdog() -> None:
             # GEN_TIMEOUT). Fail this model's leaked controller-side pending futures NOW so _send
             # returns immediately (ConnectionError) instead of hanging the coroutine for ~600s — the
             # cancel above only helps if the task handle is live; this frees it regardless.
-            _tid = getattr(m, "target_id", None)
             _failed = 0
-            # SKIP when the model is data-parallel REPLICATED: engine.pending_model is keyed by
-            # target_id, which every replica of a base shares, so failing by target_id would also
-            # ConnectionError a HEALTHY sibling replica's in-flight request. Replicas instead rely on
-            # the per-request task cancel above (rec["task"]) + the GEN_TIMEOUT fallback. Single-copy
-            # models (the common case) get the fast future-fail.
-            _base = getattr(m, "base", None) or key
-            _replicated = False
-            with contextlib.suppress(Exception):
-                _replicated = engine.replica_count(_base) > 1
-            if not _replicated:
-                for _rid, _f in list(getattr(engine, "pending", {}).items()):
-                    if engine.pending_model.get(_rid) == _tid and not _f.done():
-                        with contextlib.suppress(Exception):
-                            _f.set_exception(ConnectionError("gen-stall watchdog reclaim"))
-                        engine.pending.pop(_rid, None)
-                        engine.pending_model.pop(_rid, None)
-                        _failed += 1
+            # #5: fail this WEDGED model's leaked controller-side pending futures by the routed
+            # replica key (engine.pending_friendly[rid] == key, the unique per-replica registry
+            # name). This supersedes the m4c146 replicated-SKIP: failing by friendly (not the
+            # SHARED target_id) touches ONLY this stalled replica's requests, never a healthy
+            # sibling replica's — so data-parallel models get the fast future-fail too instead of
+            # waiting out GEN_TIMEOUT. Single-copy models: friendly == the only key, same effect as
+            # before.
+            for _rid in [r for r, fr in list(getattr(engine, "pending_friendly", {}).items())
+                         if fr == key]:
+                _f = engine.pending.get(_rid)
+                engine.pending.pop(_rid, None)
+                engine.pending_model.pop(_rid, None)
+                engine.pending_friendly.pop(_rid, None)
+                if _f is not None and not _f.done():
+                    with contextlib.suppress(Exception):
+                        _f.set_exception(ConnectionError("gen-stall watchdog reclaim"))
+                    _failed += 1
             with contextlib.suppress(Exception):
                 m.lock = asyncio.Lock()   # drop a lock an orphaned wedged gen may still hold -> unblock the queue
             engine._last_load_failure = time.time()   # arm the self-update cool-down (anti-churn after a fault)
@@ -5882,6 +5964,27 @@ def build_app() -> FastAPI:
             cons, pv = False, True
         try:
             friendly = resolve_model_name(model)
+            # #2: int8 on a MoE silently keeps the fused-3D routed experts in bf16 (the worker int8
+            # path only quantizes 2D nn.Linears; there is no int8 3D-expert quantizer — same reason
+            # /compile_shards + /compile_dist reject int8 MoE). That yields a ~bf16 footprint -> OOM /
+            # CPU-spill. Auto-DOWNGRADE to int4 (which DOES pack experts) so the user gets a real memory
+            # reduction. Reuse the controller's existing MoE detector (weight-map -> _has_moe_experts).
+            # Best-effort: if we can't introspect the model, fall through and honor int8 as requested.
+            if quant == "int8":
+                try:
+                    import shards as _sh
+                    _tgt = MODELS[friendly][0] if friendly in MODELS else friendly
+                    _mdir = await asyncio.to_thread(_controller_model_dir, _tgt)
+                    if _mdir:
+                        _wm = await asyncio.to_thread(_sh._weight_map, _mdir)
+                        if await asyncio.to_thread(_sh._has_moe_experts, _wm):
+                            log_activity(f"{_ollama_name(friendly)}: int8 on a MoE keeps experts bf16 "
+                                         "(no int8 3D-expert quantizer) — DOWNGRADING to int4 for a real "
+                                         "memory reduction")
+                            quant = "int4"
+                except Exception as _moe_exc:
+                    log_activity(f"{_ollama_name(friendly)}: MoE check for int8 downgrade failed "
+                                 f"({_moe_exc}) — honoring int8 as requested")
             # replicas>1 (#39): load N full copies on disjoint nodes for data-parallel
             # throughput. Mutually exclusive with tp (tp splits one copy; replicas duplicate it).
             if tp <= 1 and replicas > 1:
@@ -6072,7 +6175,7 @@ def build_app() -> FastAPI:
 
     @app.post("/update")
     async def update_endpoint(request: Request, workers: int = 0) -> JSONResponse:
-        # FORCED UPDATE (dashboard 'Update' button / deploy API): pull the latest code from GitLab
+        # FORCED UPDATE (dashboard 'Update' button / deploy API): pull the latest code from GitHub
         # and restart NOW — do NOT wait for idle. Mitigates the auto-load race: set engine.updating
         # so no request reloads a model mid-swap, UNLOAD all models, tell every worker to FREE its
         # RAM (and restart too if workers=1), then swap changed files + exit(42) -> supervisor
