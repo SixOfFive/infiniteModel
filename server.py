@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c132"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c133"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -650,6 +650,34 @@ AUTO_CTX_SLOW_CAP = int(os.environ.get("INFINITEMODEL_AUTO_CTX_SLOW_CAP", "16384
 MAX_LOADED_MODELS = int(os.environ.get("INFINITEMODEL_MAX_LOADED", "4"))  # default safety cap
 DEFAULT_QUEUE_DEPTH = 2  # waiters allowed per model beyond the one in the slot (Ollama's
 #                          OLLAMA_MAX_QUEUE defaults to 512 — we keep it shallow on purpose)
+
+# --- #ctx-history: per-loaded-model rolling capture of the ACTUAL context in/out, for the dashboard
+# model-detail popup. Stores TOKEN IDS (cheap at capture — the hot path never detokenizes; /history
+# decodes lazily on click) keyed by friendly name; capped to the most-recent N requests AND a token
+# budget so huge Claude-Code contexts can't grow unbounded. Cleared when the model unloads (the
+# history is only meaningful while the model is resident).
+REQUEST_HISTORY: dict = {}
+HISTORY_KEEP = int(os.environ.get("IM_HISTORY_KEEP", "30") or 30)            # max requests kept/model
+HISTORY_TOK_BUDGET = int(os.environ.get("IM_HISTORY_TOK_BUDGET", "1500000") or 1500000)  # total tok cap
+
+
+def _record_ctx_history(friendly: str, in_ids, out_ids, tok_in: int, tok_out: int) -> None:
+    """Append one request's input+output token ids to the model's rolling history. Best-effort —
+    never raises into the decode path. Oldest entries drop past HISTORY_KEEP or the token budget."""
+    try:
+        if HISTORY_KEEP <= 0:
+            return
+        dq = REQUEST_HISTORY.setdefault(friendly, [])
+        dq.append({"ts": int(time.time() * 1000), "tok_in": int(tok_in), "tok_out": int(tok_out),
+                   "in_ids": list(in_ids), "out_ids": list(out_ids)})
+        while len(dq) > HISTORY_KEEP:
+            dq.pop(0)
+        tot = sum(e["tok_in"] + e["tok_out"] for e in dq)
+        while len(dq) > 1 and tot > HISTORY_TOK_BUDGET:
+            e = dq.pop(0)
+            tot -= (e["tok_in"] + e["tok_out"])
+    except Exception:
+        pass
 
 # --- Engine config (persisted; runtime-tunable from the dashboard) ---
 #   max_loaded   : cap on how many models stay resident at once.
@@ -1824,6 +1852,7 @@ class Engine:
             self._mtp_heads.clear()   # #91 free all controller-resident MTP heads
             _free_mtp_cuda()          # the GPU head's VRAM isn't released until empty_cache()
         self.models.clear()
+        REQUEST_HISTORY.clear()   # #ctx-history: history is only meaningful while a model is resident
         for fut in self.pending.values():
             if not fut.done():
                 fut.set_exception(RuntimeError("pipeline invalidated"))
@@ -1837,6 +1866,7 @@ class Engine:
         in-flight generation (if any) fails via the broken data connection, so this just drops
         the model's resident state and frees its controller-local draft."""
         m = self.models.pop(friendly, None)
+        REQUEST_HISTORY.pop(friendly, None)   # #ctx-history
         if m is None:
             return
         print(f"[!] {friendly} invalidated: {reason} (reload required)")
@@ -3438,6 +3468,7 @@ class Engine:
                     # (item[0] is not None); the trailing stop/length marker is skipped.
                     _t0 = time.monotonic()
                     _ntoks = 0
+                    _out_ids: list = []   # #ctx-history: accumulate generated token ids (decoded lazily)
                     # Multimodal (mm) forces PLAIN decode: the controller-side draft model has
                     # no image embeds, so speculative would diverge — only the full pipeline
                     # gets the spliced vision tokens at prefill.
@@ -3451,6 +3482,7 @@ class Engine:
                         async for item in self._decode_spec(model, prompt_ids, max_new, spec_k):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _out_ids.append(item[0])   # #ctx-history
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 _dt = time.monotonic() - _t0
                                 if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
@@ -3460,6 +3492,7 @@ class Engine:
                         async for item in self._decode_spec_mtp(model, prompt_ids, max_new, mtp_head):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _out_ids.append(item[0])   # #ctx-history
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 _dt = time.monotonic() - _t0
                                 if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
@@ -3470,6 +3503,7 @@ class Engine:
                                                              temperature, top_p, mm=mm, mrope=mrope):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _out_ids.append(item[0])   # #ctx-history
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 _dt = time.monotonic() - _t0
                                 if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
@@ -3482,6 +3516,9 @@ class Engine:
                     model.req_total += 1
                     model.tok_in_total += len(prompt_ids)
                     model.tok_out_total += _ntoks
+                    with contextlib.suppress(Exception):   # #ctx-history: capture this request's in/out
+                        _record_ctx_history(model.friendly, prompt_ids, _out_ids,
+                                            len(prompt_ids), _ntoks)
                     # Record decode throughput once the generation finishes (or is cut
                     # short). Guard on a sane sample (>=1 token, measurable time) so a
                     # zero-token or instant request doesn't poison the read.
@@ -4015,6 +4052,7 @@ class Engine:
         if getattr(self, "_mtp_heads", None) and self._mtp_heads.pop(friendly, None) is not None:
             _free_mtp_cuda()          # #91 release the GPU head's VRAM (empty_cache); else it leaks
         self.models.pop(friendly, None)
+        REQUEST_HISTORY.pop(friendly, None)   # #ctx-history
         _release_ram()
         print(f"[unload] evicted {friendly} ({reason})")
 
@@ -5995,6 +6033,43 @@ def build_app() -> FastAPI:
         d = await asyncio.to_thread(_controller_model_dir, target)
         with open(os.path.join(d, "config.json"), encoding="utf-8") as fh:
             return JSONResponse(json.load(fh))
+
+    @app.get("/history")   # #ctx-history: actual context IN/OUT for a loaded model (dashboard popup)
+    async def history(model: str, dir: str = "both", n: int = 0) -> JSONResponse:
+        # Returns the rolling per-request capture (newest first), decoding the stored token ids to
+        # text LAZILY here (off the event loop) so the decode path never pays it. Empty when the model
+        # isn't resident (history is cleared on unload). `dir`=in|out|both, `n`=limit to most-recent N.
+        try:
+            friendly = resolve_model_name(model)
+        except Exception:
+            friendly = model
+        full = REQUEST_HISTORY.get(friendly) or []
+        dq = list(full)[-n:] if (n and n > 0) else list(full)
+        lm = engine.models.get(friendly)
+        tok = getattr(lm, "tokenizer", None) if lm else None
+
+        def _build():
+            def _dec(ids):
+                if not tok or not ids:
+                    return ""
+                try:
+                    return tok.decode(ids, skip_special_tokens=False)
+                except Exception:
+                    return ""
+            out = []
+            for e in reversed(dq):   # newest first
+                rec = {"ts": e.get("ts"), "tok_in": e.get("tok_in"), "tok_out": e.get("tok_out")}
+                if dir in ("in", "both"):
+                    rec["input"] = _dec(e.get("in_ids"))
+                if dir in ("out", "both"):
+                    rec["output"] = _dec(e.get("out_ids"))
+                out.append(rec)
+            return out
+
+        entries = await asyncio.to_thread(_build)
+        return JSONResponse({"model": friendly, "count": len(full), "entries": entries,
+                             "tok_in_total": getattr(lm, "tok_in_total", 0) if lm else 0,
+                             "tok_out_total": getattr(lm, "tok_out_total", 0) if lm else 0})
 
     @app.get("/mtp_probe")
     async def mtp_probe(model: str = "qwen3.6-35b-a3b", mode: str = "dump",

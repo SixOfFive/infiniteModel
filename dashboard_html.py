@@ -201,8 +201,24 @@ DASHBOARD_HTML = """<!doctype html>
   #mdlbox table { width:100%; border-collapse:collapse; font-size:12px; margin-top:4px; }
   #mdlbox th, #mdlbox td { text-align:left; padding:3px 8px; border-bottom:1px solid #21262d; }
   #mdlbox th { color:#8b949e; font-weight:normal; }
+  /* #ctx-history: nested context-in/out popup (sits above the model modal) */
+  #ctxov { position:fixed; inset:0; background:rgba(1,4,9,.78); display:none; z-index:1100;
+           align-items:flex-start; justify-content:center; overflow:auto; padding:40px 16px; }
+  #ctxov.show { display:flex; }
+  #ctxbox { background:#0d1117; border:1px solid #30363d; border-radius:10px; max-width:980px;
+            width:100%; padding:20px 26px; box-shadow:0 14px 50px rgba(0,0,0,.6); }
+  #ctxbox h2 { margin:0; font-size:17px; color:#e6edf3; }
+  #ctxbox .mdlclose { float:right; cursor:pointer; color:#8b949e; font-size:22px; line-height:1; border:none; background:none; }
+  #ctxbox .mdlclose:hover { color:#e6edf3; }
+  #ctxbox .sub { color:#8b949e; font-size:12px; }
+  .ctxlink { color:#58a6ff; cursor:pointer; text-decoration:underline dotted; }
+  .ctxent { margin:10px 0; border:1px solid #21262d; border-radius:6px; }
+  .ctxhdr { background:#161b22; color:#8b949e; font-size:11px; padding:4px 10px; border-bottom:1px solid #21262d; }
+  .ctxpre { margin:0; padding:10px; max-height:340px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+            font-family:ui-monospace,Consolas,monospace; font-size:12px; color:#c9d1d9; }
 </style></head><body>
 <div id="mdlov" onclick="if(event.target===this)closeModelModal()"><div id="mdlbox"></div></div>
+<div id="ctxov" onclick="if(event.target===this)closeCtxHistory()"><div id="ctxbox"></div></div>
 <header><h1>∞ InfiniteModel</h1>
   <span class="sub" id="ctl">connecting…</span>
   <span class="sub" style="margin-left:auto"><a href="/bandwidth" style="color:#58a6ff;text-decoration:none" title="full controller↔node + node↔node traffic">Bandwidth →</a></span>
@@ -1048,7 +1064,33 @@ function openModelModal(key){ window.__mdl=key; renderModelModal();
   document.getElementById('mdlov').classList.add('show'); }
 function closeModelModal(){ window.__mdl=null;
   document.getElementById('mdlov').classList.remove('show'); }
-document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModelModal(); });
+document.addEventListener('keydown',e=>{ if(e.key!=='Escape')return;
+  if(document.getElementById('ctxov').classList.contains('show')) closeCtxHistory(); else closeModelModal(); });
+// #ctx-history: click a Tokens in/out row -> scrollable popup of the ACTUAL context for that direction.
+// Lives only while the model is loaded (controller clears it on unload); decoded on demand by /history.
+function closeCtxHistory(){ document.getElementById('ctxov').classList.remove('show'); }
+async function openCtxHistory(key,dir){
+  const ov=document.getElementById('ctxov'), box=document.getElementById('ctxbox');
+  const close='<button class="mdlclose" onclick="closeCtxHistory()">&times;</button>';
+  box.innerHTML=close+'<h2>loading…</h2>'; ov.classList.add('show');
+  let d;
+  try{ d=await (await fetch('/history?model='+encodeURIComponent(key)+'&dir='+dir)).json(); }
+  catch(e){ box.innerHTML=close+'<h2>error</h2><div class="sub">'+esc(String(e))+'</div>'; return; }
+  const ents=d.entries||[];
+  const title=(dir==='in'?'Context sent → ':'Context received ← ')+key;
+  let html=close+'<h2>'+esc(title)+'</h2>'
+    +'<div class="sub" style="margin-bottom:8px">'+ents.length+' of '+(d.count||ents.length)
+    +' kept request(s), newest first — cleared when the model unloads</div>';
+  if(!ents.length) html+='<div class="sub">no requests captured yet</div>';
+  ents.forEach((e,i)=>{
+    const txt=(dir==='in'?e.input:e.output)||'';
+    const tk=(dir==='in'?e.tok_in:e.tok_out)||0;
+    const when=e.ts?new Date(e.ts).toLocaleString():'';
+    html+='<div class="ctxent"><div class="ctxhdr">#'+(ents.length-i)+' · '+esc(when)+' · '
+      +tk.toLocaleString()+' tok</div><pre class="ctxpre">'+esc(txt)+'</pre></div>';
+  });
+  box.innerHTML=html;
+}
 function renderModelModal(){
   const key=window.__mdl; if(!key) return;
   const lms=(LAST&&LAST.cluster&&LAST.cluster.loaded_models)||[];
@@ -1104,8 +1146,8 @@ function renderModelModal(){
      +r('Decode tok/s (live)',(lm.tok_s||0).toFixed(1))
      +r('Decode tok/s (avg)',(lm.ema_tok_s||0).toFixed(1))
      +r('Decode tok/s (peak)',(lm.max_tok_s||0).toFixed(1))
-     +r('Tokens in (prompt)',(lm.tok_in_total||0).toLocaleString())
-     +r('Tokens out (gen)',(lm.tok_out_total||0).toLocaleString())
+     +r('Tokens in (prompt)',`<span class="ctxlink" onclick="openCtxHistory('${key}','in')">${(lm.tok_in_total||0).toLocaleString()} &#9656;&nbsp;view</span>`)
+     +r('Tokens out (gen)',`<span class="ctxlink" onclick="openCtxHistory('${key}','out')">${(lm.tok_out_total||0).toLocaleString()} &#9656;&nbsp;view</span>`)
    +`</div>`
    +`<h3>Stages (${(lm.stages||[]).length})</h3>`
    +`<table><tr><th>host</th><th>layers</th><th>#</th><th>role</th><th>est GB</th><th>GPU GB</th></tr>${st}</table>`

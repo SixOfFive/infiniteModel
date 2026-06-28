@@ -58,7 +58,10 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   timeout). Both the controller's connection to stage 0 and each worker's next-hop are freshened, so a
   model that sat loaded-but-unused replies immediately instead of appearing wedged.
 - Observability: placement preview, per-load progress/ETA, fleet CPU/GPU/RAM + throughput + bandwidth,
-  curl-able fleet logs; idle-gated multi-file self-update. A managed reload (reconfigure to/from
+  curl-able fleet logs; idle-gated multi-file self-update. **Per-model context history** — the model
+  detail popup's "tokens in/out" rows are click-through to a scrollable view of the ACTUAL prompts
+  sent and text generated (`GET /history`); captured as token ids (decoded lazily, off the hot path),
+  kept to the most-recent N requests, and cleared when the model unloads. A managed reload (reconfigure to/from
   tensor-parallel) shows live layer progress on its own card (folded in from the in-flight load) rather
   than a progress-less "re-streaming weights" placeholder beside a duplicate load card.
 - **TP mesh keepalive:** the tensor-parallel all-reduce mesh used to work for one generation then
