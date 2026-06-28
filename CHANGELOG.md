@@ -31,6 +31,9 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   Each cache unit's source tensors are read in **on-disk offset order** so a spinning weights drive
   reads sequentially (readahead) instead of seeking per tensor — large win for many-tiny-tensor MoE
   layers (read dominates compile time: e.g. MiniMax-M2 ~150 s read vs ~7 s pack per layer).
+  **fp8/nvfp4-source MoE** compiles too: compressed-tensors quantizes per-expert `Linear`s, so each
+  expert is a 2D `weight_packed` dequantized to bf16 by the same path dense fp8/nvfp4 uses, then
+  fused-3D or packed per-expert on bf16 (only an exotic fused-3D *quantized* expert is unsupported).
 - **Distributed packing** (exo-inspired) — the per-layer pack fans out across the fleet's idle CPUs:
   each worker fetches a layer's bf16, packs it with the *shared* packer (and, for per-expert MoE, fuses
   to 3D against a meta skeleton it rebuilds from the model config), and posts it back. Bit-identical to

@@ -342,9 +342,18 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
         if quant != "int4":
             raise ValueError("MoE shard-cache compile supports int4 only "
                              "(no worker int8 3D-expert quantizer)")
+        # fp8/nvfp4-source MoE (#nvfp4-moe): compressed-tensors quantizes nn.Linear modules, so a
+        # quantized MoE stores experts PER-EXPERT (`...experts.<N>.<proj>.weight_packed`/`.weight`),
+        # each a 2D tensor `_get_bf16` already dequantizes (the SAME path dense nvfp4/fp8 uses); the
+        # fuse-to-3D or per-expert pack then runs on bf16 as usual. So per-expert quantized MoE IS
+        # supported. Only a FUSED-3D quantized expert tensor (one 3D weight_packed per layer) would
+        # need a 3D serve-dequant we don't have — reject just that (compressed-tensors doesn't emit it).
         if fp8_block is not None or nvfp4_group is not None:
-            raise ValueError("fp8/nvfp4-source MoE shard compile not yet supported "
-                             "(no 3D serve-dequant path)")
+            _q_perexpert = any(".experts." in s and s.split(".experts.", 1)[1][:1].isdigit()
+                               for s in wm)
+            if not _q_perexpert:
+                raise ValueError("fused-3D fp8/nvfp4-source MoE shard compile not supported "
+                                 "(no 3D serve-dequant path); per-expert quantized MoE is supported")
         if not _moe_fused and not _exp3d and not _moe_per_expert:
             raise ValueError("per-expert MoE shard compile needs the model skeleton (it failed to "
                              "build — no fused-3D layout to fuse into nor per-expert scope to pack); "
