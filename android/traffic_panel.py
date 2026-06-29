@@ -6,10 +6,20 @@ Polls the controller's /status and draws a static, non-scrolling table of every 
 traffic to the rest of the fleet (node <-> all) plus the controller and a fleet TOTAL.
 
   DOWN / UP  - current in / out rate
+  NEXT       - where this node sends its activations, INFERRED from the loaded models'
+               pipeline placement (controller -> stage0 -> ... -> head -> controller).
+               'ctrl' = back to the controller (a head stage or a single-node model);
+               'mesh' = a tensor-parallel stage (within-stage all-reduce, no single hop);
+               a node serving >1 model shows the first destination + a count
   MAX        - peak combined (in+out) rate within the DISPLAYED sparkline window (NOT lifetime),
                and the sparkline is scaled to it (full bar == at this window's max)
   XFER       - bytes transferred since the panel started (resets on restart -- nothing persists);
                rows sort busiest-first by this
+
+NEXT is an INFERENCE from placement, not a measured per-edge rate (the controller doesn't expose
+per-peer byte counts over /status). In a running pipeline almost all of a node's UP traffic is the
+hidden-state handoff to its next stage, so the label tells you who that is -- but the DOWN/UP
+numbers are still each node's TOTAL across every connection, not a per-edge measurement.
 
 Native Termux (no proot/torch); pure /status consumer -- touches nothing in the fleet client.
   python traffic_panel.py [controller_ip] [poll_seconds]
@@ -31,6 +41,7 @@ LOG_CAP    = 4 * 1024 * 1024
 LOG_EVERY  = 10.0
 SPARK      = " ▁▂▃▄▅▆▇█"
 IDLE_FLOOR = 2048                                   # below this peak (B/s) a row's spark stays flat
+CTRL       = "controller"                           # controller's row name + bookend of every chain
 
 hist  = defaultdict(lambda: deque(maxlen=HIST))    # combined (in+out) rate samples
 xfer  = defaultdict(float)                          # cumulative bytes moved this session
@@ -73,6 +84,62 @@ def track(name, i, o):
     xfer[name] += c * POLL
 
 
+def build_edges(st):
+    """Derive where each node sends activations next, from every loaded PIPELINE model's ordered
+    stages. The flow is controller -> stage0 -> ... -> head -> controller, so consecutive stages
+    are the edges. Returns (down, mesh):
+      down  - hostname -> [downstream hostname, ...]  (insertion order, de-duped)
+      mesh  - hostnames in a tensor-parallel stage (within-stage all-reduce; no single downstream)
+    Hostnames are truncated like the table's row keys so they match. Pure /status reader."""
+    down = defaultdict(list)
+    mesh = set()
+
+    def add(a, b):
+        if a and b and b not in down[a]:
+            down[a].append(b)
+
+    cl = (st or {}).get("cluster") or {}
+    seen = set()
+    for mdl in (cl.get("loaded_models") or []):
+        stages = mdl.get("stages") or []
+        if not stages:
+            continue
+        if mdl.get("is_tp") or (mdl.get("tp_size") or 1) > 1:   # TP stage = mesh, not a clean hop
+            for s in stages:
+                h = (s.get("hostname") or "")[:12]
+                if h:
+                    mesh.add(h)
+            continue
+        chain = [(s.get("hostname") or "")[:12]
+                 for s in sorted(stages, key=lambda s: (s.get("layer_start") or 0))
+                 if s.get("hostname")]
+        if not chain:
+            continue
+        key = tuple(chain)
+        if key in seen:                       # same placement reported twice (primary + resident)
+            continue
+        seen.add(key)
+        prev = CTRL                           # controller feeds stage 0 ...
+        for h in chain:
+            add(prev, h)
+            prev = h
+        add(prev, CTRL)                       # ... and the head returns logits to the controller
+    return down, mesh
+
+
+def next_label(host, down, mesh):
+    """Compact '->destination' tag for a node's UP column. 'ctrl' = back to the controller;
+    'mesh' = a tensor-parallel stage; >1 destination (a node serving several models) shows the
+    first + a count."""
+    dl = down.get(host) or []
+    if not dl:
+        return "mesh" if host in mesh else ""
+    names = ["ctrl" if d == CTRL else d for d in dl]
+    if len(names) == 1:
+        return "→" + names[0][:7]
+    return "→" + names[0][:5] + "+%d" % (len(names) - 1)
+
+
 def log_csv(ts, samples):
     if ts - _last_log[0] < LOG_EVERY:
         return
@@ -96,7 +163,7 @@ def fetch():
         return json.load(r)
 
 
-ROW = " {:<12} {:>9} {:>9} {:>9} {:>9}  {}"    # NODE DOWN UP MAX XFER <spark>; fixed width = 55
+ROW = " {:<11} {:>9} {:>9} {:<9} {:>9} {:>9}  {}"  # NODE DOWN UP NEXT MAX XFER <spark>; fixed = 64
 _last_size = [0, 0]
 
 
@@ -111,7 +178,7 @@ def render():
     if (cols, lines) != (_last_size[0], _last_size[1]):
         _last_size[0], _last_size[1] = cols, lines
         sys.stdout.write("\033[2J")                   # full clear on (re)size -> no stale artifacts
-    sw = max(8, cols - 56)
+    sw = max(6, cols - 65)
     out = []
     now = time.strftime("%H:%M:%S")
     try:
@@ -120,12 +187,13 @@ def render():
     except Exception as e:
         st, err = None, str(e)
 
-    title = f" FLEET BANDWIDTH  node ↔ all  (MAX = peak in the window shown)   poll {POLL:.0f}s   {now}"
+    title = f" FLEET BANDWIDTH  node → next hop   (MAX = peak in window)   poll {POLL:.0f}s   {now}"
     out.append(f"\033[1;36m{title[:cols].ljust(cols)}\033[0m")
 
     if err:
         out.append(f"\033[31m controller {CTRL_IP} unreachable: {err}\033[0m"[:cols + 9])
     else:
+        down, mesh = build_edges(st)                   # inferred node -> downstream-node edges
         cur = {}                                       # name -> (in, out) this poll
         ti = to = 0.0
         for n in st.get("nodes", []):
@@ -147,23 +215,25 @@ def render():
         node_names = [nm for nm in cur if nm not in ("controller", "__total__")]
         node_names.sort(key=lambda nm: xfer[nm], reverse=True)
 
-        out.append("\033[2m" + ROW.format("NODE", "DOWN", "UP", "MAX", "XFER",
+        out.append("\033[2m" + ROW.format("NODE", "DOWN", "UP", "NEXT", "MAX", "XFER",
                                           "speed vs max"[:sw]) + "\033[0m")
         budget = max(1, lines - 4)
         shown = node_names[:budget]
         for name in shown:
             i, o = cur[name]
-            out.append(ROW.format(name, human(i), human(o), human(wmax[name]),
-                                  human_bytes(xfer[name]), spark(hist[name], sw, wmax[name]))[:cols])
+            out.append(ROW.format(name, human(i), human(o), next_label(name, down, mesh),
+                                  human(wmax[name]), human_bytes(xfer[name]),
+                                  spark(hist[name], sw, wmax[name]))[:cols])
         if len(node_names) > len(shown):
             out.append(f"\033[2m   …{len(node_names) - len(shown)} more node(s)\033[0m")
 
-        cl = ROW.format("controller", human(ci), human(co), human(wmax["controller"]),
-                        human_bytes(xfer["controller"]), spark(hist["controller"], sw, wmax["controller"]))
+        cl = ROW.format("controller", human(ci), human(co), next_label("controller", down, mesh),
+                        human(wmax["controller"]), human_bytes(xfer["controller"]),
+                        spark(hist["controller"], sw, wmax["controller"]))
         out.append(f"\033[35m{cl[:cols]}\033[0m")
 
-        tl = ROW.format(f"TOTAL {len(node_names)}", human(ti), human(to), human(wmax["__total__"]),
-                        human_bytes(xfer["__total__"]), "")
+        tl = ROW.format(f"TOTAL {len(node_names)}", human(ti), human(to), "",
+                        human(wmax["__total__"]), human_bytes(xfer["__total__"]), "")
         out.append(f"\033[1m{tl[:cols]}\033[0m")
         log_csv(time.time(), [(nm, *cur[nm]) for nm in node_names] + [("controller", ci, co)])
 
