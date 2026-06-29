@@ -1,9 +1,17 @@
 # Portable InfiniteModel worker — USB / offline install
 
-This folder makes the InfiniteModel **worker** (`client.py`) runnable on any
-Windows or Linux x86‑64 box **without installing anything into the OS** — no
-admin, no `apt`, no system Python required. Everything lives inside the repo
-folder, so you can copy it to a USB stick and run it anywhere.
+This folder makes the InfiniteModel **worker** runnable on any Windows or Linux
+x86‑64 box **without installing anything into the OS** — no admin, no `apt`, no
+system Python required. Everything lives inside the repo folder, so you can copy
+it to a USB stick and run it anywhere.
+
+> The worker's entry point is `client.py`, but it now loads several sibling
+> modules (`state.py`, `wire.py`, `shard_build.py`, `shard_forward.py`,
+> `worker_load.py`, `worker_net.py`). They're committed source, so the
+> *copy‑the‑whole‑folder* step below carries them automatically — **don't ship
+> `client.py` alone.** (An online worker would self‑heal by fetching any missing
+> module from the public repo, but an offline box can't, so the bundle must
+> include them.)
 
 ## Two phases
 

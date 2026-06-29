@@ -58,6 +58,29 @@ The controller downloads the model once, plans placement (GPU-first, spill to CP
 tensor-parallel), and streams each stage's weights to its worker straight into RAM (workers keep no
 model on disk). Generation flows around the ring `controller → stage0 → … → head → controller`.
 
+## Project layout
+
+Each role keeps a single entry point — **`server.py`** (controller) and **`client.py`** (worker) — but
+the bulk of each is split into focused sibling modules, so any one subsystem fits a reader's (and an
+editor's) context window. This is an internal refactor with **zero public-API change**; the fleet's
+multi-file self-update keeps every module in lock-step across machines.
+
+**Controller** — `server.py` is the `Engine` + FastAPI `build_app()` shell that wires the modules
+together (via `state.py`):
+
+- `engine_load.py` · `engine_gen.py` · `engine_lifecycle.py` — the `Engine` mixins: load / placement / TP, prefill / decode / speculative, and data-plane / recovery / unload.
+- `routes_dashboard.py` · `routes_lifecycle.py` · `routes_api.py` · `routes_diag.py` — HTTP routes (UI + status, load / unload / compile, the inference APIs, multimodal test endpoints).
+- `serving.py` — request serving (Ollama / OpenAI / Anthropic generate + chat); `status.py` — the `/status` + dashboard payload builders.
+- `placement.py` — partition planner; `shards.py` — shard-cache compile / quant / dequant; `model_store.py` — model download / measure / storage.
+- `formats.py` — prompt/response + tool-call formatting; `multimodal.py` — vision / audio / speech encoders; `graphs.py` + `dashboard_html.py` — the dashboard; `gguf_convert.py` — GGUF→safetensors (subprocess).
+
+**Worker** — `client.py` is the `Shard` + `Worker` shell:
+
+- `shard_build.py` · `shard_forward.py` — the `Shard` mixins: placement / streaming weight-load, and the forward path.
+- `worker_load.py` · `worker_net.py` — the `Worker` mixins: build / load / pack / unload / TP, and next-hop connect / send + data-plane.
+
+**Shared:** `state.py` (a namespace registry so relocated modules resolve their former globals without a circular `import server`), `wire.py` (plain-TCP transport primitives), and `config.json` (hosts / ports + self-update source).
+
 ---
 
 ## Installation
