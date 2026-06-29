@@ -743,6 +743,24 @@ class ShardBuildMixin:
                         else int(getattr(self.cfg, "hidden_size", 0) or 0)
                     _dt = _w.dtype if _w is not None else torch.float32
                     _em._buffers["embed_scale"] = torch.tensor(_dim ** 0.5, dtype=_dt)
+        # Gemma-4 MoE router (Gemma4TextRouter) defines `scale` (hidden_size) and `per_expert_scale`
+        # (num_experts) as nn.Parameters initialized to ONES — but the checkpoint OMITS them (only
+        # router.proj.weight is stored). A streamed/cache build never fills them, so they stay on META
+        # and trip the meta-guard below. Materialize any meta router scale param to ones — exactly what
+        # HF from_pretrained does for an absent param (its _init_weights uses init.ones_). Gated on the
+        # parent module name ending in "Router" so it can't clobber an unrelated `scale` elsewhere.
+        for _lyr in self.owned_layers:
+            for _mod in _lyr.modules():
+                if not type(_mod).__name__.endswith("Router"):
+                    continue
+                for _pn in ("scale", "per_expert_scale"):
+                    _pp = _mod._parameters.get(_pn, None)
+                    if _pp is not None and getattr(_pp, "is_meta", False):
+                        _dt = next((p.dtype for p in _lyr.parameters()
+                                    if not getattr(p, "is_meta", False) and p.is_floating_point()),
+                                   torch.bfloat16)
+                        _mod._parameters[_pn] = torch.nn.Parameter(
+                            torch.ones(tuple(_pp.shape), dtype=_dt), requires_grad=False)
         model.eval()
         # TP-v2: the row-parallel o_proj/down_proj produce PARTIAL outputs — sum them across the TP
         # group via the same forward-hook + _TPAllReduce wiring as the v1 __init__ path. The reduced
