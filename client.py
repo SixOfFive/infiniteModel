@@ -1208,6 +1208,16 @@ def _w4a16_expert_cls():
                 mkw = {k: (v._materialize() if isinstance(v, cls) else v) for k, v in kwargs.items()}
                 return func(*mat, **mkw)
 
+            @classmethod
+            def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                # Required by _make_wrapper_subclass. The fast path is handled in
+                # __torch_function__ (F.linear); anything that reaches the aten dispatcher with a
+                # wrapper operand just materializes to bf16 and re-runs — correctness over speed.
+                kwargs = kwargs or {}
+                mat = [a._materialize() if isinstance(a, cls) else a for a in args]
+                mkw = {k: (v._materialize() if isinstance(v, cls) else v) for k, v in kwargs.items()}
+                return func(*mat, **mkw)
+
         _W4A16_EXPERT = _W4A16Weight
     except Exception as exc:
         _builtins.print(f"[int4] triton w4a16 expert subclass unavailable ({exc!r})", flush=True)
