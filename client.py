@@ -956,6 +956,32 @@ def _quant4_linear_cls():
                 self._fused_tried = True
                 dev = self.qweight.device
                 aten = torch.ops.aten
+                # ROCm (AMD): torch's _weight_int4pack_mm is CDNA2+-only, so on RDNA (gfx1151) the
+                # naive path rematerializes the whole bf16 weight per token (~5-20x slower). Use the
+                # Triton w4a16 GEMM that reads int4 directly. Self-checked vs naive; falls back on
+                # mismatch/unavailable. NVIDIA + CPU keep the torch tinygemm path below, untouched.
+                if dev.type == "cuda" and getattr(torch.version, "hip", None):
+                    op = _w4a16_triton_op()
+                    if op is None:
+                        return
+                    try:
+                        G = self.group_size
+                        ng = self.scale.shape[1]
+                        in_pad = ng * G
+                        sz = (self.scale, self.zero)
+                        xt = torch.randn(8, self.in_features, device=dev, dtype=torch.bfloat16)
+                        xk = xt if in_pad == self.in_features else F.pad(xt, (0, in_pad - self.in_features))
+                        yf = op(xk.contiguous(), self.qweight, G, sz).float()
+                        yn = F.linear(xt, self._dequant(torch.bfloat16)).float()
+                        rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
+                        if rel < 0.05:
+                            self._fused = (self.qweight, sz, op, in_pad)   # kernel reads qweight; keep it
+                            print(f"[int4] triton w4a16 kernel active on {dev}", flush=True)
+                        else:
+                            print(f"[int4] triton w4a16 self-check rel={rel:.3f} on {dev} -> naive", flush=True)
+                    except Exception as exc:
+                        print(f"[int4] triton w4a16 prepare failed on {dev} ({exc!r}) -> naive", flush=True)
+                    return
                 if dev.type == "cuda":
                     try:
                         ok = (torch.cuda.get_device_capability(dev) >= (8, 0)
@@ -1033,6 +1059,82 @@ def _quant4_linear_cls():
 
         _QUANT_LINEAR4 = QuantLinear4
     return _QUANT_LINEAR4
+
+
+# --- Triton w4a16 int4 GEMM (ROCm fast int4 decode) ------------------------------------------
+# torch's fused int4 (_weight_int4pack_mm) is CDNA2+-only on ROCm, so on RDNA (e.g. AMD Strix
+# Halo gfx1151) int4 decode falls back to the naive path that rematerializes the whole bf16
+# weight every token (GPU-bound, ~5-20x slower). This Triton kernel reads the packed int4
+# weight and dequantizes INSIDE the GEMM, in the worker's exact group-wise asymmetric format:
+# qweight uint8 [N, K//2] (byte j -> col 2j low nibble / 2j+1 high nibble), scale/zero bf16
+# [N, K//group], w=(q-zero)*scale per group. Bit-identical to the naive path (self-checked in
+# prepare_fused). Lazily built on first use; ROCm-only — never touches the NVIDIA/CPU paths.
+_W4A16_OP = None
+_W4A16_TRIED = False
+
+
+def _w4a16_triton_op():
+    """Callable op(x[M,Kpad] bf16, qweight uint8[N,Kpad//2], group, (scale,zero) bf16[N,ng]) ->
+    y[M,N] bf16, or None if triton is unavailable / fails to build."""
+    global _W4A16_OP, _W4A16_TRIED
+    if _W4A16_TRIED:
+        return _W4A16_OP
+    _W4A16_TRIED = True
+    try:
+        import torch
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _k(x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, M, N, K,
+               sxm, sxk, sqk, sqn, ssn, ssg, szn, szg, sym, syn,
+               GROUP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+            pid_m = tl.program_id(0)
+            pid_n = tl.program_id(1)
+            offs_m = pid_m * BM + tl.arange(0, BM)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            offs_h = tl.arange(0, GROUP // 2)            # byte index within a K-group
+            acc = tl.zeros((BM, BN), dtype=tl.float32)
+            for kb in range(0, K // GROUP):
+                k0 = kb * GROUP
+                mm = offs_m[:, None] < M
+                xe = tl.load(x_ptr + offs_m[:, None] * sxm + (k0 + 2 * offs_h)[None, :] * sxk,
+                             mask=mm, other=0.0)
+                xo = tl.load(x_ptr + offs_m[:, None] * sxm + (k0 + 2 * offs_h + 1)[None, :] * sxk,
+                             mask=mm, other=0.0)
+                qp = q_ptr + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
+                b = tl.load(qp, mask=offs_n[None, :] < N, other=0).to(tl.int32)
+                lo = (b & 0xF).to(tl.float32)
+                hi = ((b >> 4) & 0xF).to(tl.float32)
+                s = tl.load(s_ptr + offs_n * ssn + kb * ssg, mask=offs_n < N, other=0.0).to(tl.float32)
+                z = tl.load(z_ptr + offs_n * szn + kb * szg, mask=offs_n < N, other=0.0).to(tl.float32)
+                wlo = ((lo - z[None, :]) * s[None, :]).to(tl.bfloat16)
+                whi = ((hi - z[None, :]) * s[None, :]).to(tl.bfloat16)
+                acc += tl.dot(xe.to(tl.bfloat16), wlo)
+                acc += tl.dot(xo.to(tl.bfloat16), whi)
+            yp = y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn
+            tl.store(yp, acc.to(tl.bfloat16), mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+        def _op(x, qweight, group_size, sz):
+            scale, zero = sz
+            x = x.contiguous()
+            M, K = x.shape
+            N = qweight.shape[0]
+            y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+            BM, BN = 16, 128
+            grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+            _k[grid](x, qweight, scale, zero, y, M, N, K,
+                     x.stride(0), x.stride(1), qweight.stride(1), qweight.stride(0),
+                     scale.stride(0), scale.stride(1), zero.stride(0), zero.stride(1),
+                     y.stride(0), y.stride(1), GROUP=group_size, BM=BM, BN=BN)
+            return y
+
+        _W4A16_OP = _op
+        _builtins.print("[int4] triton w4a16 kernel built (ROCm fast int4)", flush=True)
+    except Exception as exc:
+        _builtins.print(f"[int4] triton w4a16 unavailable ({exc!r}) -> naive int4", flush=True)
+        _W4A16_OP = None
+    return _W4A16_OP
 
 
 def _quantize_linear4(lin, group_size: int = _INT4_GROUP):
