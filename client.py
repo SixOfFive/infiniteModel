@@ -1117,7 +1117,15 @@ def _w4a16_triton_op():
 
         def _op(x, qweight, group_size, sz):
             scale, zero = sz
+            if x.dim() != 2:
+                x = x.reshape(-1, x.shape[-1])
+            if x.dtype != torch.bfloat16:
+                x = x.to(torch.bfloat16)
             x = x.contiguous()
+            Kpad = qweight.shape[1] * 2                  # pad activations to the packed width
+            if x.shape[1] != Kpad:                       # (no-op for QuantLinear4, which pre-pads;
+                import torch.nn.functional as _F          #  used by the MoE expert path)
+                x = _F.pad(x, (0, Kpad - x.shape[1]))
             M, K = x.shape
             N = qweight.shape[0]
             y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
@@ -1135,6 +1143,76 @@ def _w4a16_triton_op():
         _builtins.print(f"[int4] triton w4a16 unavailable ({exc!r}) -> naive int4", flush=True)
         _W4A16_OP = None
     return _W4A16_OP
+
+
+_W4A16_EXPERT = None
+
+
+def _w4a16_expert_cls():
+    """torch.Tensor subclass for ONE MoE expert's int4 weight (ROCm). Packed4Tensor3D.__getitem__
+    returns this instead of a dequantized bf16 weight: it intercepts F.linear(activation, this)
+    via __torch_function__ and routes to the Triton w4a16 kernel (reads int4 directly — no
+    per-expert full-weight bf16 rematerialization), and materializes to bf16 for ANY other op so
+    nothing breaks. The MoE host calls F.linear(state, gate_up_proj[e]) / (state, down_proj[e]),
+    so this fuses the routed-expert GEMMs. None if triton is unavailable."""
+    global _W4A16_EXPERT
+    if _W4A16_EXPERT is not None:
+        return _W4A16_EXPERT
+    op = _w4a16_triton_op()
+    if op is None:
+        return None
+    try:
+        import torch
+        import torch.nn.functional as F
+
+        class _W4A16Weight(torch.Tensor):
+            @staticmethod
+            def __new__(cls, packed, scale, zero, group, in_features):
+                out = packed.shape[0]
+                t = torch.Tensor._make_wrapper_subclass(
+                    cls, (out, in_features), dtype=scale.dtype,
+                    device=packed.device, requires_grad=False)
+                t._packed = packed
+                t._scale = scale
+                t._zero = zero
+                t._group = group
+                t._infeat = in_features
+                return t
+
+            def _materialize(self):
+                qw = self._packed
+                out = qw.shape[0]
+                lo = (qw & 0x0F).to(torch.int16)
+                hi = (qw >> 4).to(torch.int16)
+                q = torch.stack((lo, hi), dim=2).reshape(out, -1)
+                ng = self._scale.shape[1]
+                G = self._group
+                dt = self._scale.dtype
+                qf = q.reshape(out, ng, G).to(dt)
+                w = (qf - self._zero.to(dt).unsqueeze(2)) * self._scale.to(dt).unsqueeze(2)
+                return w.reshape(out, ng * G)[:, :self._infeat].contiguous()
+
+            @classmethod
+            def __torch_function__(cls, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                if func is F.linear or getattr(func, "__name__", "") == "linear":
+                    inp = args[0]
+                    w = args[1] if len(args) > 1 else kwargs.get("weight")
+                    bias = args[2] if len(args) > 2 else kwargs.get("bias")
+                    if isinstance(w, cls):
+                        y = op(inp, w._packed, w._group, (w._scale, w._zero))
+                        if inp.dim() > 2:
+                            y = y.reshape(*inp.shape[:-1], y.shape[-1])
+                        return y if bias is None else y + bias.to(y.dtype)
+                mat = [a._materialize() if isinstance(a, cls) else a for a in args]
+                mkw = {k: (v._materialize() if isinstance(v, cls) else v) for k, v in kwargs.items()}
+                return func(*mat, **mkw)
+
+        _W4A16_EXPERT = _W4A16Weight
+    except Exception as exc:
+        _builtins.print(f"[int4] triton w4a16 expert subclass unavailable ({exc!r})", flush=True)
+        _W4A16_EXPERT = None
+    return _W4A16_EXPERT
 
 
 def _quantize_linear4(lin, group_size: int = _INT4_GROUP):
@@ -1201,6 +1279,7 @@ def _packed4_3d_cls():
                 self.register_buffer("zero", zero)          # dtype [E, out, ng]
                 self.in_features = in_features
                 self.group_size = group_size
+                self._expert_triton = None                  # ROCm: lazily enabled in __getitem__
 
             def __getitem__(self, e):
                 # Returns the dequantized bf16 weight for one expert; the EAGER MoE host
@@ -1212,6 +1291,32 @@ def _packed4_3d_cls():
                 # / QuantLinear4), just not the per-routed-expert fused GEMM — which is already
                 # the "correctness/memory > speed" eager path (see _quantize_experts4_).
                 e = int(e)
+                # ROCm fast path: hand the MoE host a tensor subclass whose F.linear routes into
+                # the Triton w4a16 kernel (reads int4 directly) instead of rematerializing this
+                # expert's full bf16 weight every call. One-time self-check vs the bf16 dequant;
+                # disabled on mismatch / non-ROCm / no triton.
+                if self._expert_triton is None:
+                    self._expert_triton = False
+                    with contextlib.suppress(Exception):
+                        if getattr(torch.version, "hip", None) and self.qweight.device.type == "cuda":
+                            wc = _w4a16_expert_cls()
+                            if wc is not None:
+                                import torch.nn.functional as _F
+                                w0 = wc(self.qweight[0], self.scale[0], self.zero[0],
+                                        self.group_size, self.in_features)
+                                xt = torch.randn(8, self.in_features, device=self.qweight.device,
+                                                 dtype=torch.bfloat16)
+                                yn = _F.linear(xt, w0._materialize()).float()
+                                yf = _F.linear(xt, w0).float()
+                                rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
+                                if rel < 0.05:
+                                    self._expert_triton = True
+                                    _builtins.print(f"[int4] triton w4a16 experts active (rel={rel:.4f})", flush=True)
+                                else:
+                                    _builtins.print(f"[int4] triton w4a16 experts self-check rel={rel:.3f} -> bf16 dequant", flush=True)
+                if self._expert_triton:
+                    return _w4a16_expert_cls()(self.qweight[e], self.scale[e], self.zero[e],
+                                               self.group_size, self.in_features)
                 qw = self.qweight[e]                         # [out, in_pad//2]
                 out = qw.shape[0]
                 lo = (qw & 0x0F).to(torch.int16)
