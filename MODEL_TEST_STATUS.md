@@ -32,6 +32,9 @@ new tests run. (Seeded from session testing + decision history; correct any misc
 | `nemotron:70b` | ⬜ | — | Registered; not validated this session. |
 | `kimi-dev:72b` | ⬜ | — | Registered; not validated this session. |
 | `coneml-348m-alpha-polish900` | ⬜ | — | Custom small model; not validated here. |
+| `gemma-4:12b-it` | ✅ (text) | int4 — load + **generate** | `gemma4_unified` (no PLE, no KV-sharing). **Text validated (m4c163–164, 2026-06-29):** "The capital of France is Paris…". Needed two worker fixes — materialize Gemma's `embed_scale` buffer (else meta-guard trips at load), and **per-attention-type rotary** (sliding/full interleave: build cos/sin per layer_type + `shared_kv_states={}`, else `None_inv_freq` at gen). Minor: trailing `thought`/no-stop artifact (chat-template/stop refinement). Vision (unified/encoder-free) + audio untested. |
+| `gemma-4:31b-it` | ⬜ | — | `gemma4` dense (60L, h5376), `gemma4_vision` tower. No PLE/KV-sharing. Text/vision untested (likely multi-stage — watch Gemma KV-share vs pipeline split). |
+| `gemma-4-26b-a4b-it` | ⬜ | — | `gemma4` **MoE (128 experts)** + `gemma4_vision` tower. No PLE/KV-sharing. Text/vision untested (needs MoE + per-type rotary together). |
 
 ## How to update
 When a model is tested, set its row to ✅/🟡, note the **quant + path** (e.g. `int4 serve-from-cache`,
