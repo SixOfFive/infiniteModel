@@ -509,11 +509,21 @@ def _hf_cache_bytes(repo_id: str) -> int:
                             "models--" + repo_id.replace("/", "--"))
     except Exception:
         return 0
+    # Count only the canonical blobs/ store. snapshots/<rev>/ holds symlinks (Linux) or
+    # copies (Windows, no symlink priv) of the SAME files, so walking the whole cache dir
+    # and letting os.path.getsize follow the links double-counts every shard -> the
+    # download bar overshoots 100% (seen: 85/67 GiB == 127%). blobs/ has each file exactly
+    # once, including the .incomplete partials of an in-flight download.
+    blobs = os.path.join(base, "blobs")
+    walk_root = blobs if os.path.isdir(blobs) else base
     total = 0
-    for root, _dirs, files in os.walk(base):
+    for root, _dirs, files in os.walk(walk_root):
         for f in files:
+            p = os.path.join(root, f)
             try:
-                total += os.path.getsize(os.path.join(root, f))
+                if os.path.islink(p):
+                    continue            # never follow a symlink's target (double-count guard)
+                total += os.path.getsize(p)
             except OSError:
                 pass
     return total

@@ -413,7 +413,7 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
         dl, tot = pr.get("downloaded", 0), pr.get("total", 0)
         entry["dl_done_gb"] = round(dl / GB, 2)
         entry["dl_total_gb"] = round(tot / GB, 2) if tot else None
-        entry["dl_pct"] = round(100 * dl / tot, 1) if tot else None
+        entry["dl_pct"] = round(min(100.0, 100 * dl / tot), 1) if tot else None  # never >100%
     elif status == "absent" and name in DOWNLOAD_ERROR:
         entry["dl_error"] = DOWNLOAD_ERROR[name]   # last pull failure (e.g. gated repo)
     if ready:                                       # #shard-cache: which quants are pre-compiled
