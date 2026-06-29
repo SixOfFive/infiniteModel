@@ -83,6 +83,56 @@ if _HAVE_TRITON:
         return y
 
 
+if _HAVE_TRITON:
+    @triton.jit
+    def _w4a16_splitk_kernel(
+        x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, N, K,
+        sxk, sqk, sqn, ssn, ssg, szn, szg, syn,
+        GROUP: tl.constexpr, BN: tl.constexpr, SPLITK: tl.constexpr,
+    ):
+        # M=1 GEMV, split over K for occupancy: grid (cdiv(N,BN), SPLITK). Each program reduces a
+        # contiguous slice of K-groups for its BN output block, then atomic-adds into the fp32 output.
+        pid_n = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        offs_n = pid_n * BN + tl.arange(0, BN)
+        nmask = offs_n < N
+        offs_h = tl.arange(0, GROUP // 2)
+        ngroups = K // GROUP
+        gps = (ngroups + SPLITK - 1) // SPLITK     # K-groups per split
+        g0 = pid_k * gps
+        acc = tl.zeros((BN,), dtype=tl.float32)
+        for gi in range(0, gps):
+            kb = g0 + gi
+            if kb < ngroups:
+                k0 = kb * GROUP
+                xe = tl.load(x_ptr + (k0 + 2 * offs_h) * sxk)
+                xo = tl.load(x_ptr + (k0 + 2 * offs_h + 1) * sxk)
+                qp = q_ptr + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
+                b = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)
+                lo = (b & 0xF).to(tl.float32)
+                hi = ((b >> 4) & 0xF).to(tl.float32)
+                s = tl.load(s_ptr + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
+                z = tl.load(z_ptr + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
+                acc += tl.sum(xe[:, None] * ((lo - z[None, :]) * s[None, :]), axis=0)
+                acc += tl.sum(xo[:, None] * ((hi - z[None, :]) * s[None, :]), axis=0)
+        tl.atomic_add(y_ptr + offs_n * syn, acc, mask=nmask)
+
+    def w4a16_splitk(x, qweight, scale, zero, group=128, BN=128, SPLITK=8):
+        """M=1 split-K GEMV. x [1,K] bf16 -> y [1,N] bf16."""
+        x = x.contiguous().view(-1)
+        K = x.shape[0]
+        N = qweight.shape[0]
+        y = torch.zeros((N,), device=x.device, dtype=torch.float32)   # atomic accumulator
+        grid = (triton.cdiv(N, BN), SPLITK)
+        _w4a16_splitk_kernel[grid](
+            x, qweight, scale, zero, y, N, K,
+            x.stride(0), qweight.stride(1), qweight.stride(0),
+            scale.stride(0), scale.stride(1), zero.stride(0), zero.stride(1),
+            y.stride(0), GROUP=group, BN=BN, SPLITK=SPLITK,
+        )
+        return y.to(torch.bfloat16).view(1, N)
+
+
 def naive_dequant(qweight, scale, zero, G):
     out = qweight.shape[0]
     lo = (qweight & 0x0F).to(torch.int16)
@@ -136,14 +186,25 @@ def main():
             print(f"  K={K:5d} N={N:5d} M={M:3d}  rel={rel:.4f}  {flag}")
     print("CORRECTNESS:", "PASS" if ok_all else "FAIL")
 
-    print("\n== decode (M=1) naive vs triton ==")
+    print("\n== decode (M=1): triton-dot vs split-K GEMV, effective GB/s ==")
+    def _gbps(K, N, ms):
+        return (N * K / 2) / (ms / 1e3) / 1e9      # int4 weight bytes / time
     for (K, N) in shapes:
         qw, sc, ze = _rand_int4(N, K, G, dev)
         x = torch.randn(1, K, device=dev, dtype=torch.bfloat16) * 0.1
-        t_naive = _bench(lambda: F.linear(x, naive_dequant(qw, sc, ze, G)))
+        yref = F.linear(x, naive_dequant(qw, sc, ze, G)).float()
         t_tri = _bench(lambda: w4a16(x, qw, sc, ze, G))
-        print(f"  K={K:5d} N={N:5d}  naive={t_naive:.3f}ms  triton={t_tri:.3f}ms  "
-              f"speedup={t_naive / t_tri:.2f}x")
+        best = None
+        for sk in (4, 8, 16, 32):
+            ysk = w4a16_splitk(x, qw, sc, ze, G, SPLITK=sk).float()
+            rel = ((ysk - yref).abs().mean() / (yref.abs().mean() + 1e-6)).item()
+            t = _bench(lambda: w4a16_splitk(x, qw, sc, ze, G, SPLITK=sk))
+            if best is None or t < best[1]:
+                best = (sk, t, rel)
+        sk, t_sk, rel = best
+        print(f"  K={K:5d} N={N:5d}  dot={t_tri:.3f}ms ({_gbps(K, N, t_tri):3.0f} GB/s)  "
+              f"splitK[{sk}]={t_sk:.3f}ms ({_gbps(K, N, t_sk):3.0f} GB/s)  "
+              f"speedup={t_tri / t_sk:.2f}x  rel={rel:.4f}")
 
 
 if __name__ == "__main__":
