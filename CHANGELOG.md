@@ -190,3 +190,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   A new `state.py` registry publishes the controller's namespace and injects it into the relocated modules
   at startup (`state.publish`/`state.bind`), so the moved bodies resolve their former module globals
   without a circular `import server`. server.py dropped from ~9090 to ~6790 lines.
+- **Route split (m4c153):** `build_app`'s 73 HTTP routes (~2.5k lines, all defined inline) — 57 of them
+  relocated *verbatim* into four `register_*(app)` modules: `routes_dashboard.py` (dashboard/status/
+  graphs/plan/logs/config), `routes_lifecycle.py` (load/unload/compile/reconfigure/restart/weights),
+  `routes_api.py` (Ollama+OpenAI+Anthropic inference + model-info), `routes_diag.py` (vision/audio/probe
+  test endpoints). `build_app()` calls `register(app)` on each. The 15 routes that rebind a runtime global
+  (download/add_model/forget/nodeconfig) or use a build_app-local helper (embed/delete) stay in build_app
+  — avoiding the publish/bind stale-snapshot trap. Route bodies byte-identical; globals injected via
+  `state.bind`. server.py dropped to ~4350 lines (from ~9090 at the start of the refactor).
