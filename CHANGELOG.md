@@ -205,3 +205,8 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   live). `state.py` is now shared by controller and worker (in both EXTRA_UPDATE_FILES); the worker publishes/
   binds at module load. client.py dropped from ~4570 to ~2820 lines. Across the whole refactor the two giants
   went from 9090 + 4570 ≈ 13.7k lines to ~4350 + ~2820 ≈ 7.2k, the rest living in focused 200–1200-line modules.
+- **Serving layer split (m4c154):** the request-serving functions `_serve` (Ollama/OpenAI generate+chat),
+  `_serve_anthropic` (Claude Code backend), `_count_tokens_anthropic` (+ `_serve`'s private `_prepare`/
+  `_ka_is_unload`) moved verbatim into `serving.py`. server.py back-imports the three entry points so the
+  already-relocated `routes_api` resolves them through the published namespace; `state.bind(serving)` makes
+  their bodies resolve server globals. server.py → ~3730 lines.
