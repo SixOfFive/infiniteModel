@@ -1145,6 +1145,95 @@ def _w4a16_triton_op():
     return _W4A16_OP
 
 
+_W4A16_MOE_OP = None
+_W4A16_MOE_TRIED = False
+
+
+def _w4a16_moe_op():
+    """Callable for a FUSED grouped int4 MoE-expert GEMM (ROCm decode fast path).
+
+    Replaces the eager per-expert Python loop (`for e in hit: F.linear(x, gate_up[e])`) with ONE
+    Triton launch over all B = tokens*top_k expert applications: program (b, n_block) gathers expert
+    eid[b]'s packed int4 weight tile and computes x[b] @ W_e^T. This kills the per-expert kernel
+    launches + tensor-subclass dispatch that dominate batch-1 decode (the GEMV itself is bandwidth-
+    bound either way; the win is collapsing ~8 launches + 8 Python F.linear/subclass allocs per MoE
+    layer into one). Same group-wise asymmetric dequant as `_w4a16_triton_op` (bit-exact). Rows carry
+    different experts so we can't share a `tl.dot` weight tile across them — each program does a
+    per-row GEMV reduction. Worthwhile only for small token counts (decode); the caller keeps the
+    eager batched-GEMM loop for prefill. None if triton is unavailable.
+
+    op(x[B,Kin] bf16, eid[B] int, q uint8[E,N,Kpad//2], scale/zero[E,N,ng] bf16, group, in_features)
+      -> y[B,N] bf16
+    """
+    global _W4A16_MOE_OP, _W4A16_MOE_TRIED
+    if _W4A16_MOE_TRIED:
+        return _W4A16_MOE_OP
+    _W4A16_MOE_TRIED = True
+    try:
+        import torch
+        import triton
+        import triton.language as tl
+        import torch.nn.functional as _F
+
+        @triton.jit
+        def _mk(x_ptr, e_ptr, q_ptr, s_ptr, z_ptr, y_ptr, B, N, K,
+                sxb, sxk, sqe, sqk, sqn, sse, ssn, ssg, sze, szn, szg, syb, syn,
+                GROUP: tl.constexpr, BN: tl.constexpr):
+            pid_b = tl.program_id(0)                       # one (token, expert-slot) application
+            pid_n = tl.program_id(1)                       # a BN-wide block of output channels
+            e = tl.load(e_ptr + pid_b).to(tl.int64)        # this row's expert id (64-bit weight base)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            offs_h = tl.arange(0, GROUP // 2)              # byte index within a K-group
+            nmask = offs_n < N
+            acc = tl.zeros((BN,), dtype=tl.float32)
+            for kb in range(0, K // GROUP):
+                k0 = kb * GROUP
+                xe = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h) * sxk)        # [G/2] even cols
+                xo = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h + 1) * sxk)    # [G/2] odd cols
+                qp = q_ptr + e * sqe + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
+                bb = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)        # [G/2, BN] packed
+                lo = (bb & 0xF).to(tl.float32)
+                hi = ((bb >> 4) & 0xF).to(tl.float32)
+                s = tl.load(s_ptr + e * sse + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
+                z = tl.load(z_ptr + e * sze + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
+                wlo = (lo - z[None, :]) * s[None, :]        # [G/2, BN] dequant low nibble
+                whi = (hi - z[None, :]) * s[None, :]        # [G/2, BN] dequant high nibble
+                acc += tl.sum(xe[:, None] * wlo, axis=0)    # GEMV reduce over the K-group -> [BN]
+                acc += tl.sum(xo[:, None] * whi, axis=0)
+            tl.store(y_ptr + pid_b * syb + offs_n * syn, acc.to(tl.bfloat16), mask=nmask)
+
+        def _op(x, eid, q, scale, zero, group_size, in_features):
+            if x.dim() != 2:
+                x = x.reshape(-1, x.shape[-1])
+            if x.dtype != torch.bfloat16:
+                x = x.to(torch.bfloat16)
+            x = x.contiguous()
+            Kpad = q.shape[2] * 2                          # pad activations to the packed width
+            if x.shape[1] != Kpad:
+                x = _F.pad(x, (0, Kpad - x.shape[1]))
+            eid = eid.to(torch.int32).contiguous()
+            B = x.shape[0]
+            N = q.shape[1]
+            y = torch.empty((B, N), device=x.device, dtype=torch.bfloat16)
+            BN = 128
+            grid = (B, triton.cdiv(N, BN))
+            _mk[grid](x, eid, q, scale, zero, y, B, N, Kpad,
+                      x.stride(0), x.stride(1),
+                      q.stride(0), q.stride(2), q.stride(1),
+                      scale.stride(0), scale.stride(1), scale.stride(2),
+                      zero.stride(0), zero.stride(1), zero.stride(2),
+                      y.stride(0), y.stride(1),
+                      GROUP=group_size, BN=BN)
+            return y
+
+        _W4A16_MOE_OP = _op
+        _builtins.print("[int4] triton fused-MoE w4a16 kernel built (ROCm decode fast path)", flush=True)
+    except Exception as exc:
+        _builtins.print(f"[int4] fused-MoE w4a16 unavailable ({exc!r}) -> per-expert path", flush=True)
+        _W4A16_MOE_OP = None
+    return _W4A16_MOE_OP
+
+
 _W4A16_EXPERT = None
 
 
@@ -1343,6 +1432,90 @@ def _packed4_3d_cls():
     return _PACKED4_3D
 
 
+_FUSED_MOE_T_MAX = 8   # only fuse small token counts (decode); prefill keeps the eager batched loop
+
+
+def _install_fused_moe_forward(experts_mod) -> None:
+    """ROCm decode fast path: patch a fused-3D-expert module's forward to run ALL routed experts
+    through one Triton launch (`_w4a16_moe_op`) instead of the eager per-expert Python loop. Gated to
+    ROCm + int4 Packed4Tensor3D experts + triton. A one-time self-check vs the ORIGINAL forward (on a
+    synthetic input) confirms bit-equivalence before the fused path is trusted, and every call falls
+    back to the original on a non-decode token count or any exception. No-op on CUDA (the fleet) and
+    on non-fused experts — keeps it inert everywhere it isn't proven. This is a pure decode-latency
+    optimization: it removes ~top_k Python F.linear/subclass dispatches + kernel launches per MoE
+    layer per token (the dominant batch-1 overhead), not a numerics change."""
+    import torch
+    if not getattr(torch.version, "hip", None):
+        return                                            # CUDA fleet: leave the eager path untouched
+    PT = _packed4_3d_cls()
+    gu = getattr(experts_mod, "gate_up_proj", None)
+    dn = getattr(experts_mod, "down_proj", None)
+    if not (isinstance(gu, PT) and isinstance(dn, PT) and hasattr(experts_mod, "act_fn")):
+        return                                            # not a fused-3D int4 experts module
+    if getattr(experts_mod, "_fused_moe_installed", False):
+        return
+    if gu.qweight.device.type != "cuda":
+        return                                            # experts live in CPU RAM (offload) -> skip
+    op = _w4a16_moe_op()
+    if op is None:
+        return
+    import types
+
+    orig_forward = experts_mod.forward                    # bound method (the eager loop)
+
+    def _compute(self, hidden_states, top_k_index, top_k_weights):
+        T = hidden_states.shape[0]
+        top_k = top_k_index.shape[1]
+        eid = top_k_index.reshape(-1)                     # [B] expert id per (token, slot)
+        w = top_k_weights.reshape(-1).to(hidden_states.dtype)     # [B] gate weight
+        xb = hidden_states.repeat_interleave(top_k, dim=0)        # [B, H] token per application
+        gu_h, dn_h = self.gate_up_proj, self.down_proj
+        yb = op(xb, eid, gu_h.qweight, gu_h.scale, gu_h.zero, gu_h.group_size, gu_h.in_features)
+        gate, up = yb.chunk(2, dim=-1)                    # gate_up_proj output is [gate(I) | up(I)]
+        h = self.act_fn(gate) * up
+        zb = op(h, eid, dn_h.qweight, dn_h.scale, dn_h.zero, dn_h.group_size, dn_h.in_features)
+        zb = zb * w[:, None]
+        final = torch.zeros_like(hidden_states)
+        tok = torch.arange(T, device=hidden_states.device).repeat_interleave(top_k)
+        final.index_add_(0, tok, zb.to(final.dtype))     # sum the top_k contributions per token
+        return final
+
+    def _selfcheck(self):
+        try:
+            E = int(self.gate_up_proj.qweight.shape[0])
+            H = int(self.gate_up_proj.in_features)
+            dev = self.gate_up_proj.qweight.device
+            k = min(8, E)
+            x = torch.randn(2, H, device=dev, dtype=torch.bfloat16) * 0.1
+            idx = torch.stack([torch.randperm(E, device=dev)[:k] for _ in range(2)])
+            wts = (torch.rand(2, k, device=dev, dtype=torch.bfloat16) + 0.1)
+            ref = orig_forward(x, idx, wts).float()
+            out = _compute(self, x, idx, wts).float()
+            rel = ((out - ref).abs().mean() / (ref.abs().mean() + 1e-6)).item()
+            ok = rel < 0.03
+            _builtins.print(f"[int4] fused-MoE self-check rel={rel:.4f} -> "
+                            f"{'ACTIVE' if ok else 'fallback (per-expert)'}", flush=True)
+            return ok
+        except Exception as exc:
+            _builtins.print(f"[int4] fused-MoE self-check failed ({exc!r}) -> per-expert", flush=True)
+            return False
+
+    def _fused_forward(self, hidden_states, top_k_index, top_k_weights):
+        st = self._fused_moe_ok
+        if st is None:
+            self._fused_moe_ok = st = _selfcheck(self)
+        if st and hidden_states.shape[0] <= _FUSED_MOE_T_MAX:
+            try:
+                return _compute(self, hidden_states, top_k_index, top_k_weights)
+            except Exception:
+                pass                                      # any runtime hiccup -> trusted eager path
+        return orig_forward(hidden_states, top_k_index, top_k_weights)
+
+    experts_mod._fused_moe_ok = None
+    experts_mod._fused_moe_installed = True
+    experts_mod.forward = types.MethodType(_fused_forward, experts_mod)
+
+
 # --- MoE intra-layer offload (#moe-offload): attention on GPU, routed experts in CPU RAM ----------
 # The llama.cpp --override-tensor "experts=CPU" strategy, intra-layer: a MoE layer's routed-expert
 # FFN is ~90% of its bytes but each token activates only k of E experts, while the token-mixer
@@ -1482,6 +1655,8 @@ def _quantize_experts4_(module) -> None:
         if cfg is not None and hasattr(cfg, "_experts_implementation") and id(cfg) not in seen:
             cfg._experts_implementation = "eager"
             seen.add(id(cfg))
+    for sub in {id(s): s for s, _a in targets}.values():   # ROCm fused-MoE decode fast path (no-op on CUDA)
+        _install_fused_moe_forward(sub)
 
 
 def _quantize_experts4_streamed(module, layer_idx: int, fetch_experts, dt) -> None:
@@ -1580,12 +1755,16 @@ def _quantize_experts4_streamed(module, layer_idx: int, fetch_experts, dt) -> No
         del blob, grouped
         e += k
     seen = set()
+    subs = {}
     for attr, b in tgt.items():
         delattr(b["sub"], attr)                                   # drop the meta Parameter
         setattr(b["sub"], attr, PT(b["qpacked"], b["scale"], b["zero"], b["in_f"], G))
+        subs[id(b["sub"])] = b["sub"]
         cfg = getattr(b["sub"], "config", None)                   # force eager experts forward
         if cfg is not None and hasattr(cfg, "_experts_implementation") and id(cfg) not in seen:
             cfg._experts_implementation = "eager"; seen.add(id(cfg))
+    for sub in subs.values():                                     # ROCm fused-MoE decode fast path (no-op on CUDA)
+        _install_fused_moe_forward(sub)
     print(f"[load] L{layer_idx}: streamed {E} experts (per-expert int4, chunk {chunk})")
 
 
