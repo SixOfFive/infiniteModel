@@ -151,6 +151,26 @@ def _dir_has_model(d: str) -> bool:
         return False
 
 
+def _ensure_template_files(model_id: str, local: str) -> None:
+    """Top-up small template files (chat_template.jinja) that an earlier pull — which fetched only
+    *.safetensors + *.json — missed, into an already-present model dir. Mistral3 / Devstral /
+    Ministral ship their chat template as chat_template.jinja (NOT inside tokenizer_config.json), so
+    without it AutoTokenizer loads NO template and rendering falls back to a flat prompt that breaks
+    vision (the model never sees the native [INST][IMG]...[/INST]). Best-effort + silent: a model
+    that has no such file in its repo (or an offline box) is simply left as-is."""
+    aux = ["chat_template.jinja"]
+    missing = [f for f in aux if not os.path.exists(os.path.join(local, f))]
+    if not missing:
+        return
+    with contextlib.suppress(Exception):
+        from huggingface_hub import hf_hub_download
+        for f in missing:
+            with contextlib.suppress(Exception):
+                p = hf_hub_download(model_id, f, token=_HF_TOKEN_FN())
+                shutil.copy2(p, os.path.join(local, f))
+                print(f"[model] topped up {f} for {model_id}", flush=True)
+
+
 def _controller_model_dir(model_id: str) -> str:
     """Resolve a model's dir under models/<name>/ (plain files). If already there,
     return it with ZERO network. Otherwise populate it ONCE — copying from the HF
@@ -159,14 +179,15 @@ def _controller_model_dir(model_id: str) -> str:
     /modelmeta fetch, so the already-present fast-path is just a dir check."""
     local = os.path.join(MODELS_DIR, _safe_name(model_id))
     if _dir_has_model(local):
-        return local
+        _ensure_template_files(model_id, local)   # self-heal chat_template.jinja missed by an
+        return local                              # earlier *.safetensors+*.json-only pull
     # GGUF-sourced model: there are no safetensors to pull — normalize the .gguf to a safetensors
     # checkpoint into `local` (subprocess), then it's an ordinary model from here on.
     _gf = _GGUF_FN(model_id)
     if _gf:
         return convert_gguf_to_model_dir(model_id, _gf, model_id)
     from huggingface_hub import snapshot_download
-    patterns = ["*.safetensors", "*.json"]
+    patterns = ["*.safetensors", "*.json", "*.jinja"]   # *.jinja: chat_template.jinja (Mistral3 etc.)
     src = None
     try:
         cached = snapshot_download(model_id, allow_patterns=patterns, local_files_only=True)
@@ -353,7 +374,7 @@ def _local_model_dir(target_id: str):
     else:
         try:
             from huggingface_hub import snapshot_download
-            d = snapshot_download(target_id, allow_patterns=["*.safetensors", "*.json"],
+            d = snapshot_download(target_id, allow_patterns=["*.safetensors", "*.json", "*.jinja"],
                                   local_files_only=True)
             if _dir_has_model(d):
                 result = d
@@ -509,7 +530,7 @@ def model_ready(target_id: str, ttl: float = 3.0) -> bool:
     if not ready:
         try:
             from huggingface_hub import snapshot_download
-            d = snapshot_download(target_id, allow_patterns=["*.safetensors", "*.json"],
+            d = snapshot_download(target_id, allow_patterns=["*.safetensors", "*.json", "*.jinja"],
                                   local_files_only=True)
             ready = _dir_has_model(d)
         except Exception:
