@@ -710,7 +710,10 @@ async function tick(){
         `<div class="sub" style="color:#f85149;max-width:340px;white-space:normal">${m.dl_error.replace(/</g,'&lt;')}</div>`:'');
     const cx=q.default_ctx?` · <span class="sub" title="native/default context (loads at this when ctx=0)">${ctxFmt(q.default_ctx)} ctx</span>`:'';
     const aliasLine=(m.aliases&&m.aliases.length)?`<div class="sub" style="font-size:11px;color:#8b949e" title="other names that resolve to this model">alias: ${m.aliases.map(esc).join(', ')}</div>`:'';
-    return `<tr><td>${m.name}${aliasLine}</td><td class="num">${m.size_gb!=null?m.size_gb+' GB':'–'}${cx}</td><td>${badge}</td><td>${actions}</td></tr>`;
+    const _captt={image:'image input (vision)',video:'video input',stt:'speech-to-text (audio in)',tts:'text-to-speech (audio out)',embedding:'embeddings'};
+    const _capc={image:'#58a6ff',video:'#a371f7',stt:'#3fb950',tts:'#d29922',embedding:'#8b949e'};
+    const capsLine=(m.capabilities&&m.capabilities.length)?`<div class="sub" style="font-size:10px;margin-top:1px">`+m.capabilities.map(c=>`<span title="${_captt[c]||c}" style="color:${_capc[c]||'#58a6ff'};border:1px solid ${(_capc[c]||'#58a6ff')}55;border-radius:6px;padding:0 5px;margin-right:3px">${esc(c)}</span>`).join('')+`</div>`:'';
+    return `<tr><td>${m.name}${aliasLine}${capsLine}</td><td class="num">${m.size_gb!=null?m.size_gb+' GB':'–'}${cx}</td><td>${badge}</td><td>${actions}</td></tr>`;
   }).join('');
   // don't clobber a row's run-type <select> mid-choice (the 1.5s refresh would close it)
   const _ae=document.activeElement;

@@ -316,6 +316,55 @@ def build_status() -> dict:
     }
 
 
+_CAPS_CACHE: dict = {}
+
+
+def _model_caps(tgt: str, spec=None) -> list:
+    """Modality capabilities for the dashboard badge line, inferred from the model's local
+    config.json (cached per target — configs don't change). Returns a subset of: embedding,
+    image, video, stt (audio-in / speech understanding), tts (speech-out, Omni-style). A plain
+    text LLM -> []. Reads the raw config DICT (no AutoConfig / trust_remote_code) so exotic
+    arches don't break or prompt; absent (not-yet-downloaded) models -> [] until present."""
+    if tgt in _CAPS_CACHE:
+        return _CAPS_CACHE[tgt]
+    caps: list = []
+    try:
+        if spec is not None and getattr(spec, "is_embedding", False):
+            caps = ["embedding"]
+        else:
+            import os
+            import json as _json
+            d = _local_model_dir(tgt)
+            cfgd = None
+            if d:
+                p = os.path.join(d, "config.json")
+                if os.path.exists(p):
+                    with open(p, encoding="utf-8") as fh:
+                        cfgd = _json.load(fh)
+            if cfgd:
+                base = cfgd.get("thinker_config") or cfgd   # Omni nests vision/audio under thinker
+
+                def _has(*ks):
+                    return (any(cfgd.get(k) is not None for k in ks)
+                            or (isinstance(base, dict) and any(base.get(k) is not None for k in ks)))
+                _b = base if isinstance(base, dict) else {}
+                if _b.get("vision_config") or cfgd.get("vision_config") \
+                        or _has("image_token_id", "image_token_index"):
+                    caps.append("image")
+                if _has("video_token_id", "video_token_index"):
+                    caps.append("video")
+                if _b.get("audio_config") or cfgd.get("audio_config") \
+                        or _has("audio_token_id", "audio_token_index"):
+                    caps.append("stt")
+                mt = (cfgd.get("model_type") or "").lower()
+                if "omni" in mt or cfgd.get("talker_config") or _b.get("talker_config"):
+                    caps.append("tts")
+    except Exception:
+        pass
+    _CAPS_CACHE[tgt] = caps
+    return caps
+
+
 def _model_entry(name: str, tgt: str, draft: str) -> dict:
     """Per-model status for the dashboard: ready (weights on controller),
     downloading (pull in flight), or absent. size from the spec when known."""
@@ -370,4 +419,7 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
         cs = shard_cache_status(d3) if d3 else {}
         if cs:
             entry["cached"] = cs   # {quant: {ok, size_gb, files, ...}}
+    caps = _model_caps(tgt, spec)
+    if caps:
+        entry["capabilities"] = caps   # modality badges under the name (image/video/stt/tts/embedding)
     return entry
