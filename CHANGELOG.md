@@ -175,3 +175,18 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   WITHOUT bouncing the fleet, so a casual push no longer reboots the cluster. The forced dashboard
   "Update + restart" always restarts regardless. (Stale "GitLab" self-update wording corrected to GitHub
   throughout.)
+
+## Code organization (context-economy refactor)
+- The controller and worker grew into multi-thousand-line files that were costly to read/edit. They are
+  being split along seams the *callers* don't see — **zero public-API change** — so each subsystem fits a
+  reader's (and an editor's) context window. The multi-file self-update built earlier already keeps any
+  number of sibling modules in lock-step across the fleet (each in `EXTRA_UPDATE_FILES`, each imported
+  through a pull-once **convergence bridge** so an old checkout self-heals on the deploy that introduces it).
+- **Engine split (m4c152):** `server.py`'s `Engine` class (~2.5k lines, 47 methods) was relocated
+  *verbatim* into three mixin modules — `engine_load.py` (load/placement/TP/reconfigure), `engine_gen.py`
+  (prefill/decode/spec/MTP), `engine_lifecycle.py` (data-plane/recovery/replicas/unload) — recomposed as
+  `class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin)`. Method bodies are byte-identical;
+  only `__init__` and `generate_speech` (which rebinds the `ENCODING` idle-gate global) stay on the shell.
+  A new `state.py` registry publishes the controller's namespace and injects it into the relocated modules
+  at startup (`state.publish`/`state.bind`), so the moved bodies resolve their former module globals
+  without a circular `import server`. server.py dropped from ~9090 to ~6790 lines.
