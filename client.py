@@ -1495,7 +1495,13 @@ def _install_fused_moe_forward(experts_mod) -> None:
     if os.environ.get("INFINITEMODEL_NO_FUSED_MOE"):
         return                                            # A/B kill-switch (measure fused on vs off)
     if not getattr(torch.version, "hip", None):
-        return                                            # CUDA fleet: leave the eager path untouched
+        # CUDA / CPU: the DEFAULT int4 path is portable (tinygemm `_weight_int4pack_mm` dense +
+        # bf16-rematerialize routed experts) and runs everywhere incl. Windows. The fused Triton
+        # expert kernel is an OPT-IN UPGRADE for Linux+NVIDIA only (Triton is unreliable on Windows) —
+        # enable with INFINITEMODEL_CUDA_FUSED_MOE=1. Self-checked + auto-fallback, so opt-in is safe.
+        # See docs/ACCELERATION.md. (ROCm/RDNA always uses it — it's the only fast int4 path there.)
+        if not os.environ.get("INFINITEMODEL_CUDA_FUSED_MOE"):
+            return
     PT = _packed4_3d_cls()
     gu = getattr(experts_mod, "gate_up_proj", None)
     dn = getattr(experts_mod, "down_proj", None)
