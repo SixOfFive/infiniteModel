@@ -16,7 +16,7 @@ new tests run. (Seeded from session testing + decision history; correct any misc
 | `qwen2.5:7b` | ✅ | int4, bf16 — generate | int4 fused tinygemm ~21 tok/s; TP tested. |
 | `qwen2.5:14b` (`-instruct`) | ✅ | bf16, int4 — load + generate | Coexistence + gen-stall watchdog validated (400-tok gen). |
 | `ministral-3:14b` | ✅ | load + generate | #117 fixed prefill hang (beast→theocomp hop); replies correctly. |
-| `devstral-small-2:24b` | ✅ | load + generate | #83/#89 fixed Mistral3 garbage + immediate-EOS; generates. |
+| `devstral-small-2:24b` | ✅ text + **vision** | int4 — load + generate; **vision image→text** | #83/#89 fixed Mistral3 garbage + immediate-EOS. **Pixtral vision validated END-TO-END (m4c159–161, 2026-06-29)**: split tower (`vision_tower.*` + `multi_modal_projector.*`) materialized from the RAW checkpoint prefixes, 2D rotary rebuilt via the module's own rope-init, `get_image_features(pixel_values, image_sizes)` at the merged 28px grid, embeds spliced at `[IMG]` (id 10) with plain 1D positions. Needed `chat_template.jinja` topped-up into the model dir (Mistral ships it as a separate file, not in tokenizer_config) so the native `<s>[INST][IMG]…[/INST]` renders. image→text answered correctly: "The image contains a red circle and a blue square." |
 | `deepseek-r1-distill-llama:70b` | ✅ | int4 — generate | Dense Llama; int4 decode tok/s re-measured (#73). |
 | `mixtral:8x7b` | ✅ | int4 — load + generate; **int4 shard cache** | Fused-3D MoE (per-expert ckpt fused at build); non-fused-compile validated. |
 | `olmoe:1b-7b` | ✅ | int4 — load + generate; **int4 shard cache** | Per-expert ckpt fused to 3D; serve-from-cache gens "Paris". |

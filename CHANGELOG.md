@@ -67,13 +67,20 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   hide-set and filtered out after `MODELS` is seeded on startup (re-`/add_model` un-hides it). Delete ==
   forget + purge files + hide; refuses if any of those names is loaded or downloading. (`/forget`
   remains the opposite trade-off: unregister but keep the files.)
-- **Mistral3 / Pixtral distributed vision**: the controller-side vision encoder now handles Pixtral's
-  split tower (`vision_tower` + a separate `multi_modal_projector`, both materialized from safetensors
-  with the 24B text model left on meta), driving `get_image_features(pixel_values, image_sizes)` at the
-  merged 32-px patch grid; per-image embeds splice at the `[IMG]` (id 10) placeholders with plain 1D
-  positions. Pixtral's 2D rotary table is rebuilt via the module's own rope-init (the generic 1D
-  materializer would corrupt it). Covers Devstral / Ministral. (`[IMG_BREAK]`/`[IMG_END]` row-structure
-  tokens are not yet reconstructed — a tracked follow-up; validate generation quality first.)
+- **Mistral3 / Pixtral distributed vision** (validated end-to-end on Devstral, 2026-06-29): the
+  controller-side vision encoder handles Pixtral's split tower (`vision_tower` + a separate
+  `multi_modal_projector`, both materialized from the checkpoint's RAW key prefixes — Mistral3 stores
+  them un-`model.`-wrapped — with the 24B text model left on meta), drives `get_image_features(pixel_values,
+  image_sizes)` at the merged patch grid, and splices per-image embeds at the `[IMG]` (id 10) placeholders
+  with plain 1D positions. Pixtral's 2D rotary table is rebuilt via the module's own rope-init (the generic
+  1D materializer would corrupt it). Two integration fixes were needed: (1) Mistral ships its chat template
+  as a standalone `chat_template.jinja` (not inside `tokenizer_config.json`), so the model download now
+  pulls `*.jinja` and tops it up for already-present models — without it the tokenizer had no template, the
+  prompt fell back to a flat `user:/assistant:` form, and the model degenerated; with it the native
+  `<s>[INST][IMG]…[/INST]` renders. (2) the serving path injects the image placeholder for any tokenizer
+  whose template emits none. devstral image→text: *"The image contains a red circle and a blue square."*
+  Covers Devstral / Ministral. (`[IMG_BREAK]`/`[IMG_END]` row-structure tokens are still flat — a tracked
+  refinement.)
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8
