@@ -1157,7 +1157,9 @@ def _w4a16_moe_op():
     eid[b]'s packed int4 weight tile and computes x[b] @ W_e^T. This kills the per-expert kernel
     launches + tensor-subclass dispatch that dominate batch-1 decode (the GEMV itself is bandwidth-
     bound either way; the win is collapsing ~8 launches + 8 Python F.linear/subclass allocs per MoE
-    layer into one). Same group-wise asymmetric dequant as `_w4a16_triton_op` (bit-exact). Rows carry
+    layer into one). Same group-wise asymmetric dequant as `_w4a16_triton_op`, but accumulates the
+    GEMV in fp32 (no bf16 round of the weight operand) — numerically equivalent within decode
+    tolerance, slightly MORE accurate than the 2D path, not bit-identical to it. Rows carry
     different experts so we can't share a `tl.dot` weight tile across them — each program does a
     per-row GEMV reduction. Worthwhile only for small token counts (decode); the caller keeps the
     eager batched-GEMM loop for prefill. None if triton is unavailable.
@@ -1444,7 +1446,9 @@ def _install_fused_moe_forward(experts_mod) -> None:
     on non-fused experts — keeps it inert everywhere it isn't proven. This is a pure decode-latency
     optimization: it removes ~top_k Python F.linear/subclass dispatches + kernel launches per MoE
     layer per token (the dominant batch-1 overhead), not a numerics change."""
-    import torch
+    import torch, os
+    if os.environ.get("INFINITEMODEL_NO_FUSED_MOE"):
+        return                                            # A/B kill-switch (measure fused on vs off)
     if not getattr(torch.version, "hip", None):
         return                                            # CUDA fleet: leave the eager path untouched
     PT = _packed4_3d_cls()
@@ -1482,18 +1486,30 @@ def _install_fused_moe_forward(experts_mod) -> None:
 
     def _selfcheck(self):
         try:
-            E = int(self.gate_up_proj.qweight.shape[0])
-            H = int(self.gate_up_proj.in_features)
-            dev = self.gate_up_proj.qweight.device
+            gu_h, dn_h = self.gate_up_proj, self.down_proj
+            E = int(gu_h.qweight.shape[0])
+            H = int(gu_h.in_features)
+            dev = gu_h.qweight.device
             k = min(8, E)
             x = torch.randn(2, H, device=dev, dtype=torch.bfloat16) * 0.1
             idx = torch.stack([torch.randperm(E, device=dev)[:k] for _ in range(2)])
             wts = (torch.rand(2, k, device=dev, dtype=torch.bfloat16) + 0.1)
-            ref = orig_forward(x, idx, wts).float()
+            # The reference must be INDEPENDENT of any Triton path, else orig_forward routes the SAME
+            # w4a16 kernel (Packed4Tensor3D.__getitem__'s _expert_triton subclass) and a shared bug
+            # would pass. Force both holders to the bf16 dequant for the reference, then restore lazy
+            # state so the eager fallback path keeps its own fast per-expert kernel.
+            sv = (gu_h._expert_triton, dn_h._expert_triton)
+            gu_h._expert_triton = dn_h._expert_triton = False
+            try:
+                ref = orig_forward(x, idx, wts).float()
+            finally:
+                gu_h._expert_triton, dn_h._expert_triton = sv
             out = _compute(self, x, idx, wts).float()
-            rel = ((out - ref).abs().mean() / (ref.abs().mean() + 1e-6)).item()
-            ok = rel < 0.03
-            _builtins.print(f"[int4] fused-MoE self-check rel={rel:.4f} -> "
+            scale = ref.abs().mean() + 1e-6
+            rel = ((out - ref).abs().mean() / scale).item()
+            relmax = ((out - ref).abs().max() / (ref.abs().max() + 1e-6)).item()   # worst element vs signal
+            ok = rel < 0.03 and relmax < 0.1
+            _builtins.print(f"[int4] fused-MoE self-check rel={rel:.4f} max={relmax:.4f} -> "
                             f"{'ACTIVE' if ok else 'fallback (per-expert)'}", flush=True)
             return ok
         except Exception as exc:
@@ -1501,14 +1517,16 @@ def _install_fused_moe_forward(experts_mod) -> None:
             return False
 
     def _fused_forward(self, hidden_states, top_k_index, top_k_weights):
-        st = self._fused_moe_ok
-        if st is None:
-            self._fused_moe_ok = st = _selfcheck(self)
-        if st and hidden_states.shape[0] <= _FUSED_MOE_T_MAX:
-            try:
-                return _compute(self, hidden_states, top_k_index, top_k_weights)
-            except Exception:
-                pass                                      # any runtime hiccup -> trusted eager path
+        # Only the decode path (small T) uses the fused kernel; defer the one-time self-check until a
+        # decode-eligible call so a leading prefill (T>max) doesn't pay for a check it won't use.
+        if hidden_states.shape[0] <= _FUSED_MOE_T_MAX:
+            if self._fused_moe_ok is None:
+                self._fused_moe_ok = _selfcheck(self)
+            if self._fused_moe_ok:
+                try:
+                    return _compute(self, hidden_states, top_k_index, top_k_weights)
+                except Exception:
+                    pass                                  # any runtime hiccup -> trusted eager path
         return orig_forward(hidden_states, top_k_index, top_k_weights)
 
     experts_mod._fused_moe_ok = None

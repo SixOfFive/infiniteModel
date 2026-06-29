@@ -185,9 +185,11 @@ def main():
             yr = ref_forward(x, idx, wts, GUq, GUs, GUz, GU_in, DNq, DNs, DNz, DN_in).float()
             yf = fused_forward(x, idx, wts, GUq, GUs, GUz, GU_in, DNq, DNs, DNz, DN_in).float()
             rel = ((yf - yr).abs().mean() / (yr.abs().mean() + 1e-6)).item()
-            flag = "ok" if rel < 0.03 else "FAIL"
-            ok_all &= rel < 0.03
-            print(f"  H={H:5d} I={I:4d} E={E:3d} k={k} T={T}  rel={rel:.4f}  {flag}")
+            relmax = ((yf - yr).abs().max() / (yr.abs().max() + 1e-6)).item()   # in-engine gate: max<0.1
+            ok = rel < 0.03 and relmax < 0.1
+            flag = "ok" if ok else "FAIL"
+            ok_all &= ok
+            print(f"  H={H:5d} I={I:4d} E={E:3d} k={k} T={T}  rel={rel:.4f}  max={relmax:.4f}  {flag}")
 
         # decode (T=1) timing: per-expert reference vs fused (one MoE layer's experts)
         x = torch.randn(1, H, device=dev, dtype=torch.bfloat16) * 0.1
