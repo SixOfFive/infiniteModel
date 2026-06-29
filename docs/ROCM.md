@@ -23,8 +23,9 @@ The same recipe applies to any ROCm-supported AMD GPU — substitute the GPU's a
 #    then reconnect so the new groups apply.
 sudo usermod -aG render,video "$USER"
 
-# 2) Python venv (3.13/3.14). On Debian/Ubuntu you may need the venv package first:
-#    sudo apt-get install -y python3-venv git
+# 2) Python venv + build tools. The Triton int4 kernel JIT-compiles launcher stubs, so it
+#    needs a C compiler + Python headers. On Debian/Ubuntu:
+#    sudo apt-get install -y python3-venv python3-dev gcc git
 python3 -m venv ~/imenv
 
 # 3) PyTorch for your AMD GPU. For Strix Halo (gfx1151) use AMD's arch-specific
@@ -81,6 +82,51 @@ RDNA3.5.
 
 ---
 
+## Fast int4 on RDNA — the Triton w4a16 kernel
+
+torch's fused int4 GEMM (`torch._weight_int4pack_mm`) is **CDNA2+-only** on ROCm
+(MI200/MI300). On RDNA (gfx11xx) it's unavailable, so the naive int4 path
+**rematerializes the whole bf16 weight every token** — correct, but GPU-compute-bound and
+slow (a 35B-A3B managed ~2 tok/s on Strix Halo). InfiniteModel ships a **Triton w4a16
+kernel** that reads the packed int4 weight and dequantizes *inside* the GEMM, in the
+worker's exact group-wise asymmetric format (byte j → col 2j low / 2j+1 high nibble;
+`w=(q−zero)*scale` per 128-group). It is **bit-identical** to the naive path
+(self-checked, rel<0.05, else it falls back) and **ROCm-only** — NVIDIA and CPU keep the
+torch tinygemm / naive paths untouched.
+
+Two integration points in `client.py`:
+
+- **Dense linears** (`QuantLinear4.prepare_fused`) — a Triton backend (`_w4a16_triton_op`)
+  taken on `cuda + torch.version.hip`. **5–20× faster decode** (validated by
+  `bench_w4a16.py`: 14× at 4096², 20× at 5120²).
+- **MoE routed experts** (`Packed4Tensor3D.__getitem__`) — returns a `torch.Tensor`
+  subclass (`_W4A16Weight`) that intercepts `F.linear` via `__torch_function__` and routes
+  to the kernel (and materializes to bf16 for any other op). The `qwen3_5_moe` host calls
+  `F.linear(state, gate_up_proj[e])`, so this fuses the per-expert GEMMs that dominate an
+  A3B model's decode.
+
+**Measured — AMD Strix Halo gfx1151, `qwen3.6-35b-a3b` int4, all-GPU:**
+
+| path | decode tok/s |
+|---|---|
+| naive int4 (no kernel) | 2.08 |
+| + Triton on dense linears | 3.5 |
+| + Triton on MoE experts | **5.42** |
+
+Dense models gain the most — every linear is fused, not just the ~40% dense slice of an
+MoE — so a dense 7–14B int4 decodes many× faster than its naive path. On an APU, **bf16**
+is also a fine choice when the model fits in the unified pool (no dequant tax: a plain
+rocBLAS GEMM, no Triton needed).
+
+Verify/benchmark on any AMD box: `~/imenv/bin/python bench_w4a16.py`.
+
+> **Requirement:** Triton JIT-compiles launcher stubs, so the box needs a host **C
+> compiler + Python headers** (`sudo apt-get install -y gcc python3-dev`). Without them
+> you'll see `RuntimeError: Failed to find C compiler` and int4 silently falls back to the
+> (correct but slow) naive path.
+
+---
+
 ## Launch
 
 A ROCm box can run a **standalone** controller + worker (client → its own controller):
@@ -120,11 +166,11 @@ surface, and the dashboard.
 
 **Differs (handled, no action needed):**
 
-- **Fused int4 GEMM** (`torch._weight_int4pack_mm`) is implemented only for **CDNA2+**
-  (MI200/MI300) on ROCm, not RDNA (gfx11xx). On RDNA the worker's `prepare_fused()`
-  self-check sees the `... only supported on AMD gpu arch >= CDNA2` error and silently
-  falls back to the **naive int4 dequant** path — correct results, same behavior as a
-  pre-sm80 CUDA card, just without the fused-kernel decode speedup. int4 still works.
+- **int4 GEMM** — torch's fused int4 op is CDNA2+-only, so on RDNA InfiniteModel uses its
+  own **Triton w4a16 kernel** for both dense linears and MoE experts (bit-identical,
+  self-checked, ROCm-only). See [Fast int4 on RDNA](#fast-int4-on-rdna--the-triton-w4a16-kernel).
+  Needs a host C compiler (`gcc` + `python3-dev`) for Triton's JIT; falls back to the
+  correct-but-slow naive int4 path if absent.
 - **GPU utilization %** — `torch.cuda.utilization()` needs the `amdsmi` python binding,
   which the TheRock wheels don't ship. The worker heartbeat falls back to the bundled
   `rocm-smi` CLI (`_rocm_gpu_util()` in `client.py`, ROCm-guarded), so the dashboard's

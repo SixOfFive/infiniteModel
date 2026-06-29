@@ -35,12 +35,14 @@ if ! id -nG | tr ' ' '\n' | grep -qx render; then
     echo "[warn] could not add groups; do it manually: sudo usermod -aG render,video $USER"
 fi
 
-# --- 1) python + venv --------------------------------------------------------
+# --- 1) python + venv + Triton build tools (C compiler + headers) -----------
 PY="$(command -v python3 || command -v python)"
 if [ -z "$PY" ]; then echo "[ERROR] no python3 found"; exit 1; fi
-if ! "$PY" -m venv --help >/dev/null 2>&1; then
-  echo "[1/4] installing python venv module (sudo)"
-  sudo apt-get update -qq && sudo apt-get install -y -qq "python3-venv" git || true
+# Triton JIT-compiles its launcher stubs at runtime, so the ROCm int4 kernel needs a host
+# C compiler + Python headers. Best-effort (skipped if you lack sudo).
+if ! "$PY" -m venv --help >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
+  echo "[1/4] installing build tools (python3-venv, python3-dev, gcc, git) via sudo"
+  sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-dev gcc git || true
 fi
 [ -x "$VENV/bin/python" ] || "$PY" -m venv "$VENV"
 VPY="$VENV/bin/python"
