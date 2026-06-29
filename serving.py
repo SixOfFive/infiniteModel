@@ -459,6 +459,17 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
             itid = enc_res.get("image_token_id")
             n_emb = int(embeds.shape[0]) if embeds is not None else 0
             if itid is not None and n_emb and sum(counts) == n_emb:
+                # Some tokenizers render WITHOUT the image placeholder — e.g. Mistral3/Devstral have
+                # no HF chat_template, so _render_ids falls back to a flat text join that drops image
+                # parts, leaving nothing to splice at (found=0 -> text-only, image ignored). Inject
+                # one image_token_id per image (just after any leading BOS) so the run can be
+                # expanded + spliced. Archs whose template already emits the token are left as-is.
+                if ids.count(int(itid)) != len(counts):
+                    _bos = getattr(tok, "bos_token_id", None)
+                    _p = 1 if (ids and _bos is not None and ids[0] == _bos) else 0
+                    ids = list(ids[:_p]) + [int(itid)] * len(counts) + list(ids[_p:])
+                    print(f"[v1/messages] injected {len(counts)} image placeholder(s) (id "
+                          f"{int(itid)}) — tokenizer rendered none (no chat template)")
                 new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts)
                 if found == len(counts) and len(positions) == n_emb:
                     ids, mm = new_ids, (positions, embeds)
