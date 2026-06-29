@@ -273,8 +273,23 @@ def _quant_scope(model_dir: str):
         cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         model = _skeleton_from_cfg(cfg)
         lin2d, exp3d = set(), set()
+        _by_name = dict(model.named_modules())
+
+        def _under_router(nm: str) -> bool:
+            # True if any ANCESTOR module of `nm` is a router/gate. NEVER quantize a router/gate
+            # projection: int4 on the gate weights corrupts the top-k expert selection -> garbage.
+            # gemma4's Gemma4TextRouter exposes `proj` as a plain nn.Linear (so the isinstance walk
+            # would catch it); custom routers (Mixtral/Qwen3.6) hold a raw weight Parameter with no
+            # inner Linear, so they were already skipped. Matches the worker's _quantize_int4_ which
+            # skips recursing into *Router/*Gate modules (keeps the cache == cold-load by construction).
+            parts = nm.split(".")
+            for _i in range(1, len(parts)):
+                anc = _by_name.get(".".join(parts[:_i]))
+                if anc is not None and type(anc).__name__.endswith(("Router", "Gate")):
+                    return True
+            return False
         for name, mod in model.named_modules():
-            if isinstance(mod, nn.Linear) and ".layers." in name:
+            if isinstance(mod, nn.Linear) and ".layers." in name and not _under_router(name):
                 lin2d.add(name + ".weight")
         for name, p in model.named_parameters():
             if (p.dim() == 3 and ".experts." in name

@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c167"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c168"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1033,11 +1033,17 @@ def _quantize_linear4(lin, group_size: int = _INT4_GROUP):
 
 
 def _quantize_int4_(module) -> None:
-    """Recursively replace every nn.Linear under `module` with a QuantLinear4."""
+    """Recursively replace every nn.Linear under `module` with a QuantLinear4 — EXCEPT inside a
+    router/gate module. int4 on a router gate corrupts the top-k expert selection -> garbage
+    (gemma4's Gemma4TextRouter exposes `proj` as a plain nn.Linear; custom routers hold a raw weight
+    Parameter so they had no inner Linear to skip). Mirrors the cache packer's `_quant_scope`
+    exclusion so a cold load stays bit-identical to the serve-from-cache install."""
     from torch import nn
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
             setattr(module, name, _quantize_linear4(child))
+        elif type(child).__name__.endswith(("Router", "Gate")):
+            continue   # leave router/gate projections bf16 (precision-sensitive routing)
         else:
             _quantize_int4_(child)
 
