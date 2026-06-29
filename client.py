@@ -178,6 +178,32 @@ def _gpu_mem_gb() -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def _rocm_gpu_util():
+    """GPU compute-busy % on ROCm/AMD via the bundled `rocm-smi` CLI. On ROCm,
+    torch.cuda.utilization() needs the `amdsmi` python binding, which the TheRock
+    gfx1151 wheels don't ship — so the CUDA telemetry path returns nothing on AMD
+    nodes. This keeps the dashboard's GPU% 1:1 with CUDA. Guarded to ROCm (returns
+    None on CUDA/CPU so those nodes keep using torch.cuda.utilization / pynvml).
+    Best-effort; None on any failure. -> float | None."""
+    try:
+        import torch
+        if not getattr(torch.version, "hip", None):
+            return None
+    except Exception:
+        return None
+    import os, sys, shutil, subprocess, re
+    exe = shutil.which("rocm-smi") or os.path.join(sys.prefix, "bin", "rocm-smi")
+    if not exe or not os.path.exists(exe):
+        return None
+    try:
+        out = subprocess.run([exe, "--showuse"], capture_output=True,
+                             text=True, timeout=4).stdout
+    except Exception:
+        return None
+    m = re.search(r"GPU use \(%\):\s*([0-9]+)", out)
+    return float(m.group(1)) if m else None
+
+
 def _using_gpu(args: argparse.Namespace) -> bool:
     """True when this worker is configured for, and has, a usable GPU."""
     if getattr(args, "device", "cpu") not in ("gpu", "cuda", "auto", "cpu+gpu", "hybrid"):
@@ -2327,6 +2353,10 @@ async def _heartbeat_loop(writer: asyncio.StreamWriter, lock: asyncio.Lock,
             with contextlib.suppress(Exception):   # GPU compute utilization % (#46; needs pynvml)
                 import torch
                 hb["gpu_util"] = float(torch.cuda.utilization(0))
+            if "gpu_util" not in hb:                # ROCm: torch.cuda.utilization needs the amdsmi
+                _u = _rocm_gpu_util()               # python binding (absent in TheRock wheels) -> use
+                if _u is not None:                  # the bundled rocm-smi CLI instead (AMD nodes 1:1)
+                    hb["gpu_util"] = _u
         async with lock:
             writer.write(_enc(hb))
             await writer.drain()

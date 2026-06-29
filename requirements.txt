@@ -24,3 +24,9 @@ psutil
 # huggingface_hub
 # einops         # required by some models' trust_remote_code (e.g. nomic-embed-text encoder)
 # nvidia-ml-py   # optional, only for VRAM reporting on CUDA nodes
+#
+# AMD GPU (ROCm) worker: do NOT use a CPU/CUDA torch — install a ROCm build matched to
+# your GPU arch. For Strix Halo (gfx1151) the generic download.pytorch.org wheels crash
+# in the bundled HSA runtime; use AMD's arch-specific TheRock wheels instead. The helper
+#   ./install-rocm.sh [arch]      # default gfx1151
+# does the whole venv (torch + matched ROCm runtime + these deps). See docs/ROCM.md.
