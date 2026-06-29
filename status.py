@@ -414,6 +414,15 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
         entry["dl_done_gb"] = round(dl / GB, 2)
         entry["dl_total_gb"] = round(tot / GB, 2) if tot else None
         entry["dl_pct"] = round(min(100.0, 100 * dl / tot), 1) if tot else None  # never >100%
+        # Speed + ETA — only while bytes are actually moving (the poller freezes pr on pause/stop,
+        # so a stale rate would lie). rate is bytes/sec; expose MiB/s + seconds-remaining.
+        if status in ("downloading", "pausing", "stopping"):
+            rate = pr.get("rate") or 0
+            if rate > 0:
+                entry["dl_rate_mbps"] = round(rate / (1024 * 1024), 1)
+                eta = pr.get("eta_s")
+                if eta is not None and tot:
+                    entry["dl_eta_s"] = int(eta)
     elif status == "absent" and name in DOWNLOAD_ERROR:
         entry["dl_error"] = DOWNLOAD_ERROR[name]   # last pull failure (e.g. gated repo)
     if ready:                                       # #shard-cache: which quants are pre-compiled

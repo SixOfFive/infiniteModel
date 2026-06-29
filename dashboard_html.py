@@ -670,13 +670,16 @@ async function tick(){
     else if(DLING){
       const pct = m.dl_pct!=null? m.dl_pct : 0;
       const txt = m.dl_total_gb!=null ? `${m.dl_done_gb} / ${m.dl_total_gb} GB` : `${m.dl_done_gb!=null?m.dl_done_gb+' GB':'pulling…'}`;
+      const spd = m.dl_rate_mbps!=null ? ` · ${m.dl_rate_mbps} MB/s` : '';   // rolling ~30s average
+      const etaLine = m.dl_eta_s!=null
+        ? `<div class="sub" style="color:#d29922" title="estimated time remaining at the current rate">ETA ${fmtUptime(m.dl_eta_s)}</div>` : '';
       const ctl = m.status==='downloading'
         ? `<button class="sec" title="pause after the current file (cache kept, resumable)" onclick="doDlCtl('${m.name}','pause')">Pause</button> `+
           `<button class="sec" title="stop after the current file (cache kept, resumable)" onclick="doDlCtl('${m.name}','stop')">Stop</button>`
         : `<span class="sub">${m.status}…</span>`;
       actions = `<div style="min-width:150px"><div style="background:#21262d;border-radius:3px;height:6px;overflow:hidden">`+
                 `<div style="width:${pct}%;height:100%;background:#d29922;transition:width .4s"></div></div>`+
-                `<span class="sub">${txt}</span><div style="margin-top:4px">${ctl}</div></div>`;
+                `<span class="sub">${txt}${spd}</span>${etaLine}<div style="margin-top:4px">${ctl}</div></div>`;
     }
     else if(HALT){
       const pct = m.dl_pct!=null? m.dl_pct : 0;

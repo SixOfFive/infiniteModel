@@ -173,8 +173,9 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   never arrive — which otherwise stalls the first request after an idle gap until the generation
   timeout). Both the controller's connection to stage 0 and each worker's next-hop are freshened, so a
   model that sat loaded-but-unused replies immediately instead of appearing wedged.
-- Observability: placement preview, per-load progress/ETA, fleet CPU/GPU/RAM + throughput + bandwidth,
-  curl-able fleet logs; idle-gated multi-file self-update. **Per-model context history** — the model
+- Observability: placement preview, per-load progress/ETA, **live download speed + ETA** (a rolling
+  ~30s byte-rate over the HF-cache pull → remaining/rate, surfaced per model card while a pull runs),
+  fleet CPU/GPU/RAM + throughput + bandwidth, curl-able fleet logs; idle-gated multi-file self-update. **Per-model context history** — the model
   detail popup's "tokens in/out" rows are click-through to a scrollable view of the ACTUAL prompts
   sent and text generated (`GET /history`); captured as token ids (decoded lazily, off the hot path),
   kept to the most-recent N requests, and cleared when the model unloads. A managed reload (reconfigure to/from

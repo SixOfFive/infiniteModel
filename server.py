@@ -3045,13 +3045,29 @@ def build_app() -> FastAPI:
                 "downloaded": await asyncio.to_thread(_hf_cache_bytes, target),
                 "total": total}
 
-            async def _poll():   # update bytes-so-far while the download runs
+            async def _poll():   # update bytes-so-far (+ rolling rate/ETA) while the download runs
+                samples: list[tuple[float, int]] = []   # (monotonic ts, bytes) over a ~30s window
                 try:
                     while friendly in DOWNLOADING and DOWNLOAD_EPOCH.get(friendly) == epoch:
                         db = await asyncio.to_thread(_hf_cache_bytes, target)
                         pr = DOWNLOAD_PROGRESS.get(friendly)
                         if pr is not None:
                             pr["downloaded"] = db
+                            # Rolling average rate over the trailing ~30s window (smooths the
+                            # per-file steps), then ETA = bytes-remaining / rate. Both live in pr
+                            # so /status can surface them; cleared with pr when the download ends.
+                            now = time.monotonic()
+                            samples.append((now, db))
+                            cutoff = now - 30.0
+                            while len(samples) > 2 and samples[0][0] < cutoff:
+                                samples.pop(0)
+                            dt = samples[-1][0] - samples[0][0]
+                            dbytes = samples[-1][1] - samples[0][1]
+                            if dt >= 1.0 and dbytes > 0:
+                                rate = dbytes / dt          # bytes/sec
+                                pr["rate"] = rate
+                                tot = pr.get("total") or 0
+                                pr["eta_s"] = (tot - db) / rate if tot > db else 0.0
                         await asyncio.sleep(2)
                 except asyncio.CancelledError:
                     pass
