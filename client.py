@@ -1458,8 +1458,8 @@ def _install_fused_moe_forward(experts_mod) -> None:
         return                                            # not a fused-3D int4 experts module
     if getattr(experts_mod, "_fused_moe_installed", False):
         return
-    if gu.qweight.device.type != "cuda":
-        return                                            # experts live in CPU RAM (offload) -> skip
+    # NOTE: do NOT gate on device here — install runs pre-placement (experts still on CPU heap), so a
+    # cuda check would skip every path. The device decision is deferred to the first-decode self-check.
     op = _w4a16_moe_op()
     if op is None:
         return
@@ -1487,6 +1487,8 @@ def _install_fused_moe_forward(experts_mod) -> None:
     def _selfcheck(self):
         try:
             gu_h, dn_h = self.gate_up_proj, self.down_proj
+            if gu_h.qweight.device.type != "cuda":
+                return False                              # experts on CPU (offload) -> no fused kernel
             E = int(gu_h.qweight.shape[0])
             H = int(gu_h.in_features)
             dev = gu_h.qweight.device

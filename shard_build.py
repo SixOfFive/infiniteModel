@@ -761,6 +761,16 @@ class ShardBuildMixin:
                                    torch.bfloat16)
                         _mod._parameters[_pn] = torch.nn.Parameter(
                             torch.ones(tuple(_pp.shape), dtype=_dt), requires_grad=False)
+        # ROCm fused-MoE decode fast path: install the fused grouped-expert forward on every fused-3D
+        # experts module, regardless of how it was built (cold-resident / streamed / serve-from-cache).
+        # Single catch-all so no load path is missed; idempotent + self-gating (no-op on CUDA, non-fused,
+        # or CPU-offloaded experts). Device is decided at the first-decode self-check (placed by then).
+        try:
+            for _l in self.owned_layers:
+                for _m in _l.modules():
+                    _install_fused_moe_forward(_m)
+        except Exception as _e:
+            print(f"[int4] fused-MoE install sweep skipped ({_e!r})")
         model.eval()
         # TP-v2: the row-parallel o_proj/down_proj produce PARTIAL outputs — sum them across the TP
         # group via the same forward-hook + _TPAllReduce wiring as the v1 __init__ path. The reduced
