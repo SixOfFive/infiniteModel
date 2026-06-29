@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c169"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c170"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2492,6 +2492,44 @@ def _hr(bps: float) -> str:
     return f"{bps:.1f}G/s"
 
 
+def _fwd_watchdog_loop(worker) -> None:
+    """#fwd-watchdog: backstop for an orphaned forward stuck INSIDE one un-yieldable op, where the
+    cooperative between-layer cancel in shard_forward can't bail it. Scans this node's shards; for one
+    whose forward holds _fwd_lock but whose per-layer progress heartbeat (shard._fwd_progress_ts) has
+    gone STALE, first trips _fwd_cancel (in case it's paused between ops), then — if still stalled —
+    exits(42) so the supervisor relaunches and the controller auto-recovers the model(s) (#77). It
+    measures NO-PROGRESS time, not total runtime, so a legitimately long forward that keeps advancing
+    layers never trips it. Daemon; never mutates inference state beyond setting the cancel Event."""
+    import time
+    CANCEL_S = 120.0   # no layer progress this long -> ask the forward to yield (cooperative)
+    EXIT_S = 300.0     # STILL no progress -> supervisor relaunch (genuinely wedged inside one op)
+    while True:
+        time.sleep(15)
+        try:
+            now = time.time()
+            for mid, shard in list(getattr(worker, "shards", {}).items()):
+                lock = getattr(shard, "_fwd_lock", None)
+                if lock is None or not lock.locked():
+                    continue                       # no forward running on this shard
+                prog = getattr(shard, "_fwd_progress_ts", None)
+                if prog is None:
+                    continue                       # forward hasn't reached the layer loop yet
+                stalled = now - prog
+                if stalled > EXIT_S:
+                    print(f"[fwd-watchdog] {mid}: forward stalled {stalled:.0f}s with no layer progress "
+                          f"— cooperative cancel ineffective; exiting(42) for supervisor relaunch",
+                          flush=True)
+                    os._exit(42)
+                if stalled > CANCEL_S:
+                    cancel = getattr(shard, "_fwd_cancel", None)
+                    if cancel is not None and not cancel.is_set():
+                        print(f"[fwd-watchdog] {mid}: forward no progress for {stalled:.0f}s "
+                              f"— signalling cancel", flush=True)
+                        cancel.set()
+        except Exception:
+            pass
+
+
 def _console_panel_loop(worker, node_name: str) -> None:
     """Live, NON-SCROLLING status panel pinned to the bottom of an interactive worker CONSOLE.
     OPT-IN (IM_CONSOLE_PANEL=1) + TTY only — never for a service / redirected stdout. Reserves the
@@ -2612,6 +2650,8 @@ async def run(args: argparse.Namespace) -> None:
         args.controller = "127.0.0.1"
         _ROUTE_SRC = ""
     worker = Worker(args)
+    import threading as _wt   # #fwd-watchdog: backstop daemon for a forward stuck mid-op (see _fwd_watchdog_loop)
+    _wt.Thread(target=_fwd_watchdog_loop, args=(worker,), daemon=True).start()
     # #74: live console status panel (opt-in IM_CONSOLE_PANEL=1, interactive TTY only — services /
     # redirected stdout keep plain line logging). Daemon thread, fully isolated from inference.
     if os.environ.get("IM_CONSOLE_PANEL") == "1" and sys.stdout.isatty():

@@ -5,6 +5,8 @@ leaf module; in client.py EXTRA_UPDATE_FILES.
 """
 from __future__ import annotations
 
+import time
+
 _ORPHAN_CANCEL_GRACE_S = 10.0   # #fwd-cancel: seconds a fresh forward waits for an orphan to yield
 
 
@@ -48,6 +50,10 @@ class ShardForwardMixin:
             if not lock.acquire(timeout=_ORPHAN_CANCEL_GRACE_S):
                 raise RuntimeError("shard busy with a prior (orphaned) forward — re-prefill required")
         cancel.clear()   # WE own the lock now — clear so a stale signal can't abort our own forward
+        # #fwd-watchdog: stamp start + a per-layer progress heartbeat (updated in the layer loops).
+        # The worker watchdog escalates a forward whose progress ts goes STALE (stuck inside one
+        # un-yieldable op, where cooperative cancel can't help) to a supervisor relaunch.
+        self._fwd_started_ts = self._fwd_progress_ts = time.time()
         try:
             return self._forward_impl(x, cache_start, reset, all_logits, inject,
                                       position_ids, capture_hidden, capture_pre_norm)
@@ -156,6 +162,7 @@ class ShardForwardMixin:
             for _li, (layer, dev) in enumerate(zip(self.owned_layers, self.layer_devices)):
                 if self._fwd_cancel.is_set():   # #fwd-cancel: a newer forward asked this orphan to yield
                     raise _ForwardSuperseded("forward superseded by a newer request")
+                self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
                 if h.device != dev:
                     h = h.to(dev)
                 mask, pos, pos_emb, cache_position = aux_for(dev)
@@ -249,6 +256,7 @@ class ShardForwardMixin:
         for _li, layer in enumerate(self.owned_layers):
             if self._fwd_cancel.is_set():   # #fwd-cancel: yield to a newer forward (orphan cleanup)
                 raise _ForwardSuperseded("forward superseded by a newer request")
+            self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
             if _per_type:
                 out = layer(h, attention_mask=mask, position_ids=pos,
                             past_key_values=self.kv, use_cache=True,
