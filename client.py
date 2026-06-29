@@ -1115,6 +1115,43 @@ def _w4a16_triton_op():
             yp = y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn
             tl.store(yp, acc.to(tl.bfloat16), mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
+        # DECODE (M=1) GEMV — split over K for occupancy. The tl.dot kernel above launches only
+        # ~cdiv(N,BN) programs at M=1, far too few to hide memory latency on the iGPU (~13-50% of
+        # peak BW measured). This splits K across SPLITK programs per N-block (grid grows ~SPLITKx)
+        # and atomic-adds partials into an fp32 accumulator -> 3.5-3.9x on the dense GEMV (bench).
+        @triton.autotune(
+            configs=[triton.Config({"BN": 128, "SPLITK": s}, num_warps=4) for s in (4, 8, 16)],
+            key=["N", "K"],
+        )
+        @triton.jit
+        def _ksk(x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, N, K,
+                 sxk, sqk, sqn, ssn, ssg, szn, szg, syn,
+                 GROUP: tl.constexpr, BN: tl.constexpr, SPLITK: tl.constexpr):
+            pid_n = tl.program_id(0)
+            pid_k = tl.program_id(1)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            nmask = offs_n < N
+            offs_h = tl.arange(0, GROUP // 2)
+            ngroups = K // GROUP
+            gps = (ngroups + SPLITK - 1) // SPLITK       # K-groups this split reduces
+            g0 = pid_k * gps
+            acc = tl.zeros((BN,), dtype=tl.float32)
+            for gi in range(0, gps):
+                kb = g0 + gi
+                if kb < ngroups:
+                    k0 = kb * GROUP
+                    xe = tl.load(x_ptr + (k0 + 2 * offs_h) * sxk)
+                    xo = tl.load(x_ptr + (k0 + 2 * offs_h + 1) * sxk)
+                    qp = q_ptr + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
+                    b = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)
+                    lo = (b & 0xF).to(tl.float32)
+                    hi = ((b >> 4) & 0xF).to(tl.float32)
+                    s = tl.load(s_ptr + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
+                    z = tl.load(z_ptr + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
+                    acc += tl.sum(xe[:, None] * ((lo - z[None, :]) * s[None, :]), axis=0)
+                    acc += tl.sum(xo[:, None] * ((hi - z[None, :]) * s[None, :]), axis=0)
+            tl.atomic_add(y_ptr + offs_n * syn, acc, mask=nmask)
+
         def _op(x, qweight, group_size, sz):
             scale, zero = sz
             if x.dim() != 2:
@@ -1128,6 +1165,14 @@ def _w4a16_triton_op():
                 x = _F.pad(x, (0, Kpad - x.shape[1]))
             M, K = x.shape
             N = qweight.shape[0]
+            if M == 1:                                   # decode: split-K GEMV (occupancy) -> fp32 acc
+                yf = torch.zeros((N,), device=x.device, dtype=torch.float32)
+                grid = lambda meta: (triton.cdiv(N, meta["BN"]), meta["SPLITK"])  # noqa: E731
+                _ksk[grid](x.view(-1), qweight, scale, zero, yf, N, K,
+                           x.stride(1), qweight.stride(1), qweight.stride(0),
+                           scale.stride(0), scale.stride(1), zero.stride(0), zero.stride(1),
+                           yf.stride(0), GROUP=group_size)
+                return yf.to(torch.bfloat16).view(1, N)
             y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
             BM, BN = 16, 128
             grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
