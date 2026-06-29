@@ -62,6 +62,17 @@ TP_KEEPALIVE_S = 6.0
 _STREAM_PREFETCH_MAX = 6  # max concurrent per-layer weight fetches during a streaming load
                           # (actual depth K is clamped to free RAM per node; see Shard.from_stream)
 GB = 1024 ** 3
+# Triton imported at MODULE level (guarded) so the @triton.jit kernels below resolve `triton`/`tl`
+# from module globals. They must NOT be imported as locals inside the kernel-builder functions:
+# that makes `tl` a closure freevar, which triton 3.7 captures but triton 3.2 does NOT (it only
+# reads __globals__) -> "NameError: tl is not defined" at compile on older triton (seen on a CUDA
+# node, triton 3.2). None on CPU-only workers (no triton); the builders are GPU-only and guarded.
+try:
+    import triton            # noqa: F401
+    import triton.language as tl
+except Exception:
+    triton = None
+    tl = None
 # Fused-dequant int4 GEMM (torch tinygemm _weight_int4pack_mm): ~3.6x faster int4 decode by
 # dequantizing INSIDE the matmul instead of re-expanding the whole weight every token. Built per
 # QuantLinear4 at placement, self-checked vs the naive dequant, naive fallback on any mismatch /
@@ -1082,8 +1093,8 @@ def _w4a16_triton_op():
     _W4A16_TRIED = True
     try:
         import torch
-        import triton
-        import triton.language as tl
+        if triton is None:                # module-level import (see top); None on no-triton workers
+            raise ImportError("triton unavailable")
 
         @triton.jit
         def _k(x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, M, N, K,
@@ -1218,8 +1229,8 @@ def _w4a16_moe_op():
     _W4A16_MOE_TRIED = True
     try:
         import torch
-        import triton
-        import triton.language as tl
+        if triton is None:                # module-level import (see top); None on no-triton workers
+            raise ImportError("triton unavailable")
         import torch.nn.functional as _F
 
         @triton.jit
