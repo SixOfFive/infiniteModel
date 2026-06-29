@@ -90,8 +90,23 @@ class ShardForwardMixin:
                     rot_pos = rot_pos.unsqueeze(1)
             elif self._omni:   # Omni classic mRoPE needs [3,bs,seq]; text = 3x the same positions
                 rot_pos = pos_cpu.unsqueeze(0).expand(3, -1, -1).contiguous()
-            cos_cpu, sin_cpu = self.model.model.rotary_emb(ref, rot_pos)
-            cos_cpu, sin_cpu = cos_cpu.to(self.dtype), sin_cpu.to(self.dtype)
+            _rotary = self.model.model.rotary_emb
+            _lts = getattr(self.cfg, "layer_types", None)
+            # Gemma 4: PER-attention-type rotary (sliding vs full) — the rotary exposes {type}_inv_freq
+            # buffers and forward(x, pos, layer_type). Build cos/sin for each unique type; each layer
+            # picks its own by global index and gets shared_kv_states={} (last-of-type layers WRITE it;
+            # nothing READS it at num_kv_shared_layers=0). Other archs keep the single shared rotary.
+            _per_type = bool(_lts) and hasattr(_rotary, "%s_inv_freq" % _lts[0])
+            _ls = int(getattr(self, "layer_start", 0) or 0)
+            cos_cpu = sin_cpu = None
+            _cos_t, _sin_t, _skv, _pe = {}, {}, {}, {}
+            if _per_type:
+                for _t in dict.fromkeys(_lts):
+                    _c, _s = _rotary(ref, rot_pos, _t)
+                    _cos_t[_t], _sin_t[_t] = _c.to(self.dtype), _s.to(self.dtype)
+            else:
+                cos_cpu, sin_cpu = _rotary(ref, rot_pos)
+                cos_cpu, sin_cpu = cos_cpu.to(self.dtype), sin_cpu.to(self.dtype)
             # additive mask (1,1,q,total): new position i attends keys 0..cache_start+i
             mask_cpu = torch.zeros((q, total), dtype=self.dtype)
             if q > 1:  # causal among the new tokens; prior keys all visible
@@ -104,16 +119,27 @@ class ShardForwardMixin:
             def aux_for(dev):
                 a = aux.get(dev)
                 if a is None:
-                    a = (mask_cpu.to(dev), pos_cpu.to(dev),
-                         (cos_cpu.to(dev), sin_cpu.to(dev)), cpos_cpu.to(dev))
+                    pe = None if _per_type else (cos_cpu.to(dev), sin_cpu.to(dev))
+                    a = (mask_cpu.to(dev), pos_cpu.to(dev), pe, cpos_cpu.to(dev))
                     aux[dev] = a
                 return a
 
-            for layer, dev in zip(self.owned_layers, self.layer_devices):
+            def _posemb_for(dev, lt):   # per-(dev,type) cos/sin for the Gemma4 per-type path
+                k = (dev, lt); v = _pe.get(k)
+                if v is None:
+                    v = (_cos_t[lt].to(dev), _sin_t[lt].to(dev)); _pe[k] = v
+                return v
+
+            for _li, (layer, dev) in enumerate(zip(self.owned_layers, self.layer_devices)):
                 if h.device != dev:
                     h = h.to(dev)
                 mask, pos, pos_emb, cache_position = aux_for(dev)
-                if self._hybrid:
+                if _per_type:
+                    out = layer(h, attention_mask=mask, position_ids=pos,
+                                past_key_values=self.kv, use_cache=True,
+                                position_embeddings=_posemb_for(dev, _lts[_ls + _li]),
+                                shared_kv_states=_skv, cache_position=cache_position)
+                elif self._hybrid:
                     # Per-layer-type mask: full-attn gets the causal mask; linear-attn
                     # (Gated-DeltaNet) gets None (text-only, no padding). The qwen layer
                     # has no cache_position param (it tracks position via the cache).
@@ -172,8 +198,21 @@ class ShardForwardMixin:
         elif self._omni:   # Omni classic mRoPE needs [3,bs,seq]
             rot_pos = pos.unsqueeze(0).expand(3, -1, -1).contiguous()
         ref = torch.empty(1, dtype=self.dtype, device=dev)
-        cos, sin = self.model.model.rotary_emb(ref, rot_pos)
-        pos_emb = (cos.to(self.dtype), sin.to(self.dtype))
+        _rotary = self.model.model.rotary_emb
+        _lts = getattr(self.cfg, "layer_types", None)
+        # Gemma 4: per-attention-type rotary (see _forward). Build cos/sin per type on `dev`; each
+        # layer picks by global index + gets shared_kv_states={}. Other archs: one shared rotary.
+        _per_type = bool(_lts) and hasattr(_rotary, "%s_inv_freq" % _lts[0])
+        _ls = int(getattr(self, "layer_start", 0) or 0)
+        _pe_t, _skv = {}, {}
+        pos_emb = None
+        if _per_type:
+            for _t in dict.fromkeys(_lts):
+                _c, _s = _rotary(ref, rot_pos, _t)
+                _pe_t[_t] = (_c.to(self.dtype), _s.to(self.dtype))
+        else:
+            cos, sin = _rotary(ref, rot_pos)
+            pos_emb = (cos.to(self.dtype), sin.to(self.dtype))
         cache_position = torch.arange(cache_start, cache_start + q, device=dev)
         if q > 1:   # prefill: causal among the new tokens; all prior keys visible
             mask = torch.zeros((q, total), dtype=self.dtype, device=dev)
@@ -182,8 +221,13 @@ class ShardForwardMixin:
             mask = mask.view(1, 1, q, total)
         else:       # decode: one query sees every key -> no mask needed
             mask = None
-        for layer in self.owned_layers:
-            if self._hybrid:
+        for _li, layer in enumerate(self.owned_layers):
+            if _per_type:
+                out = layer(h, attention_mask=mask, position_ids=pos,
+                            past_key_values=self.kv, use_cache=True,
+                            position_embeddings=_pe_t[_lts[_ls + _li]],
+                            shared_kv_states=_skv, cache_position=cache_position)
+            elif self._hybrid:
                 m = mask if getattr(layer, "layer_type", "full_attention") == "full_attention" else None
                 out = layer(h, attention_mask=m, position_ids=pos,
                             past_key_values=self.kv, use_cache=True,
