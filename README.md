@@ -106,31 +106,36 @@ pip install pillow librosa soundfile
 ```
 
 - Run the controller on the machine with the most disk + RAM (it holds every model's weights).
-- `torch`: install the build matching that box — CUDA wheel if it has a GPU, otherwise the CPU wheel:
-  `pip install torch --index-url https://download.pytorch.org/whl/cpu`.
+- `torch`: install the build matching that box — the default **CUDA** wheel on an NVIDIA box, or the
+  **CPU** wheel otherwise (`pip install torch --index-url https://download.pytorch.org/whl/cpu`). On an
+  **AMD** box, ROCm is a **separate setup** — see **[docs/ROCM.md](docs/ROCM.md)**, not these wheels.
 
 ### Worker (client) — `client.py`
 
 A worker only executes layers and talks to the controller over TCP — it runs **no HTTP server**, so
-it does **not** need `fastapi`/`uvicorn` (a much lighter, different dependency set):
+it does **not** need `fastapi`/`uvicorn` (a much lighter, different dependency set). **Pick the one
+path that matches the worker's hardware:**
+
+**① NVIDIA GPU or CPU worker** (the CUDA/CPU path):
 
 ```bash
-# core
+# core — NVIDIA: the default CUDA torch wheel; CPU-only: add the cpu index-url to torch (below)
 pip install torch transformers safetensors huggingface_hub numpy psutil
-
-# needed by some models' trust_remote_code (e.g. nomic-embed-text); optional VRAM reporting on CUDA nodes
-pip install einops
-pip install nvidia-ml-py            # optional, GPU nodes only
+pip install einops                 # some models' trust_remote_code (e.g. nomic-embed-text)
+pip install nvidia-ml-py           # optional, NVIDIA GPU nodes only (VRAM reporting)
 ```
 
-- **CPU-only worker:** `pip install torch --index-url https://download.pytorch.org/whl/cpu`
-- **GPU worker:** install the default CUDA `torch` wheel instead.
-- **AMD GPU (ROCm) worker:** fully supported — InfiniteModel runs **1:1 with CUDA** via PyTorch's HIP
-  (device stays `cuda:N`, same code path). Install a ROCm `torch` matched to your GPU arch — for AMD
-  **Strix Halo / RDNA** use AMD's arch-specific *TheRock* wheels (the generic ROCm wheels can crash on
-  new chips/kernels). The helper [`install-rocm.sh`](install-rocm.sh) builds the whole venv, and a
-  **Triton w4a16 int4 kernel** keeps int4 decode fast on RDNA. Full guide: **[docs/ROCM.md](docs/ROCM.md)**.
-- **Offline / pinned install:** [`install/`](install/) has `install.sh` / `install.bat` that build a
+- **CPU-only:** `pip install torch --index-url https://download.pytorch.org/whl/cpu`
+- **NVIDIA GPU:** the default CUDA `torch` wheel (above).
+
+**② AMD GPU (ROCm) worker — a SEPARATE setup; do _not_ use the CUDA/CPU wheels above.** InfiniteModel
+runs **1:1 with CUDA** on AMD via PyTorch's HIP (the device stays `cuda:N` and the inference code is
+unchanged), but it needs a ROCm `torch` matched to your GPU arch — for **Strix Halo / RDNA** use AMD's
+arch-specific *TheRock* wheels (the generic ROCm wheels can crash on new chips/kernels), plus a Triton
+w4a16 int4 kernel for fast int4 decode on RDNA. The helper **[`install-rocm.sh`](install-rocm.sh)**
+builds the entire venv in one step. **Full, self-contained guide → [docs/ROCM.md](docs/ROCM.md).**
+
+- **Offline / pinned install (NVIDIA/CPU):** [`install/`](install/) has `install.sh` / `install.bat` that build a
   self-contained venv from `install/requirements-client.txt` (drop your own wheels into
   `install/wheels/` for a fully offline build).
 
