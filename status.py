@@ -329,36 +329,38 @@ def _model_caps(tgt: str, spec=None) -> list:
         return _CAPS_CACHE[tgt]
     caps: list = []
     try:
-        if spec is not None and getattr(spec, "is_embedding", False):
-            caps = ["embedding"]
-        else:
-            import os
-            import json as _json
-            d = _local_model_dir(tgt)
-            cfgd = None
-            if d:
-                p = os.path.join(d, "config.json")
-                if os.path.exists(p):
-                    with open(p, encoding="utf-8") as fh:
-                        cfgd = _json.load(fh)
-            if cfgd:
-                base = cfgd.get("thinker_config") or cfgd   # Omni nests vision/audio under thinker
+        # Read MODALITIES from config first (so a multimodal model whose spec is mis-flagged
+        # is_embedding — e.g. Qwen2.5-Omni — still shows image/stt/tts), then fall back to the
+        # embedding badge only when the model has NO modalities (a pure encoder like nomic).
+        import os
+        import json as _json
+        d = _local_model_dir(tgt)
+        cfgd = None
+        if d:
+            p = os.path.join(d, "config.json")
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as fh:
+                    cfgd = _json.load(fh)
+        if cfgd:
+            base = cfgd.get("thinker_config") or cfgd   # Omni nests vision/audio under thinker
+            _b = base if isinstance(base, dict) else {}
 
-                def _has(*ks):
-                    return (any(cfgd.get(k) is not None for k in ks)
-                            or (isinstance(base, dict) and any(base.get(k) is not None for k in ks)))
-                _b = base if isinstance(base, dict) else {}
-                if _b.get("vision_config") or cfgd.get("vision_config") \
-                        or _has("image_token_id", "image_token_index"):
-                    caps.append("image")
-                if _has("video_token_id", "video_token_index"):
-                    caps.append("video")
-                if _b.get("audio_config") or cfgd.get("audio_config") \
-                        or _has("audio_token_id", "audio_token_index"):
-                    caps.append("stt")
-                mt = (cfgd.get("model_type") or "").lower()
-                if "omni" in mt or cfgd.get("talker_config") or _b.get("talker_config"):
-                    caps.append("tts")
+            def _has(*ks):
+                return (any(cfgd.get(k) is not None for k in ks)
+                        or any(_b.get(k) is not None for k in ks))
+            if _b.get("vision_config") or cfgd.get("vision_config") \
+                    or _has("image_token_id", "image_token_index"):
+                caps.append("image")
+            if _has("video_token_id", "video_token_index"):
+                caps.append("video")
+            if _b.get("audio_config") or cfgd.get("audio_config") \
+                    or _has("audio_token_id", "audio_token_index"):
+                caps.append("stt")
+            mt = (cfgd.get("model_type") or "").lower()
+            if "omni" in mt or cfgd.get("talker_config") or _b.get("talker_config"):
+                caps.append("tts")
+        if not caps and spec is not None and getattr(spec, "is_embedding", False):
+            caps = ["embedding"]
     except Exception:
         pass
     _CAPS_CACHE[tgt] = caps
