@@ -58,6 +58,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   models list, each loaded-model card, and the model detail modal — so it's obvious which alternate
   names resolve to a given model. (`_aliases_for` reverse-maps `MODEL_ALIASES`; rendered in Ollama
   `family:size` form.)
+- **Delete is a complete removal** (`/delete`): it purges the model's on-disk cache (its
+  `models/<name>/` incl. the `_shards/<quant>/` pre-quant caches *and* the HF-cache duplicate) AND its
+  whole registry footprint — every registered name that resolves to the same repo (so re-registered
+  alias names can't dangle on now-missing files), its GGUF mark, and any built-in `MODEL_ALIASES` entry
+  pointing at it. Delete == forget + purge files; refuses if any of those names is loaded or
+  downloading. (`/forget` remains the opposite trade-off: unregister but keep the files.)
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8

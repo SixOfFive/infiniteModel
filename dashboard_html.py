@@ -1056,7 +1056,7 @@ async function addModel(){
   }catch(e){ el.textContent='error: '+e; }
 }
 async function doDelete(name){
-  if(!confirm('Delete '+name+' weights from the controller? (re-downloadable later)')) return;
+  if(!confirm('Delete '+name+' COMPLETELY?\\n\\nRemoves its weights + shard cache (and the HF-cache copy) AND unregisters it — including any alias names registered against the same repo. To bring it back you must re-add it (org/name) and re-download.')) return;
   const r=await (await fetch(`/delete?model=${encodeURIComponent(name)}`,{method:'POST'})).json();
   document.getElementById('loadmsg').textContent=r.ok?('deleted '+name):('delete failed: '+r.error); }
 async function doGen(){

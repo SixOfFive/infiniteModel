@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c155"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c156"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -3030,17 +3030,44 @@ def build_app() -> FastAPI:
         return {"ok": True, "status": "downloading"}
 
     async def _do_delete(friendly: str) -> dict:
-        """Delete a model's weights from the controller cache. Refuses if the
-        model is currently loaded (unload first)."""
+        """Delete a model COMPLETELY from the controller: its weight/quant CACHE
+        (models/<name>/ incl. the _shards/<quant>/ pre-quant caches AND the HF-cache
+        copy) AND its registry footprint — EVERY registered name that resolves to the
+        same repo (the model + any alias names re-registered against the same HF id),
+        its GGUF mark, and any built-in alias pointing at it. Full removal: delete ==
+        forget + purge files. Refuses if any of those names is loaded or downloading."""
         target = MODELS[friendly][0] if friendly in MODELS else friendly
-        if friendly in engine.models:
-            return {"ok": False, "error": "model is currently loaded — unload it first"}
-        if friendly in DOWNLOADING:
-            return {"ok": False, "error": "model is downloading — wait for it to finish"}
+        # Every name that resolves to the SAME repo shares the on-disk files we're about
+        # to remove, so all of them must be unregistered too — otherwise they'd dangle on
+        # a now-missing model. Custom 'aliases' = multiple CUSTOM_MODELS keys -> one HF id;
+        # plus any built-in MODEL_ALIASES entry whose key or canonical target is in the set.
+        names = {friendly} | {k for k, hf in CUSTOM_MODELS.items() if hf == target}
+        names |= {a for a, c in MODEL_ALIASES.items() if a in names or c in names}
+        loaded = sorted(n for n in names if n in engine.models)
+        if loaded:
+            return {"ok": False,
+                    "error": f"model is currently loaded ({', '.join(loaded)}) — unload it first"}
+        busy = sorted(n for n in names if n in DOWNLOADING)
+        if busy:
+            return {"ok": False,
+                    "error": f"model is downloading ({', '.join(busy)}) — wait for it to finish"}
         deleted = await asyncio.to_thread(delete_model_cache, target)
-        if deleted:
-            print(f"[model] deleted {friendly} ({target}) from controller cache")
-        return {"ok": deleted, "error": None if deleted else "model not present in cache"}
+        # Purge the registry footprint regardless of whether files were present, so a
+        # half-registered model (registered, no files) is still fully removed by a delete.
+        forgot = []
+        for n in list(names):
+            if CUSTOM_MODELS.pop(n, None) is not None:
+                forgot.append(n)
+                MODELS.pop(n, None)        # drop the registry/list entry (custom only)
+            MODEL_ALIASES.pop(n, None)     # drop any alias keyed by this name
+        if forgot:
+            GGUF_FILES.pop(target, None)   # all registrations for this repo are gone
+            save_custom_models()
+        if deleted or forgot:
+            print(f"[model] deleted {friendly} ({target}) — cache_removed={deleted} "
+                  f"unregistered={sorted(forgot) or '[]'}", flush=True)
+        ok = deleted or bool(forgot)
+        return {"ok": ok, "error": None if ok else "model not present in cache or registry"}
 
     @app.post("/download")           # dashboard: pull a configured model to controller
     async def download(model: str) -> JSONResponse:
