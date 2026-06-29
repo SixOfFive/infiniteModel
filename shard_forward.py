@@ -5,6 +5,15 @@ leaf module; in client.py EXTRA_UPDATE_FILES.
 """
 from __future__ import annotations
 
+_ORPHAN_CANCEL_GRACE_S = 10.0   # #fwd-cancel: seconds a fresh forward waits for an orphan to yield
+
+
+class _ForwardSuperseded(RuntimeError):
+    """A running (orphaned) forward was asked to yield by a newer forward — raised at a layer
+    boundary so the stale thread releases _fwd_lock promptly instead of running to completion.
+    Propagates like the old 'shard busy' error: the abandoned req_id has no pending future, so the
+    controller ignores it. #fwd-cancel."""
+
 
 class ShardForwardMixin:
 
@@ -23,8 +32,22 @@ class ShardForwardMixin:
         lock = getattr(self, "_fwd_lock", None)
         if lock is None:
             lock = self._fwd_lock = threading.Lock()
+        cancel = getattr(self, "_fwd_cancel", None)
+        if cancel is None:
+            cancel = self._fwd_cancel = threading.Event()
         if not lock.acquire(blocking=False):
-            raise RuntimeError("shard busy with a prior (orphaned) forward — re-prefill required")
+            # #fwd-cancel: an ORPHANED forward holds the lock — the controller reclaimed its request
+            # (hop timeout / disconnect / gen-stall watchdog) but a worker thread can't be cancelled,
+            # so it keeps grinding and wedges the shard ("shard busy ... re-prefill required" on every
+            # later request until it finishes — minutes when CPU-spilled). Signal it to bail at its
+            # NEXT layer boundary (cooperative check in _forward_impl/_forward_uniform), then wait a
+            # short grace for it to release. If it yields we proceed (the controller re-prefills into a
+            # fresh cache); if it's stuck inside one un-yieldable op past the grace, fail fast as
+            # before (worker-restart is the backstop). Self-healing: no controller protocol change.
+            cancel.set()
+            if not lock.acquire(timeout=_ORPHAN_CANCEL_GRACE_S):
+                raise RuntimeError("shard busy with a prior (orphaned) forward — re-prefill required")
+        cancel.clear()   # WE own the lock now — clear so a stale signal can't abort our own forward
         try:
             return self._forward_impl(x, cache_start, reset, all_logits, inject,
                                       position_ids, capture_hidden, capture_pre_norm)
@@ -131,6 +154,8 @@ class ShardForwardMixin:
                 return v
 
             for _li, (layer, dev) in enumerate(zip(self.owned_layers, self.layer_devices)):
+                if self._fwd_cancel.is_set():   # #fwd-cancel: a newer forward asked this orphan to yield
+                    raise _ForwardSuperseded("forward superseded by a newer request")
                 if h.device != dev:
                     h = h.to(dev)
                 mask, pos, pos_emb, cache_position = aux_for(dev)
@@ -222,6 +247,8 @@ class ShardForwardMixin:
         else:       # decode: one query sees every key -> no mask needed
             mask = None
         for _li, layer in enumerate(self.owned_layers):
+            if self._fwd_cancel.is_set():   # #fwd-cancel: yield to a newer forward (orphan cleanup)
+                raise _ForwardSuperseded("forward superseded by a newer request")
             if _per_type:
                 out = layer(h, attention_mask=mask, position_ids=pos,
                             past_key_values=self.kv, use_cache=True,
