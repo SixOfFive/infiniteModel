@@ -51,8 +51,13 @@ This is the one place where InfiniteModel deliberately offers more on Linux than
 NVIDIA hardware.
 
 **Validated (2026-06-30):** RTX 3060 (Ampere sm_86) — kernel builds, correct (rel 0.006), **3.9× on the
-routed-expert GEMM** vs bf16-remat. Quadro P620 (Pascal sm_61) — Triton bf16 won't compile → correct
+routed-expert GEMM** (microbench) and **end-to-end in the live worker: `olmoe:1b-7b` int4 8.5 → ~31.5
+tok/s (~3.7×)** with the opt-in on. Quadro P620 (Pascal sm_61) — Triton bf16 won't compile → correct
 automatic fallback to the default path (no speedup, no breakage).
+
+> **Triton version note:** the kernels resolve `triton`/`tl` from **module globals** (not a local import
+> inside the builder), because triton 3.2 — unlike 3.7 — does not capture them as closure freevars and
+> would otherwise fail to compile with `NameError: tl is not defined`. Keep the import at module scope.
 
 ## Environment switches (worker)
 
