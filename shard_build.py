@@ -729,6 +729,20 @@ class ShardBuildMixin:
             if getattr(model.model, "rotary_emb", None) is None:   # model-level for the shared forward
                 with contextlib.suppress(Exception):
                     model.model.rotary_emb = _mk_rotary()
+        # Gemma-family scaled embeddings register a NON-persistent `embed_scale` (= sqrt(hidden_size))
+        # buffer computed in __init__; the streamed build loads checkpoint weights but never fills it,
+        # so it stays on META and trips the meta-guard below (would crash .to(device)). Recompute any
+        # meta 'embed_scale' buffer under the embed module as sqrt(embedding_dim) in the embed dtype
+        # (the Gemma normalizer) — mirrors the inv_freq rebuild above.
+        if has_embed and self.embed is not None:
+            for _em in self.embed.modules():
+                _bs = _em._buffers.get("embed_scale", None)
+                if _bs is not None and getattr(_bs, "is_meta", False):
+                    _w = getattr(_em, "weight", None)
+                    _dim = int(_w.shape[-1]) if (_w is not None and _w.dim() >= 1) \
+                        else int(getattr(self.cfg, "hidden_size", 0) or 0)
+                    _dt = _w.dtype if _w is not None else torch.float32
+                    _em._buffers["embed_scale"] = torch.tensor(_dim ** 0.5, dtype=_dt)
         model.eval()
         # TP-v2: the row-parallel o_proj/down_proj produce PARTIAL outputs — sum them across the TP
         # group via the same forward-hook + _TPAllReduce wiring as the v1 __init__ path. The reduced
