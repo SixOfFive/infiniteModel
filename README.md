@@ -31,8 +31,11 @@ dashboard.
 - **Goes faster where it can.** Tensor parallelism within a stage (capacity-proportional, GPU+CPU
   mixed meshes) and opt-in speculative decoding.
 - **Quantization.** int4 (group-wise, fused tinygemm GEMM) and int8 (per-channel) at load time;
-  serves fp8 and nvfp4 checkpoints by dequantizing on the fly. Runs on **AMD GPUs (ROCm)** too —
-  1:1 with CUDA via HIP, with a Triton w4a16 kernel for fast int4 on RDNA ([docs/ROCM.md](docs/ROCM.md)).
+  serves fp8 and nvfp4 checkpoints by dequantizing on the fly. Decode-kernel acceleration is
+  **platform-tiered** — torch tinygemm int4 on NVIDIA/CPU, a Triton w4a16 + split-K kernel on **AMD
+  GPUs (ROCm/RDNA)**, and an **opt-in fused MoE-expert kernel on Linux+NVIDIA**
+  ([docs/ACCELERATION.md](docs/ACCELERATION.md)). Runs on AMD **1:1 with CUDA via HIP**
+  ([docs/ROCM.md](docs/ROCM.md)).
 - **Pre-compiled shard cache.** The controller quantizes a model once to `_shards/<quant>/`, so later
   loads stream small **pre-packed** int4/int8 layers instead of bf16 + re-quantizing — for dense
   models *and* MoE (fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load.
