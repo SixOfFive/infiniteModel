@@ -274,13 +274,13 @@ DASHBOARD_HTML = """<!doctype html>
         <input id="cfg-auto" type="checkbox"> auto-unload idle models — after 60 min idle, or to make room</label>
       <label class="sub" title="A request for a KNOWN but not-resident model auto-loads it (GPU-first placement, using the Auto-load defaults below) instead of failing.">
         <input id="cfg-autoload" type="checkbox"> auto-load on request</label>
-      <span class="sub" style="width:100%;color:#8b949e;border-top:1px solid #21262d;padding-top:8px">Auto-load defaults — used by each model's <b>Load</b> button AND by auto-load when a request hits a non-resident model:</span>
+      <span class="sub" style="width:100%;color:#8b949e;border-top:1px solid #21262d;padding-top:8px">Auto-load defaults — the single place for quant · ctx · mode: used by each model's <b>Load</b> button, the <b>Load &amp; run</b> panel below, AND by auto-load when a request hits a non-resident model:</span>
       <label class="sub" title="Quant the Load button + auto-load use. int4 (default) = smallest: ~1/4 the bf16 memory, fits more nodes, serves pre-packed when a shard cache exists. Falls back to bf16 if int4/int8 can't quantize a given model.">quant
         <select id="cfg-aq" style="width:80px"><option value="int4">int4</option><option value="int8">int8</option><option value="none">bf16</option></select></label>
       <label class="sub" title="Default context length the Load button + auto-load use. 8192 (8k) is a sane working window that keeps KV modest. 0 = the model's native training context.">ctx
         <input id="cfg-ctx" type="number" min="0" step="1024" style="width:76px"></label>
       <label class="sub" title="Default placement mode the Load button + auto-load use. auto = GPU-first, fewest nodes (best latency); gpu-spread/distribute/proportional spread across more nodes; single = collapse to one box if it fits.">mode
-        <select id="cfg-mode" style="width:118px"><option value="auto">auto</option><option value="single">single</option><option value="gpu-spread">GPU-spread</option><option value="all-gpu">all-GPU</option><option value="distribute">distribute</option><option value="spread">spread</option><option value="proportional">proportional</option></select></label>
+        <select id="cfg-mode" style="width:118px"><option value="auto">auto</option><option value="single">single</option><option value="gpu-spread">GPU-spread</option><option value="all-gpu">all-GPU</option><option value="distribute">distribute</option><option value="spread">spread</option><option value="proportional">proportional</option><option value="tp2">tp×2 (GPU mesh)</option><option value="tp4">tp×4 (GPU mesh)</option></select></label>
       <label class="sub" title="ON (default): pack a new model's WEIGHTS into physically-free VRAM, using resident models' reserved-but-unused KV headroom — so a model lands on GPU when VRAM is free instead of spilling weights to CPU. Each model still reserves its own KV. OFF: conservative — reserve every resident model's full-context KV on GPU (weights spill to CPU before a resident model's KV is touched).">
         <input id="cfg-wf" type="checkbox"> weights-first VRAM</label>
       <button class="sec" onclick="saveConfig()">Save</button>
@@ -294,25 +294,7 @@ DASHBOARD_HTML = """<!doctype html>
     <b>Load &amp; run</b>
     <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center">
       <select id="m"></select>
-      <label class="sub" title="blank = the model's native training context (config max_position_embeddings)">ctx <input id="ctx" type="number" placeholder="auto" style="width:90px"></label>
-      <label class="sub" title="how the model is placed across the fleet">run
-        <select id="mode" style="width:auto">
-          <option value="auto" selected>auto — GPU-first, fewest nodes</option>
-          <option value="single">single box — fewest nodes (one box if it fits)</option>
-          <option value="gpu-spread">all GPUs — fill VRAM, spill to CPU</option>
-          <option value="all-gpu">all GPUs — every GPU, no CPU spill</option>
-          <option value="distribute">distribute — split across whole fleet</option>
-          <option value="spread">spread — a stage on EVERY node (incl. tiny ones)</option>
-          <option value="proportional">proportional — every node, share ∝ capacity (big int4 MoE)</option>
-          <option value="tp2">tensor-parallel ×2 (GPU mesh)</option>
-          <option value="tp4">tensor-parallel ×4 (GPU mesh)</option>
-        </select></label>
-      <label class="sub" title="weight quantization for the manual Load/Preview below (the per-model row buttons pick their own)">quant
-        <select id="q" style="width:auto">
-          <option value="none" selected>bf16 (full)</option>
-          <option value="int8">int8 (~½)</option>
-          <option value="int4">int4 (~¼)</option>
-        </select></label>
+      <span class="sub" title="Preview and Load use the quant · ctx · mode set in the Auto-load defaults above — one place for all loads. Change them there.">↑ uses the <b>quant · ctx · mode</b> from Auto-load defaults above</span>
       <button class="sec" onclick="doPreview()" title="#60: show WHERE this model would land + a pre-load sanity check (VRAM/RAM split, KV fit, est tok/s tier) WITHOUT loading">Preview</button>
       <button onclick="doLoad()">Load</button>
       <button class="sec" onclick="doUnloadAll()" title="unload EVERY model from every node — drops all shards fleet-wide, frees their RAM/VRAM, and clears the controller's draft state. Reversible (reload from the list).">Unload all</button>
@@ -883,8 +865,8 @@ async function saveConfig(){
   }catch(e){ document.getElementById('cfgmsg').textContent='error: '+e; }
 }
 async function doPreview(){   // #60: GET /plan (no load) -> show placement + the #76 assessment
-  const m=document.getElementById('m').value, ctx=document.getElementById('ctx').value||0;
-  const mode=document.getElementById('mode').value, q=document.getElementById('q').value||'none';
+  const m=document.getElementById('m').value, ctx=(document.getElementById('cfg-ctx')||{}).value||0;
+  const mode=(document.getElementById('cfg-mode')||{}).value||'auto', q=(document.getElementById('cfg-aq')||{}).value||'int4';
   const box=document.getElementById('previewbox');
   if(!m){ box.textContent='pick a model first'; return; }
   const _lm=document.getElementById('loadmsg'); if(_lm) _lm.textContent='';  // clear stale load/error msg above the preview
@@ -907,9 +889,9 @@ async function doPreview(){   // #60: GET /plan (no load) -> show placement + th
 }
 async function doLoad(quant,mode){
   const _n=Date.now(); if(window.__lastLoadClick && _n-window.__lastLoadClick<1500){ return; } window.__lastLoadClick=_n;  // debounce double-clicks
-  const m=document.getElementById('m').value, ctx=document.getElementById('ctx').value||0;
-  mode = mode || document.getElementById('mode').value;
-  const q=quant||document.getElementById('q').value||'none';
+  const m=document.getElementById('m').value, ctx=(document.getElementById('cfg-ctx')||{}).value||0;
+  mode = mode || (document.getElementById('cfg-mode')||{}).value||'auto';
+  const q=quant||(document.getElementById('cfg-aq')||{}).value||'int4';
   let tp=1;
   if(mode && mode.indexOf('tp')===0){ tp=parseInt(mode.slice(2))||2; mode='auto'; }   // tpN dropdown -> &tp=N
   // #78 guardrail: for a CONSOLIDATING mode (auto/single), pre-check the plan; if it would pile a
