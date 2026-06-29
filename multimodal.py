@@ -505,14 +505,26 @@ def _load_vision_encoder(target_id: str):
           f"({', '.join(p for _, p in mods)}); scanning {len(files)} shard(s); device={dev}")
     total, mat_all = 0, []
     for submod, prefix in mods:
-        sd = {}
-        for fn in files:
-            with safe_open(fn, framework="pt") as fh:
-                hits = [k for k in fh.keys() if k.startswith(prefix)]
-                for k in hits:
-                    sd[k[len(prefix):]] = fh.get_tensor(k)
+        # The checkpoint may store this submodule under the in-memory qualified prefix
+        # ('model.vision_tower.') OR the raw original prefix without the 'model.' wrapper
+        # ('vision_tower.' — e.g. Devstral/Mistral3, whose checkpoint keys are vision_tower.* /
+        # multi_modal_projector.* / language_model.*). transformers bridges these via
+        # _checkpoint_conversion_mapping at a normal load; we read RAW safetensors keys, so try
+        # both candidates and use whichever the checkpoint actually has.
+        cands = [prefix] + ([prefix[len("model."):]] if prefix.startswith("model.") else [])
+        sd, used = {}, None
+        for cand in cands:
+            for fn in files:
+                with safe_open(fn, framework="pt") as fh:
+                    hits = [k for k in fh.keys() if k.startswith(cand)]
+                    for k in hits:
+                        sd[k[len(cand):]] = fh.get_tensor(k)
+            if sd:
+                used = cand
+                break
+            sd = {}
         if not sd:
-            raise RuntimeError(f"no '{prefix}*' weights found in {model_dir}")
+            raise RuntimeError(f"no weights for any of {cands} in {model_dir}")
         # Computed non-persistent buffers (rotary inv_freq) stay on meta after the assign-load;
         # _materialize_meta_tensors gives them real storage on `dev` (arch-correct for 2D rope)
         # so the .to(dev) below is safe.
@@ -521,7 +533,7 @@ def _load_vision_encoder(target_id: str):
         submod.to(dev)
         total += len(sd)
         mat_all += mat
-        _vlog(f"[vision]   '{prefix}': {len(sd)} tensors assign-loaded + moved to {dev}; "
+        _vlog(f"[vision]   '{used}': {len(sd)} tensors assign-loaded + moved to {dev}; "
               f"materialized {len(mat)} meta tensor(s)")
     _VISION_MAT[target_id] = mat_all
     missing = [m for m in mat_all if "MISSING_" in m[2]]   # MISSING_WEIGHT or MISSING_ROTARY
