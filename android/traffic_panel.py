@@ -5,7 +5,8 @@ InfiniteModel tablet bandwidth panel  (standalone, READ-ONLY).
 Polls the controller's /status and draws a static, non-scrolling table of every node's
 traffic to the rest of the fleet (node <-> all) plus the controller and a fleet TOTAL.
 
-  DOWN / UP  - current in / out rate
+  DOWN / UP  - current in / out rate.  DOWN is shown in GREEN, UP in RED
+               (a legend states this below the table)
   NEXT       - where this node sends its activations, INFERRED from the loaded models'
                pipeline placement (controller -> stage0 -> ... -> head -> controller).
                'ctrl' = back to the controller (a head stage or a single-node model);
@@ -17,9 +18,8 @@ traffic to the rest of the fleet (node <-> all) plus the controller and a fleet 
                rows sort busiest-first by this
 
 NEXT is an INFERENCE from placement, not a measured per-edge rate (the controller doesn't expose
-per-peer byte counts over /status). In a running pipeline almost all of a node's UP traffic is the
-hidden-state handoff to its next stage, so the label tells you who that is -- but the DOWN/UP
-numbers are still each node's TOTAL across every connection, not a per-edge measurement.
+per-peer byte counts over /status). The DOWN/UP numbers are each node's TOTAL across every
+connection, not a per-edge measurement; the sparkline bars are the COMBINED in+out trend.
 
 Native Termux (no proot/torch); pure /status consumer -- touches nothing in the fleet client.
   python traffic_panel.py [controller_ip] [poll_seconds]
@@ -42,6 +42,9 @@ LOG_EVERY  = 10.0
 SPARK      = " ▁▂▃▄▅▆▇█"
 IDLE_FLOOR = 2048                                   # below this peak (B/s) a row's spark stays flat
 CTRL       = "controller"                           # controller's row name + bookend of every chain
+
+GRN, RED, DIM, MAG, BOLD, RST = (
+    "\033[32m", "\033[31m", "\033[2m", "\033[35m", "\033[1m", "\033[0m")
 
 hist  = defaultdict(lambda: deque(maxlen=HIST))    # combined (in+out) rate samples
 xfer  = defaultdict(float)                          # cumulative bytes moved this session
@@ -140,6 +143,26 @@ def next_label(host, down, mesh):
     return "→" + names[0][:5] + "+%d" % (len(names) - 1)
 
 
+# Column widths, in order: NODE DOWN UP NEXT MAX XFER. DOWN is index 1 (green), UP is index 2 (red).
+COLW = ((11, "<"), (9, ">"), (9, ">"), (9, "<"), (9, ">"), (9, ">"))
+FIXED = 1 + sum(w for w, _ in COLW) + (len(COLW) - 1) + 2   # leading sp + cells + gaps + "  " = 64
+
+
+def fmt_row(vals, spk, cols, base="", color=False):
+    """Assemble one fixed-width row. `vals` = the 6 column strings; `spk` = trailing sparkline.
+    When `color`, DOWN (idx 1) is green and UP (idx 2) red, each returning to `base` after.
+    Plain rows are sliced to `cols`; colored rows are sized to fit by construction (caller only
+    enables color when the terminal is wide enough), so they're never sliced mid-escape."""
+    cells = [f"{v:{a}{w}}" for v, (w, a) in zip(vals, COLW)]
+    if color:
+        cells[1] = f"{GRN}{cells[1]}{RST}{base}"
+        cells[2] = f"{RED}{cells[2]}{RST}{base}"
+        return base + " " + " ".join(cells) + "  " + spk + RST
+    plain = " " + " ".join(cells) + "  " + spk
+    plain = plain[:cols]
+    return (base + plain + RST) if base else plain
+
+
 def log_csv(ts, samples):
     if ts - _last_log[0] < LOG_EVERY:
         return
@@ -163,7 +186,6 @@ def fetch():
         return json.load(r)
 
 
-ROW = " {:<11} {:>9} {:>9} {:<9} {:>9} {:>9}  {}"  # NODE DOWN UP NEXT MAX XFER <spark>; fixed = 64
 _last_size = [0, 0]
 
 
@@ -178,7 +200,8 @@ def render():
     if (cols, lines) != (_last_size[0], _last_size[1]):
         _last_size[0], _last_size[1] = cols, lines
         sys.stdout.write("\033[2J")                   # full clear on (re)size -> no stale artifacts
-    sw = max(6, cols - 65)
+    sw = max(6, cols - (FIXED + 1))
+    color = cols >= FIXED + 8                          # only colorize when the row fits without wrap
     out = []
     now = time.strftime("%H:%M:%S")
     try:
@@ -215,26 +238,27 @@ def render():
         node_names = [nm for nm in cur if nm not in ("controller", "__total__")]
         node_names.sort(key=lambda nm: xfer[nm], reverse=True)
 
-        out.append("\033[2m" + ROW.format("NODE", "DOWN", "UP", "NEXT", "MAX", "XFER",
-                                          "speed vs max"[:sw]) + "\033[0m")
-        budget = max(1, lines - 4)
+        out.append(fmt_row(("NODE", "DOWN", "UP", "NEXT", "MAX", "XFER"),
+                           "speed vs max"[:sw], cols, base=DIM))
+        budget = max(1, lines - 6)                     # title+header+controller+total+legend(+more)
         shown = node_names[:budget]
         for name in shown:
             i, o = cur[name]
-            out.append(ROW.format(name, human(i), human(o), next_label(name, down, mesh),
-                                  human(wmax[name]), human_bytes(xfer[name]),
-                                  spark(hist[name], sw, wmax[name]))[:cols])
+            out.append(fmt_row((name, human(i), human(o), next_label(name, down, mesh),
+                                human(wmax[name]), human_bytes(xfer[name])),
+                               spark(hist[name], sw, wmax[name]), cols, color=color))
         if len(node_names) > len(shown):
-            out.append(f"\033[2m   …{len(node_names) - len(shown)} more node(s)\033[0m")
+            out.append(f"{DIM}   …{len(node_names) - len(shown)} more node(s){RST}")
 
-        cl = ROW.format("controller", human(ci), human(co), next_label("controller", down, mesh),
-                        human(wmax["controller"]), human_bytes(xfer["controller"]),
-                        spark(hist["controller"], sw, wmax["controller"]))
-        out.append(f"\033[35m{cl[:cols]}\033[0m")
-
-        tl = ROW.format(f"TOTAL {len(node_names)}", human(ti), human(to), "",
-                        human(wmax["__total__"]), human_bytes(xfer["__total__"]), "")
-        out.append(f"\033[1m{tl[:cols]}\033[0m")
+        out.append(fmt_row(("controller", human(ci), human(co), next_label("controller", down, mesh),
+                            human(wmax["controller"]), human_bytes(xfer["controller"])),
+                           spark(hist["controller"], sw, wmax["controller"]), cols,
+                           base=MAG, color=color))
+        out.append(fmt_row((f"TOTAL {len(node_names)}", human(ti), human(to), "",
+                            human(wmax["__total__"]), human_bytes(xfer["__total__"])),
+                           "", cols, base=BOLD, color=color))
+        out.append(f"  {GRN}██{RST} download    {RED}██{RST} upload    "
+                   f"{DIM}bars · combined in+out trend{RST}")
         log_csv(time.time(), [(nm, *cur[nm]) for nm in node_names] + [("controller", ci, co)])
 
     sys.stdout.write("\033[H")
