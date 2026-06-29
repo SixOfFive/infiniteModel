@@ -16,7 +16,7 @@ There are two hot matmul classes per layer:
 | Platform | Dense int4 decode | Routed MoE experts | Enabled |
 |---|---|---|---|
 | **NVIDIA · Windows** | torch **tinygemm** (`_weight_int4pack_mm`) — fast | bf16 rematerialize per expert (portable) | automatic (default) |
-| **NVIDIA · Linux** | torch **tinygemm** — fast | **fused Triton w4a16** (opt-in) *or* bf16 remat (default) | dense auto; experts **opt-in** |
+| **NVIDIA · Linux** | torch **tinygemm** — fast | **fused Triton w4a16** (opt-in, **Ampere/sm_80+**) *or* bf16 remat (default) | dense auto; experts **opt-in** |
 | **AMD ROCm · RDNA** (e.g. Strix Halo gfx1151) | **Triton w4a16 + split-K** GEMV | **fused Triton w4a16** | automatic (only fast path here) |
 | **CPU** | tinygemm-cpu (`_weight_int4pack_mm_for_cpu`) | bf16 rematerialize per expert | automatic (default) |
 
@@ -40,17 +40,25 @@ Most NVIDIA fleet boxes are Windows, so enabling it by default would risk build 
 the majority of nodes (it would safely fall back, but it's not worth the churn). Instead:
 
 - **Default (all OSes):** the portable bf16-rematerialize path — no Triton needed, works on Windows.
-- **Opt-in (Linux+NVIDIA):** set `INFINITEMODEL_CUDA_FUSED_MOE=1` on the worker to route routed experts
-  through the fused Triton kernel. This is the **advanced acceleration tier**, available on Linux only.
+- **Opt-in (Linux + NVIDIA Ampere/sm_80+):** set `INFINITEMODEL_CUDA_FUSED_MOE=1` on the worker to route
+  routed experts through the fused Triton kernel. This is the **advanced acceleration tier**, available on
+  Linux only **and only on Ampere-or-newer GPUs** — the kernel uses bf16, which pre-Ampere cards
+  (Pascal/Turing, < sm_80) cannot compile (`ptxas: Feature '.bf16' requires .target sm_80 or higher`).
+  On an unsupported card the self-check catches the compile error and **falls back to the default**, so
+  enabling it is harmless there — just ineffective.
 
 This is the one place where InfiniteModel deliberately offers more on Linux than on Windows for the same
 NVIDIA hardware.
+
+**Validated (2026-06-30):** RTX 3060 (Ampere sm_86) — kernel builds, correct (rel 0.006), **3.9× on the
+routed-expert GEMM** vs bf16-remat. Quadro P620 (Pascal sm_61) — Triton bf16 won't compile → correct
+automatic fallback to the default path (no speedup, no breakage).
 
 ## Environment switches (worker)
 
 | Variable | Effect |
 |---|---|
-| `INFINITEMODEL_CUDA_FUSED_MOE=1` | **Linux+NVIDIA opt-in:** use the fused Triton MoE-expert kernel instead of bf16 remat. No effect on ROCm (already on) or if Triton can't build. |
+| `INFINITEMODEL_CUDA_FUSED_MOE=1` | **Linux + NVIDIA Ampere (sm_80+) opt-in:** use the fused Triton MoE-expert kernel instead of bf16 remat. No effect on ROCm (already on); on pre-Ampere NVIDIA the bf16 kernel won't compile and the self-check falls back to the default. |
 | `INFINITEMODEL_NO_FUSED_MOE=1` | Kill switch: force the bf16-remat (default) expert path everywhere, incl. ROCm. Use to A/B the fused kernel on/off. |
 
 Set them in the worker's environment (e.g. a systemd `--user` unit `Environment=` line, or the shell
