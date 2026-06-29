@@ -198,3 +198,10 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   (download/add_model/forget/nodeconfig) or use a build_app-local helper (embed/delete) stay in build_app
   — avoiding the publish/bind stale-snapshot trap. Route bodies byte-identical; globals injected via
   `state.bind`. server.py dropped to ~4350 lines (from ~9090 at the start of the refactor).
+- **Worker split (m4c153):** the worker's `Shard` (~1260 lines) and `Worker` (~760) classes split the same
+  way — `shard_build.py` (placement / streaming weight-load / from_*), `shard_forward.py` (forward path),
+  `worker_load.py` (build/load/pack/unload/TP), `worker_net.py` (next-hop connect/send + data-plane). Shells
+  keep `__init__` (+ `Shard._finalize_placement`, which reads the rebound `_CPU_FP32_GEMM` so must read it
+  live). `state.py` is now shared by controller and worker (in both EXTRA_UPDATE_FILES); the worker publishes/
+  binds at module load. client.py dropped from ~4570 to ~2820 lines. Across the whole refactor the two giants
+  went from 9090 + 4570 ≈ 13.7k lines to ~4350 + ~2820 ≈ 7.2k, the rest living in focused 200–1200-line modules.
