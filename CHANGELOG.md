@@ -210,3 +210,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   `_ka_is_unload`) moved verbatim into `serving.py`. server.py back-imports the three entry points so the
   already-relocated `routes_api` resolves them through the published namespace; `state.bind(serving)` makes
   their bodies resolve server globals. server.py → ~3730 lines.
+- **Status layer split (m4c155):** the read-only status builders `build_status` (the big /status + dashboard
+  payload), `_model_entry`, `_loading_view`, `_tag_entry` moved verbatim into `status.py`; server.py
+  back-imports `build_status`/`_tag_entry` (called by routes_dashboard/routes_api). Prerequisite fix:
+  `load_download_state()` now mutates `DOWNLOAD_STATE` **in place** (`clear()`+`update()`) instead of
+  rebinding it, preserving object identity so the `state.publish` snapshot stays live for the relocated
+  `_model_entry` (and removing the last `DOWNLOAD_STATE` rebind footgun). server.py → ~3380 lines. The
+  history/metrics block was analysed for extraction too but deliberately **left in server.py** — it's
+  movable but needs ~16 back-imports (server would re-import almost the whole API) plus the
+  `graphs.set_history_sources` identity invariant, i.e. a line-count move with little real decoupling.
