@@ -49,6 +49,7 @@ hf_cache/
 node_config.json
 engine_config.json
 net_history.json
+deleted_models.json
 *.json.tmp
 # scratch test/check files
 _dash_check.js

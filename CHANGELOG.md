@@ -62,8 +62,18 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   `models/<name>/` incl. the `_shards/<quant>/` pre-quant caches *and* the HF-cache duplicate) AND its
   whole registry footprint — every registered name that resolves to the same repo (so re-registered
   alias names can't dangle on now-missing files), its GGUF mark, and any built-in `MODEL_ALIASES` entry
-  pointing at it. Delete == forget + purge files; refuses if any of those names is loaded or
-  downloading. (`/forget` remains the opposite trade-off: unregister but keep the files.)
+  pointing at it. The model also **leaves the list entirely** (no stale "download" button): custom
+  models drop from `custom_models.json`, and a deleted **built-in** is persisted to a `deleted_models.json`
+  hide-set and filtered out after `MODELS` is seeded on startup (re-`/add_model` un-hides it). Delete ==
+  forget + purge files + hide; refuses if any of those names is loaded or downloading. (`/forget`
+  remains the opposite trade-off: unregister but keep the files.)
+- **Mistral3 / Pixtral distributed vision**: the controller-side vision encoder now handles Pixtral's
+  split tower (`vision_tower` + a separate `multi_modal_projector`, both materialized from safetensors
+  with the 24B text model left on meta), driving `get_image_features(pixel_values, image_sizes)` at the
+  merged 32-px patch grid; per-image embeds splice at the `[IMG]` (id 10) placeholders with plain 1D
+  positions. Pixtral's 2D rotary table is rebuilt via the module's own rope-init (the generic 1D
+  materializer would corrupt it). Covers Devstral / Ministral. (`[IMG_BREAK]`/`[IMG_END]` row-structure
+  tokens are not yet reconstructed — a tracked follow-up; validate generation quality first.)
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8

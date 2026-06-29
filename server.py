@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c156"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c158"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -368,6 +368,35 @@ def save_custom_models() -> None:
             json.dump(CUSTOM_MODELS, fh, indent=2)
     except Exception as exc:
         print(f"[cfg] could not save custom models: {exc!r}")
+
+
+# Models the user has DELETED (a full removal: cache + registry + aliases). For CUSTOM models the
+# removal already persists by dropping them from custom_models.json — but a BUILT-IN re-seeds into
+# MODELS from the literal above on every startup, so to keep a deleted built-in OUT of the list
+# (no stale "download" button for a model the user removed) we persist its friendly name here and
+# filter it after MODELS is seeded. Re-adding via /add_model un-hides it.
+DELETED_MODELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deleted_models.json")
+DELETED_MODELS: set[str] = set()
+
+
+def load_deleted_models() -> None:
+    """Load the deleted-model hide-set and drop any matching entries from MODELS. MUST run AFTER
+    MODELS is seeded with built-ins AND load_custom_models() has merged customs, so a hidden name
+    is filtered no matter which source re-introduced it."""
+    global DELETED_MODELS
+    try:
+        with open(DELETED_MODELS_PATH, encoding="utf-8") as fh:
+            DELETED_MODELS = set(json.load(fh))
+    except Exception:
+        DELETED_MODELS = set()
+    for friendly in DELETED_MODELS:
+        MODELS.pop(friendly, None)
+
+
+def save_deleted_models() -> None:
+    with contextlib.suppress(Exception):
+        with open(DELETED_MODELS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(sorted(DELETED_MODELS), fh, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -1496,12 +1525,69 @@ def _encode_images(target_id: str, images: list) -> dict:
         ip = _get_image_processor(target_id)
         model, dev = _load_vision_encoder(target_id)
         t_load = time.time()
-        inputs = ip(images=images, return_tensors="pt")
+        mtype = getattr(getattr(model, "config", None), "model_type", "") or ""
+        if mtype == "mistral3":
+            # Pixtral resizes/pads to the MERGED patch grid (vision patch_size * spatial_merge_size
+            # = 32); the bare PixtralImageProcessor defaults to 16, so pass the merged size
+            # explicitly — matching the canonical PixtralProcessor. Without this, image_sizes align
+            # to 16 and the tower sees a ~4x, off-distribution tiling (degraded understanding).
+            _vc = getattr(model.config, "vision_config", None)
+            _ps = int(getattr(_vc, "patch_size", 16) or 16) if _vc is not None else 16
+            _sm = int(getattr(model.config, "spatial_merge_size", 2) or 2)
+            inputs = ip(images=images, patch_size=_ps * _sm, return_tensors="pt")
+        else:
+            inputs = ip(images=images, return_tensors="pt")
         pv = inputs["pixel_values"].to(dev)
         grid = inputs.get("image_grid_thw")
         grid_dev = grid.to(dev) if grid is not None else None
         info: dict = {"device": dev, "pixel_values_shape": list(pv.shape),
                       "load_s": round(t_load - t0, 1)}
+        if mtype == "mistral3":
+            # Pixtral / Mistral3: a SEPARATE vision_tower + multi_modal_projector (both
+            # materialized by _load_vision_encoder). get_image_features(pixel_values, image_sizes)
+            # returns pooler_output as a TUPLE of per-image [tokens_i, text_hidden] (already
+            # LM-ready / projected). No image_grid_thw, no spatial-merge math here, image_token_id
+            # from config (10), and PLAIN 1D positions (pos_scheme='1d' -> serving skips mRoPE).
+            sizes = inputs.get("image_sizes")
+            sizes_dev = sizes.to(dev) if sizes is not None else None
+            t_fwd = time.time()
+            with torch.inference_mode():
+                # Pass vision_feature_layer explicitly (config default -1, an int) so correctness
+                # doesn't hinge on the @merge_with_config_defaults decorator injecting it.
+                feats = model.get_image_features(
+                    pixel_values=pv, image_sizes=sizes_dev,
+                    vision_feature_layer=getattr(model.config, "vision_feature_layer", -1))
+            pooler = getattr(feats, "pooler_output", None)
+            if pooler is None and isinstance(feats, (tuple, list)):   # @can_return_tuple path
+                for x in feats:
+                    if isinstance(x, (tuple, list)) and x and all(
+                            isinstance(t, torch.Tensor) for t in x):
+                        pooler = x
+                        break
+            parts = [pooler] if isinstance(pooler, torch.Tensor) \
+                else [t for t in (pooler or []) if isinstance(t, torch.Tensor)]
+            if not parts:
+                raise RuntimeError("mistral3 get_image_features returned no image embeds "
+                                   f"(type={type(feats).__name__})")
+            parts = [t.reshape(-1, t.shape[-1]) for t in parts]   # each -> [tokens_i, hidden]
+            emb = torch.cat(parts, dim=0)
+            counts = [int(t.shape[0]) for t in parts]
+            cfg = model.config
+            itid = getattr(cfg, "image_token_id", None)
+            if itid is None:
+                itid = getattr(cfg, "image_token_index", None)
+            tcfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") \
+                else getattr(cfg, "text_config", cfg)
+            out_hidden = getattr(tcfg, "hidden_size", None) or int(emb.shape[-1])
+            info.update({"arch": "mistral3", "forward_s": round(time.time() - t_fwd, 1),
+                         "raw_return_type": type(feats).__name__, "embeds_shape": list(emb.shape),
+                         "path": "get_image_features(pixel_values, image_sizes)"})
+            print(f"[vision] encoded {len(images)} image(s) on {dev} [mistral3]: "
+                  f"load={info['load_s']}s forward={info['forward_s']}s -> {list(emb.shape)} "
+                  f"counts={counts} itid={itid}")
+            return {"image_embeds": emb, "grid_thw": None, "info": info, "counts": counts,
+                    "image_token_id": itid, "out_hidden": out_hidden, "merge": 1,
+                    "grid_list": [], "pos_scheme": "1d"}
         visual, _prefix = _resolve_visual(model)
         t_fwd = time.time()
         with torch.inference_mode():
@@ -1542,7 +1628,7 @@ def _encode_images(target_id: str, images: list) -> dict:
               f"forward={info['forward_s']}s -> {list(emb.shape)} counts={counts}")
         return {"image_embeds": emb, "grid_thw": grid, "info": info, "counts": counts,
                 "image_token_id": image_token_id, "out_hidden": out_hidden, "merge": merge,
-                "grid_list": (grid.tolist() if grid is not None else [])}
+                "grid_list": (grid.tolist() if grid is not None else []), "pos_scheme": "mrope"}
     finally:
         ENCODING -= 1
 
@@ -3054,20 +3140,26 @@ def build_app() -> FastAPI:
         deleted = await asyncio.to_thread(delete_model_cache, target)
         # Purge the registry footprint regardless of whether files were present, so a
         # half-registered model (registered, no files) is still fully removed by a delete.
-        forgot = []
+        forgot, hidden = [], []
         for n in list(names):
             if CUSTOM_MODELS.pop(n, None) is not None:
-                forgot.append(n)
-                MODELS.pop(n, None)        # drop the registry/list entry (custom only)
-            MODEL_ALIASES.pop(n, None)     # drop any alias keyed by this name
+                forgot.append(n)               # custom: persistence via custom_models.json
+            elif n in MODELS:
+                hidden.append(n)               # built-in: persistence via the deleted hide-set
+            MODELS.pop(n, None)                # drop from the live list (no stale download button)
+            MODEL_ALIASES.pop(n, None)         # drop any alias keyed by this name
         if forgot:
-            GGUF_FILES.pop(target, None)   # all registrations for this repo are gone
+            GGUF_FILES.pop(target, None)       # all registrations for this repo are gone
             save_custom_models()
-        if deleted or forgot:
+        if hidden:
+            DELETED_MODELS.update(hidden)
+            save_deleted_models()
+        removed = bool(deleted or forgot or hidden)
+        if removed:
             print(f"[model] deleted {friendly} ({target}) — cache_removed={deleted} "
-                  f"unregistered={sorted(forgot) or '[]'}", flush=True)
-        ok = deleted or bool(forgot)
-        return {"ok": ok, "error": None if ok else "model not present in cache or registry"}
+                  f"unregistered={sorted(forgot) or '[]'} hidden={sorted(hidden) or '[]'}", flush=True)
+        return {"ok": removed,
+                "error": None if removed else "model not present in cache or registry"}
 
     @app.post("/download")           # dashboard: pull a configured model to controller
     async def download(model: str) -> JSONResponse:
@@ -3193,6 +3285,9 @@ def build_app() -> FastAPI:
         elif gf and GGUF_FILES.get(hf) != gf:
             GGUF_FILES[hf] = gf                  # update the chosen quant for an already-registered repo
             save_custom_models()
+        if friendly in DELETED_MODELS:           # re-adding a previously deleted model un-hides it
+            DELETED_MODELS.discard(friendly)
+            save_deleted_models()
         r = await _start_download(friendly)
         return JSONResponse({"ok": True, "friendly": friendly, "target": hf,
                              "gguf_file": gf or None, "status": r.get("status")})
@@ -3353,6 +3448,10 @@ def main() -> None:
     load_custom_models()
     if CUSTOM_MODELS:
         print(f"[cfg] loaded {len(CUSTOM_MODELS)} user-added model(s): {', '.join(CUSTOM_MODELS)}")
+    load_deleted_models()    # hide built-ins the user deleted (filter AFTER MODELS is fully seeded)
+    if DELETED_MODELS:
+        print(f"[cfg] {len(DELETED_MODELS)} deleted model(s) hidden from the list: "
+              f"{', '.join(sorted(DELETED_MODELS))}")
     load_download_state()    # restore paused/stopped intents (no auto-resume — user-driven)
     if DOWNLOAD_STATE:
         print("[cfg] halted downloads (resume from cache when ready): "

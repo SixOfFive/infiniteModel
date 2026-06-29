@@ -297,6 +297,51 @@ def _vlog(msg: str) -> None:
             os.fsync(fh.fileno())
 
 
+def _recompute_rotary(mod, dev) -> bool:
+    """Re-derive a rotary module's computed `inv_freq` (a non-persistent buffer, so it lands on
+    meta after the assign-load) on `dev` using the MODULE'S OWN rope-init — so arch-specific
+    layouts are exact: Pixtral's 2D per-patch frequency TABLE [positions, dim], Qwen's 1D vector,
+    Gemma's theta. A flat one-size formula (or zero-fill) corrupts anything but plain 1D RoPE.
+    Returns True iff it rebuilt inv_freq. Used by _materialize_meta_tensors for the 2D case."""
+    import torch
+    cfg = getattr(mod, "config", None)
+    if cfg is None:
+        return False
+    fn = (getattr(mod, "rope_init_fn", None)
+          or getattr(mod, "compute_default_rope_parameters", None))
+    if fn is None:                          # fall back to the transformers registry by rope_type
+        with contextlib.suppress(Exception):
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+            rt = (getattr(mod, "rope_type", None)
+                  or getattr(cfg, "rope_type", None) or "default")
+            fn = ROPE_INIT_FUNCTIONS.get(rt)
+    if fn is None:
+        return False
+    inv_freq, scaling = None, None
+    for call in (lambda: fn(cfg, dev), lambda: fn(cfg, device=dev), lambda: fn(cfg)):
+        try:
+            res = call()
+        except TypeError:
+            continue                        # wrong arity — try the next call shape
+        except Exception:
+            return False
+        if isinstance(res, tuple):
+            inv_freq = res[0]
+            scaling = res[1] if len(res) > 1 else None
+        else:
+            inv_freq = res
+        break
+    if not isinstance(inv_freq, torch.Tensor):
+        return False
+    mod.register_buffer("inv_freq", inv_freq.to(dev), persistent=False)
+    if hasattr(mod, "original_inv_freq"):
+        mod.original_inv_freq = inv_freq.detach().clone().to(dev)
+    if scaling is not None and hasattr(mod, "attention_scaling"):
+        with contextlib.suppress(Exception):
+            mod.attention_scaling = float(scaling)
+    return True
+
+
 def _materialize_meta_tensors(module, dev: str) -> list:
     """After a partial `load_state_dict(..., assign=True)`, the weights present in the
     safetensors are real but COMPUTED non-persistent buffers (e.g. rotary `inv_freq`,
@@ -310,6 +355,13 @@ def _materialize_meta_tensors(module, dev: str) -> list:
     import torch
     report = []
     for mod in module.modules():
+        # Pixtral-style 2D positional rotary table (and any rotary module exposing its own rope
+        # init): rebuild inv_freq on `dev` via the MODULE'S OWN function so the arch layout/theta
+        # is exact. Gated on ndim>=2 so Qwen's validated 1D inv_freq path below is untouched.
+        if any(("inv_freq" in n and b is not None and b.device.type == "meta" and b.ndim >= 2)
+               for n, b in mod._buffers.items()):
+            if _recompute_rotary(mod, dev):
+                report.append((f"{type(mod).__name__}.inv_freq", [], "rope_init_fn(module 2D)"))
         for name, buf in list(mod._buffers.items()):
             if buf is None or buf.device.type != "meta":
                 continue
@@ -337,7 +389,12 @@ def _materialize_meta_tensors(module, dev: str) -> list:
                 how = "whisper_sinusoids(theta=1e4)"
             else:
                 new = torch.zeros(shape, dtype=dtype, device=dev)
-                how = "zeros"
+                # A >=2D inv_freq reaching here means _recompute_rotary did NOT rebuild it (unknown
+                # rope arch / missing config). Zero-fill would SILENTLY strip all vision positions
+                # (cos=1/sin=0) -> garbage embeds with no error. Flag it so the missing-list below
+                # surfaces it in /vision_test rather than corrupting silently. (Never fires on the
+                # in-scope Qwen/Pixtral paths.)
+                how = "zeros[MISSING_ROTARY]" if "inv_freq" in name else "zeros"
             mod._buffers[name] = new
             report.append((name, list(shape), how))
         for name, p in list(mod._parameters.items()):
@@ -383,6 +440,26 @@ def _resolve_visual(model):
     return model.model.visual, "model.visual."
 
 
+def _visual_modules(model):
+    """The vision submodule(s) to materialize, as (submodule, full_weight_prefix) pairs — a LIST
+    so an arch with a SPLIT tower materializes every piece:
+      * Qwen2.5-Omni:        thinker.visual                         ('thinker.visual.')
+      * standard image-text: model.model.visual                    ('model.visual.')
+      * Mistral3 / Pixtral / Llava-style: model.model.vision_tower PLUS the SEPARATE
+                             model.model.multi_modal_projector      (two prefixes)
+    The projector is its own top-level module in these arches (not nested in the tower), so it
+    must be loaded + materialized too or get_image_features projects through meta weights."""
+    th = getattr(model, "thinker", None)
+    if th is not None and getattr(th, "visual", None) is not None:
+        return [(th.visual, "thinker.visual.")]
+    inner = getattr(model, "model", None)
+    if inner is not None and getattr(inner, "vision_tower", None) is not None \
+            and getattr(inner, "multi_modal_projector", None) is not None:
+        return [(inner.vision_tower, "model.vision_tower."),
+                (inner.multi_modal_projector, "model.multi_modal_projector.")]
+    return [(model.model.visual, "model.visual.")]
+
+
 def _vision_cfg_and_token(model):
     """(vision_config, image_token_id) handling Omni's nesting (vision_config + image_token
     live under thinker_config; image_token_id is NULL at the top Omni config, like audio)."""
@@ -420,35 +497,36 @@ def _load_vision_encoder(target_id: str):
     model.eval()
     t_meta = time.time()
     _vlog(f"[vision] meta-built {type(model).__name__} in {t_meta - t0:.1f}s")
-    visual, prefix = _resolve_visual(model)
+    mods = _visual_modules(model)
     model_dir = _MODEL_DIR_FN(target_id)
-    sd = {}
     files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    _vlog(f"[vision] scanning {len(files)} safetensors shard(s) for '{prefix}*' ...")
-    for fi, fn in enumerate(files):
-        with safe_open(fn, framework="pt") as fh:
-            hits = [k for k in fh.keys() if k.startswith(prefix)]
-            for k in hits:
-                sd[k[len(prefix):]] = fh.get_tensor(k)
-        if hits:
-            _vlog(f"[vision]   shard {fi+1}/{len(files)}: +{len(hits)} visual tensors "
-                  f"(total {len(sd)})")
-    if not sd:
-        raise RuntimeError(f"no '{prefix}*' weights found in {model_dir}")
-    t_read = time.time()
-    _vlog(f"[vision] read {len(sd)} visual tensors in {t_read - t_meta:.1f}s; assign-loading ...")
-    visual.load_state_dict(sd, strict=False, assign=True)
     dev = _pick_vision_device()
-    _vlog(f"[vision] assign-loaded; materializing meta buffers; target device={dev}")
-    # Computed non-persistent buffers (rotary inv_freq) are still on meta after the
-    # assign-load; give them real storage on `dev` so the whole-tower .to(dev) is safe.
-    mat = _materialize_meta_tensors(visual, dev)
-    _VISION_MAT[target_id] = mat
-    _vlog(f"[vision] materialized {len(mat)} meta tensor(s); moving tower to {dev} ...")
-    visual.to(dev)
-    missing = [m for m in mat if "MISSING_WEIGHT" in m[2]]
-    _vlog(f"[vision] encoder READY {target_id}: {len(sd)} tensors on {dev}; "
-          f"materialized {len(mat)}"
+    _vlog(f"[vision] {len(mods)} vision submodule(s) to materialize "
+          f"({', '.join(p for _, p in mods)}); scanning {len(files)} shard(s); device={dev}")
+    total, mat_all = 0, []
+    for submod, prefix in mods:
+        sd = {}
+        for fn in files:
+            with safe_open(fn, framework="pt") as fh:
+                hits = [k for k in fh.keys() if k.startswith(prefix)]
+                for k in hits:
+                    sd[k[len(prefix):]] = fh.get_tensor(k)
+        if not sd:
+            raise RuntimeError(f"no '{prefix}*' weights found in {model_dir}")
+        # Computed non-persistent buffers (rotary inv_freq) stay on meta after the assign-load;
+        # _materialize_meta_tensors gives them real storage on `dev` (arch-correct for 2D rope)
+        # so the .to(dev) below is safe.
+        submod.load_state_dict(sd, strict=False, assign=True)
+        mat = _materialize_meta_tensors(submod, dev)
+        submod.to(dev)
+        total += len(sd)
+        mat_all += mat
+        _vlog(f"[vision]   '{prefix}': {len(sd)} tensors assign-loaded + moved to {dev}; "
+              f"materialized {len(mat)} meta tensor(s)")
+    _VISION_MAT[target_id] = mat_all
+    missing = [m for m in mat_all if "MISSING_" in m[2]]   # MISSING_WEIGHT or MISSING_ROTARY
+    _vlog(f"[vision] encoder READY {target_id}: {total} tensors across {len(mods)} "
+          f"submodule(s) on {dev}; materialized {len(mat_all)}"
           + (f"; WARNING {len(missing)} missing: {[m[0] for m in missing][:5]}"
              if missing else ""))
     _VISION_CACHE[target_id] = (model, dev)

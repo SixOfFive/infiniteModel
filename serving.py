@@ -462,13 +462,20 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                 new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts)
                 if found == len(counts) and len(positions) == n_emb:
                     ids, mm = new_ids, (positions, embeds)
-                    # #22 inc 4: 3D mRoPE positions for the expanded prompt (image tokens get
-                    # t/h/w grid positions; the counter advances slowly past each image).
-                    merge = int(enc_res.get("merge") or 1)
-                    grid_list = enc_res.get("grid_list") or []
-                    mrope = _mrope_position_ids(ids, grid_list, int(itid), merge)
-                    print(f"[v1/messages] vision: {len(images)} image(s) -> {len(positions)} "
-                          f"image tokens spliced (counts={counts}); mRoPE base={mrope[1]}")
+                    if enc_res.get("pos_scheme") == "1d":
+                        # Pixtral / Mistral3: standard 1D RoPE — spliced image tokens take normal
+                        # sequential positions, no grid mRoPE. Leave mrope=None (worker default).
+                        mrope = None
+                        print(f"[v1/messages] vision: {len(images)} image(s) -> {len(positions)} "
+                              f"image tokens spliced (counts={counts}); plain 1D positions")
+                    else:
+                        # #22 inc 4: 3D mRoPE positions for the expanded prompt (image tokens get
+                        # t/h/w grid positions; the counter advances slowly past each image).
+                        merge = int(enc_res.get("merge") or 1)
+                        grid_list = enc_res.get("grid_list") or []
+                        mrope = _mrope_position_ids(ids, grid_list, int(itid), merge)
+                        print(f"[v1/messages] vision: {len(images)} image(s) -> {len(positions)} "
+                              f"image tokens spliced (counts={counts}); mRoPE base={mrope[1]}")
                 else:
                     print(f"[v1/messages] vision MISMATCH: found {found} placeholder(s) "
                           f"(expected {len(counts)}), {len(positions)} positions vs {n_emb} "
