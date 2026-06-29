@@ -115,6 +115,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   NOT attempt a full model build, so natively-registered archs the worker hand-builds via a special path
   (e.g. Qwen2.5-Omni) still pass; trust_remote_code models (auto_map) pass through too (the worker fetches
   their .py via `/modelcode`), so no known-good model is rejected.
+- **Complete Ollama + OpenAI API surface:** alongside the Ollama routes (`/api/tags`, `/api/chat`,
+  `/api/generate`, `/api/show`, `/api/ps`, `/api/embed`+`/api/embeddings`, `/api/version`, `/api/pull`,
+  `/api/delete`) and the Anthropic Messages API (`/v1/messages` — the Claude Code backend), the OpenAI
+  surface is now complete: `/v1/chat/completions`, **`/v1/completions`** (legacy text completion —
+  `text_completion` objects, SSE + `[DONE]`, prompt string-or-array), `/v1/models` + **`/v1/models/{id}`**
+  (retrieve), `/v1/embeddings`, `/v1/audio/speech`. An unknown model returns **HTTP 404** with the
+  dialect-correct shape — Ollama `{"error":"model 'X' not found"}`, OpenAI
+  `{"error":{message,type,code:"model_not_found"}}` (was a bare 400) — and OpenAI endpoints default
+  `stream` to FALSE when omitted (single JSON, per the OpenAI spec) while Ollama keeps its
+  stream-when-omitted default.
 - **Fast dead-hop recovery:** a mid-pipeline hop dying *during* a generation used to leave the request
   blocked until the gen-stall watchdog (~240s) or GEN_TIMEOUT (~600s) reclaimed it — the one-way data
   chain delivers no upstream error frame. Now, when a worker's forward to its next hop fails even after
@@ -125,6 +135,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   the control writer's lock+framing so it can't corrupt a heartbeat, doesn't double-decrement `active`
   (the resumed generate() does that), and resets `last_token_ts` so the watchdog doesn't double-act —
   falling back to the watchdog only if the control link is mid-reconnect.
+- **Active-decode stall reclaim:** `hop_error` can't catch a *buffered-write deadlock* — a downstream
+  hop dies, the upstream's small forward write buffers "successfully" (no error raised), and the one-way
+  pipeline then deadlocks so the upstream never writes again to surface the failure. A **second, shorter
+  watchdog threshold** (`gen_stall_decode_s`, default 60s) now covers it: it applies ONLY once a
+  generation has produced its first token (it's *decoding*, tracked via `gen_started_ts` vs
+  `last_token_ts`), so a streaming gen that goes silent is reclaimed in ~60s instead of ~240s. Cold
+  prefill keeps the conservative 240s `gen_stall_s` (a slow big-model first-token wait is never
+  false-killed — 60s is far longer than any healthy per-token decode, even heavy CPU spill). Both
+  thresholds are `/config`-tunable. (Found by an isolated fault-injection test: a worker *crash*
+  recovers in ~2.6s via the control-link drop, but a pure *data-plane* partition needed this.)
 - **Idle-pipeline self-heal:** every data-plane hop is fresh-reconnected at each generation's prefill
   if it has been idle (an idle TCP socket can go silently half-open — the write succeeds but the bytes
   never arrive — which otherwise stalls the first request after an idle gap until the generation

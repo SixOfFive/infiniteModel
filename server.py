@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c150"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c151"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -282,6 +282,12 @@ GEN_STALL_S = 240.0     # #gen-stall-watchdog: a model active>0 that has produce
                         # long is WEDGED (dead pipeline hop -> 0 tokens + idle data plane). The
                         # watchdog cancels its in-flight request(s) + reclaims the leaked active slot.
                         # > worst-case legit first-token wait (big CPU prefill) so it never false-fires.
+GEN_STALL_DECODE_S = 60.0  # #active-decode-stall: a SHORTER stall threshold that applies ONLY once a gen
+                        # has produced its first token (it's DECODING, not in cold prefill). A decoding
+                        # gen that goes silent this long = a wedged mid-pipeline hop (e.g. the buffered-
+                        # write deadlock the hop_error channel can't catch). Cold prefill keeps GEN_STALL_S;
+                        # 60s >> any healthy per-token decode time (even heavy CPU spill), so no false-fire.
+                        # 0 disables it (fall back to GEN_STALL_S for decode too).
 REQUEUE_GRACE_S = 12.0  # #stage0-stale-reconnect: when a head's return data-conn closes, wait this
                         # long before dooming the requests it was serving — a head that just FRESHENED
                         # its return socket (drop+reconnect at prefill) re-delivers their logits on the
@@ -762,6 +768,8 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # #gen-stall-watchdog: seconds a model may show active>0 with NO token produced
                        # before the watchdog declares it wedged and reclaims the slot. 0 disables it.
                        "gen_stall_s": GEN_STALL_S,
+                       # #active-decode-stall: tighter stall threshold AFTER the first token (decode phase)
+                       "gen_stall_decode_s": GEN_STALL_DECODE_S,
                        # #77 persistence: models to AUTO-RELOAD on controller startup (survives a
                        # restart/crash/deploy). reg_key -> {"ctx", "quant"}. Workers drop their shards
                        # when the controller link drops, so recovery = re-stream on startup (after the
@@ -834,6 +842,18 @@ def _client_ip(req) -> str:
     if xff:
         return xff.split(",")[0].strip()
     return req.client.host if req.client else "?"
+
+
+def _not_found_json(model: str, mode: str) -> JSONResponse:
+    """HTTP 404 for a truly-UNKNOWN model name (resolve_model_name ValueError). OpenAI callers
+    (mode openai|openai_text) get the OpenAI error envelope w/ code model_not_found; Ollama callers
+    get Ollama's {"error":"model '<name>' not found"} shape. Only the unknown case routes here —
+    a present-but-not-loadable model keeps its distinct error elsewhere."""
+    if mode in ("openai", "openai_text"):
+        return JSONResponse({"error": {"message": f"The model '{model}' does not exist",
+                             "type": "invalid_request_error", "code": "model_not_found"}},
+                            status_code=404)
+    return JSONResponse({"error": f"model '{model}' not found"}, status_code=404)
 
 
 def load_engine_config() -> None:
@@ -1381,6 +1401,7 @@ class LoadedModel:
     # dead pipeline hop -> 0 tokens + idle data plane) and reclaims its leaked active slot. Seeded
     # at load so a fresh model isn't flagged before its first generate.
     last_token_ts: float = 0.0
+    gen_started_ts: float = 0.0   # #active-decode-stall: gen-begin time; last_token_ts advances past it on token 1
     # Data-parallel replication (#39): `base` is the user-facing model name shared by all
     # copies; `friendly` is the unique registry key (base, then base#1, base#2 ...). Requests
     # for `base` are least-loaded / round-robin routed across its replicas. Each copy is a
@@ -3560,6 +3581,7 @@ class Engine:
                 model.queued -= 1
                 model.active += 1
                 model.last_token_ts = time.time()   # #gen-stall-watchdog: start the no-progress timer at gen begin
+                model.gen_started_ts = model.last_token_ts   # #active-decode-stall: prefill marker (token 1 advances last_token_ts past this)
                 # #stage0-stale-reconnect: rebuild a stale (idle-since-last-request) stage0 conn BEFORE
                 # the prefill so this request rides a fresh, proven socket instead of a possibly
                 # half-open one (the 'loaded but never replies' / ~600s hang). No-op when hot (busy
@@ -4815,7 +4837,21 @@ async def gen_stall_watchdog() -> None:
             if getattr(m, "active", 0) <= 0:
                 continue
             last = getattr(m, "last_token_ts", 0.0) or 0.0
-            if last <= 0 or (now - last) <= stall_s:
+            # #active-decode-stall: once this gen produced its first token (last_token_ts advanced past
+            # gen_started_ts) it's DECODING — apply the SHORTER gen_stall_decode_s so a wedged hop (the
+            # buffered-write deadlock hop_error can't catch) is reclaimed fast (~60s not ~240s). Cold
+            # prefill (no token yet) keeps the conservative stall_s so a slow big-model first-token is safe.
+            _started = getattr(m, "gen_started_ts", 0.0) or 0.0
+            _decoding = last > _started > 0
+            _eff = stall_s
+            if _decoding:
+                try:
+                    _ds = float(ENGINE_CONFIG.get("gen_stall_decode_s", GEN_STALL_DECODE_S))
+                except (TypeError, ValueError):
+                    _ds = GEN_STALL_DECODE_S
+                if _ds > 0:
+                    _eff = min(_eff, _ds)
+            if last <= 0 or (now - last) <= _eff:
                 continue
             idle = int(now - last)
             cancelled = 0
@@ -4864,6 +4900,7 @@ async def gen_stall_watchdog() -> None:
                 m.lock = asyncio.Lock()   # drop a lock an orphaned wedged gen may still hold -> unblock the queue
             engine._last_load_failure = time.time()   # arm the self-update cool-down (anti-churn after a fault)
             log_activity(f"gen-stall watchdog: {_ollama_name(key)} wedged — no token for {idle}s "
+                         f"({'decode' if _decoding else 'prefill'}, thresh {int(_eff)}s) "
                          f"(active {old_active}, cancelled {cancelled} req) — reclaimed slot + reset pipeline lock")
 
 
@@ -5151,6 +5188,7 @@ def build_status() -> dict:
             "autoload_mode": ENGINE_CONFIG.get("autoload_mode", "auto"),
             "vram_weights_first": ENGINE_CONFIG.get("vram_weights_first", True),
             "gen_stall_s": ENGINE_CONFIG.get("gen_stall_s", GEN_STALL_S),
+            "gen_stall_decode_s": ENGINE_CONFIG.get("gen_stall_decode_s", GEN_STALL_DECODE_S),
             "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH),
         },
         "pool": {"nodes": len(nodes), "total_gb": round(pool_total, 2),
@@ -6798,14 +6836,23 @@ def build_app() -> FastAPI:
             {"id": _ollama_name(name), "object": "model",
              "created": int(START_TIME), "owned_by": "infinitemodel"} for name in names]}
 
+    @app.get("/v1/models/{model_id:path}")   # OpenAI retrieve-model (LiteLLM + some clients validate here)
+    async def v1_model_get(model_id: str) -> JSONResponse:
+        try:
+            friendly = resolve_model_name(model_id)
+        except Exception:
+            return _not_found_json(model_id, "openai")
+        return JSONResponse({"id": _ollama_name(friendly), "object": "model",
+                             "created": int(START_TIME), "owned_by": "infinitemodel"})
+
     @app.post("/api/show")
     async def api_show(req: Request) -> JSONResponse:
         body = await req.json()
         name = body.get("model") or body.get("name") or ""
         try:
             friendly = resolve_model_name(name)
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ValueError:
+            return _not_found_json(name, "chat")   # canonical Ollama model-not-found shape
         spec = resolve_spec(friendly)
         target = MODELS[friendly][0] if friendly in MODELS else friendly
         if not model_ready(target):
@@ -6880,8 +6927,8 @@ def build_app() -> FastAPI:
         and shapes the response per `mode` ('ollama' | 'legacy' | 'openai')."""
         try:
             friendly = resolve_model_name(model)
-        except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception:
+            return _not_found_json(model, mode)   # unknown model -> 404 (OpenAI envelope|Ollama shape)
         try:
             lm = await engine.ensure_loaded(friendly, 0)
         except ValueError as exc:   # not loaded -> 404 (no auto-load)
@@ -7295,6 +7342,7 @@ def build_app() -> FastAPI:
                          autoload_mode: Optional[str] = None,
                          vram_weights_first: Optional[bool] = None,
                          gen_stall_s: Optional[float] = None,
+                         gen_stall_decode_s: Optional[float] = None,
                          persist: Optional[str] = None,
                          unpersist: Optional[str] = None) -> JSONResponse:
         if persist is not None:                          # #77: keep this model across restarts
@@ -7339,6 +7387,8 @@ def build_app() -> FastAPI:
             ENGINE_CONFIG["vram_weights_first"] = bool(vram_weights_first)
         if gen_stall_s is not None:                       # #gen-stall-watchdog: wedged-gen reclaim threshold (0=off)
             ENGINE_CONFIG["gen_stall_s"] = max(0.0, float(gen_stall_s))
+        if gen_stall_decode_s is not None:                # #active-decode-stall: tighter post-first-token stall (0=off)
+            ENGINE_CONFIG["gen_stall_decode_s"] = max(0.0, float(gen_stall_decode_s))
         save_engine_config()
         log_activity(f"config: max_loaded={ENGINE_CONFIG['max_loaded']} "
                      f"auto_unload={ENGINE_CONFIG['auto_unload']} "
@@ -8179,6 +8229,17 @@ def build_app() -> FastAPI:
         return await _serve(body.get("model", ""), None, body.get("messages", []),
                             body, mode="openai", ip=_client_ip(req))
 
+    @app.post("/v1/completions")     # OpenAI legacy text-completion (prompt-based, like /api/generate)
+    async def v1_completions(req: Request):
+        body = await req.json()
+        p = body.get("prompt", "")   # OpenAI allows a string OR an array of strings -> join
+        if isinstance(p, list):
+            p = "\n".join(x if isinstance(x, str) else str(x) for x in p)
+        elif not isinstance(p, str):
+            p = str(p)
+        return await _serve(body.get("model", ""), p, None,
+                            body, mode="openai_text", ip=_client_ip(req))
+
     # ---- Anthropic Messages API (Claude Code backend) ----
     @app.post("/v1/messages")
     async def v1_messages(req: Request):
@@ -8318,7 +8379,7 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     # still generates (we simply never auto-unload after).
     if _ka_is_unload(body.get("keep_alive")) and not (prompt or "").strip() and not messages:
         # silently ignore client keep_alive:0 unloads — no activity-log line (just keep the model)
-        if mode == "openai":
+        if mode in ("openai", "openai_text"):
             return JSONResponse({"id": "chatcmpl-noop", "object": "chat.completion",
                                  "created": int(time.time()), "model": model,
                                  "choices": [{"index": 0, "finish_reason": "stop",
@@ -8333,8 +8394,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     # loads) shows in that model's queue. 1 slot + queue_depth waiters; else 503.
     try:
         friendly = resolve_model_name(model)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception:
+        return _not_found_json(model, mode)   # unknown model -> 404 (OpenAI envelope|Ollama shape)
     rec = _inflight_admit(ip, friendly, engine.replica_count(friendly))  # K slots for K replicas
     if rec is None:
         return JSONResponse(
@@ -8342,9 +8403,12 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                       f"{ENGINE_CONFIG.get('queue_depth', DEFAULT_QUEUE_DEPTH)} queued — "
                       f"retry shortly"}, status_code=503)
     created = int(time.time())
-    cmpl_id = "chatcmpl-" + hashlib.sha256(str(time.time()).encode()).hexdigest()[:24]
+    _idp = "cmpl-" if mode == "openai_text" else "chatcmpl-"   # OpenAI: text vs chat id prefix
+    cmpl_id = _idp + hashlib.sha256(str(time.time()).encode()).hexdigest()[:24]
     state = {"tokens": 0}  # token count (run() updates it; stream funcs read it)
-    stream = bool(body.get("stream", True))   # decided from the body alone — no model load needed
+    # stream default: OpenAI endpoints default FALSE (single JSON when omitted); Ollama default TRUE.
+    _stream_default = mode not in ("openai", "openai_text")
+    stream = bool(body.get("stream", _stream_default))   # decided from the body alone — no model load needed
     P: dict = {}             # prepared values, filled by _prepare (resident: instant; else load-on-request)
     _KEEPALIVE_LOAD_S = 8.0  # while a requested model auto-loads, emit a keepalive this often (Ollama-style)
 
@@ -8462,6 +8526,19 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             yield s
 
         async def openai_stream():
+            # One SSE streamer for /v1/chat/completions AND /v1/completions: chat emits
+            # chat.completion.chunk w/ choices[].delta.content; text emits text_completion w/ choices[].text.
+            _is_text = (mode == "openai_text")
+            _obj = "text_completion" if _is_text else "chat.completion.chunk"
+            def _chunk(piece, finish):
+                ch = {"index": 0, "finish_reason": finish}
+                if _is_text:
+                    ch["text"] = piece or ""
+                    ch["logprobs"] = None
+                else:
+                    ch["delta"] = ({"content": piece} if piece else {})
+                return {"id": cmpl_id, "object": _obj, "created": created,
+                        "model": model, "choices": [ch]}
             finish = "stop"
             entered = False
             try:
@@ -8474,20 +8551,15 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                     except asyncio.TimeoutError:
                         yield ": loading\n\n"   # SSE comment keepalive (ignored by clients)
                 if emsg is not None:
-                    s = ("data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
-                         "created": created, "model": model, "error": {"message": emsg},
-                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
-                         + "\n\ndata: [DONE]\n\n")
+                    d = _chunk("", "stop")
+                    d["error"] = {"message": emsg, "type": "invalid_request_error"}
+                    s = "data: " + json.dumps(d) + "\n\ndata: [DONE]\n\n"
                     METRICS["api_out"] += len(s); yield s
                     return
                 entered = True
                 async for piece, reason in run():
                     if piece:
-                        s = "data: " + json.dumps({
-                            "id": cmpl_id, "object": "chat.completion.chunk",
-                            "created": created, "model": model,
-                            "choices": [{"index": 0, "delta": {"content": piece},
-                                         "finish_reason": None}]}) + "\n\n"
+                        s = "data: " + json.dumps(_chunk(piece, None)) + "\n\n"
                         METRICS["api_out"] += len(s)
                         yield s
                     if reason:
@@ -8497,15 +8569,12 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             finally:
                 if not entered:
                     _inflight_release(rec)
-            s = "data: " + json.dumps({
-                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}) + "\n\n"
+            s = "data: " + json.dumps(_chunk("", finish)) + "\n\n"
             s += "data: [DONE]\n\n"
             METRICS["api_out"] += len(s)
             yield s
 
-        if mode == "openai":
+        if mode in ("openai", "openai_text"):
             return StreamingResponse(openai_stream(), media_type="text/event-stream")
         return StreamingResponse(ollama_stream(), media_type="application/x-ndjson")
 
@@ -8516,8 +8585,11 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     except Exception as exc:
         _inflight_release(rec)
         return JSONResponse({"error": str(exc), "model": model}, status_code=400)
-    if emsg is not None:   # unknown model / auto-load off / embedding model
+    if emsg is not None:   # auto-load off / embedding model (truly-unknown already 404'd above)
         _inflight_release(rec)
+        if mode in ("openai", "openai_text"):
+            return JSONResponse({"error": {"message": emsg, "type": "invalid_request_error"}},
+                                status_code=404)
         return JSONResponse({"error": emsg, "model": model}, status_code=404)
     t0 = time.perf_counter_ns()
     text = ""
@@ -8539,13 +8611,21 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     dur = time.perf_counter_ns() - t0
     n = state["tokens"]
 
-    if mode == "openai":
-        payload = {
-            "id": cmpl_id, "object": "chat.completion", "created": created, "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": _map_finish(done_reason)}],
-            "usage": {"prompt_tokens": len(P["ids"]), "completion_tokens": n,
-                      "total_tokens": len(P["ids"]) + n}}
+    if mode in ("openai", "openai_text"):
+        usage = {"prompt_tokens": len(P["ids"]), "completion_tokens": n,
+                 "total_tokens": len(P["ids"]) + n}
+        if mode == "openai_text":   # OpenAI legacy text completion
+            payload = {
+                "id": cmpl_id, "object": "text_completion", "created": created, "model": model,
+                "choices": [{"text": text, "index": 0, "logprobs": None,
+                             "finish_reason": _map_finish(done_reason)}],
+                "usage": usage}
+        else:
+            payload = {
+                "id": cmpl_id, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                             "finish_reason": _map_finish(done_reason)}],
+                "usage": usage}
         METRICS["api_out"] += len(json.dumps(payload))
         return JSONResponse(payload)
     out = {"model": model, "created_at": _iso(), "done": True, "done_reason": done_reason,
