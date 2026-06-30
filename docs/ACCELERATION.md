@@ -63,10 +63,12 @@ keyed on `(B, N, K)`, so it picks the best tile per expert shape on each GPU. Th
 measured winners) to bound first-decode JIT cost. Sweep on the 4070 Ti SUPER (`bench_moe_w4a16.py`):
 `num_stages=3` buys **~1.18×** on narrow-N shapes (qwen3-a3b expert GEMM) and is ~neutral on wider ones
 (olmoe). It's a small end-to-end gain — on NVIDIA the dense GEMMs (tinygemm) dominate decode, and even the
-best MoE config sits at only **~35–48% of the card's ~672 GB/s peak**. The remaining ~2× is *structural*
-(the serial-K GEMV + on-the-fly dequant), reachable only by a **split-K rewrite** of this kernel (the same
-trick used for the ROCm *dense* GEMV) — not by these three knobs. Tuning is therefore optional polish here,
-not load-bearing as it was on RDNA (where no vendor int4 GEMM exists at all).
+best MoE config sits at only **~35–48% of the card's ~672 GB/s peak**. The remaining ~2× is *not*
+occupancy — a **split-K variant was prototyped and measured slower** (0.66–0.85× — see "Further
+optimization headroom"), because the kernel's `B = top_k` grid dimension already supplies enough programs
+at decode. The gap is the memory-access pattern (the per-expert weight tile is strided across `N`) plus
+the on-the-fly dequant, which only a re-pack / re-tile would address. Tuning is therefore optional polish
+here, not load-bearing as it was on RDNA (where no vendor int4 GEMM exists at all).
 
 > **Triton version note:** the kernels resolve `triton`/`tl` from **module globals** (not a local import
 > inside the builder), because triton 3.2 — unlike 3.7 — does not capture them as closure freevars and
@@ -180,20 +182,30 @@ MoE models where the routed experts are a big share of decode.
 
 These kernels are good but not the ceiling. Ranked by likely payoff:
 
-1. **Split-K the MoE GEMV (the big one).** The fused expert kernel does a *serial* K-reduction per
-   program and sits at only ~35–48% of peak bandwidth on the 4070. Splitting K across programs with an
-   fp32 atomic-add accumulator — exactly what already won 3.5–3.9× on the *dense* RDNA GEMV (#4) — is the
-   one change that can close most of that ~2× gap. Single biggest remaining MoE-decode lever, on every GPU.
-2. **CUDA/HIP-graph capture of the decode step.** Now unblocked: fusing the experts removed the
+1. **CUDA/HIP-graph capture of the decode step.** Now unblocked: fusing the experts removed the
    data-dependent per-expert Python loop, so the per-token graph is static and capturable. Removes most
    per-token launch + Python-dispatch overhead (the ~20% non-compute idle measured on Strix Halo).
-3. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
+   Likely the single biggest remaining decode lever now that the kernels themselves are near their ceiling.
+2. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
    kernel is gated behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. Attention is a real slice of decode
    on the hybrid (Gated-DeltaNet + SDPA) models.
-4. **Single-node in-process transport.** Adjacent pipeline stages on the *same* box still hand off over
+3. **Single-node in-process transport.** Adjacent pipeline stages on the *same* box still hand off over
    loopback TCP; an in-process path removes that per-token round-trip.
-5. **Dense-kernel autotune on RDNA.** The RDNA dense Triton kernel still uses fixed tiles; the AMD iGPU is
-   ~5× behind llama.cpp/Vulkan on the same silicon — the dense kernel plus (1)+(2)+(3) is where that gap lives.
+4. **Dense-kernel autotune on RDNA.** The RDNA dense Triton kernel still uses fixed tiles; the AMD iGPU is
+   ~5× behind llama.cpp/Vulkan on the same silicon — the dense kernel plus (1)+(2) is where that gap lives.
+5. **MoE weight re-pack for coalescing (hard, uncertain).** The fused MoE GEMV reaches ~35–48% of peak;
+   the gap is the strided per-expert weight tile (laid out `[E, N, K/2]`, read strided across `N`), not
+   occupancy. A transposed/tiled pack could coalesce it, but it's a format change touching the packer,
+   shard cache, and kernel — large surface, uncertain win, and decode on NVIDIA is dominated by the dense
+   tinygemm path anyway. Not currently worth it.
+
+> **Tested and rejected — split-K for the MoE GEMV.** Splitting the K reduction across programs (the trick
+> that won 3.5–3.9× on the *dense* M=1 GEMV, #4) was prototyped and benched on the 4070 Ti SUPER:
+> **0.66× (olmoe) / 0.85× (qwen3-a3b) — slower.** Unlike the dense M=1 case (only ~`cdiv(N,128)`≈16
+> programs, badly under-occupied), the MoE kernel's grid is `(B, cdiv(N,BN))` where `B = top_k` already
+> multiplies the program count ~8× (≈128 programs ≈ 2 waves), so there's no occupancy to recover and the
+> extra fp32 atomic-add contention on the shared output makes it a net loss. Generalizes to RDNA (fewer
+> CUs → even more waves → even less starved). Kept here so it isn't re-attempted.
 
 None is required for correctness; each is a throughput lever with diminishing returns on NVIDIA (where
 dense is already fast) and larger upside on the bandwidth-starved AMD iGPU.

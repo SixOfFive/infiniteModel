@@ -119,8 +119,9 @@ The last two rows are the newer decode path: a **single grouped Triton launch** 
 experts (replacing the per-expert subclass loop), and a **split-K** GEMV that gives the batch-1 dense
 matmul enough programs to saturate the iGPU's bus. Both are ROCm-automatic + self-checked; the MoE
 kernel is also `@triton.autotune`d per shape. Full cross-platform detail, the NVIDIA opt-in, and the
-remaining optimization headroom (split-K for the MoE GEMV, HIP-graph capture, AOTriton flash-attn) live
-in **[ACCELERATION.md](ACCELERATION.md)**.
+remaining optimization headroom (HIP-graph capture, AOTriton flash-attn; note split-K — which won on the
+*dense* GEMV — was tested and **rejected** for the MoE GEMV, it's already occupied) live in
+**[ACCELERATION.md](ACCELERATION.md)**.
 
 Dense models gain the most — every linear is fused, not just the ~40% dense slice of an
 MoE — so a dense 7–14B int4 decodes many× faster than its naive path. On an APU, **bf16**
