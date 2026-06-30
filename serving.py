@@ -168,6 +168,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                         yield piece, None
                 if reason:
                     text = _decode_visible(tok, produced)
+                    if text.endswith("�"):           # gen ended mid multi-byte char -> drop the
+                        text = text.rstrip("�")       # partial (it can never complete now) (#detok-tail)
                     yield text[len(prev):], reason   # flush remainder + signal done
         finally:
             _inflight_release(rec)   # free the slot/queue entry when generation ends
@@ -560,6 +562,8 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                     yield piece, None
             if reason:
                 text = _decode_visible(tok, produced)
+                if text.endswith("�"):               # incomplete multi-byte at gen end -> drop partial
+                    text = text.rstrip("�")           # (#detok-tail)
                 yield text[len(prev):], reason
         finally:
             _inflight_release(rec)   # free the slot/queue entry when generation ends
