@@ -870,6 +870,68 @@ def _nvfp4_dequant_part_bytes(part: dict) -> bytes:
     return deq.contiguous().flatten().view(torch.uint8).numpy().tobytes()
 
 
+# ---- MXFP4 checkpoints (gpt-oss: MoE experts in OCP microscaling FP4) ---------------------------
+# gpt-oss quantizes ONLY its fused 3D MoE expert weights (mlp.experts.gate_up_proj / down_proj) to
+# MXFP4; attention / router / embeddings stay bf16. Each quantized expert weight is TWO tensors:
+#   '<name>_blocks': uint8 [E, out, G, 16] — 2 FP4 E2M1 codes/byte (low nibble = EVEN output elem),
+#                    16 bytes = 32 codes = ONE microscaling block along the in-dim (so in = G*32).
+#   '<name>_scales': uint8 [E, out, G]     — ONE E8M0 scale per 32-code block (biased: real exp =
+#                    value-127; the block multiplier is a pure power of two, NOT a float like nvfp4).
+# Dequant MIRRORS transformers.integrations.mxfp4._convert_moe_packed_tensors EXACTLY (tf 5.12.1):
+#   value = E2M1[code] * 2**(scale_u8 - 127)  via ldexp, reshape -> [E, out, in], then TRANSPOSE(1,2)
+#   -> [E, in, out] (gpt-oss applies experts in_features-major: y = x @ W). E2M1 LUT == _E2M1_VALUES.
+# Unlike fp8/nvfp4 this is a NATIVELY 3D-FUSED MoE source (the exact case _assemble_sd's serve path
+# rejects for fp8/nvfp4) — so wiring it into the int4 cache compile + gpt-oss arch support (attention
+# sinks, clamped SwiGLU) is the remaining work. This primitive is the validated foundation
+# (unit-tested bit-exact vs transformers; see #161).
+_MXFP4_BLOCK = 32   # microscaling block size: FP4 codes per E8M0 scale
+
+
+def _mxfp4_quantized(model_dir: str) -> bool:
+    """True if this checkpoint is MXFP4-quantized (gpt-oss), read from quantization_config."""
+    try:
+        with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+            qc = (json.load(fh) or {}).get("quantization_config") or {}
+    except Exception:
+        return False
+    return "mxfp4" in str(qc.get("quant_method", "")).lower()
+
+
+def _mxfp4_blocks_name(weight_name: str) -> str:
+    """'<name>'/'<name>.weight' -> '<name>_blocks' (the packed FP4 tensor)."""
+    base = weight_name[: -len(".weight")] if weight_name.endswith(".weight") else weight_name
+    return base + "_blocks"
+
+
+def _mxfp4_scales_name(weight_name: str) -> str:
+    """'<name>'/'<name>.weight' -> '<name>_scales' (the E8M0 per-block scale tensor)."""
+    base = weight_name[: -len(".weight")] if weight_name.endswith(".weight") else weight_name
+    return base + "_scales"
+
+
+def _dequant_mxfp4_to_bf16(blocks_u8, scales_u8):
+    """Faithful mirror of transformers _convert_moe_packed_tensors (tf 5.12.1).
+    blocks_u8: uint8 [*prefix, G, 16] (2 E2M1 codes/byte, LOW nibble = even output element).
+    scales_u8: uint8 [*prefix, G]     (E8M0 biased exponent; real exp = value-127).
+    For a gpt-oss 3D expert ([E, out, G, 16]) returns bf16 [E, in, out] (dequant then transpose(1,2));
+    in = G*32. value = E2M1[code] * 2**(scale-127)."""
+    import torch, math
+    blocks = blocks_u8.to(torch.uint8)
+    scales = scales_u8.to(torch.int32) - 127                 # E8M0 unbias (128 = 2**7 bias-of-127)
+    assert blocks.shape[:-1] == scales.shape, f"{blocks.shape[:-1]} != {scales.shape}"
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.bfloat16, device=blocks.device)
+    *prefix, G, B = blocks.shape
+    rows = math.prod(prefix) * G
+    blk = blocks.reshape(rows, B)
+    exp = scales.reshape(rows, 1)
+    out = torch.empty(rows, B * 2, dtype=torch.bfloat16, device=blocks.device)
+    out[:, 0::2] = lut[(blk & 0x0F).to(torch.int)]           # low nibble  -> even element
+    out[:, 1::2] = lut[(blk >> 4).to(torch.int)]             # high nibble -> odd element
+    torch.ldexp(out, exp, out=out)                           # * 2**(scale-127), per-block broadcast
+    out = out.reshape(*prefix, G, B * 2).view(*prefix, G * B * 2)
+    return out.transpose(1, 2).contiguous()                  # [E, out, in] -> [E, in, out]
+
+
 def _plan_weight_stream(model_dir: str, start: int, end: int,
                         has_embed: bool, has_head: bool,
                         skip_experts: bool = False) -> tuple[bytes, list, int]:
