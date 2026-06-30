@@ -1055,7 +1055,18 @@ def resolve_model_name(name: str) -> str:
         if cand and (cand in MODELS or cand in MODEL_SPECS):
             return cand
     if "/" in norm:          # an arbitrary HF id — accept (download/spec resolve it)
-        return norm
+        # #cache-case: _normalize_model_request LOWERCASES HF ids, but a model's dir + its
+        # _shards/<quant> cache live under the ORIGINAL-CASE registered target (e.g.
+        # 'mistralai/Devstral-Small-2-24B-Instruct-2512'). On a case-SENSITIVE filesystem (Linux/
+        # om3nbox) the lowercased id resolves to a DIFFERENT, cache-less dir, so /weights can't see
+        # the int4 cache and the load silently streams + serves bf16 (4x the memory; harmless on
+        # case-insensitive Windows, which is why it only bit the Linux box). Map the (mis-cased) HF
+        # id BACK to its registered target so serve + compile share ONE dir; else preserve the
+        # caller's ORIGINAL case (never the lowercased norm) so a fresh download lands in the right dir.
+        for _tgt, _draft in MODELS.values():
+            if _tgt.lower() == norm.lower():
+                return _tgt
+        return name.strip() if (name and "/" in name) else norm
     raise ValueError(f"unknown model '{name}'; known: {', '.join(MODELS)}")
 
 
