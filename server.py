@@ -3322,10 +3322,18 @@ def build_app() -> FastAPI:
         """Unregister a custom (added) model: drop its friendly->HF mapping from CUSTOM_MODELS +
         MODELS + custom_models.json. UNLIKE /delete, this does NOT delete the cached weight files
         — the model stays on disk, just no longer registered. Refuses if currently loaded."""
-        try:
-            friendly = resolve_model_name(model)
-        except ValueError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        # Prefer the LITERAL registered entry over an alias redirect: a custom model whose name
+        # is shadowed by a built-in MODEL_ALIASES entry (e.g. 'qwen2.5:14b', shadowed by
+        # qwen2.5-14b -> qwen2.5-14b-instruct) is otherwise UNFORGETTABLE — resolve_model_name
+        # would redirect to the alias target and report it "loaded". (#forget-shadow)
+        literal = _normalize_model_request(model)
+        if literal in CUSTOM_MODELS:
+            friendly = literal
+        else:
+            try:
+                friendly = resolve_model_name(model)
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
         if friendly in engine.models:
             return JSONResponse({"ok": False, "error": "model is loaded — unload it first"},
                                 status_code=409)

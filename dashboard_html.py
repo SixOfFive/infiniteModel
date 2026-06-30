@@ -279,12 +279,14 @@ function render(){
   $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
   // fleet tiles
   const loaded=(d.models||[]).filter(m=>m.loaded).length, reg=(d.models||[]).length;
-  const vU=p.vram_gb-p.vram_free_gb, rU=p.ram_gb-p.ram_free_gb;
+  // pool bars: PHYSICAL used (total - free) against PHYSICAL total, one base (#pool-base).
+  const vT=p.vram_total_gb||0, rT=p.ram_total_gb||0;
+  const vU=Math.max(0,vT-(p.vram_free_gb||0)), rU=Math.max(0,rT-(p.ram_free_gb||0));
   $('#fleet').innerHTML=[
     tile('Nodes', (p.nodes||0)+' <small>· '+(comp.gpus||0)+' GPU</small>'),
     tile('Loaded', loaded+' <small>/ '+reg+' registered</small>'),
-    tile('GPU pool', fmt(vU)+'<small> / '+fmt(p.vram_gb)+' GB</small>', bar(vU,p.vram_gb)),
-    tile('RAM pool', fmt(rU)+'<small> / '+fmt(p.ram_gb)+' GB</small>', bar(rU,p.ram_gb)),
+    tile('GPU pool', fmt(vU)+'<small> / '+fmt(vT)+' GB</small>', bar(vU,vT)),
+    tile('RAM pool', fmt(rU)+'<small> / '+fmt(rT)+' GB</small>', bar(rU,rT)),
     tile('Throughput', ((d.metrics||{}).tokens_per_s||0).toFixed(1)+' <small>tok/s · '+Math.round(comp.overall_pct||0)+'% busy</small>'),
   ].join('');
   renderModels(d,cl);

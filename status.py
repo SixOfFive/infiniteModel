@@ -62,6 +62,12 @@ def build_status() -> dict:
     pool_ram = sum(n.eff_ram_gb for n in nodes)    # enabled tiers only (planner budget)
     pool_vram = sum(n.eff_vram_gb for n in nodes)  # disabled VRAM leaves the pool
     pool_usable = pool_ram + pool_vram            # usable pool now includes VRAM
+    # Physical (pre-reserve) totals split by form. The dashboard's GPU/RAM pool bars render
+    # LIVE used (total - free) against THESE so used and total share one base — the usable
+    # splits above subtract OS/VRAM reserve and don't line up with the physical *_free below
+    # (free is measured against the bigger physical total → used went negative; see #pool-base).
+    pool_ram_total = sum(n.total_mem_gb for n in nodes if n.ram_enabled)
+    pool_vram_total = sum(n.vram_total_gb for n in nodes if n.vram_enabled)
     # LIVE physical used/free against the STABLE total — so the dashboard shows usage CLIMBING
     # as models load, not the total shrinking. RAM used = total-free (heartbeat); VRAM used = heartbeat.
     pool_used = sum(((n.total_mem_gb - n.free_mem_gb) if n.ram_enabled else 0.0)
@@ -279,6 +285,8 @@ def build_status() -> dict:
                  "ctrlr_gb": round(ctrl_rss_gb, 2),    # controller process RSS alone
                  "usable_gb": round(pool_usable, 2),   # planner budget (live free, for fit checks)
                  "ram_gb": round(pool_ram, 2), "vram_gb": round(pool_vram, 2),
+                 # PHYSICAL totals by form (pool-bar denominator; pairs with *_free below)
+                 "ram_total_gb": round(pool_ram_total, 2), "vram_total_gb": round(pool_vram_total, 2),
                  # LIVE physical free split by form (what's available as RAM vs VRAM)
                  "ram_free_gb": round(pool_ram_free, 2), "vram_free_gb": round(pool_vram_free, 2)},
         "compute": {"overall_pct": round(overall_pct, 1),
