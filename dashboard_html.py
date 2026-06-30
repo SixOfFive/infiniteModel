@@ -471,3 +471,203 @@ tick(); setInterval(tick,2000);
 </script>
 </body></html>
 """
+
+
+CONFIG_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InfiniteModel — Config</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:980px;margin:0 auto;padding:18px 20px 60px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 13px;font-size:13px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn:active{transform:scale(.98)} .btn.pri{border-color:var(--accent);color:#cfe0ff}
+  .btn.sm{padding:4px 9px;font-size:12px} .btn.danger{border-color:#5a2a2a;color:#ff9a9a} .btn.danger:hover{border-color:var(--bad)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 4px} .card .sub{font-size:12px;color:var(--dim);margin-bottom:12px}
+  .frm{display:grid;grid-template-columns:1fr 1fr;gap:13px 22px}
+  .fld{display:flex;flex-direction:column;gap:4px} .fld label{font-size:12px;color:var(--muted)}
+  .fld input,.fld select{background:var(--bg);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 10px;font-size:13px}
+  .tog{display:flex;align-items:center;gap:8px;font-size:13px} .tog input{width:16px;height:16px}
+  .nrow{display:flex;align-items:center;gap:14px;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .nrow:last-child{border-bottom:none} .nrow .nn{min-width:150px;font-weight:600}
+  .nrow .nn small{font-weight:400;color:var(--dim);font-size:11px} .nrow .grow{flex:1}
+  .saved{color:var(--good);font-size:12px;margin-left:10px} .err{color:var(--bad);font-size:12px;margin-left:10px}
+  .actrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a class="on" href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+</header>
+
+<div class="card">
+  <h2>Engine settings</h2><div class="sub">Runtime config, persisted across restarts.</div>
+  <div class="frm">
+    <div class="fld"><label>Max concurrent loaded models</label><input id="max_loaded" type="number" min="1"></div>
+    <div class="fld"><label>Per-model queue depth</label><input id="queue_depth" type="number" min="1"></div>
+    <div class="fld"><label>Auto-load default quant</label><select id="autoload_quant"><option>int4</option><option>int8</option><option value="none">none (bf16)</option></select></div>
+    <div class="fld"><label>Auto-load default ctx (0 = native)</label><input id="autoload_ctx" type="number" min="0"></div>
+    <div class="fld"><label>Auto-load placement mode</label><select id="autoload_mode"><option>auto</option><option>all-gpu</option><option>distribute</option><option>proportional</option><option>single</option></select></div>
+    <div class="fld"><label>Prefill stall-watchdog (s, 0=off)</label><input id="gen_stall_s" type="number" min="0"></div>
+    <div class="fld"><label>Decode stall-watchdog (s, 0=off)</label><input id="gen_stall_decode_s" type="number" min="0"></div>
+    <div class="fld"></div>
+    <div class="fld tog"><input type="checkbox" id="auto_unload"><label for="auto_unload">LRU auto-unload</label></div>
+    <div class="fld tog"><input type="checkbox" id="auto_load"><label for="auto_load">Auto-load on request</label></div>
+    <div class="fld tog"><input type="checkbox" id="vram_weights_first"><label for="vram_weights_first">Budget weights vs physical-free VRAM</label></div>
+  </div>
+  <div style="margin-top:14px"><button class="btn pri" onclick="save()">Save settings</button><span id="cfg-msg"></span></div>
+</div>
+
+<div class="card">
+  <h2>Nodes — compute tiers</h2><div class="sub">Enable/disable each node's CPU/RAM and GPU/VRAM in the placement pool. Changes re-plan affected models.</div>
+  <div class="actrow" style="margin-bottom:8px">
+    <span style="font-size:12px;color:var(--muted)">Bulk:</span>
+    <button class="btn sm" onclick="bulk('ram',true)">All RAM on</button><button class="btn sm" onclick="bulk('ram',false)">All RAM off</button>
+    <button class="btn sm" onclick="bulk('vram',true)">All VRAM on</button><button class="btn sm" onclick="bulk('vram',false)">All VRAM off</button>
+    <span id="node-msg"></span>
+  </div>
+  <div id="nodes"></div>
+</div>
+
+<div class="card">
+  <h2>Controller</h2><div class="sub">Fleet-level operations. Use with care.</div>
+  <div class="actrow">
+    <button class="btn" onclick="ctlAct('/restart?workers=0','Restart the CONTROLLER only?')">Restart controller</button>
+    <button class="btn" onclick="ctlAct('/restart?workers=1','Restart the WHOLE fleet (controller + all workers)?')">Restart fleet</button>
+    <button class="btn" onclick="ctlAct('/update?workers=1','Pull latest code from GitHub and restart the fleet?')">Update + deploy</button>
+    <button class="btn" onclick="ctlAct('/gc_cache','Reclaim disk by removing redundant HF-cache copies?')">GC disk cache</button>
+    <span id="ctl-msg"></span>
+  </div>
+</div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s'];
+const TOGS=['auto_unload','auto_load','vram_weights_first'];
+let NODES=[];
+async function load(){
+  let d; try{ d=await (await fetch('/status')).json(); }catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; return; }
+  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
+  FIELDS.forEach(k=>{ if($('#'+k)&&c[k]!=null)$('#'+k).value=c[k]; });
+  TOGS.forEach(k=>{ if($('#'+k))$('#'+k).checked=!!c[k]; });
+  NODES=d.nodes||[]; renderNodes();
+}
+function renderNodes(){
+  $('#nodes').innerHTML=NODES.slice().sort((a,b)=>(b.has_gpu?1:0)-(a.has_gpu?1:0)||a.hostname.localeCompare(b.hostname)).map(n=>{
+    const gpu=n.has_gpu;
+    return '<div class="nrow"><div class="nn">'+esc(n.hostname)+' <small>'+(gpu?esc(n.device_name||'GPU'):((n.cores||'')+'c CPU'))+(n.alive?'':' · offline')+'</small></div>'
+      +'<label class="tog"><input type="checkbox" '+(n.ram_enabled?'checked':'')+' onchange="setTier(\''+esc(n.hostname)+'\',\'ram\',this.checked)">RAM</label>'
+      +(gpu?'<label class="tog"><input type="checkbox" '+(n.vram_enabled?'checked':'')+' onchange="setTier(\''+esc(n.hostname)+'\',\'vram\',this.checked)">VRAM</label>':'<span style="color:var(--dim);font-size:12px">no GPU</span>')
+      +'<span class="grow"></span><span style="font-size:11px;color:var(--dim)">'+(gpu?fmt(n.vram_used_gb)+'/'+fmt(n.vram_total_gb)+' GB VRAM':fmt((n.total_mem_gb||0)-(n.free_mem_gb||0))+'/'+fmt(n.total_mem_gb)+' GB RAM')+'</span></div>';
+  }).join('')||'<div style="color:var(--dim);font-size:13px">no nodes</div>';
+}
+function fmt(v){return v==null?'—':Math.round(v*10)/10}
+async function post(path){ const r=await fetch(path,{method:'POST'}); const t=await r.text(); let j;try{j=JSON.parse(t)}catch(e){j={ok:r.ok}} if(!r.ok||j.ok===false)throw new Error(j.error||('HTTP '+r.status)); return j; }
+function msg(id,txt,bad){ $(id).innerHTML=(bad?'<span class="err">':'<span class="saved">')+esc(txt)+'</span>'; setTimeout(()=>{$(id).innerHTML='';},3500); }
+async function save(){
+  const q=new URLSearchParams();
+  FIELDS.forEach(k=>{ const v=$('#'+k).value; if(v!=='')q.set(k,v); });
+  TOGS.forEach(k=>{ q.set(k,$('#'+k).checked?'true':'false'); });
+  try{ await post('/config?'+q.toString()); msg('#cfg-msg','saved'); load(); }catch(e){ msg('#cfg-msg',String(e.message||e),1); }
+}
+async function setTier(host,tier,on){ try{ await post('/nodeconfig?host='+encodeURIComponent(host)+'&'+tier+'='+(on?'true':'false')); msg('#node-msg',host+' '+tier+'='+on); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
+async function bulk(tier,on){ try{ await post('/nodeconfig_all?tier='+tier+'&enabled='+(on?'true':'false')); msg('#node-msg','all '+tier+'='+on); load(); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
+async function ctlAct(path,confirmMsg){ if(!confirm(confirmMsg))return; try{ await post(path); msg('#ctl-msg','sent — controller restarting if applicable'); }catch(e){ msg('#ctl-msg',String(e.message||e),1);} }
+load(); setInterval(load,5000);
+</script>
+</body></html>
+"""
+
+LOGS_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InfiniteModel — Logs</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:1180px;margin:0 auto;padding:18px 20px 40px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn.on{border-color:var(--accent);color:#cfe0ff}
+  select.f{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:6px 10px;font-size:13px}
+  .tog{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+  .panes{display:grid;grid-template-columns:2.4fr 1fr;gap:14px;align-items:start}
+  @media(max-width:860px){.panes{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .card h2{font-size:14px;margin:0;padding:10px 14px;border-bottom:1px solid var(--border);color:var(--muted)}
+  pre#log{margin:0;padding:12px 14px;font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--text);
+    white-space:pre-wrap;word-break:break-word;height:72vh;overflow:auto;background:#0a0e14}
+  .act{padding:4px 0} .act div{padding:6px 14px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted)}
+  .act div:last-child{border-bottom:none} .act .t{color:var(--dim);font-size:11px;margin-right:6px}
+  .empty{padding:20px;color:var(--dim);font-size:13px;text-align:center}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a href="/config">Config</a><a class="on" href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+  <span class="grow"></span>
+  <span class="tog">source <select class="f" id="src" onchange="refresh()"></select></span>
+  <button class="btn on" id="auto" onclick="toggleAuto()">auto ⟳</button>
+  <button class="btn" onclick="refresh()">refresh</button>
+</header>
+<div class="panes">
+  <div class="card"><h2 id="logtitle">controller log</h2><pre id="log">loading…</pre></div>
+  <div class="card"><h2>activity</h2><div class="act" id="act"></div></div>
+</div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let AUTO=true, SRCS=false;
+async function srcList(){
+  try{ const d=await (await fetch('/status')).json();
+    const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
+    if(!SRCS){ const sel=$('#src'); const cur=sel.value;
+      sel.innerHTML='<option value="">controller</option>'+(d.nodes||[]).map(n=>'<option value="'+esc(n.hostname)+'">'+esc(n.hostname)+(n.has_gpu?' (GPU)':'')+'</option>').join('');
+      if(cur)sel.value=cur; SRCS=true; }
+    renderAct(d.activity||[]);
+  }catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; }
+}
+function renderAct(a){
+  if(!a.length){ $('#act').innerHTML='<div class="empty">no recent activity</div>'; return; }
+  $('#act').innerHTML=a.slice(-60).reverse().map(e=>{
+    const txt=typeof e==='string'?e:(e.msg||e.text||JSON.stringify(e)); const t=(e&&e.ts)?('<span class="t">'+esc(String(e.ts).slice(11,19))+'</span>'):'';
+    return '<div>'+t+esc(txt)+'</div>';
+  }).join('');
+}
+async function refresh(){
+  const host=$('#src').value;
+  $('#logtitle').textContent=host?('worker log · '+host):'controller log';
+  try{
+    const r=await fetch('/logs'+(host?('?node='+encodeURIComponent(host)):''));
+    const t=await r.text();
+    const el=$('#log'); const atBottom=el.scrollHeight-el.scrollTop-el.clientHeight<40;
+    el.textContent=t||'(empty)';
+    if(atBottom) el.scrollTop=el.scrollHeight;
+  }catch(e){ $('#log').textContent='error fetching log: '+(e.message||e); }
+}
+function toggleAuto(){ AUTO=!AUTO; $('#auto').classList.toggle('on',AUTO); $('#auto').textContent=AUTO?'auto ⟳':'auto off'; }
+async function tick(){ await srcList(); if(AUTO) refresh(); }
+refresh(); tick(); setInterval(tick,3000);
+</script>
+</body></html>
+"""

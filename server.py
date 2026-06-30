@@ -3412,7 +3412,7 @@ def _display_host() -> str:
 
 # Dashboard + bandwidth HTML live in dashboard_html.py (server-only); kept in sync by the
 # multi-file self-update (in EXTRA_UPDATE_FILES) + present from a fresh git clone -> plain import.
-from dashboard_html import DASHBOARD_HTML, BANDWIDTH_HTML   # noqa: F401
+from dashboard_html import DASHBOARD_HTML, BANDWIDTH_HTML, CONFIG_HTML, LOGS_HTML   # noqa: F401
 
 
 # ---------------------------------------------------------------------------

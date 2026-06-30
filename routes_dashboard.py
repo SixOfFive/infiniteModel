@@ -17,6 +17,14 @@ def register(app):
     async def bandwidth_page() -> str:
         return BANDWIDTH_HTML
 
+    @app.get("/config", response_class=HTMLResponse)   # dashboard: Configuration page (settings + node tiers)
+    async def config_page() -> str:
+        return CONFIG_HTML
+
+    @app.get("/logs-page", response_class=HTMLResponse)   # dashboard: Logging page (controller + per-node logs)
+    async def logs_page() -> str:
+        return LOGS_HTML
+
     @app.get("/bandwidthdata")       # full traffic picture: controller<->node + node<->node
     async def bandwidthdata() -> JSONResponse:
         """Combine the controller's own socket metering (authoritative for controller<->node)
