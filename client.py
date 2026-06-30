@@ -106,7 +106,26 @@ def _release_vram() -> None:
     with contextlib.suppress(Exception):
         import torch
         if torch.cuda.is_available():
+            # #vram-release-rocm: on ROCm/HIP (gfx1151 APU) a dropped shard's VRAM was seen NOT
+            # returned by empty_cache alone — unload left the model resident (~13.5 GB int4 / ~44 GB
+            # bf16) and only a process restart reclaimed it. Pending HIP frees can be DEFERRED until
+            # the stream syncs, so sync FIRST so empty_cache sees the freed blocks. Then log
+            # allocated-vs-reserved (ROCm only) so a lingering live REFERENCE (allocated stays high
+            # after gc+empty_cache) is told apart from an allocator POOL the release SHOULD reclaim
+            # (reserved high, allocated low). Harmless + silent on CUDA (BEAST behavior unchanged).
+            is_rocm = bool(getattr(torch.version, "hip", None))
+            if is_rocm:
+                with contextlib.suppress(Exception):
+                    torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            if is_rocm:
+                with contextlib.suppress(Exception):
+                    a = torch.cuda.memory_allocated() / (1024 ** 3)
+                    r = torch.cuda.memory_reserved() / (1024 ** 3)
+                    _builtins.print(f"[vram-release] ROCm after gc+empty_cache: "
+                                    f"allocated={a:.2f}GB reserved={r:.2f}GB "
+                                    f"({'LIVE-REF leak' if a > 1.0 else 'pool reclaimed' if r < 1.0 else 'POOL held'})",
+                                    flush=True)
 
 
 def _release_ram(trim_working_set: bool = False) -> None:
