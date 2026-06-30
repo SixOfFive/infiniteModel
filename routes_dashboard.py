@@ -102,7 +102,7 @@ def register(app):
                              "now": int(time.time() * 1000), "hosts": hosts})
 
     @app.get("/plan")
-    async def plan(model: str, ctx: int = 0, quant: str = "none", mode: str = "auto", node: str = "") -> JSONResponse:
+    async def plan(model: str, ctx: int = 0, quant: str = "none", mode: str = "auto", node: str = "", cpu_only: bool = False) -> JSONResponse:
         # #60 Preview: same inputs as /load (model, ctx, quant, mode) -> the placement + #76
         # assessment WITHOUT loading. tp modes are pipeline-planned here (TP frees the fleet and
         # plans differently at load); the dashboard tells the user TP preview is approximate.
@@ -138,18 +138,19 @@ def register(app):
             fv = max(0.0, n.eff_vram_gb - PLAN_VRAM_FLOOR_GB)   # same VRAM floor as live load
             # #78: mirror the live load's controller-box RAM reserve so Preview's pool matches reality
             _ram = n.eff_ram_gb - (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
+            _vfv = 0.0 if cpu_only else fv   # #pin-device: cpu_only previews against RAM only (VRAM=0)
             mems.append(NodeMem(n.node_id, n.hostname,
-                                int((max(0.0, _ram) + fv) * GB), int(fv * GB)))
+                                int((max(0.0, _ram) + _vfv) * GB), int(_vfv * GB)))
             node_by_id[n.node_id] = n
-        p = plan_pipeline(spec, mems, ctx_len=ctx, consolidate=cons, prefer_vram=pv,
+        p = plan_pipeline(spec, mems, ctx_len=ctx, consolidate=cons, prefer_vram=(pv and not cpu_only),
                           spread=(mode == "spread"),
                           proportional=(mode == "proportional"),
-                          gpu_spread=(mode == "all-gpu"))
+                          gpu_spread=(mode == "all-gpu" and not cpu_only))
         d = p.to_dict()
         if p.ok:   # #60/#76: surface the basis + pre-load assessment so a Preview matches the load
-            d["basis"] = _describe_plan(p.stages, node_by_id, False, pv, quant,
-                                        gpu_spread=(mode == "all-gpu"))
-            d["assess"] = _assess_placement(spec, ctx, mems, p.stages)
+            d["basis"] = _describe_plan(p.stages, node_by_id, cpu_only, (pv and not cpu_only), quant,
+                                        gpu_spread=(mode == "all-gpu" and not cpu_only))
+            d["assess"] = _assess_placement(spec, ctx, mems, p.stages, cpu_only=cpu_only)
             # #78 guardrail: a CONSOLIDATING mode (auto/single) can pile a heavy shard onto the
             # controller's co-located worker, which must ALSO serve the whole stream -> it OOM-drops
             # mid-load (the beast minimax crash). Flag it so the dashboard offers 'proportional'

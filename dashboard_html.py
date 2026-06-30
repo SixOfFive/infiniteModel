@@ -441,7 +441,7 @@ function placeParams(name){
 }
 async function preview(name){
   const p=placeParams(name); const q=new URLSearchParams({model:p.model,quant:p.quant,ctx:p.ctx});
-  if(p.mode)q.set('mode',p.mode); if(p.node)q.set('node',p.node);
+  if(p.mode)q.set('mode',p.mode); if(p.node)q.set('node',p.node); if(p.cpu_only)q.set('cpu_only',p.cpu_only);
   $('#l-out').textContent='planning…';
   try{ const r=await (await fetch('/plan?'+q.toString())).json();
     if(!r.ok){ $('#l-out').innerHTML='<span class="err">'+esc(r.error||'cannot place')+'</span>'; return; }
