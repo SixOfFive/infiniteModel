@@ -189,38 +189,51 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
          P["max_new"], _st, P["speculative"], P["spec_k"]) = res
         return None
 
+    # #cold-contract (BUG-1/2/6/8): LOAD (or fail) BEFORE opening ANY response — for streaming too.
+    # Previously the streaming path opened HTTP 200 + SSE immediately, then ran the load inside the
+    # stream; a load FAILURE (auto-load off, capacity/VRAM, unknown) could then only be emitted as a
+    # terminal {done_reason:"error", content:""} frame — an empty-200 a fan-out/quorum client misreads
+    # as a finished/empty vote. Now BOTH stream and non-stream block here until the model is ready, so
+    # a failure surfaces as a real typed HTTP error (503+Retry-After retryable, or 4xx) with NO 200
+    # ever opened. Success -> P is filled and the model is resident; the decode loop below never runs
+    # against a mid-load/unstable pipeline (also closes BUG-8's gate).
+    try:
+        emsg = await _prep_unpack()
+    except Exception as exc:
+        _inflight_release(rec)
+        log_activity(f"generate {model}: prepare FAILED — {exc!r}")
+        # Resident-but-failed (e.g. ctx-too-long) = a genuine bad request -> 400 (not retryable).
+        # Not-resident = the LOAD itself failed (capacity/placement) -> retryable 503 + Retry-After.
+        _bad_req = friendly in engine.models
+        _code = 400 if _bad_req else 503
+        _hdr = {} if _bad_req else {"Retry-After": "3"}
+        _emsg = f"{type(exc).__name__}: {exc}"
+        if mode in ("openai", "openai_text"):
+            return JSONResponse({"error": {"message": _emsg,
+                                 "type": "invalid_request_error" if _bad_req else "model_loading"}},
+                                status_code=_code, headers=_hdr)
+        return JSONResponse({"error": _emsg, "model": friendly}, status_code=_code, headers=_hdr)
+    if emsg is not None:   # couldn't load (auto-load off / capacity / embedding) -> RETRYABLE typed 503
+        _inflight_release(rec)
+        if mode in ("openai", "openai_text"):
+            return JSONResponse({"error": {"message": emsg, "type": "model_loading", "code": "loading"}},
+                                status_code=503, headers={"Retry-After": "3"})
+        return JSONResponse({"model": friendly, "error": emsg, "state": "loading"},
+                            status_code=503, headers={"Retry-After": "3"})
+
     # ---------- streaming ----------
     if stream:
         async def ollama_stream():
             t0 = time.perf_counter_ns()
             done_reason = "stop"
             err = None
-            entered = False   # True once run() owns rec (its finally releases it then)
             body_key = "message" if mode == "chat" else "response"
             empty_val = {"role": "assistant", "content": ""} if mode == "chat" else ""
+            # Model already loaded above (#cold-contract): stream the decode directly — no in-stream
+            # load, no keepalive-empty-chunk that could become an empty-200 on a load failure. run()
+            # owns + releases the inflight slot.
             try:
-                # AUTO-LOAD WITH KEEPALIVE (Ollama-style load-on-request): a non-resident model loads
-                # now; emit empty done:false chunks every _KEEPALIVE_LOAD_S so headers go out at once
-                # and the client/proxy doesn't time out waiting on a slow load. Resident -> one poll.
-                prep_task = asyncio.ensure_future(_prep_unpack())
-                emsg = None
-                while True:
-                    try:
-                        emsg = await asyncio.wait_for(asyncio.shield(prep_task), _KEEPALIVE_LOAD_S)
-                        break
-                    except asyncio.TimeoutError:
-                        s = json.dumps({"model": model, "created_at": _iso(),
-                                        body_key: empty_val, "done": False}) + "\n"
-                        METRICS["api_out"] += len(s)
-                        yield s
-                if emsg is not None:   # load/prepare error
-                    final = {"model": model, "created_at": _iso(), "done": True,
-                             "done_reason": "error", "error": emsg}
-                    final[body_key] = empty_val
-                    s = json.dumps(final) + "\n"; METRICS["api_out"] += len(s); yield s
-                    return
-                entered = True
-                async for piece, reason in run():   # run() owns + releases rec from here
+                async for piece, reason in run():
                     if piece:
                         val = {"role": "assistant", "content": piece} if mode == "chat" else piece
                         s = json.dumps({"model": model, "created_at": _iso(),
@@ -229,11 +242,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                         yield s
                     if reason:
                         done_reason = reason
-            except Exception as exc:  # load or generation failed
+            except Exception as exc:  # generation failed mid-stream (model WAS ready); run() frees rec
                 err, done_reason = str(exc), "error"
-            finally:
-                if not entered:
-                    _inflight_release(rec)   # run() never took ownership -> release here
             dur = time.perf_counter_ns() - t0
             final = {"model": model, "created_at": _iso(), "done": True,
                      "done_reason": done_reason, "total_duration": dur, "load_duration": 0,
@@ -261,23 +271,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                 return {"id": cmpl_id, "object": _obj, "created": created,
                         "model": model, "choices": [ch]}
             finish = "stop"
-            entered = False
+            # Model already loaded above (#cold-contract): stream directly; run() owns+releases rec.
             try:
-                prep_task = asyncio.ensure_future(_prep_unpack())
-                emsg = None
-                while True:
-                    try:
-                        emsg = await asyncio.wait_for(asyncio.shield(prep_task), _KEEPALIVE_LOAD_S)
-                        break
-                    except asyncio.TimeoutError:
-                        yield ": loading\n\n"   # SSE comment keepalive (ignored by clients)
-                if emsg is not None:
-                    d = _chunk("", "stop")
-                    d["error"] = {"message": emsg, "type": "invalid_request_error"}
-                    s = "data: " + json.dumps(d) + "\n\ndata: [DONE]\n\n"
-                    METRICS["api_out"] += len(s); yield s
-                    return
-                entered = True
                 async for piece, reason in run():
                     if piece:
                         s = "data: " + json.dumps(_chunk(piece, None)) + "\n\n"
@@ -287,9 +282,6 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                         finish = _map_finish(reason)
             except Exception:
                 finish = "stop"
-            finally:
-                if not entered:
-                    _inflight_release(rec)
             s = "data: " + json.dumps(_chunk("", finish)) + "\n\n"
             s += "data: [DONE]\n\n"
             METRICS["api_out"] += len(s)
@@ -300,18 +292,7 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         return StreamingResponse(ollama_stream(), media_type="application/x-ndjson")
 
     # ---------- non-streaming ----------
-    # Non-stream inherently blocks until done (no keepalive possible) — load on request, then collect.
-    try:
-        emsg = await _prep_unpack()
-    except Exception as exc:
-        _inflight_release(rec)
-        return JSONResponse({"error": str(exc), "model": model}, status_code=400)
-    if emsg is not None:   # auto-load off / embedding model (truly-unknown already 404'd above)
-        _inflight_release(rec)
-        if mode in ("openai", "openai_text"):
-            return JSONResponse({"error": {"message": emsg, "type": "invalid_request_error"}},
-                                status_code=404)
-        return JSONResponse({"error": emsg, "model": model}, status_code=404)
+    # Model already loaded above (#cold-contract — shared load gate); collect the full decode.
     t0 = time.perf_counter_ns()
     text = ""
     done_reason = "stop"
