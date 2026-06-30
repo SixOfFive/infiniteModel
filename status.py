@@ -257,6 +257,29 @@ def build_status() -> dict:
     queue = [{"id": r["id"], "ip": r["ip"], "model": r["model"],
               "waiting_s": round(now - r["enqueued"], 1)}
              for r in _inflight if r["state"] == "queued"]
+    # #model-detail: build the per-model registry cards, then fold each RESIDENT model's RUNTIME
+    # fields (ctx / quant / VRAM / RAM / KV / tok-s / placement stages / lifetime totals) into its
+    # card. _model_entry alone knows only name/size/cached/loaded; the runtime lives in
+    # loaded_models — without this merge the dashboard's loaded-model row + detail modal show
+    # blank ctx/quant/VRAM/RAM and no placement (the reported bug).
+    model_cards = [_model_entry(name, tgt, draft) for name, (tgt, draft) in MODELS.items()]
+    _lm_by_key: dict = {}
+    for _ld in loaded_models:
+        for _k in (_ld.get("friendly"), _ld.get("display_name")):
+            if _k:
+                _lm_by_key[_k] = _ld
+    _RUNTIME_KEYS = ("ctx", "quant", "vram_used_gb", "ram_used_gb", "cpu_frac",
+                     "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
+                     "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",
+                     "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
+                     "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe")
+    for _e in model_cards:
+        if _e.get("loaded"):
+            _ld = _lm_by_key.get(_e.get("internal_name")) or _lm_by_key.get(_e.get("name"))
+            if _ld:
+                for _k in _RUNTIME_KEYS:
+                    if _k in _ld and _e.get(_k) is None:
+                        _e[_k] = _ld[_k]
     return {
         "controller": {
             "hostname": platform.node(), "os": f"{platform.system()} {platform.release()}",
@@ -316,8 +339,7 @@ def build_status() -> dict:
                     "reconfiguring": getattr(engine, "reconfiguring", None),   # #88 managed reload
                     "slots": slots, "queue": queue,
                     "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH)},
-        "models": [_model_entry(name, tgt, draft)
-                   for name, (tgt, draft) in MODELS.items()],
+        "models": model_cards,   # registry cards enriched with resident runtime (#model-detail)
         "nodes": [n.to_dict() for n in nodes],
         "activity": list(ACTIVITY),   # newest-first controller activity (dashboard panel)
         "unloads": list(UNLOADS),     # newest-first "why a model left" events (dashboard panel)

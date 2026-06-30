@@ -332,7 +332,8 @@ function modelRow(m,s){
     parts.push('ctx '+(m.ctx||'?'));
     if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
     if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');
-    if(m.last_tok_s)parts.push('<span style="color:var(--good)">'+m.last_tok_s.toFixed(1)+' tok/s</span>');
+    const _ts=m.tok_s||m.ema_tok_s; if(_ts)parts.push('<span style="color:var(--good)">'+_ts.toFixed(1)+' tok/s</span>');
+    if(m.cpu_frac>=0.5)parts.push('<span style="color:var(--hot)">'+Math.round(m.cpu_frac*100)+'% CPU</span>');
     if(m.active)parts.push(m.active+' active');
     meta=parts.join(' · ');
     acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
@@ -471,22 +472,63 @@ function openDetail(name){
   add('HF id',esc(m.target)); add('arch',esc(m.arch||'')); add('status',esc(m.status));
   add('aliases',(m.aliases||[]).map(esc).join(', ')); add('size',gb(m.size_gb));
   add('native ctx',m.default_ctx||''); add('cached quants',Object.keys(cz).filter(q=>cz[q]&&cz[q].ok).join(', '));
-  if(m.loaded){ add('loaded ctx',m.ctx); add('quant',esc(m.quant)); add('VRAM',gb(m.vram_used_gb)); add('RAM',gb(m.ram_used_gb)); add('KV reserved',gb(m.kv_reserved_gb)); }
+  if(m.loaded){
+    add('loaded ctx',m.ctx); add('quant',esc(m.quant)+(m.tp_size>1?(' · TP'+m.tp_size):' · pipeline'));
+    add('VRAM',gb(m.vram_used_gb)); add('RAM',gb(m.ram_used_gb)+(m.cpu_frac>=0.5?(' <span style="color:var(--hot)">('+Math.round(m.cpu_frac*100)+'% on CPU)</span>'):''));
+    add('KV used / reserved',gb(m.kv_used_gb)+' / '+gb(m.kv_reserved_gb));
+    add('tok/s (live · avg · max)',[(m.tok_s||0).toFixed(1),(m.ema_tok_s||0).toFixed(1),(m.max_tok_s||0).toFixed(1)].join(' · '));
+    add('requests',m.req_total!=null?m.req_total:'');
+    add('tokens in / out',m.tok_in_total!=null?((m.tok_in_total||0)+' / '+(m.tok_out_total||0)):'');
+    add('placement basis',esc(m.plan_basis||''));
+  }
   let stages='';
   if(m.stages&&m.stages.length) stages='<h3 style="font-size:13px;margin-top:14px">Placement</h3>'
     +'<table class="kv">'+m.stages.map(s=>'<tr><td>'+esc(s.hostname)+'</td><td class="v">L'+s.layer_start+'-'+s.layer_end+(s.role?(' · '+esc(s.role)):'')+'</td></tr>').join('')+'</table>';
+  // precache (shard cache): compile int4/int8 so future loads serve from cache instantly.
+  let pre='';
+  if(m.ready){
+    let chips='';
+    for(const q of ['int4','int8']){
+      if(cz[q]&&cz[q].ok) chips+='<span class="chip al">'+q+' cached '+gb(cz[q].size_gb)+'</span> ';
+      else chips+='<button class="btn sm ghost" onclick="compileShards(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
+    }
+    pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
+  }
   let acts='';
   if(m.loaded) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
+    +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
     +'<button class="btn sm ghost" onclick="reconf(\''+esc(name)+'\')">Reconfigure…</button>';
   else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<table class="kv">'+rows+'</table>'+stages
+    +'<table class="kv">'+rows+'</table>'+stages+pre
     +((m.warnings||[]).length?'<div class="note">⚠ '+m.warnings.map(esc).join('<br>⚠ ')+'</div>':'')
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
 }
+// Context viewer: one scrollable popup showing the IN/OUT flow of recent requests (newest first).
+// History is kept only while the model is resident (cleared on unload).
+async function openHistory(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Context · '+esc(name)+'</h3><div class="empty">loading…</div>';
+  $('#ov').classList.add('show');
+  let d; try{ d=await api('/history?model='+encodeURIComponent(name)+'&dir=both'); }
+  catch(e){ $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Context · '+esc(name)+'</h3><div class="note">'+esc(String(e.message||e))+'</div>'; return; }
+  const es=d.entries||[];
+  const head='<span class="x" onclick="closeOv()">×</span><h3>Context · '+esc(name)+'</h3>'
+    +'<div style="font-size:12px;color:var(--dim);margin-bottom:8px">'+es.length+' of '+(d.count||0)+' captured · lifetime '+(d.tok_in_total||0)+' in / '+(d.tok_out_total||0)+' out tokens · newest first '
+    +'<button class="btn sm ghost" style="float:right" onclick="openDetail(\''+esc(name)+'\')">← back</button></div>';
+  if(!es.length){ $('#modal').innerHTML=head+'<div class="empty">no requests captured yet — generate something, then reopen</div>'; return; }
+  const blk=es.map(e=>{
+    const t=e.ts?new Date(e.ts*1000).toLocaleTimeString():'';
+    return '<div style="border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:8px">'
+      +'<div style="font-size:11px;color:var(--dim);margin-bottom:4px">'+t+' · '+(e.tok_in||0)+' in → '+(e.tok_out||0)+' out</div>'
+      +'<div style="font-size:11px;color:var(--accent)">IN</div><pre style="white-space:pre-wrap;word-break:break-word;margin:2px 0;padding:6px;background:var(--bg);border-radius:6px;font-size:11px;max-height:220px;overflow:auto">'+esc(e.input||'')+'</pre>'
+      +'<div style="font-size:11px;color:var(--good);margin-top:4px">OUT</div><pre style="white-space:pre-wrap;word-break:break-word;margin:2px 0;padding:6px;background:var(--bg);border-radius:6px;font-size:11px;max-height:220px;overflow:auto">'+esc(e.output||'')+'</pre></div>';
+  }).join('');
+  $('#modal').innerHTML=head+'<div style="max-height:60vh;overflow:auto">'+blk+'</div>';
+}
+async function compileShards(name,quant){ try{ await api('/compile_shards?model='+encodeURIComponent(name)+'&quant='+quant,{method:'POST'}); closeOv(); toast('compiling '+quant+' cache for '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function forget(name){ if(!confirm('Forget '+name+'? (keeps weight files)'))return; try{ await api('/forget?model='+encodeURIComponent(name),{method:'POST'}); closeOv(); toast('forgot '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function del(name){ if(!confirm('DELETE '+name+' and its weight files?'))return; try{ await api('/delete?model='+encodeURIComponent(name),{method:'POST'}); closeOv(); toast('deleted '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function reconf(name){ const tp=prompt('Reconfigure '+name+' — tp size (1=pipeline):','1'); if(tp==null)return;
