@@ -107,11 +107,20 @@ Two integration points in `client.py`:
 
 **Measured — AMD Strix Halo gfx1151, `qwen3.6-35b-a3b` int4, all-GPU:**
 
-| path | decode tok/s |
-|---|---|
-| naive int4 (no kernel) | 2.08 |
-| + Triton on dense linears | 3.5 |
-| + Triton on MoE experts | **5.42** |
+| path | decode tok/s | vs naive |
+|---|---|---|
+| naive int4 (no kernel) | 2.08 | 1.0× |
+| + Triton on dense linears | 3.5 | 1.7× |
+| + per-expert Triton on MoE | 5.42 | 2.6× |
+| + **fused grouped** MoE kernel (`_w4a16_moe_op`) | 10.8 | 5.2× |
+| + **split-K** dense GEMV (M=1 decode) | **15.4** | **7.4×** |
+
+The last two rows are the newer decode path: a **single grouped Triton launch** over all `top_k`
+experts (replacing the per-expert subclass loop), and a **split-K** GEMV that gives the batch-1 dense
+matmul enough programs to saturate the iGPU's bus. Both are ROCm-automatic + self-checked; the MoE
+kernel is also `@triton.autotune`d per shape. Full cross-platform detail, the NVIDIA opt-in, and the
+remaining optimization headroom (split-K for the MoE GEMV, HIP-graph capture, AOTriton flash-attn) live
+in **[ACCELERATION.md](ACCELERATION.md)**.
 
 Dense models gain the most — every linear is fused, not just the ~40% dense slice of an
 MoE — so a dense 7–14B int4 decodes many× faster than its naive path. On an APU, **bf16**

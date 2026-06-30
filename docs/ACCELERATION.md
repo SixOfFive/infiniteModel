@@ -83,6 +83,49 @@ Set them in the worker's environment (e.g. a systemd `--user` unit `Environment=
 that launches `client.py`), then restart the worker and reload the model — the fused forward installs at
 load time.
 
+## Windows + NVIDIA — enabling the advanced MoE tier (setup & requirements)
+
+The fused MoE opt-in needs a working **Triton-on-Windows** build toolchain (the kernel JIT-compiles
+through MSVC + `ptxas`). This is the only setup beyond the normal worker deps. Validated on the RTX
+4070 Ti SUPER (Ada, sm_89).
+
+**Requirements (one-time, on the worker box):**
+
+1. **Visual Studio Build Tools** (the "Desktop development with C++" workload) — provides `cl.exe`. Note
+   its full path, e.g. `C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\<ver>\bin\Hostx64\x64\cl.exe`.
+2. **CUDA Toolkit** (toolkit-only, *no driver*) — provides `ptxas` + `cuda.lib`, which the pip
+   `nvidia-cuda-*` wheels do **not** ship on Windows. Install just the compiler pieces, e.g.
+   `cuda_12.8.x_windows_network.exe -s nvcc_12.8 cudart_12.8 cuobjdump_12.8 nvdisasm_12.8` → lands at
+   `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`.
+3. **triton-windows**: `pip install --user triton-windows` (the woct0rdho fork; pick the wheel matching
+   your Python — validated with 3.7.1 on CPython 3.14).
+4. GPU must be **Ampere or newer (sm_80+)** — the kernel is bf16; Pascal/Turing can't compile it.
+
+**Worker launch** (no `vcvars` needed — Triton auto-detects the MSVC/SDK paths, and `cl` finds its
+sibling DLLs from the full path). A `start_worker.bat`:
+
+```bat
+set "CC=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\<ver>\bin\Hostx64\x64\cl.exe"
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+set "INFINITEMODEL_CUDA_FUSED_MOE=1"
+cd /d D:\infinitemodel
+python client.py --controller <controller-ip> --control-port 50100
+```
+
+⚠ **WDDM / consumer-GPU gotcha — run the worker in the interactive session.** A consumer GeForce/Quadro
+card under the WDDM driver is **not visible to a Windows *service* or a "run whether logged on or not"
+scheduled task** (session 0). The worker must run in the **logged-on interactive desktop session** —
+launch it from a normal `cmd`/shortcut or `shell:startup`, *not* a service/Task Scheduler entry.
+(Datacenter cards in TCC mode don't have this limit.)
+
+**Verify it engaged:** load a MoE and look for `[int4] fused-MoE self-check ... -> ACTIVE` in the worker
+log (controller `GET /logs?node=<host>`). `-> fallback` means it self-checked out (or the toolchain is
+incomplete) and the safe bf16-remat path is in use.
+
+> Perf-only changes (these kernels) carry **no VERSION bump**, so a self-update *stages* the new code but
+> does **not** auto-restart the worker — relaunch the batch file to pick up a kernel change. Run **exactly
+> one** worker per box (two workers sharing a hostname fight over the controller registration).
+
 ## Safety
 
 Whenever the fused MoE kernel installs, it runs a **one-time self-check** on the first decode: it compares
@@ -92,19 +135,86 @@ back to the per-expert path. Every call also falls back on any runtime exception
 is safe — a build failure, numeric mismatch, or unsupported arch degrades to the default, never to wrong
 output. Look for `[int4] fused-MoE self-check ... -> ACTIVE` (or `-> fallback`) in the worker log.
 
-## Measured
+## The optimization stack & measured speedups
 
-On AMD Strix Halo (gfx1151, ~150 GB/s realized iGPU bandwidth), `qwen3.6-35b-a3b` int4 decode:
+int4 decode speed is built from several layers; each targets a different bottleneck on a different
+platform. This table is the whole story — what each one does, where it runs, and the measured gain.
 
-| Build | tok/s |
+| # | Optimization | What it does | Runs on | Measured gain |
+|---|---|---|---|---|
+| 1 | **int4 group-wise quant** | weights → ~4.25-bit (asymmetric, 128-group) → ¼ the bytes read per token | all | enables fit; the baseline everything below builds on |
+| 2 | **Fused dense int4 GEMM** (torch tinygemm `_weight_int4pack_mm`) | dequantizes *inside* the GEMM — no bf16 rematerialize | NVIDIA, CPU, CDNA2+ | int4 7B **3.25 → 21.13 tok/s**; int4 now beats bf16 |
+| 3 | **Triton w4a16 dense** | hand-rolled substitute where tinygemm is absent | AMD RDNA only | **5–20×** over naive (14× @4096², 20× @5120²) |
+| 4 | **Split-K dense GEMV** (M=1 decode) | splits K across more programs to saturate the bus at batch-1 | AMD RDNA only | **3.5–3.9×** on the dense GEMV |
+| 5 | **Fused grouped MoE GEMV** (`_w4a16_moe_op`) | all `top_k` experts' int4 GEMVs in ONE launch (kills the per-expert Python loop) | ROCm (auto), NVIDIA (opt-in) | **~3.7×** on the expert GEMM (per-platform below) |
+| 6 | **MoE autotune** `(BN, warps, stages)` | best tile per `(B,N,K)` per GPU | ROCm, NVIDIA | up to **1.18×** (shape-dependent) |
+| 7 | **Serve-from-cache pre-packed int4** | streams pre-quantized layers; skips load-time re-quant | all | faster *loads* (not decode) |
+| 8 | **Speculative decoding** (dense draft) | draft + batched verify | dense models (opt-in) | ~**1.5–2×** on a dense 70B |
+
+### AMD Strix Halo (gfx1151 iGPU, ~150 GB/s realized) — `qwen3.6-35b-a3b` int4
+
+| Build | tok/s | vs naive |
+|---|---|---|
+| naive int4 (bf16 rematerialize, no kernel) | 2.08 | 1.0× |
+| + Triton w4a16 on dense linears (#3) | 3.5 | 1.7× |
+| + per-expert w4a16 on MoE (#5, subclass form) | 5.42 | 2.6× |
+| + **fused grouped** MoE kernel (#5) | 10.8 | 5.2× |
+| + **split-K** dense GEMV (#4) | **15.4** | **7.4×** |
+
+Decode here is **memory-bandwidth-bound** (~80% GPU-busy), so tok/s tracks effective GB/s, not FLOPs.
+RDNA needs *all* of these — no vendor int4 GEMM exists on it at all.
+
+### NVIDIA — the MoE opt-in (dense is already tinygemm-fast)
+
+| GPU | What was measured |
 |---|---|
-| baseline (per-expert + tl.dot dense) | 5.4 |
-| + fused MoE experts | 10.8 |
-| + split-K dense GEMV | 15.4 |
+| **RTX 3060** (Ampere sm_86, Linux) | fused MoE opt-in: **3.9×** on the expert GEMM (microbench) and **end-to-end `olmoe:1b-7b` int4 8.5 → ~31.5 tok/s (~3.7×)** |
+| **RTX 4070 Ti SUPER** (Ada sm_89, Windows) | Triton builds on Windows; fused MoE **self-check ACTIVE on all layers**, coherent gen. Expert-GEMM microbench **24–34×** over the bf16-remat default. Autotune: `num_stages=3` → **1.18×** on qwen3-a3b shapes; kernel sits at **~35–48%** of the card's ~672 GB/s peak |
+| **Quadro P620** (Pascal sm_61) | bf16 Triton won't compile (< sm_80) → safe automatic fallback (no speedup, no breakage) |
 
-Decode on this iGPU is **memory-bandwidth-bound** (~80% GPU-busy), so absolute speed tracks effective
-GB/s, not FLOPs. The same kernels on NVIDIA (much higher GDDR bandwidth) make the routed-expert decode
-proportionally cheaper than the bf16-remat default — that's the win the Linux opt-in unlocks.
+On NVIDIA the **dense** GEMMs already use tinygemm (#2), so they're fast without Triton; the opt-in only
+upgrades the **routed-expert** GEMV. End-to-end gain is therefore smaller than on RDNA, and largest for
+MoE models where the routed experts are a big share of decode.
+
+## Further optimization headroom
+
+These kernels are good but not the ceiling. Ranked by likely payoff:
+
+1. **Split-K the MoE GEMV (the big one).** The fused expert kernel does a *serial* K-reduction per
+   program and sits at only ~35–48% of peak bandwidth on the 4070. Splitting K across programs with an
+   fp32 atomic-add accumulator — exactly what already won 3.5–3.9× on the *dense* RDNA GEMV (#4) — is the
+   one change that can close most of that ~2× gap. Single biggest remaining MoE-decode lever, on every GPU.
+2. **CUDA/HIP-graph capture of the decode step.** Now unblocked: fusing the experts removed the
+   data-dependent per-expert Python loop, so the per-token graph is static and capturable. Removes most
+   per-token launch + Python-dispatch overhead (the ~20% non-compute idle measured on Strix Halo).
+3. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
+   kernel is gated behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. Attention is a real slice of decode
+   on the hybrid (Gated-DeltaNet + SDPA) models.
+4. **Single-node in-process transport.** Adjacent pipeline stages on the *same* box still hand off over
+   loopback TCP; an in-process path removes that per-token round-trip.
+5. **Dense-kernel autotune on RDNA.** The RDNA dense Triton kernel still uses fixed tiles; the AMD iGPU is
+   ~5× behind llama.cpp/Vulkan on the same silicon — the dense kernel plus (1)+(2)+(3) is where that gap lives.
+
+None is required for correctness; each is a throughput lever with diminishing returns on NVIDIA (where
+dense is already fast) and larger upside on the bandwidth-starved AMD iGPU.
+
+## CPU / RAM workers — do these kernels help? No.
+
+**The Triton kernels (fused MoE, split-K dense) are GPU-only**, and torch tinygemm is GPU/CPU *vendor*
+code — so none of this kernel work runs on a CPU worker. The CPU path is entirely separate:
+
+- **Dense int4 on CPU** uses torch's own **CPU tinygemm** (`_weight_int4pack_mm_for_cpu`) when present;
+  otherwise it falls back to **dequant→fp32 GEMM** (at batch-1 the int4 unpack is paid regardless, so the
+  fp32 weight is "free" and the fp32 GEMM is the faster CPU path).
+- **MoE experts on CPU** always **bf16-rematerialize** per expert — the fused Triton kernel's self-check
+  returns `False` off-`cuda`, so a CPU worker never takes it.
+
+So adding split-K, the fused MoE, or the autotune does **nothing** for CPU/RAM decode — and it wouldn't
+help much even if ported: CPU decode is bound by **DDR bandwidth (~50–90 GB/s, vs 150–670 GB/s on a GPU)**
+plus CPU compute, so it's fundamentally ~5–10× slower regardless of kernel. The fleet's CPU/RAM nodes
+exist for **capacity** — fitting models too big for the GPU pool — not single-stream speed; CPU
+tensor-parallel never beats pipelining onto a GPU here. A fused CPU-int4 MoE path is *possible* but
+low-payoff, so it's intentionally not built.
 
 ## Choosing a fast model on bandwidth-limited GPUs
 

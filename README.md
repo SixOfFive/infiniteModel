@@ -129,7 +129,11 @@ pip install nvidia-ml-py           # optional, NVIDIA GPU nodes only (VRAM repor
 ```
 
 - **CPU-only:** `pip install torch --index-url https://download.pytorch.org/whl/cpu`
-- **NVIDIA GPU:** the default CUDA `torch` wheel (above).
+- **NVIDIA GPU:** the default CUDA `torch` wheel (above). Dense int4 decode is fast out of the box
+  (torch tinygemm). The **fused-MoE acceleration tier** for routed experts is an *optional opt-in*
+  (Ampere/sm_80+) — extra build toolchain + `INFINITEMODEL_CUDA_FUSED_MOE=1`; recipe (incl. the
+  Windows + CUDA-Toolkit + triton-windows setup and the WDDM interactive-session caveat) in
+  **[docs/ACCELERATION.md](docs/ACCELERATION.md)**.
 
 **② AMD GPU (ROCm) worker — a SEPARATE setup; do _not_ use the CUDA/CPU wheels above.** InfiniteModel
 runs **1:1 with CUDA** on AMD via PyTorch's HIP (the device stays `cuda:N` and the inference code is
