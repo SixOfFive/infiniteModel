@@ -188,12 +188,16 @@ These kernels are good but not the ceiling. Ranked by likely payoff:
    rotary + SDPA over a fixed KV + router top-k + the real fused int4 MoE) measured **eager 15.9 → graph
    2.9 ms/token = 5.56×**, i.e. **~82% of batch-1 compute-region time is pure launch/dispatch overhead**
    (~240 tiny kernel launches/token, GPU mostly idle between them). This is by far the largest remaining
-   decode lever. **Caveats for the real end-to-end win:** the probe is compute-only — it excludes the
+   decode lever. The **correctness mechanism is proven**: a fixed-size KV buffer + position-driven causal
+   mask + `index_copy_` write-at-position + rotary-from-static-position, captured and replayed per token,
+   produced a **token-for-token identical** 24-step autoregressive sequence vs eager (4070, synthetic
+   weights). **Caveats for the real end-to-end win:** the probe is compute-only — it excludes the
    per-hop loopback-TCP transport (not capturable), so a *distributed* model gains less; and the
-   integration is substantial — it needs a **fixed-size KV buffer (HF `StaticCache`) with the position as
-   a captured tensor** (a growing/dynamic KV breaks capture), per-shard capture with the transport left
-   outside the graph, and recapture per ctx bucket. Standard-attention single-GPU models are the clean
-   first target; hybrid (Gated-DeltaNet) state, multimodal, and spec-decode are harder.
+   integration is substantial — it needs a **fixed-size KV buffer (HF `StaticCache` semantics) with the
+   position as a captured tensor** (a growing/dynamic KV breaks capture), capture-once-replay-many with
+   the prefill KV refilled per sequence, an opt-in flag + first-decode self-check vs eager + fallback,
+   and the transport left outside the graph. Standard-attention single-GPU models are the clean first
+   target; hybrid (Gated-DeltaNet) state, multimodal, and spec-decode are harder.
 2. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
    kernel is gated behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. Attention is a real slice of decode
    on the hybrid (Gated-DeltaNet + SDPA) models.
