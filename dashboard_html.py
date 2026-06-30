@@ -456,11 +456,14 @@ async function preview(name){
 }
 async function doLoad(name){
   const q=new URLSearchParams(placeParams(name));
-  $('#l-out').textContent='loading…';
-  try{ await api('/load?'+q.toString(),{method:'POST'}); closeOv(); toast('loading '+name); tick(); }
-  catch(e){ $('#l-out').innerHTML='<span class="err">'+esc(String(e.message||e))+'</span>'; }
+  // /load blocks until the load finishes — so close the popup NOW (the loading card appears on the
+  // models page via the status poll) instead of holding the dialog open for the whole load.
+  closeOv(); toast('loading '+name+'…'); tick();
+  try{ await api('/load?'+q.toString(),{method:'POST'}); toast(name+' loaded'); }
+  catch(e){ toast(name+' load failed: '+String(e.message||e),1); }
+  tick();
 }
-async function unload(name){ try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
+async function unload(name){ closeOv(); try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function cancelLoad(name){ try{ await api('/cancel_load?model='+encodeURIComponent(name),{method:'POST'}); toast('cancelled load'); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function dl(name,action){ try{ await api('/download'+(action==='start'?'':'/'+action)+'?model='+encodeURIComponent(name),{method:'POST'}); toast(action+' '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 
@@ -528,11 +531,11 @@ async function openHistory(name){
   }).join('');
   $('#modal').innerHTML=head+'<div style="max-height:60vh;overflow:auto">'+blk+'</div>';
 }
-async function compileShards(name,quant){ try{ await api('/compile_shards?model='+encodeURIComponent(name)+'&quant='+quant,{method:'POST'}); closeOv(); toast('compiling '+quant+' cache for '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
-async function forget(name){ if(!confirm('Forget '+name+'? (keeps weight files)'))return; try{ await api('/forget?model='+encodeURIComponent(name),{method:'POST'}); closeOv(); toast('forgot '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
-async function del(name){ if(!confirm('DELETE '+name+' and its weight files?'))return; try{ await api('/delete?model='+encodeURIComponent(name),{method:'POST'}); closeOv(); toast('deleted '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
+async function compileShards(name,quant){ closeOv(); toast('compiling '+quant+' cache for '+name+'…'); tick(); try{ await api('/compile_shards?model='+encodeURIComponent(name)+'&quant='+quant,{method:'POST'}); toast(quant+' cache for '+name+' done'); }catch(e){ toast(String(e.message||e),1);} tick(); }
+async function forget(name){ if(!confirm('Forget '+name+'? (keeps weight files)'))return; closeOv(); try{ await api('/forget?model='+encodeURIComponent(name),{method:'POST'}); toast('forgot '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
+async function del(name){ if(!confirm('DELETE '+name+' and its weight files?'))return; closeOv(); toast('deleting '+name+'…'); try{ await api('/delete?model='+encodeURIComponent(name),{method:'POST'}); toast('deleted '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function reconf(name){ const tp=prompt('Reconfigure '+name+' — tp size (1=pipeline):','1'); if(tp==null)return;
-  try{ await api('/reconfigure?model='+encodeURIComponent(name)+'&tp='+encodeURIComponent(tp),{method:'POST'}); closeOv(); toast('reconfiguring '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
+  closeOv(); toast('reconfiguring '+name+'…'); try{ await api('/reconfigure?model='+encodeURIComponent(name)+'&tp='+encodeURIComponent(tp),{method:'POST'}); toast('reconfigured '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
 
 tick(); setInterval(tick,2000);
 </script>
