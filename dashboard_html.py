@@ -388,7 +388,63 @@ function renderNodes(d){
 }
 
 // ---------- actions ----------
-function closeOv(){ $('#ov').classList.remove('show'); }
+function closeOv(){ chatAbort(); $('#ov').classList.remove('show'); }
+function chatAbort(){ if(window._chatAbort){ try{window._chatAbort.abort();}catch(e){} window._chatAbort=null; } }
+
+// ---- Quick test: a throwaway streaming chat against a loaded model. Closing the popup (closeOv ->
+// chatAbort) aborts the fetch, which disconnects the client -> the controller cancels the generation. ----
+let _chatMsgs=[], _chatLive='', _chatBusy=false, _chatModel='';
+function openChat(name){
+  chatAbort(); _chatModel=name; _chatMsgs=[]; _chatLive=''; _chatBusy=false;
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Quick test · '+esc(name)+'</h3>'
+    +'<div style="font-size:12px;color:var(--dim);margin-bottom:6px">Streams live · throwaway · closing this popup ends the generation '
+    +'<button class="btn sm ghost" style="float:right" onclick="chatAbort();openDetail(\''+esc(name)+'\')">← back</button></div>'
+    +'<div id="chatlog" style="max-height:48vh;overflow:auto;margin-bottom:8px"></div>'
+    +'<div style="display:flex;gap:6px"><textarea id="chatin" rows="2" placeholder="type a prompt — Enter to send, Shift+Enter for a newline" '
+    +'style="flex:1;resize:vertical" onkeydown="chatKey(event)"></textarea>'
+    +'<button class="btn pri" id="chatsend" onclick="chatSend()">Send</button></div>';
+  $('#ov').classList.add('show'); chatRender(); setTimeout(()=>{const i=$('#chatin'); if(i)i.focus();},50);
+}
+function chatKey(e){ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); chatSend(); } }
+function _bubble(role,text){ const me=role==='user';
+  return '<div style="margin-bottom:8px"><div style="font-size:11px;color:'+(me?'var(--accent)':'var(--good)')+'">'+(me?'you':'model')+'</div>'
+    +'<pre style="white-space:pre-wrap;word-break:break-word;margin:2px 0;padding:6px;background:var(--bg);border-radius:6px;font-size:12px">'+esc(text||'')+'</pre></div>'; }
+function chatRender(){
+  const log=$('#chatlog'); if(!log)return;
+  let h=_chatMsgs.map(m=>_bubble(m.role,m.content)).join('');
+  if(_chatBusy) h+=_bubble('assistant',_chatLive||'…');
+  log.innerHTML=h||'<div class="empty">enter a prompt to test the model</div>';
+  log.scrollTop=log.scrollHeight;
+}
+async function chatSend(){
+  if(_chatBusy)return;
+  const ta=$('#chatin'); if(!ta)return; const text=ta.value.trim(); if(!text)return;
+  ta.value=''; _chatMsgs.push({role:'user',content:text}); _chatLive=''; _chatBusy=true;
+  const sb=$('#chatsend'); if(sb)sb.disabled=true; chatRender();
+  const ctrl=new AbortController(); window._chatAbort=ctrl;
+  try{
+    const r=await fetch('/api/chat',{method:'POST',signal:ctrl.signal,headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:_chatModel,messages:_chatMsgs,stream:true,options:{temperature:0.7,num_predict:512}})});
+    if(!r.ok){ const t=await r.text(); throw new Error(t||('HTTP '+r.status)); }
+    const reader=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    while(true){ const rd=await reader.read(); if(rd.done)break;
+      buf+=dec.decode(rd.value,{stream:true}); let nl;
+      while((nl=buf.indexOf('\n'))>=0){ const line=buf.slice(0,nl).trim(); buf=buf.slice(nl+1);
+        if(!line)continue; let j; try{j=JSON.parse(line);}catch(e){continue;}
+        if(j.error) _chatLive+='\n[error] '+j.error;
+        const piece=(j.message&&j.message.content)||j.response||'';
+        if(piece){ _chatLive+=piece; chatRender(); }
+      }
+    }
+    _chatMsgs.push({role:'assistant',content:_chatLive||'(no output)'});
+  }catch(e){
+    if(e.name!=='AbortError') _chatMsgs.push({role:'assistant',content:'[error] '+String(e.message||e)});
+  }finally{
+    _chatBusy=false; _chatLive=''; window._chatAbort=null;
+    const s2=$('#chatsend'); if(s2)s2.disabled=false; chatRender();
+    const i=$('#chatin'); if(i)i.focus();
+  }
+}
 function openAdd(){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Add a model</h3>'
    +'<div style="font-size:12px;color:var(--muted);margin-top:4px">Register any Hugging Face id. It downloads in the background.</div>'
@@ -498,7 +554,8 @@ function openDetail(name){
     pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
   }
   let acts='';
-  if(m.loaded) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
+  if(m.loaded) acts='<button class="btn sm pri" onclick="openChat(\''+esc(name)+'\')">Quick test ▾</button> '
+    +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
     +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
     +'<button class="btn sm ghost" onclick="reconf(\''+esc(name)+'\')">Reconfigure…</button>';
   else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
