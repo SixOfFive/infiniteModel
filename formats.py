@@ -119,6 +119,56 @@ def _safe_decode(tok, ids) -> str:
         return "".join(out)
 
 
+def _harmony_final_text(tok, ids):
+    """OpenAI-harmony (gpt-oss) channel filter -> the user-facing FINAL channel text only.
+
+    A harmony assistant turn is a sequence of channels:
+        <|channel|>analysis<|message|> {chain-of-thought} <|end|>
+        <|start|>assistant<|channel|>final<|message|> {answer} <|return|>
+    The `analysis` (and `commentary`) channels are model reasoning, NOT shown to the user; only the
+    `final` channel is the answer. Markers are special tokens (stripped by skip_special_tokens), so we
+    split at the TOKEN level: find the <|message|> that closes a `<|channel|>final` header and decode
+    everything after it. Returns:
+      - None  if this isn't a harmony stream (no <|channel|> token) -> caller does a plain decode;
+      - ""    if the final channel hasn't started yet (so STREAMING suppresses the analysis channel);
+      - the decoded final-channel answer otherwise.
+    """
+    try:
+        chan = tok.convert_tokens_to_ids("<|channel|>")
+        msg = tok.convert_tokens_to_ids("<|message|>")
+    except Exception:
+        return None
+    unk = getattr(tok, "unk_token_id", None)
+    if chan in (None, unk) or msg in (None, unk) or chan not in ids:
+        return None
+    n = len(ids)
+    final_start = None
+    i = 0
+    while i < n:
+        if ids[i] == chan:                       # a channel header: <|channel|> NAME <|message|>
+            j = i + 1
+            name = []
+            while j < n and ids[j] != msg:
+                name.append(ids[j])
+                j += 1
+            if j < n:                            # found the closing <|message|>
+                with contextlib.suppress(Exception):
+                    if tok.decode(name, skip_special_tokens=True).strip() == "final":
+                        final_start = j + 1      # answer begins right after <|message|>
+            i = j
+        i += 1
+    if final_start is None:
+        return ""                                # final channel not reached yet
+    return _safe_decode(tok, ids[final_start:])
+
+
+def _decode_visible(tok, ids) -> str:
+    """User-facing detok: harmony-aware (gpt-oss returns only the final channel, dropping the
+    analysis CoT); otherwise a plain _safe_decode. Byte-identical for every non-harmony model."""
+    h = _harmony_final_text(tok, ids)
+    return h if h is not None else _safe_decode(tok, ids)
+
+
 # ---------------------------------------------------------------------------
 # Anthropic Messages API helpers (so Claude Code can use the fleet as a backend)
 # ---------------------------------------------------------------------------

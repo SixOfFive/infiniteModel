@@ -71,6 +71,17 @@ class EngineGenMixin:
                 tid = tok.convert_tokens_to_ids(t)
                 if tid is not None and tid >= 0 and tid != unk:
                     ids.add(int(tid))
+        # OpenAI-harmony (gpt-oss): <|end|> ends a CHANNEL (the analysis CoT), NOT the assistant
+        # turn — the turn ends at <|return|> (or <|call|> for tools), already supplied by
+        # generation_config.eos_token_id above. If <|end|> stays a stop, gen halts after the analysis
+        # channel and never emits the final answer. So on a harmony tokenizer, DROP <|end|> from the
+        # stops (and ensure <|return|> is in). Detected by the harmony marker tokens. (#harmony)
+        with contextlib.suppress(Exception):
+            ch = tok.convert_tokens_to_ids("<|channel|>")
+            ret = tok.convert_tokens_to_ids("<|return|>")
+            if ch not in (None, unk) and ch >= 0 and ret not in (None, unk) and ret >= 0:
+                ids.discard(int(tok.convert_tokens_to_ids("<|end|>")))
+                ids.add(int(ret))
         return {i for i in ids if isinstance(i, int) and i >= 0}
 
     def _sample(self, row, temperature: float, top_p: float) -> int:

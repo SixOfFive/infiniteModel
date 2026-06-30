@@ -2815,7 +2815,7 @@ except Exception:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "formats.py"), "wb") as _fmt_f:
             _fmt_f.write(_fmt_src)
 from formats import (_iso, _digest, _human_params, _details, _model_info,
-                     _to_id_list, _safe_decode,
+                     _to_id_list, _safe_decode, _decode_visible,
                      _parse_params, _parse_tool_calls, _strip_reasoning, _tool_instruction,
                      _anth_id, _anth_flatten, _anthropic_messages_to_chat,
                      _expand_image_placeholders, _mrope_position_ids, _audio_position_ids,

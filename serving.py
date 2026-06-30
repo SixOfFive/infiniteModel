@@ -160,14 +160,14 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                     produced.append(tid)
                     state["tokens"] = len(produced)
                     METRICS["tokens"] += 1
-                    text = _safe_decode(tok, produced)
+                    text = _decode_visible(tok, produced)
                     if text.endswith("�"):   # incomplete multi-byte char; wait
                         continue
                     piece, prev = text[len(prev):], text
                     if piece:
                         yield piece, None
                 if reason:
-                    text = _safe_decode(tok, produced)
+                    text = _decode_visible(tok, produced)
                     yield text[len(prev):], reason   # flush remainder + signal done
         finally:
             _inflight_release(rec)   # free the slot/queue entry when generation ends
@@ -552,14 +552,14 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                 produced.append(tid)
                 state["tokens"] = len(produced)
                 METRICS["tokens"] += 1
-                text = _safe_decode(tok, produced)
+                text = _decode_visible(tok, produced)
                 if text.endswith("�"):
                     continue
                 piece, prev = text[len(prev):], text
                 if piece:
                     yield piece, None
             if reason:
-                text = _safe_decode(tok, produced)
+                text = _decode_visible(tok, produced)
                 yield text[len(prev):], reason
         finally:
             _inflight_release(rec)   # free the slot/queue entry when generation ends
