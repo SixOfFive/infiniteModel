@@ -58,6 +58,16 @@ self-check went `-> ACTIVE` on **all 10 layers** (rel 0.0055–0.0061, max-eleme
 output. Quadro P620 (Pascal sm_61) — Triton bf16 won't compile → correct automatic fallback to the
 default path (no speedup, no breakage).
 
+**Kernel autotuning.** The fused MoE-expert GEMV is `@triton.autotune`d over `(BN, num_warps, num_stages)`
+keyed on `(B, N, K)`, so it picks the best tile per expert shape on each GPU. The config set is lean (the
+measured winners) to bound first-decode JIT cost. Sweep on the 4070 Ti SUPER (`bench_moe_w4a16.py`):
+`num_stages=3` buys **~1.18×** on narrow-N shapes (qwen3-a3b expert GEMM) and is ~neutral on wider ones
+(olmoe). It's a small end-to-end gain — on NVIDIA the dense GEMMs (tinygemm) dominate decode, and even the
+best MoE config sits at only **~35–48% of the card's ~672 GB/s peak**. The remaining ~2× is *structural*
+(the serial-K GEMV + on-the-fly dequant), reachable only by a **split-K rewrite** of this kernel (the same
+trick used for the ROCm *dense* GEMV) — not by these three knobs. Tuning is therefore optional polish here,
+not load-bearing as it was on RDNA (where no vendor int4 GEMM exists at all).
+
 > **Triton version note:** the kernels resolve `triton`/`tl` from **module globals** (not a local import
 > inside the builder), because triton 3.2 — unlike 3.7 — does not capture them as closure freevars and
 > would otherwise fail to compile with `NameError: tl is not defined`. Keep the import at module scope.

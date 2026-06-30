@@ -56,8 +56,16 @@ def dequant_expert(qw, scale, zero, in_f, group=G):
     return w.reshape(out, ng * group)[:, :in_f].contiguous()
 
 
-# --- fused kernel (copy of client.py _w4a16_moe_op _mk) --------------------------------------
+# --- fused kernel (copy of client.py _w4a16_moe_op _mk, incl. its autotune set) -------------
 if _HAVE_TRITON:
+    @triton.autotune(
+        configs=[
+            triton.Config({"BN": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BN": 128}, num_warps=4, num_stages=3),
+            triton.Config({"BN": 64}, num_warps=2, num_stages=3),
+        ],
+        key=["B", "N", "K"],
+    )
     @triton.jit
     def _mk(x_ptr, e_ptr, q_ptr, s_ptr, z_ptr, y_ptr, B, N, K,
             sxb, sxk, sqe, sqk, sqn, sse, ssn, ssg, sze, szn, szg, syb, syn,
@@ -95,14 +103,13 @@ if _HAVE_TRITON:
         eid = eid.to(torch.int32).contiguous()
         B, N = x.shape[0], q.shape[1]
         y = torch.empty((B, N), device=x.device, dtype=torch.bfloat16)
-        BN = 128
-        grid = (B, triton.cdiv(N, BN))
+        grid = lambda meta: (B, triton.cdiv(N, meta["BN"]))  # noqa: E731 — BN chosen by autotune
         _mk[grid](x, eid, q, scale, zero, y, B, N, Kpad,
                   x.stride(0), x.stride(1),
                   q.stride(0), q.stride(2), q.stride(1),
                   scale.stride(0), scale.stride(1), scale.stride(2),
                   zero.stride(0), zero.stride(1), zero.stride(2),
-                  y.stride(0), y.stride(1), GROUP=group, BN=BN)
+                  y.stride(0), y.stride(1), GROUP=group)
         return y
 
 

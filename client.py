@@ -1233,6 +1233,21 @@ def _w4a16_moe_op():
             raise ImportError("triton unavailable")
         import torch.nn.functional as _F
 
+        # Autotuned per (B,N,K). This GEMV is bandwidth-bound, so block-width / warps / pipeline
+        # depth are the only knobs that move it (the bytes read are fixed). Measured on a 4070 Ti
+        # SUPER (sm_89): num_stages=3 buys ~1.18x on narrow-N expert shapes (qwen3-a3b), ~neutral on
+        # wider ones (olmoe) — and even the best config tops out ~35-48% of peak BW; the rest is the
+        # serial-K GEMV + dequant, which only a split-K rewrite would close. Lean config set = the
+        # measured winners, to bound first-decode JIT cost (esp. on Windows). BN=128/w4/s2 ==
+        # the prior hardcoded default, so autotune is never worse. Serves ROCm too (re-tuned there).
+        @triton.autotune(
+            configs=[
+                triton.Config({"BN": 128}, num_warps=4, num_stages=2),
+                triton.Config({"BN": 128}, num_warps=4, num_stages=3),
+                triton.Config({"BN": 64}, num_warps=2, num_stages=3),
+            ],
+            key=["B", "N", "K"],
+        )
         @triton.jit
         def _mk(x_ptr, e_ptr, q_ptr, s_ptr, z_ptr, y_ptr, B, N, K,
                 sxb, sxk, sqe, sqk, sqn, sse, ssn, ssg, sze, szn, szg, syb, syn,
@@ -1273,15 +1288,14 @@ def _w4a16_moe_op():
             B = x.shape[0]
             N = q.shape[1]
             y = torch.empty((B, N), device=x.device, dtype=torch.bfloat16)
-            BN = 128
-            grid = (B, triton.cdiv(N, BN))
+            grid = lambda meta: (B, triton.cdiv(N, meta["BN"]))  # noqa: E731 — BN chosen by autotune
             _mk[grid](x, eid, q, scale, zero, y, B, N, Kpad,
                       x.stride(0), x.stride(1),
                       q.stride(0), q.stride(2), q.stride(1),
                       scale.stride(0), scale.stride(1), scale.stride(2),
                       zero.stride(0), zero.stride(1), zero.stride(2),
                       y.stride(0), y.stride(1),
-                      GROUP=group_size, BN=BN)
+                      GROUP=group_size)
             return y
 
         _W4A16_MOE_OP = _op
