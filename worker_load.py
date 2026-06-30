@@ -346,6 +346,41 @@ class WorkerLoadMixin:
                   flush=True)
             os._exit(42)   # supervisor relaunches on the same code -> RAM returns to the OS
 
+    def _release_shard_vram(self, shard) -> None:
+        """#vram-release-rocm: free a shard's GPU tensor STORAGES IN PLACE before dropping it. On
+        gfx1151 a dropped int4 shard stayed pinned at full weight size (~13.5 GB) after unload —
+        empty_cache works there (verified) but only frees tensors with NO remaining refs, and some
+        lingering ref (triton-kernel closure / fused tuple / autograd) still pointed at the shard's
+        weights, so they never freed until a process restart. Resetting each CUDA param/buffer to an
+        EMPTY storage releases the bytes regardless of who else holds the module (the held object's
+        own tensor is emptied in place); the gc + empty_cache that follow then reclaim. No-op for a
+        CPU-resident shard; harmless on CUDA (frees a touch earlier). Safe at unload (model idle)."""
+        import torch
+        import contextlib as _cl
+        m = getattr(shard, "model", None)
+        mods = [m] if m is not None else []
+        for _attr in ("embed", "norm", "head", "encoder"):
+            x = getattr(shard, _attr, None)
+            if x is not None and x is not m:
+                mods.append(x)
+        seen: set = set()
+        for mod in mods:
+            if not hasattr(mod, "parameters"):
+                continue
+            with _cl.suppress(Exception):
+                for t in list(mod.parameters(recurse=True)) + list(mod.buffers(recurse=True)):
+                    if t is None or getattr(t, "device", None) is None or t.device.type != "cuda":
+                        continue
+                    if id(t) in seen:
+                        continue
+                    seen.add(id(t))
+                    with _cl.suppress(Exception):
+                        t.data = torch.empty(0, dtype=t.dtype, device=t.device)
+            with _cl.suppress(Exception):   # drop each int4 layer's cached fused tuple (qweight + op)
+                for sub in mod.modules():
+                    if getattr(sub, "_fused", None) is not None:
+                        sub._fused = None
+
     async def _unload_model(self, model_id: str) -> None:
         """Drop ONE model's shard + next-hop conn + temp file, keeping other models resident.
         If it was the TP model, tear the mesh + follower thread down too. Closes the shared
@@ -360,7 +395,9 @@ class WorkerLoadMixin:
         if w is not None:
             with contextlib.suppress(Exception):
                 w.close()
-        self.shards.pop(model_id, None)
+        _sh = self.shards.pop(model_id, None)
+        if _sh is not None:
+            self._release_shard_vram(_sh)   # #vram-release-rocm: free GPU storages in place first
         self.assignments.pop(model_id, None)
         # Drop any staged multimodal embeds for THIS model so they can't be mis-consumed by a
         # later request after a controller restart (req_id resets to 0 -> key reuse).
@@ -456,6 +493,8 @@ class WorkerLoadMixin:
             with contextlib.suppress(Exception):
                 self.data_server.close()
             self.data_server = None
+        for _sh in list(self.shards.values()):   # #vram-release-rocm: free GPU storages in place first
+            self._release_shard_vram(_sh)
         self.shards.clear()
         self.assignments.clear()
         # Full teardown (incl. on controller disconnect) -> flush ALL staged multimodal embeds
