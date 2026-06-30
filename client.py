@@ -1149,8 +1149,12 @@ def _w4a16_triton_op():
         # ~cdiv(N,BN) programs at M=1, far too few to hide memory latency on the iGPU (~13-50% of
         # peak BW measured). This splits K across SPLITK programs per N-block (grid grows ~SPLITKx)
         # and atomic-adds partials into an fp32 accumulator -> 3.5-3.9x on the dense GEMV (bench).
+        # num_warps is the dominant knob for a BW-bound GEMV (more warps = more in-flight loads to
+        # hide memory latency); RDNA/iGPU often wants more than sm_89, so sweep {4,8} x SPLITK and
+        # let autotune pick per (N,K)/arch. SPLITK=4/w4 == the prior default, so never worse.
         @triton.autotune(
-            configs=[triton.Config({"BN": 128, "SPLITK": s}, num_warps=4) for s in (4, 8, 16)],
+            configs=[triton.Config({"BN": 128, "SPLITK": s}, num_warps=w)
+                     for s in (4, 8, 16) for w in (4, 8)],
             key=["N", "K"],
         )
         @triton.jit
@@ -1253,46 +1257,58 @@ def _w4a16_moe_op():
         import torch.nn.functional as _F
 
         # Autotuned per (B,N,K). This GEMV is bandwidth-bound, so block-width / warps / pipeline
-        # depth are the only knobs that move it (the bytes read are fixed). Measured on a 4070 Ti
-        # SUPER (sm_89): num_stages=3 buys ~1.18x on narrow-N expert shapes (qwen3-a3b), ~neutral on
-        # wider ones (olmoe) — and even the best config tops out ~35-48% of peak BW; the rest is the
-        # serial-K GEMV + dequant, which only a split-K rewrite would close. Lean config set = the
-        # measured winners, to bound first-decode JIT cost (esp. on Windows). BN=128/w4/s2 ==
-        # the prior hardcoded default, so autotune is never worse. Serves ROCm too (re-tuned there).
+        # depth / K-PARALLELISM are the knobs that move it (the bytes read are fixed). The original
+        # serial-K kernel topped out ~35-48% of peak BW on the iGPU: at decode B=tokens*top_k is tiny
+        # (~8) so the grid (B, cdiv(N,BN)) launches far too few programs to saturate memory. SPLIT-K
+        # fixes that — each program reduces a K-SLICE and atomic-adds its fp32 partial, growing the
+        # grid ~SPLITKx (same trick the dense decode GEMV `_ksk` uses for its 3.5-3.9x). SPLITK=1 ==
+        # the prior serial-K kernel (so autotune is never worse); >1 trades a little atomic traffic
+        # for occupancy. fp32 atomic accumulation -> within decode tolerance (not bit-identical across
+        # SPLITK, like all atomic reductions). Lean config set bounds first-decode JIT cost (esp.
+        # Windows/ROCm). Re-tuned per (B,N,K) on each arch (sm_89, gfx1151, ...).
         @triton.autotune(
             configs=[
-                triton.Config({"BN": 128}, num_warps=4, num_stages=2),
-                triton.Config({"BN": 128}, num_warps=4, num_stages=3),
-                triton.Config({"BN": 64}, num_warps=2, num_stages=3),
+                triton.Config({"BN": 128, "SPLITK": 1}, num_warps=4, num_stages=2),   # == prior default
+                triton.Config({"BN": 128, "SPLITK": 2}, num_warps=4, num_stages=2),
+                triton.Config({"BN": 128, "SPLITK": 4}, num_warps=4, num_stages=3),
+                triton.Config({"BN": 128, "SPLITK": 8}, num_warps=4, num_stages=3),
+                triton.Config({"BN": 64, "SPLITK": 4}, num_warps=2, num_stages=3),
+                triton.Config({"BN": 64, "SPLITK": 8}, num_warps=4, num_stages=2),
             ],
             key=["B", "N", "K"],
         )
         @triton.jit
         def _mk(x_ptr, e_ptr, q_ptr, s_ptr, z_ptr, y_ptr, B, N, K,
                 sxb, sxk, sqe, sqk, sqn, sse, ssn, ssg, sze, szn, szg, syb, syn,
-                GROUP: tl.constexpr, BN: tl.constexpr):
+                GROUP: tl.constexpr, BN: tl.constexpr, SPLITK: tl.constexpr):
             pid_b = tl.program_id(0)                       # one (token, expert-slot) application
             pid_n = tl.program_id(1)                       # a BN-wide block of output channels
+            pid_k = tl.program_id(2)                       # which K-slice this program reduces (split-K)
             e = tl.load(e_ptr + pid_b).to(tl.int64)        # this row's expert id (64-bit weight base)
             offs_n = pid_n * BN + tl.arange(0, BN)
             offs_h = tl.arange(0, GROUP // 2)              # byte index within a K-group
             nmask = offs_n < N
+            ngroups = K // GROUP
+            gps = (ngroups + SPLITK - 1) // SPLITK         # K-groups this split reduces
+            g0 = pid_k * gps
             acc = tl.zeros((BN,), dtype=tl.float32)
-            for kb in range(0, K // GROUP):
-                k0 = kb * GROUP
-                xe = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h) * sxk)        # [G/2] even cols
-                xo = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h + 1) * sxk)    # [G/2] odd cols
-                qp = q_ptr + e * sqe + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
-                bb = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)        # [G/2, BN] packed
-                lo = (bb & 0xF).to(tl.float32)
-                hi = ((bb >> 4) & 0xF).to(tl.float32)
-                s = tl.load(s_ptr + e * sse + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
-                z = tl.load(z_ptr + e * sze + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
-                wlo = (lo - z[None, :]) * s[None, :]        # [G/2, BN] dequant low nibble
-                whi = (hi - z[None, :]) * s[None, :]        # [G/2, BN] dequant high nibble
-                acc += tl.sum(xe[:, None] * wlo, axis=0)    # GEMV reduce over the K-group -> [BN]
-                acc += tl.sum(xo[:, None] * whi, axis=0)
-            tl.store(y_ptr + pid_b * syb + offs_n * syn, acc.to(tl.bfloat16), mask=nmask)
+            for gi in range(0, gps):
+                kb = g0 + gi
+                if kb < ngroups:                           # tail split may reduce fewer groups
+                    k0 = kb * GROUP
+                    xe = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h) * sxk)        # [G/2] even cols
+                    xo = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h + 1) * sxk)    # [G/2] odd cols
+                    qp = q_ptr + e * sqe + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
+                    bb = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)        # [G/2, BN] packed
+                    lo = (bb & 0xF).to(tl.float32)
+                    hi = ((bb >> 4) & 0xF).to(tl.float32)
+                    s = tl.load(s_ptr + e * sse + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
+                    z = tl.load(z_ptr + e * sze + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
+                    wlo = (lo - z[None, :]) * s[None, :]    # [G/2, BN] dequant low nibble
+                    whi = (hi - z[None, :]) * s[None, :]    # [G/2, BN] dequant high nibble
+                    acc += tl.sum(xe[:, None] * wlo, axis=0)  # GEMV reduce over the K-group -> [BN]
+                    acc += tl.sum(xo[:, None] * whi, axis=0)
+            tl.atomic_add(y_ptr + pid_b * syb + offs_n * syn, acc, mask=nmask)   # fp32 partial -> y
 
         def _op(x, eid, q, scale, zero, group_size, in_features):
             if x.dim() != 2:
@@ -1306,8 +1322,9 @@ def _w4a16_moe_op():
             eid = eid.to(torch.int32).contiguous()
             B = x.shape[0]
             N = q.shape[1]
-            y = torch.empty((B, N), device=x.device, dtype=torch.bfloat16)
-            grid = lambda meta: (B, triton.cdiv(N, meta["BN"]))  # noqa: E731 — BN chosen by autotune
+            # split-K atomic-adds fp32 partials -> y must be fp32 + zero-initialized, then cast to bf16
+            y = torch.zeros((B, N), device=x.device, dtype=torch.float32)
+            grid = lambda meta: (B, triton.cdiv(N, meta["BN"]), meta["SPLITK"])  # noqa: E731
             _mk[grid](x, eid, q, scale, zero, y, B, N, Kpad,
                       x.stride(0), x.stride(1),
                       q.stride(0), q.stride(2), q.stride(1),
@@ -1315,7 +1332,7 @@ def _w4a16_moe_op():
                       zero.stride(0), zero.stride(1), zero.stride(2),
                       y.stride(0), y.stride(1),
                       GROUP=group_size)
-            return y
+            return y.to(torch.bfloat16)
 
         _W4A16_MOE_OP = _op
         _builtins.print("[int4] triton fused-MoE w4a16 kernel built (ROCm decode fast path)", flush=True)

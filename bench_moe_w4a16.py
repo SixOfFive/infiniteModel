@@ -58,40 +58,50 @@ def dequant_expert(qw, scale, zero, in_f, group=G):
 
 # --- fused kernel (copy of client.py _w4a16_moe_op _mk, incl. its autotune set) -------------
 if _HAVE_TRITON:
+    # split-K MoE GEMV — byte-for-byte mirror of client.py _w4a16_moe_op _mk (incl. its autotune set)
     @triton.autotune(
         configs=[
-            triton.Config({"BN": 128}, num_warps=4, num_stages=2),
-            triton.Config({"BN": 128}, num_warps=4, num_stages=3),
-            triton.Config({"BN": 64}, num_warps=2, num_stages=3),
+            triton.Config({"BN": 128, "SPLITK": 1}, num_warps=4, num_stages=2),   # == prior default
+            triton.Config({"BN": 128, "SPLITK": 2}, num_warps=4, num_stages=2),
+            triton.Config({"BN": 128, "SPLITK": 4}, num_warps=4, num_stages=3),
+            triton.Config({"BN": 128, "SPLITK": 8}, num_warps=4, num_stages=3),
+            triton.Config({"BN": 64, "SPLITK": 4}, num_warps=2, num_stages=3),
+            triton.Config({"BN": 64, "SPLITK": 8}, num_warps=4, num_stages=2),
         ],
         key=["B", "N", "K"],
     )
     @triton.jit
     def _mk(x_ptr, e_ptr, q_ptr, s_ptr, z_ptr, y_ptr, B, N, K,
             sxb, sxk, sqe, sqk, sqn, sse, ssn, ssg, sze, szn, szg, syb, syn,
-            GROUP: tl.constexpr, BN: tl.constexpr):
+            GROUP: tl.constexpr, BN: tl.constexpr, SPLITK: tl.constexpr):
         pid_b = tl.program_id(0)
         pid_n = tl.program_id(1)
+        pid_k = tl.program_id(2)                            # which K-slice this program reduces
         e = tl.load(e_ptr + pid_b).to(tl.int64)
         offs_n = pid_n * BN + tl.arange(0, BN)
         offs_h = tl.arange(0, GROUP // 2)
         nmask = offs_n < N
+        ngroups = K // GROUP
+        gps = (ngroups + SPLITK - 1) // SPLITK
+        g0 = pid_k * gps
         acc = tl.zeros((BN,), dtype=tl.float32)
-        for kb in range(0, K // GROUP):
-            k0 = kb * GROUP
-            xe = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h) * sxk)
-            xo = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h + 1) * sxk)
-            qp = q_ptr + e * sqe + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
-            bb = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)
-            lo = (bb & 0xF).to(tl.float32)
-            hi = ((bb >> 4) & 0xF).to(tl.float32)
-            s = tl.load(s_ptr + e * sse + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
-            z = tl.load(z_ptr + e * sze + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
-            wlo = (lo - z[None, :]) * s[None, :]
-            whi = (hi - z[None, :]) * s[None, :]
-            acc += tl.sum(xe[:, None] * wlo, axis=0)
-            acc += tl.sum(xo[:, None] * whi, axis=0)
-        tl.store(y_ptr + pid_b * syb + offs_n * syn, acc.to(tl.bfloat16), mask=nmask)
+        for gi in range(0, gps):
+            kb = g0 + gi
+            if kb < ngroups:
+                k0 = kb * GROUP
+                xe = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h) * sxk)
+                xo = tl.load(x_ptr + pid_b * sxb + (k0 + 2 * offs_h + 1) * sxk)
+                qp = q_ptr + e * sqe + (k0 // 2 + offs_h)[:, None] * sqk + offs_n[None, :] * sqn
+                bb = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)
+                lo = (bb & 0xF).to(tl.float32)
+                hi = ((bb >> 4) & 0xF).to(tl.float32)
+                s = tl.load(s_ptr + e * sse + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
+                z = tl.load(z_ptr + e * sze + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
+                wlo = (lo - z[None, :]) * s[None, :]
+                whi = (hi - z[None, :]) * s[None, :]
+                acc += tl.sum(xe[:, None] * wlo, axis=0)
+                acc += tl.sum(xo[:, None] * whi, axis=0)
+        tl.atomic_add(y_ptr + pid_b * syb + offs_n * syn, acc, mask=nmask)
 
     def moe_op(x, eid, q, scale, zero, in_features, group=G):
         if x.dtype != torch.bfloat16:
@@ -102,15 +112,15 @@ if _HAVE_TRITON:
             x = F.pad(x, (0, Kpad - x.shape[1]))
         eid = eid.to(torch.int32).contiguous()
         B, N = x.shape[0], q.shape[1]
-        y = torch.empty((B, N), device=x.device, dtype=torch.bfloat16)
-        grid = lambda meta: (B, triton.cdiv(N, meta["BN"]))  # noqa: E731 — BN chosen by autotune
+        y = torch.zeros((B, N), device=x.device, dtype=torch.float32)   # split-K atomic-add accumulator
+        grid = lambda meta: (B, triton.cdiv(N, meta["BN"]), meta["SPLITK"])  # noqa: E731
         _mk[grid](x, eid, q, scale, zero, y, B, N, Kpad,
                   x.stride(0), x.stride(1),
                   q.stride(0), q.stride(2), q.stride(1),
                   scale.stride(0), scale.stride(1), scale.stride(2),
                   zero.stride(0), zero.stride(1), zero.stride(2),
                   y.stride(0), y.stride(1), GROUP=group)
-        return y
+        return y.to(torch.bfloat16)
 
 
 def act(x):
