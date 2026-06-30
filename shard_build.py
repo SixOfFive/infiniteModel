@@ -361,6 +361,14 @@ class ShardBuildMixin:
             self._hybrid = bool(_lt) and any(t != "full_attention" for t in _lt)
             self._omni = omni_thinker is not None
             self.cfg._attn_implementation = attn
+            # gpt-oss attention SINKS (a per-head learned logit concatenated into the softmax, then
+            # dropped) are applied ONLY by transformers' eager_attention_forward (s_aux=self.sinks);
+            # plain SDPA silently ignores s_aux -> the sink mass is lost and attention is subtly wrong.
+            # Force eager for gpt_oss regardless of the requested `attn`. (gpt-oss's sliding-window
+            # softmax layers still get the causal mask in shard_forward — they have no `.layer_type`
+            # attr, so the hybrid mask-skip doesn't strip it; windowing exactness is a follow-up.)
+            if str(getattr(self.cfg, "model_type", "")).lower() == "gpt_oss":
+                self.cfg._attn_implementation = attn = "eager"
             # transformers 5.x LlamaRotaryEmbedding reads cfg.rope_parameters["rope_type"] in __init__;
             # a 4.x-era custom config (e.g. MiniMax-M2) leaves rope_parameters=None -> 'NoneType' not
             # subscriptable at from_config. Synthesize it from the legacy rope_theta/rope_scaling so the

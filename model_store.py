@@ -124,6 +124,47 @@ def convert_gguf_to_model_dir(repo_id: str, gguf_file: str, model_id: str) -> st
     return local
 
 
+def _is_mxfp4_dir(d: str) -> bool:
+    """True if the checkpoint at `d` is MXFP4-quantized (gpt-oss) — read from config.json."""
+    try:
+        with open(os.path.join(d, "config.json"), encoding="utf-8") as fh:
+            qc = (json.load(fh) or {}).get("quantization_config") or {}
+        return "mxfp4" in str(qc.get("quant_method", "")).lower()
+    except Exception:
+        return False
+
+
+def convert_mxfp4_to_model_dir(src_dir: str, local: str, model_id: str) -> str:
+    """Normalize an MXFP4 checkpoint (gpt-oss) to plain bf16 safetensors under models/<name>/, ONCE.
+    The dequant runs in a SUBPROCESS (mxfp4_convert.py) that STREAMS one source file at a time, so it
+    never materializes the full ~42 GB model in RAM — safe on a co-hosted box that is also serving
+    (unlike a from_pretrained(dequantize)+save, which would OOM). After this it is an ordinary bf16
+    model: chunk-streamed, run on the pipeline (transformers' real GptOss modules handle attention
+    sinks + clamped SwiGLU natively). Mirrors convert_gguf_to_model_dir."""
+    if _dir_has_model(local) and not _is_mxfp4_dir(local):
+        return local                                 # already normalized
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mxfp4_convert.py")
+    if not os.path.exists(script):
+        raise RuntimeError("mxfp4_convert.py not present on this node — self-update may not have synced it yet")
+    env = dict(os.environ)
+    _tok = _HF_TOKEN_FN()
+    if _tok:
+        env["HF_TOKEN"] = _tok          # pass via env, never argv
+    os.makedirs(local, exist_ok=True)
+    print(f"[model] MXFP4 -> bf16: {model_id} (streaming subprocess)", flush=True)
+    proc = subprocess.run([sys.executable, script, src_dir, local],
+                          env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-800:]
+        shutil.rmtree(local, ignore_errors=True)     # don't leave a half-converted dir
+        raise RuntimeError(f"MXFP4 conversion failed ({model_id}): {tail}")
+    for _ln in (proc.stdout or "").splitlines()[-6:]:
+        if _ln.strip():
+            print(f"[mxfp4] {_ln.rstrip()}", flush=True)
+    print(f"[model] MXFP4 conversion complete -> {local}", flush=True)
+    return local
+
+
 # ---------------------------------------------------------------------------
 # M2d: controller-side model storage
 # ---------------------------------------------------------------------------
@@ -198,6 +239,10 @@ def _controller_model_dir(model_id: str) -> str:
     if src is None:                       # nothing cached, or the cache is partial/broken
         src = snapshot_download(model_id, allow_patterns=patterns,
                                 token=_HF_TOKEN_FN())   # authenticated pull (resumes partials)
+    # MXFP4-quantized source (gpt-oss): normalize the MXFP4 experts to plain bf16 ONCE (bounded-memory
+    # streaming subprocess) INTO `local` — then it's an ordinary bf16 model downstream. Mirrors GGUF.
+    if _is_mxfp4_dir(src):
+        return convert_mxfp4_to_model_dir(src, local, model_id)
     os.makedirs(local, exist_ok=True)
     # MOVE the cache blobs into models/ instead of COPYING them: on the same drive a move is
     # an instant rename — no 2x read+write (brutal on a USB/spinning disk), and no half-written

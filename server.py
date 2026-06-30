@@ -118,6 +118,7 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py",
                                  "formats.py", "multimodal.py", "graphs.py", "model_store.py",
                                  "mtp_core.py",   # #91 MTP head forward (controller-only import)
                                  "gguf_convert.py",  # GGUF->safetensors converter (subprocess)
+                                 "mxfp4_convert.py",  # MXFP4(gpt-oss)->bf16 converter (subprocess)
                                  # m4c152 code-split: shared-state registry + relocated Engine mixins
                                  "state.py", "engine_load.py", "engine_gen.py", "engine_lifecycle.py",
                                  # m4c153 code-split: relocated build_app routes
