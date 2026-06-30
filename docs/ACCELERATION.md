@@ -80,6 +80,7 @@ here, not load-bearing as it was on RDNA (where no vendor int4 GEMM exists at al
 |---|---|
 | `INFINITEMODEL_CUDA_FUSED_MOE=1` | **Linux + NVIDIA Ampere (sm_80+) opt-in:** use the fused Triton MoE-expert kernel instead of bf16 remat. No effect on ROCm (already on); on pre-Ampere NVIDIA the bf16 kernel won't compile and the self-check falls back to the default. |
 | `INFINITEMODEL_NO_FUSED_MOE=1` | Kill switch: force the bf16-remat (default) expert path everywhere, incl. ROCm. Use to A/B the fused kernel on/off. |
+| `INFINITEMODEL_CUDA_GRAPH=<ctx>` | **Opt-in CUDA-graph decode** (single-node, standard-attention, CUDA). Set to the serving context length (e.g. `8192`) — it sizes the fixed StaticCache. Decode replays a captured per-token graph (~5x less launch overhead at batch-1); first-decode self-check vs eager (`rel<0.05`) with permanent fallback. Inert/ignored for distributed, hybrid (Gated-DeltaNet), omni, Gemma-per-type, and multimodal models, and on non-CUDA workers. A sequence that outgrows `<ctx>` drops to the eager path. Look for `[cudagraph] decode capture ACTIVE` in the worker log. |
 
 Set them in the worker's environment (e.g. a systemd `--user` unit `Environment=` line, or the shell
 that launches `client.py`), then restart the worker and reload the model — the fused forward installs at
@@ -182,7 +183,7 @@ MoE models where the routed experts are a big share of decode.
 
 These kernels are good but not the ceiling. Ranked by likely payoff:
 
-1. **CUDA/HIP-graph capture of the decode step — the big one (measured).** Now unblocked: fusing the
+1. **CUDA/HIP-graph capture of the decode step — the big one (measured; opt-in landed).** Now unblocked: fusing the
    experts removed the data-dependent per-expert Python loop, so the per-token graph is static and
    capturable. A faithful 16-layer batch-1 decode probe on the 4070 Ti SUPER (norms + q/k/v/o linears +
    rotary + SDPA over a fixed KV + router top-k + the real fused int4 MoE) measured **eager 15.9 → graph
@@ -197,7 +198,12 @@ These kernels are good but not the ceiling. Ranked by likely payoff:
    position as a captured tensor** (a growing/dynamic KV breaks capture), capture-once-replay-many with
    the prefill KV refilled per sequence, an opt-in flag + first-decode self-check vs eager + fallback,
    and the transport left outside the graph. Standard-attention single-GPU models are the clean first
-   target; hybrid (Gated-DeltaNet) state, multimodal, and spec-decode are harder.
+   target; hybrid (Gated-DeltaNet) state, multimodal, and spec-decode are harder. **Status: landed as an
+   opt-in** (`INFINITEMODEL_CUDA_GRAPH=<ctx>`, default off — see Environment switches). Single-node
+   standard-attention only; a persistent StaticCache + captured per-token graph + first-decode self-check
+   vs eager (permanent fallback on mismatch). To activate on a worker: add the env var to its launch
+   (e.g. `start_worker.bat`), restart, load an eligible model, and confirm `[cudagraph] decode capture
+   ACTIVE` in the log.
 2. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
    kernel is gated behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. Attention is a real slice of decode
    on the hybrid (Gated-DeltaNet + SDPA) models.
