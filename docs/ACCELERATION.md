@@ -52,8 +52,11 @@ NVIDIA hardware.
 
 **Validated (2026-06-30):** RTX 3060 (Ampere sm_86) — kernel builds, correct (rel 0.006), **3.9× on the
 routed-expert GEMM** (microbench) and **end-to-end in the live worker: `olmoe:1b-7b` int4 8.5 → ~31.5
-tok/s (~3.7×)** with the opt-in on. Quadro P620 (Pascal sm_61) — Triton bf16 won't compile → correct
-automatic fallback to the default path (no speedup, no breakage).
+tok/s (~3.7×)** with the opt-in on. RTX 4070 Ti SUPER (Ada sm_89, **Windows**) — Triton builds on Windows
+too; **end-to-end in the live worker** (`olmoe:1b-7b` int4, 10 MoE layers placed on the card): the
+self-check went `-> ACTIVE` on **all 10 layers** (rel 0.0055–0.0061, max-element 0.005–0.013) with coherent
+output. Quadro P620 (Pascal sm_61) — Triton bf16 won't compile → correct automatic fallback to the
+default path (no speedup, no breakage).
 
 > **Triton version note:** the kernels resolve `triton`/`tl` from **module globals** (not a local import
 > inside the builder), because triton 3.2 — unlike 3.7 — does not capture them as closure freevars and
