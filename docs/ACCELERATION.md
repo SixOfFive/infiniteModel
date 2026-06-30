@@ -182,10 +182,18 @@ MoE models where the routed experts are a big share of decode.
 
 These kernels are good but not the ceiling. Ranked by likely payoff:
 
-1. **CUDA/HIP-graph capture of the decode step.** Now unblocked: fusing the experts removed the
-   data-dependent per-expert Python loop, so the per-token graph is static and capturable. Removes most
-   per-token launch + Python-dispatch overhead (the ~20% non-compute idle measured on Strix Halo).
-   Likely the single biggest remaining decode lever now that the kernels themselves are near their ceiling.
+1. **CUDA/HIP-graph capture of the decode step — the big one (measured).** Now unblocked: fusing the
+   experts removed the data-dependent per-expert Python loop, so the per-token graph is static and
+   capturable. A faithful 16-layer batch-1 decode probe on the 4070 Ti SUPER (norms + q/k/v/o linears +
+   rotary + SDPA over a fixed KV + router top-k + the real fused int4 MoE) measured **eager 15.9 → graph
+   2.9 ms/token = 5.56×**, i.e. **~82% of batch-1 compute-region time is pure launch/dispatch overhead**
+   (~240 tiny kernel launches/token, GPU mostly idle between them). This is by far the largest remaining
+   decode lever. **Caveats for the real end-to-end win:** the probe is compute-only — it excludes the
+   per-hop loopback-TCP transport (not capturable), so a *distributed* model gains less; and the
+   integration is substantial — it needs a **fixed-size KV buffer (HF `StaticCache`) with the position as
+   a captured tensor** (a growing/dynamic KV breaks capture), per-shard capture with the transport left
+   outside the graph, and recapture per ctx bucket. Standard-attention single-GPU models are the clean
+   first target; hybrid (Gated-DeltaNet) state, multimodal, and spec-decode are harder.
 2. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
    kernel is gated behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. Attention is a real slice of decode
    on the hybrid (Gated-DeltaNet + SDPA) models.
