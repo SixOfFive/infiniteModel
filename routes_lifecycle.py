@@ -416,7 +416,7 @@ def register(app):
                    consolidate: bool = True, quant: str = "none", tp: int = 1,
                    replicas: int = 1, cpu_only: bool = False,
                    moe_offload: bool = False, force: bool = False,
-                   node: str = "") -> JSONResponse:
+                   node: str = "", kv_quant: str = "") -> JSONResponse:
         # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
         # it. Also reloads an already-resident copy (skips the idempotent no-op). Without force, a
@@ -438,6 +438,11 @@ def register(app):
         # Legacy: if mode is omitted but consolidate=false is passed, honor it.
         if quant not in ("none", "int8", "int4"):
             return JSONResponse({"ok": False, "error": f"bad quant '{quant}' (none|int8|int4)"},
+                                status_code=400)
+        # #172 TurboQuant KV preset. Empty -> _load_impl inherits the ENGINE_CONFIG knob (default 'none').
+        if kv_quant and kv_quant not in ("none", "turbo2", "turbo3", "turbo4"):
+            return JSONResponse({"ok": False,
+                                 "error": f"bad kv_quant '{kv_quant}' (none|turbo2|turbo3|turbo4)"},
                                 status_code=400)
         cons, pv = LOAD_MODES.get(mode, LOAD_MODES["auto"])
         if mode == "auto" and not consolidate:   # back-compat with the old checkbox
@@ -469,7 +474,8 @@ def register(app):
             # throughput. Mutually exclusive with tp (tp splits one copy; replicas duplicate it).
             if tp <= 1 and replicas > 1:
                 lms = await engine.replicate(friendly, ctx, replicas,
-                                             consolidate=cons, prefer_vram=pv, quant=quant)
+                                             consolidate=cons, prefer_vram=pv, quant=quant,
+                                             kv_quant=kv_quant)
                 return JSONResponse({"ok": True, "model": friendly, "ctx": lms[0].ctx,
                                      "mode": mode, "quant": quant, "replicas": len(lms),
                                      "placements": [{"key": m.friendly,
@@ -482,7 +488,8 @@ def register(app):
                                    spread=(mode == "spread"),
                                    proportional=(mode == "proportional"),
                                    gpu_spread=(mode == "all-gpu"),
-                                   moe_offload=moe_offload, force=force, pin_host=node)
+                                   moe_offload=moe_offload, force=force, pin_host=node,
+                                   kv_quant=kv_quant)
             _modelbl = ("pin:%s/%s" % (node, "cpu" if cpu_only else "gpu")) if node else \
                        (((("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp)) if tp > 1 else mode))
             return JSONResponse({"ok": True, "model": lm.friendly, "ctx": lm.ctx,

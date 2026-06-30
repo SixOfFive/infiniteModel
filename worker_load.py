@@ -82,7 +82,8 @@ class WorkerLoadMixin:
                                       plan_ram_bytes=plan_ram_bytes, ctx=int(a.get("ctx", 0) or 0),
                                       gpu_budget_gb=gpu_budget_gb,   # #95 coexistence cap
                                       moe_offload=moe_offload,       # #moe-offload (pipeline only)
-                                      cache=cache)                   # #shard-cache Inc 2 serve-from-cache
+                                      cache=cache,                   # #shard-cache Inc 2 serve-from-cache
+                                      kv_quant=a.get("kv_quant", "none"))   # #172 TurboQuant KV preset
         else:
             # TENSOR-PARALLEL PATH (tp>1) — TP-v2 PER-RANK STREAMING: this rank fetches ONLY its
             # 1/tp tensor slice from /weights_tp and builds reduced-dim modules directly, so a node
@@ -120,7 +121,8 @@ class WorkerLoadMixin:
                                       tp_rank=tp_rank, tp_size=tp_size, tp_allreduce=tp,
                                       plan_ram_bytes=plan_ram_bytes, tp_weights=tpw,
                                       ctx=int(a.get("ctx", 0) or 0),
-                                      gpu_budget_gb=gpu_budget_gb)   # #95 coexistence cap
+                                      gpu_budget_gb=gpu_budget_gb,   # #95 coexistence cap
+                                      kv_quant=a.get("kv_quant", "none"))   # #172 TurboQuant KV preset
         print(f"[load] stage L{a['layer_start']}-{a['layer_end']} placement: {shard.placement}"
               f" device={device} attn={self.attn} quant={quant} ({shard.loaded_bytes/GB:.2f} GB)")
         # #2 pre-alloc: reserve the full-ctx KV now so a node that can't hold it fails the LOAD

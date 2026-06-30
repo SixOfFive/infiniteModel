@@ -147,59 +147,100 @@ class TurboQuantizer:
         return (x + x_qjl).to(self.dtype)
 
 
-# transformers Cache subclass — imported lazily so this module loads without transformers.
-def make_turboquant_cache(transformers_cache_base):
-    """Build a TurboQuantCache class subclassing the given transformers DynamicCache base.
-    Done as a factory so kv_quant.py imports with torch only (no hard transformers dep)."""
+# transformers Cache integration — built lazily so this module imports with torch only.
+def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factory):
+    """Return a TurboQuantCache INSTANCE that keeps each layer's K/V QUANTIZED and returns the
+    DEQUANTIZED (un-rotated, original-basis) full K/V from update() — so the model's attention runs
+    UNCHANGED. Written against the transformers 5.x Cache API (validated on 5.12.1): a DynamicCache
+    holds one DynamicLayer per layer in ``self.layers``; the model's attention consumes the TUPLE
+    update() RETURNS (it does NOT re-read the cache mid-forward), and the causal mask is sized from
+    ``layer.get_seq_length()``. So we subclass DynamicLayer, store only the quantized reps, and
+    reconstruct the full bf16 K/V as update()'s return value.
 
-    class TurboQuantCache(transformers_cache_base):
-        """A DynamicCache that QUANTIZES K/V on update() and returns the DEQUANTIZED (un-rotated,
-        original-basis) full K/V to the attention — so the model's attention runs UNCHANGED.
+    quantizer_factory(head_dim, device, dtype) -> TurboQuantizer (preset bits bound by the caller).
 
-        Correctness path: resting KV is stored quantized; each step dequantizes for the attention
-        math. NOTE (peak-VRAM follow-up): this transiently materializes the full bf16 K/V per step,
-        so it lowers RESTING KV but not the per-step PEAK — the placement/reservation win needs a
-        chunked or fused quantized-attention that consumes the quantized KV directly. Until then the
-        reservation stays bf16-sized; this class proves the quantizer end-to-end + is the substrate
-        for that kernel."""
+    MEMORY: each layer persistently holds only the quantized reps (uint8 index/coord + a few fp32
+    norms/head ~= 1 byte/coord vs bf16's 2) — a ~2x RESTING KV reduction at the foundation; bit-
+    packing the indices to b bits reaches ~b/8. update() transiently rebuilds ONE layer's full bf16
+    K/V for the attention (freed when the forward returns); because the pipeline runs layers
+    sequentially, only one layer's bf16 lives at a time, so even the per-step PEAK drops
+    (all-layers-quantized + one-layer-bf16 << all-layers-bf16). The KV RESERVATION still budgets
+    bf16 (conservative) until that peak headroom is measured and tightened — see kv_reserve_probe."""
 
-        def __init__(self, *a, quantizer_factory=None, **kw):
-            super().__init__(*a, **kw)
-            self._qf = quantizer_factory                 # (head_dim, device, dtype) -> TurboQuantizer
-            self._q = {}                                 # layer_idx -> TurboQuantizer
-            self._kq = {}                                # layer_idx -> list of key-quant tuples (per step)
-            self._vq = {}
+    class _TurboQuantLayer(dynamic_layer_cls):
+        """A DynamicLayer that stores K/V QUANTIZED (TurboQuant) and reconstructs full bf16 on
+        update(). Every method the model/cache uses for length + masking (get_seq_length, and via it
+        get_mask_sizes) is overridden or routes through our token counter, so the causal mask stays
+        correct; get_max_cache_shape (==-1, unbounded) + reset (no-op while uninitialized) are safe
+        as inherited because we never lazy-initialize the bf16 self.keys/self.values buffers."""
 
-        def _quantizer(self, layer_idx, k):
-            q = self._q.get(layer_idx)
-            if q is None:
-                q = self._qf(k.shape[-1], k.device, k.dtype)
-                self._q[layer_idx] = q
-            return q
+        def __init__(self, config=None):
+            super().__init__()
+            self._tq = None                              # this layer's TurboQuantizer (built on 1st update)
+            self._ki = self._kn = None                   # key   indices [b,h,S,d] uint8, norms [b,h,S,1]
+            self._vi = self._vn = None                   # value indices/norms
+            self._vq = self._vg = None                   # value QJL sign-bits/gammas (None unless value_qjl)
+            self._len = 0                                # cached token count (drives get_seq_length + mask)
 
-        def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-            # Quantize the NEW K/V, append, then return the full DEQUANTIZED K/V (all positions).
-            qz = self._quantizer(layer_idx, key_states)
-            self._kq.setdefault(layer_idx, []).append(qz.quant_keys(key_states))
-            self._vq.setdefault(layer_idx, []).append(qz.quant_values(value_states))
-            keys = self.torch_cat([qz.dequant_keys(*t) for t in self._kq[layer_idx]])
-            vals = self.torch_cat([qz.dequant_values(*t) for t in self._vq[layer_idx]])
-            # mirror DynamicCache's bookkeeping so get_seq_length()/attention masks stay correct
+        def _q(self, k):
+            if self._tq is None:
+                self._tq = quantizer_factory(k.shape[-1], k.device, k.dtype)
+            return self._tq
+
+        def update(self, key_states, value_states, *args, **kwargs):
             import torch
-            if layer_idx < len(self.key_cache):
-                self.key_cache[layer_idx] = keys
-                self.value_cache[layer_idx] = vals
-            else:
-                while len(self.key_cache) <= layer_idx:
-                    self.key_cache.append(torch.tensor([]))
-                    self.value_cache.append(torch.tensor([]))
-                self.key_cache[layer_idx] = keys
-                self.value_cache[layer_idx] = vals
+            q = self._q(key_states)
+            ki, kn = q.quant_keys(key_states)
+            vi, vn, vq, vg = q.quant_values(value_states)
+            if self._ki is None:
+                self._ki, self._kn = ki, kn
+                self._vi, self._vn, self._vq, self._vg = vi, vn, vq, vg
+            else:                                        # append the new step's reps along the seq dim
+                self._ki = torch.cat([self._ki, ki], dim=-2)
+                self._kn = torch.cat([self._kn, kn], dim=-2)
+                self._vi = torch.cat([self._vi, vi], dim=-2)
+                self._vn = torch.cat([self._vn, vn], dim=-2)
+                if vq is not None:
+                    self._vq = torch.cat([self._vq, vq], dim=-2)
+                    self._vg = torch.cat([self._vg, vg], dim=-2)
+            self._len += int(key_states.shape[-2])
+            keys = q.dequant_keys(self._ki, self._kn)            # full bf16, transient (returned only)
+            vals = q.dequant_values(self._vi, self._vn, self._vq, self._vg)
             return keys, vals
 
-        @staticmethod
-        def torch_cat(seq):
-            import torch
-            return torch.cat(seq, dim=-2)                # cat along the sequence dim
+        def get_seq_length(self) -> int:
+            return int(self._len)
 
-    return TurboQuantCache
+        def crop(self, max_length: int) -> None:
+            # spec-decode rollback: truncate the quantized reps to `max_length` tokens (seq dim = -2).
+            if max_length < 0:
+                max_length = self._len - abs(max_length)
+            if self._ki is None or self._len <= max_length:
+                return
+            def _sl(t):
+                return t[..., :max_length, :] if t is not None else None
+            self._ki, self._kn = _sl(self._ki), _sl(self._kn)
+            self._vi, self._vn = _sl(self._vi), _sl(self._vn)
+            self._vq, self._vg = _sl(self._vq), _sl(self._vg)
+            self._len = int(max_length)
+
+        def reorder_cache(self, beam_idx) -> None:
+            # beam search isn't used by this engine; reorder the quantized reps if ever invoked.
+            if self._ki is None:
+                return
+            bi = beam_idx.to(self._ki.device)
+            for nm in ("_ki", "_kn", "_vi", "_vn", "_vq", "_vg"):
+                t = getattr(self, nm)
+                if t is not None:
+                    setattr(self, nm, t.index_select(0, bi))
+
+    class _TurboQuantCache(dynamic_cache_cls):
+        """A DynamicCache whose lazily-appended layers are _TurboQuantLayer (quantized KV). Built with
+        NO config so DynamicCache uses its lazy layer_class_to_replicate path — kv_quant is gated to
+        non-hybrid (plain full-attention) models, exactly the case that takes that path."""
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.layer_class_to_replicate = _TurboQuantLayer
+
+    return _TurboQuantCache()

@@ -110,7 +110,8 @@ class EngineLoadMixin:
                    exclude_nodes: Optional[set] = None, replica_idx: int = 0,
                    spread: bool = False, proportional: bool = False,
                    force: bool = False, moe_offload: bool = False,
-                   gpu_spread: bool = False, pin_host: str = "") -> LoadedModel:
+                   gpu_spread: bool = False, pin_host: str = "",
+                   kv_quant: str = "") -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -129,7 +130,7 @@ class EngineLoadMixin:
                                          exclude_nodes=exclude_nodes, replica_idx=replica_idx,
                                          spread=spread, proportional=proportional, force=force,
                                          moe_offload=moe_offload, gpu_spread=gpu_spread,
-                                         pin_host=pin_host, _own=_own)
+                                         pin_host=pin_host, kv_quant=kv_quant, _own=_own)
         finally:
             if _own["v"]:
                 self._reservations.pop(rk, None)
@@ -146,7 +147,7 @@ class EngineLoadMixin:
                    spread: bool = False, proportional: bool = False,
                    force: bool = False, moe_offload: bool = False,
                    gpu_spread: bool = False, pin_host: str = "",
-                   _own: Optional[dict] = None) -> LoadedModel:
+                   kv_quant: str = "", _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
         # reservation ledger; planning is serialized by this lock, only the streaming overlaps.
@@ -284,8 +285,14 @@ class EngineLoadMixin:
             # quantize. (Multi-stage fp32 carries fp32 activations over the same dtype-agnostic transport.)
             load_dtype = ("float32" if (quant == "none" and (spec.src_dtype or "") == "F32")
                           else "bfloat16")
+            # #172 TurboQuant KV: empty -> inherit the global ENGINE_CONFIG default; normalize+validate
+            # here so EVERY caller (route, auto-load, replicate, reconfigure) gets the configured default.
+            kv_quant = (kv_quant or str(ENGINE_CONFIG.get("kv_quant", "none") or "none")).strip().lower()
+            if kv_quant not in ("none", "turbo2", "turbo3", "turbo4"):
+                kv_quant = "none"
             await self.ensure_data_listener()
             log_activity(f"load {friendly}: planning (ctx={ctx}, quant={quant}"
+                         + (f", kv_quant={kv_quant}" if kv_quant != "none" else "")
                          + (f", tp={tp}" if tp > 1 else "")
                          + (", CPU-ONLY (RAM, no VRAM)" if cpu_only else "") + ")")
 
@@ -639,6 +646,7 @@ class EngineLoadMixin:
                         "moe_offload": moe_offload,  # #moe-offload: split MoE layers (attn->GPU, experts->CPU RAM)
                         "cache": _cache_quant,       # #shard-cache Inc 2: '' | 'int4' -> fetch pre-packed cache
                         "quant": quant,              # 'none' | 'int8' (load-time choice)
+                        "kv_quant": kv_quant,        # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4)
                         "ctx": ctx,                  # full ctx -> worker pre-reserves KV (fail-fast)
                         # #63: this stage's planned resident bytes (quantized). The worker reserves
                         # this much RAM up front (a balloon) and consumes it shard-by-shard as layers
@@ -944,7 +952,7 @@ class EngineLoadMixin:
 
     async def replicate(self, friendly: str, ctx: int, count: int,
                         consolidate: bool = True, prefer_vram: bool = True,
-                        quant: str = "none") -> list["LoadedModel"]:
+                        quant: str = "none", kv_quant: str = "") -> list["LoadedModel"]:
         """Load `count` full copies of `friendly` on DISJOINT node sets — the small-model
         throughput lever (#39). Replica 0 is keyed `friendly`; replica i (i>=1) is keyed
         `friendly#i`. Requests for `friendly` are then least-loaded / round-robin routed
@@ -962,7 +970,7 @@ class EngineLoadMixin:
                 key = friendly if i == 0 else f"{friendly}#{i}"
                 try:
                     lm = await self.load(friendly, ctx, consolidate=consolidate,
-                                         prefer_vram=prefer_vram, quant=quant,
+                                         prefer_vram=prefer_vram, quant=quant, kv_quant=kv_quant,
                                          reg_key=key, exclude_nodes=set(used), replica_idx=i)
                 except Exception as exc:
                     if i == 0:

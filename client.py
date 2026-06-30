@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c172"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c173"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2457,7 +2457,8 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
                  has_embed: bool, has_head: bool, dtype,
                  device: str = "cpu", gpu_mem_gb: float = 0.0,
                  attn: str = "eager", quant: str = "none",
-                 tp_rank: int = 0, tp_size: int = 1, tp_allreduce=None) -> None:
+                 tp_rank: int = 0, tp_size: int = 1, tp_allreduce=None,
+                 kv_quant: str = "none") -> None:
         import torch
         from transformers import AutoModelForCausalLM
         self.torch = torch
@@ -2563,6 +2564,7 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         # int8: ~1/2 footprint, head quantized too. int4: ~1/4 footprint, head LEFT bf16
         # (logits are quant-sensitive; the head is one matrix so the memory cost is small).
         self.quant = quant
+        self.kv_quant = kv_quant   # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4); read in shard_forward
         if quant in ("int8", "int4"):
             qlayer = _quantize_int4_ if quant == "int4" else _quantize_int8_
             for lyr in self.owned_layers:

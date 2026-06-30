@@ -318,7 +318,7 @@ class ShardBuildMixin:
                     tp_rank: int = 0, tp_size: int = 1, tp_allreduce=None,
                     plan_ram_bytes: int = 0, tp_weights=None, ctx: int = 0,
                     gpu_budget_gb: float = -1.0, moe_offload: bool = False,
-                    cache: str = "") -> "Shard":
+                    cache: str = "", kv_quant: str = "none") -> "Shard":
         """Build a shard by STREAMING weights one layer at a time straight into RAM — no temp
         file, no disk. `fetch(start, end, embed, head) -> bytes` returns a safetensors blob for
         that slice. Each layer is fetched, loaded, quantized and FREED before the next, so peak
@@ -386,6 +386,7 @@ class ShardBuildMixin:
             self.has_embed, self.has_head = has_embed, has_head
             self.tp_rank, self.tp_size, self.tp_allreduce = tp_rank, tp_size, tp_allreduce
             self.quant = quant
+            self.kv_quant = kv_quant   # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4); read in shard_forward
             # Build the meta skeleton WHILE the config dir (with the remote .py) is alive so
             # from_config can resolve a trust_remote_code class. For a remote-code model keep BUFFERS
             # REAL (accelerate include_buffers=False) — per-layer computed buffers (rotary inv_freq …)
@@ -862,7 +863,7 @@ class ShardBuildMixin:
     def from_hf(cls, model_id: str, layer_start: int, layer_end: int,
                 has_embed: bool, has_head: bool, dtype: str = "bfloat16",
                 device: str = "cpu", gpu_mem_gb: float = 0.0,
-                attn: str = "eager", quant: str = "none") -> "Shard":
+                attn: str = "eager", quant: str = "none", kv_quant: str = "none") -> "Shard":
         """Build a shard by reading directly from the HF cache (used by the
         standalone self-test; the fleet path uses from_blob)."""
         import torch
@@ -878,7 +879,8 @@ class ShardBuildMixin:
         dt = getattr(torch, dtype)
         sd = {k: v.to(dt) for k, v in sd.items()}
         return cls(cfg, sd, layer_start, layer_end, has_embed, has_head, dt,
-                   device=device, gpu_mem_gb=gpu_mem_gb, attn=attn, quant=quant)
+                   device=device, gpu_mem_gb=gpu_mem_gb, attn=attn, quant=quant,
+                   kv_quant=kv_quant)
 
     def crop(self, length: int) -> None:
         """Truncate the KV cache to `length` tokens (speculative-decode rollback)."""

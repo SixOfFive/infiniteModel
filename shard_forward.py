@@ -60,6 +60,30 @@ class ShardForwardMixin:
         finally:
             lock.release()
 
+    def _make_kv_quant_cache(self, name):
+        """#172 TurboQuant KV cache (kv_quant != 'none'): a DynamicCache whose layers store K/V
+        QUANTIZED (rotated Lloyd-Max; un-rotated on read, so the model's attention runs UNCHANGED).
+        Built against the INSTALLED transformers' DynamicCache/DynamicLayer (validated on 5.12.1).
+        Correctness-first: ANY failure (module missing, unknown preset, transformers API drift)
+        falls back to a plain bf16 DynamicCache so generation never breaks. Gated to non-hybrid
+        models by the caller (linear-attn layers hold conv/recurrent state, not standard KV)."""
+        from transformers import DynamicCache
+        try:
+            from transformers.cache_utils import DynamicLayer
+            import kv_quant as _kq
+            pb = _kq.preset_bits(name)
+            if not pb:
+                return DynamicCache()
+            kb, vb = pb
+            torch = self.torch
+            def _qf(head_dim, device, dtype):
+                return _kq.TurboQuantizer(torch, head_dim, key_bits=kb, value_bits=vb,
+                                          device=device, dtype=dtype)
+            return _kq.make_turboquant_cache(DynamicCache, DynamicLayer, _qf)
+        except Exception as exc:
+            print(f"[kv_quant] '{name}' unavailable ({exc!r}) -> plain bf16 KV", flush=True)
+            return DynamicCache()
+
     def _forward_impl(self, x, cache_start: int = 0, reset: bool = True,
                       all_logits: bool = False, inject=None, position_ids=None,
                       capture_hidden: bool = False, capture_pre_norm: bool = False):
@@ -88,7 +112,14 @@ class ShardForwardMixin:
             # (conv+recurrent for linear-attn layers, KV for full-attn) so the
             # Gated-DeltaNet layers can store/read state instead of IndexError-ing on
             # an empty generic cache. Reused across prefill + every decode step.
-            self.kv = DynamicCache(config=self.cfg) if self._hybrid else DynamicCache()
+            _kvq = getattr(self, "kv_quant", "none")
+            if self._hybrid:
+                self.kv = DynamicCache(config=self.cfg)
+            elif _kvq and _kvq != "none":
+                # #172 TurboQuant: quantized resting KV (un-rotated on read -> attention unchanged).
+                self.kv = self._make_kv_quant_cache(_kvq)
+            else:
+                self.kv = DynamicCache()
             # #cudagraph: a new sequence invalidates the graph's StaticCache mirror (it must be
             # re-synced from this fresh DynamicCache at the next decode). Cheap, idempotent.
             self._gkv_pos = 0
@@ -420,6 +451,8 @@ class ShardForwardMixin:
                         and ud is not None and getattr(ud, "type", None) == "cuda"
                         and self.has_embed and self.has_head
                         and not self._hybrid and not self._omni
+                        and getattr(self, "kv_quant", "none") == "none"   # #172: graph mirrors a
+                        # StaticCache that can't re-quantize TurboQuant KV -> stay eager when active
                         and not getattr(self, "_mm_capable", False)):
                     _lts = getattr(self.cfg, "layer_types", None)
                     _rot = self.model.model.rotary_emb
