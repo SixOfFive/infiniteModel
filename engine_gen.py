@@ -37,16 +37,41 @@ class EngineGenMixin:
                 self.pending_model.pop(rid, None)
 
     @staticmethod
-    def _eos_ids(tok) -> set:
+    def _eos_ids(tok, model_dir: str = "") -> set:
+        """Every token id that must STOP generation. Beyond the tokenizer's own eos_token_id we
+        MUST include (a) the checkpoint's declared eos_token_id — often a LIST (Gemma, Llama-3) —
+        and (b) the family end-of-turn markers, because many chat templates end the assistant turn
+        with a token that is NOT the tokenizer eos: Gemma uses <end_of_turn> (106), Llama-3 uses
+        <|eot_id|>, ChatML uses <|im_end|>. If those aren't registered, the model emits one, we
+        don't recognize it as a stop, generation runs to max_new, the marker leaks into the text
+        ("thought"/"off"/"<end_of_turn>") and in streaming the whole answer repeats. (#stop-eos) """
+        import os, json as _json
         ids = set()
-        if tok.eos_token_id is not None:
+        if getattr(tok, "eos_token_id", None) is not None:
             ids.add(int(tok.eos_token_id))
-        for t in ("<|im_end|>", "<|endoftext|>"):
+        # Authoritative gen-time eos from the checkpoint (int OR list). generation_config wins.
+        md = model_dir or getattr(tok, "name_or_path", "") or ""
+        for fn in ("generation_config.json", "config.json"):
+            if not md:
+                break
+            with contextlib.suppress(Exception):
+                with open(os.path.join(md, fn), encoding="utf-8") as fh:
+                    ev = _json.load(fh).get("eos_token_id")
+                if isinstance(ev, int):
+                    ids.add(ev)
+                elif isinstance(ev, (list, tuple)):
+                    ids.update(int(x) for x in ev if isinstance(x, int))
+        # Family end-of-turn markers, resolved through THIS tokenizer's vocab. Guard against the
+        # unk id (an absent token resolves to <unk> on many tokenizers — adding it would stop on
+        # every unknown token), and against accidentally adding a normal-word id.
+        unk = getattr(tok, "unk_token_id", None)
+        for t in ("<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<|end|>",
+                  "<|endoftext|>", "<|end_of_text|>", "</s>"):
             with contextlib.suppress(Exception):
                 tid = tok.convert_tokens_to_ids(t)
-                if tid is not None and tid >= 0:
+                if tid is not None and tid >= 0 and tid != unk:
                     ids.add(int(tid))
-        return ids
+        return {i for i in ids if isinstance(i, int) and i >= 0}
 
     def _sample(self, row, temperature: float, top_p: float) -> int:
         import torch
