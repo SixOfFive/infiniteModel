@@ -107,6 +107,22 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             {"error": f"queue full for '{friendly}': 1 slot + "
                       f"{ENGINE_CONFIG.get('queue_depth', DEFAULT_QUEUE_DEPTH)} queued — "
                       f"retry shortly"}, status_code=429, headers={"Retry-After": "1"})
+    # #cold-contract (BUG-1/2): a KNOWN-but-not-resident model with auto-load OFF must return a
+    # RETRYABLE typed signal HERE — BEFORE any 200/SSE is opened — never the streaming empty-200
+    # error frame or a bare non-stream 404 (a fan-out/quorum client misreads an empty-200 as a
+    # finished-but-empty vote, and a bare 404 as an unknown model). Unknown models already 404'd
+    # above with code=model_not_found (terminal); this is the distinct cold-but-cataloged case.
+    # With auto-load ON this never fires — the keepalive path below loads the model and serves it.
+    if friendly not in engine.models and not ENGINE_CONFIG.get("auto_load", True):
+        _inflight_release(rec)
+        _msg = (f"model '{friendly}' is not loaded and auto-load is disabled — "
+                f"POST /load it (or enable auto_load), then retry")
+        if mode in ("openai", "openai_text"):
+            return JSONResponse({"error": {"message": _msg, "type": "model_loading",
+                                 "code": "not_loaded"}}, status_code=503,
+                                headers={"Retry-After": "3"})
+        return JSONResponse({"model": friendly, "error": _msg, "state": "not_loaded"},
+                            status_code=503, headers={"Retry-After": "3"})
     created = int(time.time())
     _idp = "cmpl-" if mode == "openai_text" else "chatcmpl-"   # OpenAI: text vs chat id prefix
     cmpl_id = _idp + hashlib.sha256(str(time.time()).encode()).hexdigest()[:24]
@@ -365,6 +381,14 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
             "message": f"queue full for '{friendly}': 1 slot + "
                        f"{ENGINE_CONFIG.get('queue_depth', DEFAULT_QUEUE_DEPTH)} queued"}},
             status_code=429, headers={"Retry-After": "1"})
+    # #cold-contract: known-but-cold model + auto-load OFF -> retryable typed signal (not a terminal
+    # not_found_error). Unknown already 404'd above. With auto-load ON this never fires (loads below).
+    if friendly not in engine.models and not ENGINE_CONFIG.get("auto_load", True):
+        _inflight_release(rec)
+        return JSONResponse({"type": "error", "error": {"type": "overloaded_error",
+            "message": f"model '{friendly}' is not loaded and auto-load is disabled — "
+                       f"POST /load it (or enable auto_load), then retry"}},
+            status_code=503, headers={"Retry-After": "3"})
     try:
         resident = engine.models.get(friendly)
         ctx = resident.ctx if resident else 0

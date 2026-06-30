@@ -18,12 +18,19 @@ def register(app):
         # Only advertise models whose weights are actually present here — a model
         # that isn't downloaded yet can't be distributed, so it isn't "available".
         out = [_tag_entry(name) for name in MODELS if model_ready(MODELS[name][0])]
+        seen = {e["name"] for e in out}   # #dedup (BUG-3): never advertise the same rendered name twice
         # advertise ALIASES too (e.g. 'qwen2.5:14b' -> 'qwen2.5:14b-instruct') so a client can
-        # discover + use the alias name; same target/size, just the alias display name.
+        # discover + use the alias name; same target/size, just the alias display name. Skip an alias
+        # whose rendered Ollama name collides with a MODELS entry already listed (e.g. 'qwen2.5-14b'
+        # is BOTH a MODELS key AND an alias -> two identical 'qwen2.5:14b' rows without this guard).
         for alias, canon in MODEL_ALIASES.items():
             if canon in MODELS and model_ready(MODELS[canon][0]):
+                nm = _ollama_name(alias)
+                if nm in seen:
+                    continue
                 e = _tag_entry(canon)
-                e["name"] = e["model"] = _ollama_name(alias)
+                e["name"] = e["model"] = nm
+                seen.add(nm)
                 out.append(e)
         return {"models": out}
 
@@ -31,9 +38,15 @@ def register(app):
     async def v1_models() -> dict:
         names = [name for name in MODELS if model_ready(MODELS[name][0])]
         names += [a for a, c in MODEL_ALIASES.items() if c in MODELS and model_ready(MODELS[c][0])]
-        return {"object": "list", "data": [
-            {"id": _ollama_name(name), "object": "model",
-             "created": int(START_TIME), "owned_by": "infinitemodel"} for name in names]}
+        data, seen = [], set()
+        for name in names:                    # #dedup (BUG-3): no duplicate rendered ids
+            nm = _ollama_name(name)
+            if nm in seen:
+                continue
+            seen.add(nm)
+            data.append({"id": nm, "object": "model",
+                         "created": int(START_TIME), "owned_by": "infinitemodel"})
+        return {"object": "list", "data": data}
 
     @app.get("/v1/models/{model_id:path}")   # OpenAI retrieve-model (LiteLLM + some clients validate here)
     async def v1_model_get(model_id: str) -> JSONResponse:
