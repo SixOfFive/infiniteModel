@@ -83,12 +83,20 @@ class ShardForwardMixin:
         # Treating position 0 as an unconditional fresh start makes stale KV impossible to reuse —
         # cache_start==0 is ONLY ever a sequence start (decode/verify always send cache_start>0).
         if reset or self.kv is None or cache_start == 0:
-            from transformers import DynamicCache
-            # Hybrid arch: a config-typed cache pre-creates the right per-layer slot
-            # (conv+recurrent for linear-attn layers, KV for full-attn) so the
-            # Gated-DeltaNet layers can store/read state instead of IndexError-ing on
-            # an empty generic cache. Reused across prefill + every decode step.
-            self.kv = DynamicCache(config=self.cfg) if self._hybrid else DynamicCache()
+            if self._graph_enabled():
+                # #cudagraph: the opt-in StaticCache decode path OWNS self.kv (a persistent fixed-size
+                # cache whose buffers the captured graph references). Don't replace it on a new
+                # sequence — prefill overwrites positions 0..q-1 and the position-driven mask hides any
+                # stale tail. Only drop a leftover non-static cache so the static path rebuilds it.
+                if self.kv is not None and not self._is_static_cache(self.kv):
+                    self.kv = None
+            else:
+                from transformers import DynamicCache
+                # Hybrid arch: a config-typed cache pre-creates the right per-layer slot
+                # (conv+recurrent for linear-attn layers, KV for full-attn) so the
+                # Gated-DeltaNet layers can store/read state instead of IndexError-ing on
+                # an empty generic cache. Reused across prefill + every decode step.
+                self.kv = DynamicCache(config=self.cfg) if self._hybrid else DynamicCache()
         # NOTE: a defensive "reconcile self.kv length to cache_start" was tried here but MISFIRES on
         # multi-stage shards — DynamicCache.get_seq_length() inspects layer 0, which a mid/tail stage
         # (e.g. layers 24-48) doesn't own, so it reports 0 and a length check falsely trips on every
@@ -216,6 +224,19 @@ class ShardForwardMixin:
         on CPU it stays bit-exact. Called inside torch.inference_mode()."""
         torch = self.torch
         dev = self.uniform_device
+        # #cudagraph (opt-in, default OFF): single-node standard-attention models run decode against a
+        # persistent fixed-size StaticCache and replay a captured per-token graph (~5x less launch
+        # overhead at batch-1). inject/position_ids never occur for graph-eligible archs (gated off);
+        # if the sequence outgrows the graph cache, disable + fall through to the eager path below.
+        if self._graph_enabled() and inject is None and position_ids is None:
+            maxlen = self._graph_maxlen()
+            if cache_start + x.shape[1] <= maxlen:
+                return self._forward_uniform_static(x, cache_start, all_logits,
+                                                    capture_hidden, capture_pre_norm, maxlen)
+            if self.kv is not None and self._is_static_cache(self.kv):
+                self._graph_ok = False   # outgrew the graph cache mid-sequence -> drop to eager for good
+                self.kv = None
+                raise RuntimeError("ctx exceeds INFINITEMODEL_CUDA_GRAPH maxlen — re-prefill on eager path")
         h = self.embed(x.to(dev)) if self.has_embed else x.to(dev)
         if inject is not None and self.has_embed:
             h = self._splice_mm(h, inject)
@@ -283,3 +304,172 @@ class ShardForwardMixin:
                 return logits, nh.to(self.cpu)
             return logits
         return h.to(self.cpu)
+
+    # ---- #cudagraph: opt-in single-node CUDA-graph decode (default OFF) -----------------------
+    # A batch-1 decode step is ~80% per-op launch/dispatch overhead (measured ~5.6x on a 4070). With
+    # INFINITEMODEL_CUDA_GRAPH set, a single-node standard-attention model runs decode against a
+    # persistent fixed-size StaticCache and captures the per-token step into a CUDA graph, replayed
+    # per token. Correctness is guarded by a first-decode self-check vs eager (rel<0.05) with a
+    # PERMANENT fallback, and the feature is inert unless the env flag is set — the default
+    # DynamicCache path is byte-identical. See docs/ACCELERATION.md.
+
+    def _is_static_cache(self, c) -> bool:
+        try:
+            from transformers import StaticCache
+            return isinstance(c, StaticCache)
+        except Exception:
+            return False
+
+    def _graph_maxlen(self) -> int:
+        """Fixed KV size for the StaticCache = the value of INFINITEMODEL_CUDA_GRAPH if it's an int
+        (the operator sets it to the serving ctx), else a safe default."""
+        import os
+        try:
+            n = int(os.environ.get("INFINITEMODEL_CUDA_GRAPH", ""))
+            if n > 1:
+                return n
+        except Exception:
+            pass
+        return 8192
+
+    def _graph_enabled(self) -> bool:
+        """Model-level gate (cached): env flag on + single-GPU CUDA + owns embed&head + standard
+        attention (no hybrid/omni/Gemma-per-type) + not multimodal. The per-model latch
+        self._graph_ok goes False permanently on a failed build/self-check."""
+        en = getattr(self, "_graph_en", None)
+        if en is None:
+            import os
+            ok = False
+            try:
+                ud = self.uniform_device
+                if (os.environ.get("INFINITEMODEL_CUDA_GRAPH")
+                        and ud is not None and getattr(ud, "type", None) == "cuda"
+                        and self.has_embed and self.has_head
+                        and not self._hybrid and not self._omni
+                        and not getattr(self, "_mm_capable", False)):
+                    _lts = getattr(self.cfg, "layer_types", None)
+                    _rot = self.model.model.rotary_emb
+                    per_type = bool(_lts) and hasattr(_rot, "%s_inv_freq" % _lts[0])
+                    ok = not per_type
+            except Exception:
+                ok = False
+            self._graph_en = en = ok
+            if not hasattr(self, "_graph_ok"):
+                self._graph_ok = None
+        return bool(en) and (getattr(self, "_graph_ok", None) is not False)
+
+    def _forward_uniform_static(self, x, cache_start, all_logits, capture_hidden,
+                                capture_pre_norm, maxlen):
+        """StaticCache decode path. self.kv is a fixed-size StaticCache kept for the model's lifetime
+        (so the captured graph's buffer references stay valid across sequences — a new sequence
+        overwrites positions 0..q-1 and the position-driven mask hides any stale tail). A plain q==1
+        decode replays the captured graph; prefill / all_logits / capture run eagerly on the same
+        cache. Called holding _fwd_lock, inside inference_mode."""
+        if self.kv is None or not self._is_static_cache(self.kv):
+            from transformers import StaticCache
+            self.kv = StaticCache(config=self.cfg, max_cache_len=maxlen)
+        q = x.shape[1]
+        if (q == 1 and not all_logits and not capture_hidden and not capture_pre_norm
+                and getattr(self, "_graph_ok", None) is not False):
+            try:
+                return self._graph_decode(x, cache_start, maxlen)
+            except Exception as exc:
+                self._graph_ok = False
+                self._gcap = None
+                print(f"[cudagraph] decode failed ({exc!r}) -> eager StaticCache fallback", flush=True)
+        return self._static_eager(x, cache_start, q, maxlen, all_logits,
+                                  capture_hidden, capture_pre_norm)
+
+    def _static_eager(self, x, cache_start, q, maxlen, all_logits, capture_hidden, capture_pre_norm):
+        """Eager forward over a StaticCache with a max_ctx-wide position-driven causal mask. Handles
+        prefill (q>1), verify (all_logits), capture, and graph-disabled decode."""
+        torch = self.torch
+        dev = self.uniform_device
+        h = self.embed(x.to(dev))
+        pos = torch.arange(cache_start, cache_start + q, device=dev).unsqueeze(0)
+        ref = torch.empty(1, dtype=self.dtype, device=dev)
+        cos, sin = self.model.model.rotary_emb(ref, pos)
+        pos_emb = (cos.to(self.dtype), sin.to(self.dtype))
+        cache_position = torch.arange(cache_start, cache_start + q, device=dev)
+        zero = torch.zeros((), dtype=self.dtype, device=dev)
+        ninf = torch.full((), float("-inf"), dtype=self.dtype, device=dev)
+        kj = torch.arange(maxlen, device=dev).view(1, -1)        # [1,maxlen] key positions
+        qi = cache_position.view(-1, 1)                          # [q,1] query absolute positions
+        mask = torch.where(kj <= qi, zero, ninf).view(1, 1, q, maxlen)
+        for layer in self.owned_layers:
+            if self._fwd_cancel.is_set():
+                raise _ForwardSuperseded("forward superseded by a newer request")
+            self._fwd_progress_ts = time.time()
+            out = layer(h, attention_mask=mask, position_ids=pos, past_key_values=self.kv,
+                        use_cache=True, position_embeddings=pos_emb, cache_position=cache_position)
+            h = out[0] if isinstance(out, tuple) else out
+        nh = self.norm(h)
+        sel = nh if all_logits else nh[:, -1:, :]
+        logits = self.head(sel).to(self.cpu)
+        if capture_pre_norm:
+            return logits, (h if all_logits else h[:, -1:, :]).to(self.cpu)
+        if capture_hidden:
+            return logits, nh.to(self.cpu)
+        return logits
+
+    def _decode_compute(self):
+        """The captured per-token decode step: reads the static input/position buffers + self.kv
+        (StaticCache), returns logits [1,1,V] on device. Pure GPU, no host syncs (graph-safe)."""
+        torch = self.torch
+        dev = self.uniform_device
+        inp = self._g_input                 # [1,1] long (static buffer)
+        pos1 = self._g_pos                  # [1] long (static buffer)
+        h = self.embed(inp)
+        pos_ids = pos1.view(1, 1)
+        ref = torch.empty(1, dtype=self.dtype, device=dev)
+        cos, sin = self.model.model.rotary_emb(ref, pos_ids)
+        pos_emb = (cos.to(self.dtype), sin.to(self.dtype))
+        zero = torch.zeros((), dtype=self.dtype, device=dev)
+        ninf = torch.full((), float("-inf"), dtype=self.dtype, device=dev)
+        mask = torch.where(self._g_arange <= pos1, zero, ninf).view(1, 1, 1, -1)
+        for layer in self.owned_layers:
+            out = layer(h, attention_mask=mask, position_ids=pos_ids, past_key_values=self.kv,
+                        use_cache=True, position_embeddings=pos_emb, cache_position=pos1)
+            h = out[0] if isinstance(out, tuple) else out
+        nh = self.norm(h)
+        return self.head(nh)                # [1,1,V]
+
+    def _graph_decode(self, x, cache_start, maxlen):
+        """Capture-once / replay-many single-token decode. First call captures (the capture run is
+        also this token's real compute — it writes position cache_start into the prefilled
+        StaticCache), self-checks vs an independent eager recompute, then activates. Later calls copy
+        the new token+position into the static buffers and replay."""
+        torch = self.torch
+        dev = self.uniform_device
+        cap = getattr(self, "_gcap", None)
+        if cap is None:
+            self._g_input = x.to(dev).reshape(1, 1).long().clone()
+            self._g_pos = torch.tensor([cache_start], device=dev, dtype=torch.long)
+            self._g_arange = torch.arange(maxlen, device=dev)
+            self._fwd_progress_ts = time.time()
+            s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    _ = self._decode_compute()
+            torch.cuda.current_stream().wait_stream(s)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._g_logits = self._decode_compute()
+            self._gcap = g
+            eager = self._decode_compute()          # independent reference (idempotent write at cache_start)
+            rel = ((self._g_logits.float() - eager.float()).abs().max()
+                   / (eager.float().abs().max() + 1e-6)).item()
+            self._fwd_progress_ts = time.time()
+            if rel > 0.05:
+                self._graph_ok = False
+                self._gcap = None
+                print(f"[cudagraph] self-check rel={rel:.3f} -> DISABLED (eager StaticCache)", flush=True)
+                return eager[:, -1:, :].to(self.cpu)
+            self._graph_ok = True
+            print(f"[cudagraph] decode capture ACTIVE (self-check rel={rel:.4f}, maxlen={maxlen})", flush=True)
+            return self._g_logits[:, -1:, :].to(self.cpu)
+        self._g_input.copy_(x.to(dev).reshape(1, 1).long())
+        self._g_pos.fill_(cache_start)
+        self._fwd_progress_ts = time.time()
+        cap.replay()
+        return self._g_logits[:, -1:, :].to(self.cpu)

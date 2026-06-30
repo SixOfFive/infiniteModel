@@ -2421,6 +2421,13 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         # — they only hold text layers, and constructing those heavy towers destabilized nodes.
         # self.cfg = the Thinker's text config.
         omni_thinker = getattr(cfg, "thinker_config", None)
+        # #cudagraph: is this a multimodal-capable checkpoint (its prefill can carry image/audio
+        # `inject` frames)? Captured here from the ORIGINAL top-level config, BEFORE the text-config
+        # extraction below drops the vision/audio/thinker markers. Used only to gate the opt-in
+        # CUDA-graph decode path OFF for multimodal models. Additive — no effect on any other path.
+        self._mm_capable = bool(omni_thinker is not None
+                                or getattr(cfg, "vision_config", None) is not None
+                                or getattr(cfg, "audio_config", None) is not None)
         if omni_thinker is not None:
             self.cfg = cfg.get_text_config()
         else:
