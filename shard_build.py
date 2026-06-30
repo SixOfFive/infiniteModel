@@ -229,6 +229,19 @@ class ShardBuildMixin:
         if self.has_head:
             gb += self._mod_gpu_bytes(self.norm) + self._mod_gpu_bytes(self.head)
         self.gpu_bytes = gb
+        # #int4-vram-probe: int4 weights have been seen resident ~bf16-sized on gfx1151/ROCm (devstral
+        # 13.5 GB int4 cache -> 43.9 GB VRAM). Free any transient build/dequant buffers the caching
+        # allocator still holds, then log the TRUTH — in-use tensor bytes vs the allocator's reserved
+        # pool vs our per-module sum — so a real bf16-resident footprint (int4 not applied) is told
+        # apart from a reclaimable pool / an accounting over-count. Safe: empty_cache never frees
+        # in-use tensors.
+        if any(d.type == "cuda" for d in self.layer_devices):
+            with contextlib.suppress(Exception):
+                torch.cuda.empty_cache()
+                _al = torch.cuda.memory_allocated() / GB
+                _rv = torch.cuda.memory_reserved() / GB
+                print(f"[int4-vram] L{self.layer_start}-{self.layer_end} quant={self.quant} "
+                      f"sum={gb/GB:.2f}GB in-use={_al:.2f}GB reserved={_rv:.2f}GB", flush=True)
         # full-ctx KV these GPU-resident layers will grow into — reported so the controller can
         # RESERVE it against coexisting loads (a 2nd model must not eat this model's KV space).
         self.gpu_kv_bytes = kv_per_layer * sum(1 for d in self.layer_devices if d.type == "cuda")
