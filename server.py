@@ -737,8 +737,13 @@ CTX_AUTOFIT_FLOOR = int(os.environ.get("INFINITEMODEL_CTX_FLOOR", "1024"))
 # AUTO ctx to this sane interactive default; an explicit ctx is always honored. Override via env.
 AUTO_CTX_SLOW_CAP = int(os.environ.get("INFINITEMODEL_AUTO_CTX_SLOW_CAP", "16384"))
 MAX_LOADED_MODELS = int(os.environ.get("INFINITEMODEL_MAX_LOADED", "4"))  # default safety cap
-DEFAULT_QUEUE_DEPTH = 2  # waiters allowed per model beyond the one in the slot (Ollama's
-#                          OLLAMA_MAX_QUEUE defaults to 512 — we keep it shallow on purpose)
+DEFAULT_QUEUE_DEPTH = 16  # waiters allowed per model beyond the one in the slot. Generation is
+#                           serialized per model (model.lock), so a waiter just holds its connection
+#                           until its turn — the gen-stall watchdog guards true wedges. Was 2 (cap 3),
+#                           which 503'd a quorum/agent client that fans out 5-6+ concurrent requests to
+#                           ONE model (#queue-depth). 16 → cap 17/model absorbs that; overflow now
+#                           returns a RETRYABLE 429+Retry-After (not 503). Tunable live via /config
+#                           queue_depth. (Ollama's OLLAMA_MAX_QUEUE defaults to 512.)
 
 # --- #ctx-history: per-loaded-model rolling capture of the ACTUAL context in/out, for the dashboard
 # model-detail popup. Stores TOKEN IDS (cheap at capture — the hot path never detokenizes; /history

@@ -101,10 +101,12 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         return _not_found_json(model, mode)   # unknown model -> 404 (OpenAI envelope|Ollama shape)
     rec = _inflight_admit(ip, friendly, engine.replica_count(friendly))  # K slots for K replicas
     if rec is None:
+        # #queue-depth: overflow beyond (1 slot + queue_depth) is RETRYABLE — return 429+Retry-After
+        # (a fan-out client should back off and retry, not treat it as a hard 503 outage).
         return JSONResponse(
             {"error": f"queue full for '{friendly}': 1 slot + "
                       f"{ENGINE_CONFIG.get('queue_depth', DEFAULT_QUEUE_DEPTH)} queued — "
-                      f"retry shortly"}, status_code=503)
+                      f"retry shortly"}, status_code=429, headers={"Retry-After": "1"})
     created = int(time.time())
     _idp = "cmpl-" if mode == "openai_text" else "chatcmpl-"   # OpenAI: text vs chat id prefix
     cmpl_id = _idp + hashlib.sha256(str(time.time()).encode()).hexdigest()[:24]
@@ -356,12 +358,13 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         return JSONResponse({"type": "error",
                              "error": {"type": "not_found_error", "message": str(exc)}},
                             status_code=404)
-    rec = _inflight_admit(ip, friendly, engine.replica_count(friendly))  # K slots + queue; else 503
+    rec = _inflight_admit(ip, friendly, engine.replica_count(friendly))  # K slots + queue; else 429
     if rec is None:
+        # #queue-depth: retryable overflow -> 429+Retry-After (Anthropic overloaded_error envelope).
         return JSONResponse({"type": "error", "error": {"type": "overloaded_error",
             "message": f"queue full for '{friendly}': 1 slot + "
                        f"{ENGINE_CONFIG.get('queue_depth', DEFAULT_QUEUE_DEPTH)} queued"}},
-            status_code=503)
+            status_code=429, headers={"Retry-After": "1"})
     try:
         resident = engine.models.get(friendly)
         ctx = resident.ctx if resident else 0
