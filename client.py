@@ -3316,7 +3316,8 @@ async def run(args: argparse.Namespace) -> None:
 # Self-test (single-process load + correctness vs reference)
 # ---------------------------------------------------------------------------
 
-def run_self_test_load(model_id: str, attn: str = "eager", quant: str = "none") -> None:
+def run_self_test_load(model_id: str, attn: str = "eager", quant: str = "none",
+                       device: str = "cpu") -> None:
     tune_cpu_threads()   # self-test runs CPU shards too; benefit from tuned threads + fp32 GEMM
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -3325,9 +3326,18 @@ def run_self_test_load(model_id: str, attn: str = "eager", quant: str = "none") 
     tok = AutoTokenizer.from_pretrained(model_id)
     ids = tok("The capital of France is", return_tensors="pt").input_ids
 
-    print(f"\nShard load self-test: {model_id}  ({n_layers} layers, attn={attn}, quant={quant})")
-    full = Shard.from_hf(model_id, 0, n_layers, has_embed=True, has_head=True, attn=attn, quant=quant)
-    print(f"  footprint: {full.loaded_bytes/GB:.2f} GB")
+    # Honor --device so the self-test exercises the SAME GPU path the worker uses (the test
+    # used to hardcode CPU -> the int4/CUDA path went unverified on GPU boxes). _place_modules
+    # maps cpu|gpu|cuda|auto|cpu+gpu|hybrid; a GPU mode with no CUDA falls back to CPU + a note.
+    want_gpu = (device or "cpu").lower() in ("gpu", "cuda", "auto", "cpu+gpu", "hybrid")
+    if want_gpu and not torch.cuda.is_available():
+        print(f"  [notice] --device {device} requested a GPU but torch reports no CUDA "
+              "device — running the self-test on CPU.")
+    print(f"\nShard load self-test: {model_id}  ({n_layers} layers, attn={attn}, "
+          f"quant={quant}, device={device})")
+    full = Shard.from_hf(model_id, 0, n_layers, has_embed=True, has_head=True,
+                         attn=attn, quant=quant, device=device)
+    print(f"  placement: {getattr(full, 'placement', '?')}  |  footprint: {full.loaded_bytes/GB:.2f} GB")
     our_next = int(full.forward(ids)[0, -1].float().argmax())
     ref = AutoModelForCausalLM.from_pretrained(
         model_id, dtype=torch.bfloat16, attn_implementation="eager").eval()
@@ -3446,7 +3456,7 @@ def main() -> None:
         _CPU_FP32_GEMM = False
     tune_cpu_threads()
     if args.self_test_load:
-        run_self_test_load(args.model, args.attn, args.quant)
+        run_self_test_load(args.model, args.attn, args.quant, args.device)
         return
     if not args.controller:
         raise SystemExit("--controller is required (or use --self-test-load)")
