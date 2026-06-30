@@ -139,22 +139,7 @@ class ShardForwardMixin:
             else:
                 cos_cpu, sin_cpu = _rotary(ref, rot_pos)
                 cos_cpu, sin_cpu = cos_cpu.to(self.dtype), sin_cpu.to(self.dtype)
-            # additive mask (1,1,q,total): new position i attends keys 0..cache_start+i
-            mask_cpu = torch.zeros((q, total), dtype=self.dtype)
-            if q > 1:  # causal among the new tokens; prior keys all visible
-                mask_cpu[:, cache_start:] = torch.triu(
-                    torch.full((q, q), float("-inf"), dtype=self.dtype), diagonal=1)
-            mask_cpu = mask_cpu.view(1, 1, q, total)
             cpos_cpu = torch.arange(cache_start, cache_start + q)
-            aux: dict = {}
-
-            def aux_for(dev):
-                a = aux.get(dev)
-                if a is None:
-                    pe = None if _per_type else (cos_cpu.to(dev), sin_cpu.to(dev))
-                    a = (mask_cpu.to(dev), pos_cpu.to(dev), pe, cpos_cpu.to(dev))
-                    aux[dev] = a
-                return a
 
             def _posemb_for(dev, lt):   # per-(dev,type) cos/sin for the Gemma4 per-type path
                 k = (dev, lt); v = _pe.get(k)
@@ -162,31 +147,75 @@ class ShardForwardMixin:
                     v = (_cos_t[lt].to(dev), _sin_t[lt].to(dev)); _pe[k] = v
                 return v
 
-            for _li, (layer, dev) in enumerate(zip(self.owned_layers, self.layer_devices)):
-                if self._fwd_cancel.is_set():   # #fwd-cancel: a newer forward asked this orphan to yield
-                    raise _ForwardSuperseded("forward superseded by a newer request")
-                self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
-                if h.device != dev:
-                    h = h.to(dev)
-                mask, pos, pos_emb, cache_position = aux_for(dev)
-                if _per_type:
-                    out = layer(h, attention_mask=mask, position_ids=pos,
-                                past_key_values=self.kv, use_cache=True,
-                                position_embeddings=_posemb_for(dev, _lts[_ls + _li]),
-                                shared_kv_states=_skv, cache_position=cache_position)
-                elif self._hybrid:
-                    # Per-layer-type mask: full-attn gets the causal mask; linear-attn
-                    # (Gated-DeltaNet) gets None (text-only, no padding). The qwen layer
-                    # has no cache_position param (it tracks position via the cache).
-                    m = mask if getattr(layer, "layer_type", "full_attention") == "full_attention" else None
-                    out = layer(h, attention_mask=m, position_ids=pos,
-                                past_key_values=self.kv, use_cache=True,
-                                position_embeddings=pos_emb)
-                else:
-                    out = layer(h, attention_mask=mask, position_ids=pos,
-                                past_key_values=self.kv, use_cache=True,
-                                position_embeddings=pos_emb, cache_position=cache_position)
-                h = out[0] if isinstance(out, tuple) else out
+            # #prefill-chunk: process a long PREFILL in query-chunks so the explicit additive mask never
+            # forces SDPA to materialize the full [1,H,q,total] score tensor (the math-backend fallback on
+            # a CPU shard or a no-flash GPU -> OOM on long prompts). _run_layers runs every owned layer
+            # (across their devices, KV accumulating) over one (sub)sequence with a freshly-built, per-dev
+            # additive mask (1,1,cl,cache_start+off+cl); math-identical to the single pass (validated).
+            # Standard-attention only; per-type (Gemma4) / hybrid (linear-attn state) / mRoPE-omni keep the
+            # original single full pass (do_chunk False below -> byte-identical pre-chunk behavior).
+            def _run_layers(h_, off, cl):
+                cs_off = cache_start + off                  # absolute start of this chunk's queries
+                tot_off = cs_off + cl                       # cache length once this chunk's keys land
+                m_cpu = torch.zeros((cl, tot_off), dtype=self.dtype)
+                if cl > 1:   # causal among the chunk's tokens; all prior keys visible
+                    m_cpu[:, cs_off:] = torch.triu(
+                        torch.full((cl, cl), float("-inf"), dtype=self.dtype), diagonal=1)
+                m_cpu = m_cpu.view(1, 1, cl, tot_off)
+                p_cpu = pos_cpu[:, off:off + cl]
+                cp_cpu = cpos_cpu[off:off + cl]
+                cc_cpu = None if _per_type else cos_cpu[:, off:off + cl, :]
+                sc_cpu = None if _per_type else sin_cpu[:, off:off + cl, :]
+                _a: dict = {}
+
+                def _aux(dev):
+                    a = _a.get(dev)
+                    if a is None:
+                        pe = None if _per_type else (cc_cpu.to(dev), sc_cpu.to(dev))
+                        a = (m_cpu.to(dev), p_cpu.to(dev), pe, cp_cpu.to(dev))
+                        _a[dev] = a
+                    return a
+
+                for _li, (layer, dev) in enumerate(zip(self.owned_layers, self.layer_devices)):
+                    if self._fwd_cancel.is_set():   # #fwd-cancel: a newer forward asked this orphan to yield
+                        raise _ForwardSuperseded("forward superseded by a newer request")
+                    self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
+                    if h_.device != dev:
+                        h_ = h_.to(dev)
+                    mask, pos, pos_emb, cache_position = _aux(dev)
+                    if _per_type:
+                        out = layer(h_, attention_mask=mask, position_ids=pos,
+                                    past_key_values=self.kv, use_cache=True,
+                                    position_embeddings=_posemb_for(dev, _lts[_ls + _li]),
+                                    shared_kv_states=_skv, cache_position=cache_position)
+                    elif self._hybrid:
+                        # Per-layer-type mask: full-attn gets the causal mask; linear-attn
+                        # (Gated-DeltaNet) gets None (text-only, no padding). The qwen layer
+                        # has no cache_position param (it tracks position via the cache).
+                        m = mask if getattr(layer, "layer_type", "full_attention") == "full_attention" else None
+                        out = layer(h_, attention_mask=m, position_ids=pos,
+                                    past_key_values=self.kv, use_cache=True,
+                                    position_embeddings=pos_emb)
+                    else:
+                        out = layer(h_, attention_mask=mask, position_ids=pos,
+                                    past_key_values=self.kv, use_cache=True,
+                                    position_embeddings=pos_emb, cache_position=cache_position)
+                    h_ = out[0] if isinstance(out, tuple) else out
+                return h_
+
+            cstep = self._prefill_chunk_len(q)
+            do_chunk = (q > 1 and cstep < q and not _per_type and not self._hybrid
+                        and not self._omni and position_ids is None)
+            if not do_chunk:
+                h = _run_layers(h, 0, q)
+            else:
+                outs = []
+                off = 0
+                while off < q:
+                    cl = min(cstep, q - off)
+                    outs.append(_run_layers(h[:, off:off + cl, :], off, cl))
+                    off += cl
+                h = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
             if self.has_head:
                 if h.device != self.head_device:
                     h = h.to(self.head_device)
@@ -260,32 +289,65 @@ class ShardForwardMixin:
             cos, sin = _rotary(ref, rot_pos)
             pos_emb = (cos.to(self.dtype), sin.to(self.dtype))
         cache_position = torch.arange(cache_start, cache_start + q, device=dev)
-        if q > 1:   # prefill: causal among the new tokens; all prior keys visible
-            mask = torch.zeros((q, total), dtype=self.dtype, device=dev)
-            mask[:, cache_start:] = torch.triu(
-                torch.full((q, q), float("-inf"), dtype=self.dtype, device=dev), diagonal=1)
-            mask = mask.view(1, 1, q, total)
-        else:       # decode: one query sees every key -> no mask needed
-            mask = None
-        for _li, layer in enumerate(self.owned_layers):
-            if self._fwd_cancel.is_set():   # #fwd-cancel: yield to a newer forward (orphan cleanup)
-                raise _ForwardSuperseded("forward superseded by a newer request")
-            self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
-            if _per_type:
-                out = layer(h, attention_mask=mask, position_ids=pos,
-                            past_key_values=self.kv, use_cache=True,
-                            position_embeddings=_pe_t[_lts[_ls + _li]],
-                            shared_kv_states=_skv, cache_position=cache_position)
-            elif self._hybrid:
-                m = mask if getattr(layer, "layer_type", "full_attention") == "full_attention" else None
-                out = layer(h, attention_mask=m, position_ids=pos,
-                            past_key_values=self.kv, use_cache=True,
-                            position_embeddings=pos_emb)
-            else:
-                out = layer(h, attention_mask=mask, position_ids=pos,
-                            past_key_values=self.kv, use_cache=True,
-                            position_embeddings=pos_emb, cache_position=cache_position)
-            h = out[0] if isinstance(out, tuple) else out
+
+        def _run(h_, mask_, pos_, pe_, cpos_):   # run this stage's layers over one (sub)sequence
+            for _li, layer in enumerate(self.owned_layers):
+                if self._fwd_cancel.is_set():   # #fwd-cancel: yield to a newer forward (orphan cleanup)
+                    raise _ForwardSuperseded("forward superseded by a newer request")
+                self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
+                if _per_type:
+                    out = layer(h_, attention_mask=mask_, position_ids=pos_,
+                                past_key_values=self.kv, use_cache=True,
+                                position_embeddings=_pe_t[_lts[_ls + _li]],
+                                shared_kv_states=_skv, cache_position=cpos_)
+                elif self._hybrid:
+                    m = mask_ if getattr(layer, "layer_type", "full_attention") == "full_attention" else None
+                    out = layer(h_, attention_mask=m, position_ids=pos_,
+                                past_key_values=self.kv, use_cache=True,
+                                position_embeddings=pe_)
+                else:
+                    out = layer(h_, attention_mask=mask_, position_ids=pos_,
+                                past_key_values=self.kv, use_cache=True,
+                                position_embeddings=pe_, cache_position=cpos_)
+                h_ = out[0] if isinstance(out, tuple) else out
+            return h_
+
+        # #prefill-chunk: long PREFILL is processed in query-chunks so the explicit additive mask never
+        # forces SDPA to materialize the full [1,H,q,total] score tensor — the math-backend fallback on
+        # devices without an efficient/flash attention kernel (notably ROCm gfx1151) that OOMs on long
+        # prompts (the 43 GiB single-alloc seen on om3nbox). Each chunk runs every layer with its own
+        # [1,1,cl,cache_start+off+cl] mask while the KV cache accumulates; math-identical to the single
+        # pass (validated: max|dlogits|~1e-6, argmax exact at every position). Only the standard-attention
+        # path chunks; per-type (Gemma4), hybrid (linear-attn recurrent state) and mRoPE/omni keep the
+        # original single full pass (do_chunk False -> byte-identical to the pre-chunk behavior).
+        cstep = self._prefill_chunk_len(q)
+        do_chunk = (q > 1 and cstep < q and not _per_type and not self._hybrid
+                    and not self._omni and position_ids is None)
+        if not do_chunk:
+            if q > 1:   # prefill: causal among the new tokens; all prior keys visible
+                mask = torch.zeros((q, total), dtype=self.dtype, device=dev)
+                mask[:, cache_start:] = torch.triu(
+                    torch.full((q, q), float("-inf"), dtype=self.dtype, device=dev), diagonal=1)
+                mask = mask.view(1, 1, q, total)
+            else:       # decode: one query sees every key -> no mask needed
+                mask = None
+            h = _run(h, mask, pos, pos_emb, cache_position)
+        else:
+            outs = []
+            off = 0
+            while off < q:
+                cl = min(cstep, q - off)
+                cs_off = cache_start + off       # absolute start of this chunk's queries
+                tot_off = cs_off + cl            # cache length once this chunk's keys are appended
+                mask = torch.zeros((cl, tot_off), dtype=self.dtype, device=dev)
+                mask[:, cs_off:] = torch.triu(
+                    torch.full((cl, cl), float("-inf"), dtype=self.dtype, device=dev), diagonal=1)
+                mask = mask.view(1, 1, cl, tot_off)
+                pe_c = (pos_emb[0][:, off:off + cl, :], pos_emb[1][:, off:off + cl, :])
+                outs.append(_run(h[:, off:off + cl, :], mask, pos[:, off:off + cl],
+                                 pe_c, cache_position[off:off + cl]))
+                off += cl
+            h = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
         if self.has_head:
             nh = self.norm(h)
             sel = nh if all_logits else nh[:, -1:, :]
@@ -297,6 +359,22 @@ class ShardForwardMixin:
                 return logits, nh.to(self.cpu)
             return logits
         return h.to(self.cpu)
+
+    def _prefill_chunk_len(self, q: int) -> int:
+        """#prefill-chunk: query-chunk length for a long PREFILL pass. The shard hands HF layers an
+        explicit additive float mask, which disables SDPA's flash backend; on a device without the
+        mem-efficient backend (notably ROCm gfx1151, and the CPU math path) SDPA then materializes the
+        full [1, H, q, total] score tensor -> O(H*q^2) memory -> OOM on long prompts (the 43 GiB single
+        alloc seen on om3nbox). Chunking the query dim caps peak score memory to [1, H, C, total],
+        cutting it by ~q/C; math-identical (validated). Returns the chunk length, or q (a single full
+        pass = byte-identical to the pre-chunk path) for short prompts / decode / when disabled.
+        Tunable: INFINITEMODEL_PREFILL_CHUNK=<tokens> (default 2048; 0 disables chunking entirely)."""
+        import os
+        try:
+            c = int(os.environ.get("INFINITEMODEL_PREFILL_CHUNK", "2048"))
+        except ValueError:
+            c = 2048
+        return q if (c <= 0 or q <= c) else c
 
     # ---- #cudagraph: opt-in single-node CUDA-graph decode (default OFF) -----------------------
     # A batch-1 decode step is ~80% per-op launch/dispatch overhead (measured ~5.6x on a 4070). With
