@@ -197,7 +197,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .node .mb .lab{font-size:11px;color:var(--muted);width:46px}
   .node .util{font-size:11px;color:var(--dim);width:120px;text-align:right}
   /* overlay/modal */
-  .ov{position:absolute;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-start;justify-content:center;z-index:50}
+  .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-start;justify-content:center;z-index:50}
   .ov.show{display:flex}
   .modal{background:var(--surface);border:1px solid var(--border2);border-radius:12px;max-width:640px;width:92%;
          margin:60px 0;padding:20px 22px;max-height:80vh;overflow:auto}
