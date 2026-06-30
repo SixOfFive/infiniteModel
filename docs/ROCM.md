@@ -197,3 +197,12 @@ surface, and the dashboard.
   group changes apply on the next login/SSH session, not the current one.
 - The amdgpu **kernel driver is in-tree** on modern kernels — you do *not* need a
   system ROCm/`amdgpu-dkms` install; the TheRock pip packages provide all userspace.
+- **Long-prompt prefill OOM (gfx1151):** a long prompt to a standard-attention model can
+  fail with a huge single CUDA allocation (e.g. *"tried to allocate 43.06 GiB"*) inside
+  `sdpa_attention_forward`. Cause: the shard passes HF layers an explicit additive float
+  mask, which disables SDPA's flash backend; gfx1151 has no mem-efficient backend either,
+  so SDPA falls back to the **math** backend and materializes the full `[1, H, q, total]`
+  score tensor (`O(H·q²)`). The fix ships on by default — **chunked prefill**
+  (`INFINITEMODEL_PREFILL_CHUNK`, default 2048) caps peak score memory to `O(H·C·q)`; see
+  [ACCELERATION.md](ACCELERATION.md). For very long contexts on a memory-tight box, lower it
+  (e.g. `512`); `0` disables it.
