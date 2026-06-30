@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c171"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c172"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2595,6 +2595,36 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
             if _nf:
                 print(f"[int4] fused tinygemm kernel active on {_nf} linear(s) "
                       f"({self.placement})", flush=True)
+        # #int4-vram: the per-layer prepare_fused self-checks dequant each weight to bf16 transiently;
+        # the caching allocator (esp. ROCm/gfx1151) holds those freed blocks, inflating resident VRAM.
+        # Release them, then LOG THE TRUTH: real in-use (memory_allocated) vs the allocator pool
+        # (memory_reserved) + an int4 census (packed qweight bytes vs bf16 param bytes) so a genuine
+        # bf16-resident footprint is told apart from a reclaimable pool / an accounting over-count.
+        try:
+            import torch as _t
+            _mods = (([self.embed] if self.has_embed else []) + list(self.owned_layers)
+                     + ([self.norm, self.head] if (self.has_head and self.norm is not None) else []))
+            _cuda = any(p.device.type == "cuda" for m in _mods for p in m.parameters()) \
+                or any(b.device.type == "cuda" for m in _mods for b in m.buffers())
+            if _cuda and _t.cuda.is_available():
+                _t.cuda.empty_cache()
+                _GB = 1024 ** 3
+                _al = _t.cuda.memory_allocated() / _GB
+                _rv = _t.cuda.memory_reserved() / _GB
+                _nq = _qb = _bf = 0
+                for _m in _mods:
+                    for _s in _m.modules():
+                        _qw = getattr(_s, "qweight", None)
+                        if _qw is not None and getattr(_qw, "device", None) is not None and _qw.device.type == "cuda":
+                            _nq += 1
+                            _qb += _qw.numel() * _qw.element_size()
+                    for _p in _m.parameters():
+                        if _p.device.type == "cuda" and _p.dtype == _t.bfloat16:
+                            _bf += _p.numel() * _p.element_size()
+                print(f"[int4-vram] {self.placement} | in-use={_al:.2f}GB reserved={_rv:.2f}GB | "
+                      f"QuantLinear4={_nq} qweight={_qb/_GB:.2f}GB bf16params={_bf/_GB:.2f}GB", flush=True)
+        except Exception as _e:
+            print(f"[int4-vram] probe failed: {_e!r}", flush=True)
 
 
 def _weight_map(model_dir: str) -> dict[str, str]:
