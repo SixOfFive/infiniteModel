@@ -69,6 +69,7 @@ if _HAVE_TRITON:
             triton.Config({"BN": 64, "SPLITK": 8}, num_warps=4, num_stages=2),
         ],
         key=["B", "N", "K"],
+        reset_to_zero=["y_ptr"],   # atomic-acc kernel: zero y before each autotune trial + launch
     )
     @triton.jit
     def _mk(x_ptr, e_ptr, q_ptr, s_ptr, z_ptr, y_ptr, B, N, K,

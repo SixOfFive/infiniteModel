@@ -1152,10 +1152,15 @@ def _w4a16_triton_op():
         # num_warps is the dominant knob for a BW-bound GEMV (more warps = more in-flight loads to
         # hide memory latency); RDNA/iGPU often wants more than sm_89, so sweep {4,8} x SPLITK and
         # let autotune pick per (N,K)/arch. SPLITK=4/w4 == the prior default, so never worse.
+        # reset_to_zero: this kernel atomic-adds into y_ptr, so autotune's timing reruns would
+        # accumulate into the same buffer and corrupt the first call for each (N,K) — zero it per
+        # launch. (Was missing before; first-token-per-shape corruption was masked by the load-time
+        # self-check absorbing it.)
         @triton.autotune(
             configs=[triton.Config({"BN": 128, "SPLITK": s}, num_warps=w)
                      for s in (4, 8, 16) for w in (4, 8)],
             key=["N", "K"],
+            reset_to_zero=["y_ptr"],
         )
         @triton.jit
         def _ksk(x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, N, K,
@@ -1266,6 +1271,11 @@ def _w4a16_moe_op():
         # for occupancy. fp32 atomic accumulation -> within decode tolerance (not bit-identical across
         # SPLITK, like all atomic reductions). Lean config set bounds first-decode JIT cost (esp.
         # Windows/ROCm). Re-tuned per (B,N,K) on each arch (sm_89, gfx1151, ...).
+        # reset_to_zero: the kernel ATOMIC-ADDS into y_ptr (split-K), so autotune's per-config timing
+        # reruns would otherwise pile their partials into the SAME buffer -> the first call for each
+        # (B,N,K) returns garbage (a multiple of the result). reset_to_zero zeros y before every
+        # trial AND before the real launch, so every launch is clean. (Mandatory for any atomic-acc
+        # kernel under autotune; the dense _ksk needs it for the same reason.)
         @triton.autotune(
             configs=[
                 triton.Config({"BN": 128, "SPLITK": 1}, num_warps=4, num_stages=2),   # == prior default
@@ -1276,6 +1286,7 @@ def _w4a16_moe_op():
                 triton.Config({"BN": 64, "SPLITK": 8}, num_warps=4, num_stages=2),
             ],
             key=["B", "N", "K"],
+            reset_to_zero=["y_ptr"],
         )
         @triton.jit
         def _mk(x_ptr, e_ptr, q_ptr, s_ptr, z_ptr, y_ptr, B, N, K,
