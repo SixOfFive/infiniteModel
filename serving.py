@@ -50,6 +50,13 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     stream = bool(body.get("stream", True))
     speculative = bool(opts.get("speculative", body.get("speculative", False)))
     spec_k = int(opts.get("spec_k", body.get("spec_k", 0)) or 0)   # per-request SPEC_K override (0=default)
+    # #ctx-guard: reject a prompt that exceeds the loaded context window BEFORE dispatch — an over-ctx
+    # prefill overflows the worker's fixed KV cache and crashes the shard. (engine.generate also backstops
+    # this universally; rejecting here surfaces a clean error to the Ollama/OpenAI paths.)
+    _lc = int(getattr(lm, "ctx", 0) or 0)
+    if _lc and len(ids) >= _lc:
+        raise ValueError(f"prompt is {len(ids)} tokens but model '{friendly}' is loaded with a "
+                         f"{_lc}-token context window — shorten the prompt or reload it at a larger ctx")
     return friendly, tok, ids, temperature, top_p, max_new, stream, speculative, spec_k
 
 

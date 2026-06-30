@@ -203,6 +203,20 @@ class EngineGenMixin:
         model = self._pick_replica(friendly)   # data-parallel: least-loaded replica (#39)
         if model is None or model.stage0_writer is None:
             raise RuntimeError("no model loaded")
+        # #ctx-guard: REJECT a prompt that doesn't fit the loaded context window instead of dispatching
+        # an over-ctx prefill — that overflows the worker's fixed (ctx-sized) KV cache and HARD-CRASHES
+        # the shard (drops the node; observed: a 42k-token prompt into a 32768-ctx model). Also cap
+        # max_new so prompt+generated can't overflow the KV during decode. The serving layer rejects
+        # pre-stream too (clean 400); this is the universal backstop for EVERY entrypoint (Ollama /
+        # OpenAI / Anthropic / future).
+        _ctx = int(getattr(model, "ctx", 0) or 0)
+        if _ctx:
+            if len(prompt_ids) >= _ctx:
+                raise ValueError(f"prompt is {len(prompt_ids)} tokens but the model is loaded with a "
+                                 f"{_ctx}-token context window — shorten the prompt or reload it at a "
+                                 f"larger ctx")
+            if max_new > _ctx - len(prompt_ids):
+                max_new = _ctx - len(prompt_ids)
         # PER-REPLICA lock: different models AND different replicas of one model decode
         # concurrently; requests routed to the SAME replica queue on its lock.
         # Track queue depth for /status (queued = waiting on this model's lock; active = generating).
