@@ -2762,7 +2762,8 @@ def _fetch_repo_file(fname: str):
 EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py",
                                  # m4c153 code-split: shared-state registry + Shard/Worker mixins
                                  "state.py", "shard_build.py", "shard_forward.py",
-                                 "worker_load.py", "worker_net.py"]   # config + shared packer
+                                 "worker_load.py", "worker_net.py",   # config + shared packer
+                                 "kv_quant.py"]   # TurboQuant KV-cache quantizer (#172)
 # (#distributed-packing) synced like a module — shards.pack_unit_tensors is the shared packer the
 # remote-pack handler calls, so a worker-packed cache unit is bit-identical to a controller-compiled one.
 

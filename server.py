@@ -119,6 +119,7 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py",
                                  "mtp_core.py",   # #91 MTP head forward (controller-only import)
                                  "gguf_convert.py",  # GGUF->safetensors converter (subprocess)
                                  "mxfp4_convert.py",  # MXFP4(gpt-oss)->bf16 converter (subprocess)
+                                 "kv_quant.py",       # TurboQuant KV-cache quantizer (#172)
                                  # m4c152 code-split: shared-state registry + relocated Engine mixins
                                  "state.py", "engine_load.py", "engine_gen.py", "engine_lifecycle.py",
                                  # m4c153 code-split: relocated build_app routes
@@ -796,6 +797,13 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # own ctx>0 overrides autoload_ctx. Configurable via /config + the dashboard.
                        "autoload_ctx": DEFAULT_CTX,
                        "autoload_mode": "auto",
+                       # #kv-quant (TurboQuant): KV-cache quantization preset for a load. "none" = bf16
+                       # KV (default, unchanged). "turbo3"/"turbo4"/"turbo2" = TurboQuant K/V at 3/4/2
+                       # bits (random-rotation + Lloyd-Max scalar quant; see kv_quant.py) — stores KV at
+                       # ~3 bits/coord at near-FP quality to relieve the KV-VRAM ctx cap (#76). Plumbed
+                       # to the worker shard at load; the quantized cache (TurboQuantCache) activates in
+                       # shard_forward. (#172)
+                       "kv_quant": "none",
                        # #vram-weights-first: budget a NEW model's WEIGHTS against PHYSICALLY-free VRAM
                        # (live: total - actually-used), letting them use resident models' RESERVED-but-
                        # unfaulted full-ctx KV headroom — so a model lands on GPU when VRAM is physically
