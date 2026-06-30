@@ -3338,8 +3338,22 @@ def build_app() -> FastAPI:
             return JSONResponse({"ok": False, "error": "model is loaded — unload it first"},
                                 status_code=409)
         if friendly not in CUSTOM_MODELS:
-            return JSONResponse({"ok": False, "error": f"'{friendly}' is not a registered custom "
-                                "model (built-ins can't be forgotten)"}, status_code=400)
+            # Not a custom entry. A BUILT-IN can still be removed from the list: "forget" HIDES it
+            # (persisted in the deleted hide-set) while KEEPING any downloaded weights — unlike
+            # /delete, which also purges files. Re-adding via /add_model un-hides it. Without this a
+            # built-in (e.g. mixtral:8x7b) flashed "built-ins can't be forgotten" and never left the
+            # list. (#forget-builtin)
+            if friendly in MODELS:
+                MODELS.pop(friendly, None)
+                MODEL_ALIASES.pop(friendly, None)   # drop any alias keyed by this name
+                DELETED_MODELS.add(friendly)
+                save_deleted_models()
+                print(f"[model] forgot built-in {friendly} (hidden from list; weight files KEPT)",
+                      flush=True)
+                return JSONResponse({"ok": True, "forgot": friendly, "hf": None,
+                                     "files_kept": True, "builtin": True})
+            return JSONResponse({"ok": False, "error": f"'{friendly}' is not a registered model"},
+                                status_code=404)
         hf = CUSTOM_MODELS.pop(friendly, None)
         MODELS.pop(friendly, None)
         if hf and not any(v == hf for v in CUSTOM_MODELS.values()):

@@ -267,7 +267,7 @@ async function api(path,opts){
   catch(e){ throw e; }
 }
 function toast(msg,bad){ const c=$('#ctl'); const o=c.textContent; c.innerHTML=(bad?'<span class="err">':'<span style="color:var(--good)">')+esc(msg)+'</span>';
-  setTimeout(()=>{c.textContent=o;},3500); }
+  window._toastUntil=Date.now()+(bad?6000:3500); setTimeout(()=>{c.textContent=o;},bad?6000:3500); }   // errors linger longer + survive status polls
 
 async function tick(){
   let d; try{ d=await (await fetch('/status')).json(); }catch(e){ $('#ctl').innerHTML='<span class="err">controller unreachable</span>'; return; }
@@ -276,7 +276,7 @@ async function tick(){
 function render(){
   const d=LAST; if(!d)return;
   const c=d.controller||{}, p=d.pool||{}, comp=d.compute||{}, cl=d.cluster||{};
-  $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
+  if(!(window._toastUntil>Date.now())) $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');  // don't clobber an active toast
   // fleet tiles
   const loaded=(d.models||[]).filter(m=>m.loaded).length, reg=(d.models||[]).length;
   // pool bars: PHYSICAL used (total - free) against PHYSICAL total, one base (#pool-base).
