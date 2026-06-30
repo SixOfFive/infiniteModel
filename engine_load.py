@@ -110,7 +110,7 @@ class EngineLoadMixin:
                    exclude_nodes: Optional[set] = None, replica_idx: int = 0,
                    spread: bool = False, proportional: bool = False,
                    force: bool = False, moe_offload: bool = False,
-                   gpu_spread: bool = False) -> LoadedModel:
+                   gpu_spread: bool = False, pin_host: str = "") -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -128,7 +128,8 @@ class EngineLoadMixin:
                                          cpu_only=cpu_only, reg_key=reg_key,
                                          exclude_nodes=exclude_nodes, replica_idx=replica_idx,
                                          spread=spread, proportional=proportional, force=force,
-                                         moe_offload=moe_offload, gpu_spread=gpu_spread, _own=_own)
+                                         moe_offload=moe_offload, gpu_spread=gpu_spread,
+                                         pin_host=pin_host, _own=_own)
         finally:
             if _own["v"]:
                 self._reservations.pop(rk, None)
@@ -144,7 +145,7 @@ class EngineLoadMixin:
                    exclude_nodes: Optional[set] = None, replica_idx: int = 0,
                    spread: bool = False, proportional: bool = False,
                    force: bool = False, moe_offload: bool = False,
-                   gpu_spread: bool = False,
+                   gpu_spread: bool = False, pin_host: str = "",
                    _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
@@ -296,7 +297,7 @@ class EngineLoadMixin:
             # proportional), only when weights > auto_tp_ratio x GPU pool (else pipeline keeps the GPU),
             # gated by ENGINE_CONFIG auto_tp; any failure falls through to the pipeline path below.
             auto_tp_on = bool(ENGINE_CONFIG.get("auto_tp", True))
-            if (tp == 1 and not cpu_only and not spread and not proportional
+            if (tp == 1 and not cpu_only and not spread and not proportional and not pin_host
                     and consolidate and prefer_vram and auto_tp_on
                     and not getattr(spec, "is_embedding", False)):
                 _flaky = {"steamdeck", "tablet", "mobile", "phone"}
@@ -403,6 +404,8 @@ class EngineLoadMixin:
                         continue
                     if exclude_nodes and n.node_id in exclude_nodes:
                         continue   # a sibling replica already owns this node (disjoint placement)
+                    if pin_host and n.hostname != pin_host:
+                        continue   # #pin-device: user pinned this load to one node (dashboard placement)
                     # cpu_only: plan against RAM ONLY (VRAM=0) so the model never lands in
                     # any GPU's VRAM — the worker is also told device='cpu' below.
                     # GPU budget = the MORE CONSERVATIVE of two views, so the planner never assigns

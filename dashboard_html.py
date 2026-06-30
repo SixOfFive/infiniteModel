@@ -403,35 +403,58 @@ async function doAdd(){
   try{ await api('/add_model?'+q.toString(),{method:'POST'}); closeOv(); toast('added '+hf); tick(); }
   catch(e){ $('#a-err').textContent=String(e.message||e); }
 }
+function _devOpts(){
+  const ns=(LAST&&LAST.nodes||[]).slice().sort((a,b)=>(b.has_gpu?1:0)-(a.has_gpu?1:0)||a.hostname.localeCompare(b.hostname));
+  const g=ns.filter(n=>n.has_gpu&&n.vram_enabled!==false&&n.alive).map(n=>'<option value="g:'+esc(n.hostname)+'">'+esc(n.hostname)+' — GPU ('+fmt(n.vram_total_gb)+' GB)</option>').join('');
+  const c=ns.filter(n=>n.alive&&n.ram_enabled!==false).map(n=>'<option value="c:'+esc(n.hostname)+'">'+esc(n.hostname)+' — CPU/RAM ('+fmt(n.total_mem_gb)+' GB)</option>').join('');
+  return (g?'<optgroup label="Pin to a GPU device">'+g+'</optgroup>':'')+(c?'<optgroup label="Pin to a CPU node">'+c+'</optgroup>':'');
+}
 function openLoad(name){
   const m=(LAST.models||[]).find(x=>x.name===name)||{};
   const cz=m.cached||{}; const dc=m.default_ctx||0;
   const ctxDefault = dc>=131072 ? 16384 : (dc||8192);
-  const qopt=q=>'<option value="'+q+'"'+((cz[q]&&cz[q].ok)?'':'')+'>'+q+(cz[q]&&cz[q].ok?' · '+gb(cz[q].size_gb)+' cached':'')+'</option>';
+  const qopt=q=>'<option value="'+q+'">'+q+(cz[q]&&cz[q].ok?' · '+gb(cz[q].size_gb)+' cached':'')+'</option>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load '+esc(name)+'</h3>'
    +'<div class="grid2"><div><label>Quant</label><select id="l-q">'+qopt('int4')+qopt('int8')+'<option value="none">none (bf16)</option></select></div>'
    +'<div><label>Context length</label><input id="l-ctx" type="number" value="'+ctxDefault+'"></div></div>'
-   +'<label>Placement</label><select id="l-mode"><option value="auto">auto · GPU-first</option><option value="all-gpu">all-GPU</option>'
-   +'<option value="distribute">distribute (CPU+GPU)</option><option value="proportional">proportional</option><option value="single">single node</option></select>'
+   +'<label>Placement</label><select id="l-place" onchange="_placeChg()">'
+   +'<optgroup label="Auto / distribute"><option value="m:auto">auto · GPU-first</option><option value="m:all-gpu">all-GPU</option>'
+   +'<option value="m:distribute">distribute (CPU+GPU)</option><option value="m:proportional">proportional</option></optgroup>'
+   +_devOpts()
+   +'<optgroup label="Tensor-parallel"><option value="tp:gpu">GPU tensor-parallel</option><option value="tp:cpu">CPU tensor-parallel (RAM)</option></optgroup></select>'
+   +'<div id="l-tpwrap" style="display:none;margin-top:8px"><label>TP width (number of nodes)</label><input id="l-tpn" type="number" min="2" value="2"></div>'
    +(dc>=131072?'<div class="note">⚠ native ctx is '+(Math.round(dc/1024))+'k — a huge KV cache. Keep ctx modest (8–16k) unless you need more.</div>':'')
    +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
    +'<button class="btn pri" onclick="doLoad(\''+esc(name)+'\')">Load</button></div>'
    +'<div id="l-out" style="font-size:12px;color:var(--muted);margin-top:10px"></div>';
   $('#ov').classList.add('show');
 }
+function _placeChg(){ $('#l-tpwrap').style.display=$('#l-place').value.indexOf('tp:')===0?'block':'none'; }
+function placeParams(name){
+  const v=$('#l-place').value, p={model:name, quant:$('#l-q').value, ctx:$('#l-ctx').value};
+  if(v.indexOf('m:')===0) p.mode=v.slice(2);
+  else if(v.indexOf('g:')===0){ p.node=v.slice(2); }
+  else if(v.indexOf('c:')===0){ p.node=v.slice(2); p.cpu_only='true'; }
+  else if(v==='tp:gpu'){ p.tp=$('#l-tpn').value||2; }
+  else if(v==='tp:cpu'){ p.tp=$('#l-tpn').value||2; p.cpu_only='true'; }
+  return p;
+}
 async function preview(name){
-  const q=new URLSearchParams({model:name,quant:$('#l-q').value,ctx:$('#l-ctx').value,mode:$('#l-mode').value});
+  const p=placeParams(name); const q=new URLSearchParams({model:p.model,quant:p.quant,ctx:p.ctx});
+  if(p.mode)q.set('mode',p.mode); if(p.node)q.set('node',p.node);
   $('#l-out').textContent='planning…';
   try{ const r=await (await fetch('/plan?'+q.toString())).json();
     if(!r.ok){ $('#l-out').innerHTML='<span class="err">'+esc(r.error||'cannot place')+'</span>'; return; }
     const st=(r.stages||[]).map(s=>esc(s.hostname)+' L'+s.layer_start+'-'+s.layer_end).join(', ');
-    $('#l-out').innerHTML='<b>plan:</b> '+(esc(r.basis||''))+'<br>'+st+(r.overload?'<div class="note">⚠ '+esc(r.overload.reason)+' — suggest '+esc(r.overload.suggest||'proportional')+'</div>':''); }
+    $('#l-out').innerHTML='<b>plan:</b> '+(esc(r.basis||''))+'<br>'+st
+      +(p.tp?'<div class="note">TP preview is approximate (planned as pipeline)</div>':'')
+      +(r.overload?'<div class="note">⚠ '+esc(r.overload.reason)+' — suggest '+esc(r.overload.suggest||'proportional')+'</div>':''); }
   catch(e){ $('#l-out').innerHTML='<span class="err">'+esc(String(e.message||e))+'</span>'; }
 }
 async function doLoad(name){
-  const q=new URLSearchParams({model:name,quant:$('#l-q').value,ctx:$('#l-ctx').value,mode:$('#l-mode').value});
+  const q=new URLSearchParams(placeParams(name));
   $('#l-out').textContent='loading…';
-  try{ const r=await api('/load?'+q.toString(),{method:'POST'}); closeOv(); toast('loading '+name); tick(); }
+  try{ await api('/load?'+q.toString(),{method:'POST'}); closeOv(); toast('loading '+name); tick(); }
   catch(e){ $('#l-out').innerHTML='<span class="err">'+esc(String(e.message||e))+'</span>'; }
 }
 async function unload(name){ try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }

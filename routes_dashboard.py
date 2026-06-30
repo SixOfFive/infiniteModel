@@ -102,7 +102,7 @@ def register(app):
                              "now": int(time.time() * 1000), "hosts": hosts})
 
     @app.get("/plan")
-    async def plan(model: str, ctx: int = 0, quant: str = "none", mode: str = "auto") -> JSONResponse:
+    async def plan(model: str, ctx: int = 0, quant: str = "none", mode: str = "auto", node: str = "") -> JSONResponse:
         # #60 Preview: same inputs as /load (model, ctx, quant, mode) -> the placement + #76
         # assessment WITHOUT loading. tp modes are pipeline-planned here (TP frees the fleet and
         # plans differently at load); the dashboard tells the user TP preview is approximate.
@@ -133,6 +133,8 @@ def register(app):
         mems = []
         node_by_id = {}
         for n in registry.alive_sorted():
+            if node and n.hostname != node:
+                continue   # #pin-device: preview the pinned-node placement
             fv = max(0.0, n.eff_vram_gb - PLAN_VRAM_FLOOR_GB)   # same VRAM floor as live load
             # #78: mirror the live load's controller-box RAM reserve so Preview's pool matches reality
             _ram = n.eff_ram_gb - (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)

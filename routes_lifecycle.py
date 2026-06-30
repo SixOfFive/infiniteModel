@@ -415,7 +415,8 @@ def register(app):
     async def load(model: str, ctx: int = 0, mode: str = "auto",
                    consolidate: bool = True, quant: str = "none", tp: int = 1,
                    replicas: int = 1, cpu_only: bool = False,
-                   moe_offload: bool = False, force: bool = False) -> JSONResponse:
+                   moe_offload: bool = False, force: bool = False,
+                   node: str = "") -> JSONResponse:
         # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
         # it. Also reloads an already-resident copy (skips the idempotent no-op). Without force, a
@@ -474,15 +475,18 @@ def register(app):
                                      "placements": [{"key": m.friendly,
                                                      "hosts": [s.hostname for s in m.plan.stages]}
                                                     for m in lms]})
+            if node:               # #pin-device: pinning to one node is single-node pipeline (TP needs many)
+                tp = 1
             lm = await engine.load(friendly, ctx, consolidate=cons, prefer_vram=pv,
                                    quant=quant, tp=tp, cpu_only=cpu_only,
                                    spread=(mode == "spread"),
                                    proportional=(mode == "proportional"),
                                    gpu_spread=(mode == "all-gpu"),
-                                   moe_offload=moe_offload, force=force)
+                                   moe_offload=moe_offload, force=force, pin_host=node)
+            _modelbl = ("pin:%s/%s" % (node, "cpu" if cpu_only else "gpu")) if node else \
+                       (((("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp)) if tp > 1 else mode))
             return JSONResponse({"ok": True, "model": lm.friendly, "ctx": lm.ctx,
-                                 "mode": (("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp))
-                                         if tp > 1 else mode, "quant": quant,
+                                 "mode": _modelbl, "quant": quant,
                                  "warnings": getattr(lm, "load_warnings", []),   # #76 guardrail
                                  "stages": [s.to_dict() for s in lm.plan.stages]})
         except Exception as exc:
