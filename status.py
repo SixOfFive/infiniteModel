@@ -343,6 +343,7 @@ def build_status() -> dict:
         "nodes": [n.to_dict() for n in nodes],
         "activity": list(ACTIVITY),   # newest-first controller activity (dashboard panel)
         "unloads": list(UNLOADS),     # newest-first "why a model left" events (dashboard panel)
+        "errors": list(ERRORS),       # #error-log: newest-first HTTP 4xx/5xx responses (Logs UI)
     }
 
 

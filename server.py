@@ -911,12 +911,22 @@ def save_engine_config() -> None:
 # /status for the dashboard's activity panel and echoed to the console.
 ACTIVITY: deque = deque(maxlen=80)
 UNLOADS: deque = deque(maxlen=12)   # recent "why a model left" events (dashboard panel)
+# #error-log: HTTP error responses (4xx/5xx) returned to any client/node — surfaced in the Logs UI
+# so a 404/500/502 a caller saw is visible server-side without tailing the console.
+ERRORS: deque = deque(maxlen=120)
 
 
 def log_activity(msg: str) -> None:
     """Record a one-line 'what the controller is doing' event (newest first) + echo it."""
     ACTIVITY.appendleft({"t": round(time.time(), 1), "msg": msg})
     print(f"[activity] {msg}")
+
+
+def log_error(method: str, path: str, status: int, ip: str = "?", detail: str = "") -> None:
+    """Record an HTTP error response (status >= 400) for the Logs UI's Errors panel (newest first)."""
+    ERRORS.appendleft({"t": round(time.time(), 1), "method": str(method or "?"),
+                       "path": str(path or "?"), "status": int(status),
+                       "ip": str(ip or "?"), "detail": (str(detail or ""))[:300]})
 
 
 def _classify_unload(reason: str) -> str:
@@ -2930,6 +2940,28 @@ def build_app() -> FastAPI:
             print("[*] controller stopped")
 
     app = FastAPI(title="InfiniteModel Controller", version=VERSION, lifespan=lifespan)
+
+    @app.middleware("http")            # #error-log: capture every 4xx/5xx response for the Logs UI
+    async def _capture_errors(request, call_next):
+        resp = await call_next(request)
+        try:
+            if int(getattr(resp, "status_code", 200)) >= 400:
+                detail = ""
+                body = getattr(resp, "body", None)   # JSONResponse/Response have .body; streams don't
+                if body:
+                    try:
+                        d = json.loads(bytes(body).decode("utf-8", "ignore"))
+                        detail = d.get("error") or d.get("detail") or ""
+                        if not isinstance(detail, str):
+                            detail = json.dumps(detail)
+                    except Exception:
+                        detail = bytes(body).decode("utf-8", "ignore")[:200]
+                ip = request.client.host if request.client else "?"
+                log_error(request.method, request.url.path, resp.status_code, ip, detail)
+        except Exception:
+            pass
+        return resp
+
     # m4c153 code-split: attach relocated routes (see routes_*.py / state.py)
     routes_dashboard_register(app)
     routes_lifecycle_register(app)

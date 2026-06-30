@@ -800,6 +800,7 @@ LOGS_HTML = r"""<!doctype html>
   <div class="card"><h2 id="logtitle">controller log</h2><pre id="log">loading…</pre></div>
   <div class="card"><h2>activity</h2><div class="act" id="act"></div></div>
 </div>
+<div class="card" style="margin-top:14px"><h2>HTTP errors · 4xx / 5xx returned to clients &amp; nodes</h2><div class="act" id="errs"></div></div>
 </div>
 <script>
 const $=s=>document.querySelector(s);
@@ -812,7 +813,19 @@ async function srcList(){
       sel.innerHTML='<option value="">controller</option>'+(d.nodes||[]).map(n=>'<option value="'+esc(n.hostname)+'">'+esc(n.hostname)+(n.has_gpu?' (GPU)':'')+'</option>').join('');
       if(cur)sel.value=cur; SRCS=true; }
     renderAct(d.activity||[]);
+    renderErrors(d.errors||[]);
   }catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; }
+}
+function renderErrors(es){
+  if(!es.length){ $('#errs').innerHTML='<div class="empty">no HTTP errors recorded</div>'; return; }
+  $('#errs').innerHTML=es.slice(0,80).map(e=>{
+    const ts=e.t?new Date(e.t*1000).toLocaleTimeString():'';
+    const col=(e.status>=500)?'var(--bad)':'var(--warn)';
+    return '<div><span class="t">'+esc(ts)+'</span><b style="color:'+col+'">'+esc(e.status)+'</b> '
+      +esc(e.method||'')+' <span style="font-family:var(--mono)">'+esc(e.path||'')+'</span>'
+      +' <span style="color:var(--dim)">· '+esc(e.ip||'')+'</span>'
+      +(e.detail?('<div style="color:var(--dim);font-size:11px;margin-top:2px">'+esc(e.detail)+'</div>'):'')+'</div>';
+  }).join('');
 }
 function renderAct(a){
   if(!a.length){ $('#act').innerHTML='<div class="empty">no recent activity</div>'; return; }
