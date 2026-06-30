@@ -220,6 +220,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <span class="ctl" id="ctl">connecting…</span>
   <nav>
     <a class="on" href="/">Models</a>
+    <a href="/chat">Chat</a>
     <a href="/config">Config</a>
     <a href="/logs-page">Logs</a>
     <a href="/bandwidth">Bandwidth</a>
@@ -388,63 +389,7 @@ function renderNodes(d){
 }
 
 // ---------- actions ----------
-function closeOv(){ chatAbort(); $('#ov').classList.remove('show'); }
-function chatAbort(){ if(window._chatAbort){ try{window._chatAbort.abort();}catch(e){} window._chatAbort=null; } }
-
-// ---- Quick test: a throwaway streaming chat against a loaded model. Closing the popup (closeOv ->
-// chatAbort) aborts the fetch, which disconnects the client -> the controller cancels the generation. ----
-let _chatMsgs=[], _chatLive='', _chatBusy=false, _chatModel='';
-function openChat(name){
-  chatAbort(); _chatModel=name; _chatMsgs=[]; _chatLive=''; _chatBusy=false;
-  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Quick test · '+esc(name)+'</h3>'
-    +'<div style="font-size:12px;color:var(--dim);margin-bottom:6px">Streams live · throwaway · closing this popup ends the generation '
-    +'<button class="btn sm ghost" style="float:right" onclick="chatAbort();openDetail(\''+esc(name)+'\')">← back</button></div>'
-    +'<div id="chatlog" style="max-height:48vh;overflow:auto;margin-bottom:8px"></div>'
-    +'<div style="display:flex;gap:6px"><textarea id="chatin" rows="2" placeholder="type a prompt — Enter to send, Shift+Enter for a newline" '
-    +'style="flex:1;resize:vertical" onkeydown="chatKey(event)"></textarea>'
-    +'<button class="btn pri" id="chatsend" onclick="chatSend()">Send</button></div>';
-  $('#ov').classList.add('show'); chatRender(); setTimeout(()=>{const i=$('#chatin'); if(i)i.focus();},50);
-}
-function chatKey(e){ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); chatSend(); } }
-function _bubble(role,text){ const me=role==='user';
-  return '<div style="margin-bottom:8px"><div style="font-size:11px;color:'+(me?'var(--accent)':'var(--good)')+'">'+(me?'you':'model')+'</div>'
-    +'<pre style="white-space:pre-wrap;word-break:break-word;margin:2px 0;padding:6px;background:var(--bg);border-radius:6px;font-size:12px">'+esc(text||'')+'</pre></div>'; }
-function chatRender(){
-  const log=$('#chatlog'); if(!log)return;
-  let h=_chatMsgs.map(m=>_bubble(m.role,m.content)).join('');
-  if(_chatBusy) h+=_bubble('assistant',_chatLive||'…');
-  log.innerHTML=h||'<div class="empty">enter a prompt to test the model</div>';
-  log.scrollTop=log.scrollHeight;
-}
-async function chatSend(){
-  if(_chatBusy)return;
-  const ta=$('#chatin'); if(!ta)return; const text=ta.value.trim(); if(!text)return;
-  ta.value=''; _chatMsgs.push({role:'user',content:text}); _chatLive=''; _chatBusy=true;
-  const sb=$('#chatsend'); if(sb)sb.disabled=true; chatRender();
-  const ctrl=new AbortController(); window._chatAbort=ctrl;
-  try{
-    const r=await fetch('/api/chat',{method:'POST',signal:ctrl.signal,headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model:_chatModel,messages:_chatMsgs,stream:true,options:{temperature:0.7,num_predict:512}})});
-    if(!r.ok){ const t=await r.text(); throw new Error(t||('HTTP '+r.status)); }
-    const reader=r.body.getReader(), dec=new TextDecoder(); let buf='';
-    while(true){ const rd=await reader.read(); if(rd.done)break;
-      buf+=dec.decode(rd.value,{stream:true}); let nl;
-      while((nl=buf.indexOf('\n'))>=0){ const line=buf.slice(0,nl).trim(); buf=buf.slice(nl+1);
-        if(!line)continue; let j; try{j=JSON.parse(line);}catch(e){continue;}
-        if(j.error) _chatLive+='\n[error] '+j.error;
-        const piece=(j.message&&j.message.content)||j.response||'';
-        if(piece){ _chatLive+=piece; chatRender(); }
-      }
-    }
-    _chatMsgs.push({role:'assistant',content:_chatLive||'(no output)'});
-  }catch(e){
-    if(e.name!=='AbortError') _chatMsgs.push({role:'assistant',content:'[error] '+String(e.message||e)});
-  }finally{
-    _chatBusy=false; _chatLive=''; window._chatAbort=null;
-    const s2=$('#chatsend'); if(s2)s2.disabled=false; chatRender();
-    const i=$('#chatin'); if(i)i.focus();
-  }
-}
+function closeOv(){ $('#ov').classList.remove('show'); }
 function openAdd(){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Add a model</h3>'
    +'<div style="font-size:12px;color:var(--muted);margin-top:4px">Register any Hugging Face id. It downloads in the background.</div>'
@@ -554,7 +499,7 @@ function openDetail(name){
     pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
   }
   let acts='';
-  if(m.loaded) acts='<button class="btn sm pri" onclick="openChat(\''+esc(name)+'\')">Quick test ▾</button> '
+  if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
     +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
     +'<button class="btn sm ghost" onclick="reconf(\''+esc(name)+'\')">Reconfigure…</button>';
@@ -634,7 +579,7 @@ CONFIG_HTML = r"""<!doctype html>
 <body><div class="wrap">
 <header>
   <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
-  <nav><a href="/">Models</a><a class="on" href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a class="on" href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
 </header>
 
 <div class="card">
@@ -717,6 +662,101 @@ load(); setInterval(load,5000);
 </body></html>
 """
 
+CHAT_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InfiniteModel — Chat</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:980px;margin:0 auto;padding:18px 20px 30px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:14px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  select,textarea{background:var(--bg);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:8px 10px;font-size:14px;font-family:var(--sans)}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn.pri{border-color:var(--accent);color:#cfe0ff} .btn.sm{padding:4px 9px;font-size:12px}
+  .btn:disabled{opacity:.5;cursor:default} .grow{flex:1}
+  #log{border:1px solid var(--border);border-radius:12px;background:var(--surface);padding:12px;height:58vh;overflow:auto;margin-bottom:10px}
+  .msg{margin-bottom:10px} .who{font-size:11px;margin-bottom:2px} .who.u{color:var(--accent)} .who.a{color:var(--good)}
+  .bub{white-space:pre-wrap;word-break:break-word;background:var(--bg);border-radius:8px;padding:8px 10px;font-size:13px}
+  .empty{color:var(--dim);text-align:center;padding:40px 0}
+  .inrow{display:flex;gap:8px} .inrow textarea{flex:1;resize:vertical;min-height:46px}
+  .hint{font-size:12px;color:var(--dim)}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a class="on" href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+</header>
+<div class="bar">
+  <label class="hint">Model</label>
+  <select id="model" onchange="switchModel()"></select>
+  <span class="hint" id="mhint"></span>
+  <span class="grow"></span>
+  <button class="btn sm" onclick="clearChat()">Clear</button>
+</div>
+<div id="log"></div>
+<div class="inrow">
+  <textarea id="in" rows="2" placeholder="type a prompt — Enter to send, Shift+Enter for newline" onkeydown="key(event)"></textarea>
+  <button class="btn pri" id="send" onclick="send()">Send</button>
+</div>
+<div class="hint" style="margin-top:6px">Throwaway test chat · streams live · leaving this tab or switching models ends the generation.</div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const qp=new URLSearchParams(location.search);
+let MODELS=[], cur='', msgs=[], live='', busy=false, abort=null;
+function aborter(){ if(abort){ try{abort.abort();}catch(e){} abort=null; } }
+async function loadModels(){
+  let d; try{ d=await (await fetch('/status',{cache:'no-store'})).json(); }
+  catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; return; }
+  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
+  MODELS=(d.models||[]).filter(m=>m.loaded).map(m=>m.name);
+  const sel=$('#model'); const want=cur||qp.get('model')||MODELS[0]||'';
+  sel.innerHTML=MODELS.length
+    ? MODELS.map(n=>'<option value="'+esc(n)+'"'+(n===want?' selected':'')+'>'+esc(n)+'</option>').join('')
+    : '<option value="">(no models loaded)</option>';
+  if(MODELS.length){ cur=sel.value; $('#mhint').textContent=''; $('#send').disabled=false; $('#in').disabled=false; }
+  else { cur=''; $('#mhint').innerHTML='no models loaded — <a href="/">load one on the Models tab</a>'; $('#send').disabled=true; $('#in').disabled=true; }
+}
+function switchModel(){ aborter(); cur=$('#model').value; msgs=[]; live=''; busy=false; render(); $('#in').focus(); }
+function clearChat(){ aborter(); msgs=[]; live=''; busy=false; render(); }
+function key(e){ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); } }
+function bub(role,text){ const u=role==='user';
+  return '<div class="msg"><div class="who '+(u?'u':'a')+'">'+(u?'you':esc(cur))+'</div><div class="bub">'+esc(text||'')+'</div></div>'; }
+function render(){ const l=$('#log'); if(!l)return;
+  let h=msgs.map(m=>bub(m.role,m.content)).join(''); if(busy)h+=bub('assistant',live||'…');
+  l.innerHTML=h||'<div class="empty">select a loaded model and send a prompt</div>'; l.scrollTop=l.scrollHeight; }
+async function send(){
+  if(busy||!cur)return; const ta=$('#in'); const t=ta.value.trim(); if(!t)return;
+  ta.value=''; msgs.push({role:'user',content:t}); live=''; busy=true; $('#send').disabled=true; render();
+  const ctrl=new AbortController(); abort=ctrl;
+  try{
+    const r=await fetch('/api/chat',{method:'POST',signal:ctrl.signal,headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:cur,messages:msgs,stream:true,options:{temperature:0.7,num_predict:512}})});
+    if(!r.ok){ const tx=await r.text(); throw new Error(tx||('HTTP '+r.status)); }
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    while(true){ const x=await rd.read(); if(x.done)break; buf+=dec.decode(x.value,{stream:true}); let nl;
+      while((nl=buf.indexOf('\n'))>=0){ const ln=buf.slice(0,nl).trim(); buf=buf.slice(nl+1); if(!ln)continue;
+        let j; try{j=JSON.parse(ln);}catch(e){continue;} if(j.error)live+='\n[error] '+j.error;
+        const p=(j.message&&j.message.content)||j.response||''; if(p){ live+=p; render(); } } }
+    msgs.push({role:'assistant',content:live||'(no output)'});
+  }catch(e){ if(e.name!=='AbortError') msgs.push({role:'assistant',content:'[error] '+String(e.message||e)}); }
+  finally{ busy=false; live=''; abort=null; $('#send').disabled=(!cur); render(); const i=$('#in'); if(i)i.focus(); }
+}
+window.addEventListener('beforeunload',aborter);
+loadModels(); render(); setInterval(loadModels,5000);
+</script>
+</body></html>
+"""
+
 LOGS_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -750,7 +790,7 @@ LOGS_HTML = r"""<!doctype html>
 <body><div class="wrap">
 <header>
   <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
-  <nav><a href="/">Models</a><a href="/config">Config</a><a class="on" href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a class="on" href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
   <span class="grow"></span>
   <span class="tog">source <select class="f" id="src" onchange="refresh()"></select></span>
   <button class="btn on" id="auto" onclick="toggleAuto()">auto ⟳</button>

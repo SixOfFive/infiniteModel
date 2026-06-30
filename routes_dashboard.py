@@ -25,6 +25,10 @@ def register(app):
     async def logs_page() -> str:
         return LOGS_HTML
 
+    @app.get("/chat", response_class=HTMLResponse)   # dashboard: Chat page (pick a loaded model, send/stream)
+    async def chat_page() -> str:
+        return CHAT_HTML
+
     @app.get("/bandwidthdata")       # full traffic picture: controller<->node + node<->node
     async def bandwidthdata() -> JSONResponse:
         """Combine the controller's own socket metering (authoritative for controller<->node)
