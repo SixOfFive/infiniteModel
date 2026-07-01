@@ -135,6 +135,10 @@ def build_status() -> dict:
             # The historical rate stays visible as ema_tok_s ("avg"). active==0 => idle => 0.
             "tok_s": round(lm.last_tok_s if lm.active > 0 else 0.0, 2),   # decode tok/s, live (#46)
             "ema_tok_s": round(lm.ema_tok_s, 2),     # smoothed decode tok/s across gens, historical (#46)
+            # #detail: the RAW last-gen rate — NOT zeroed when idle, so the UI can freeze the last
+            # HONEST measured tok/s between runs (tok_s above goes to 0 at idle by design). Never
+            # recomputed while idle, so it can't drift into a dishonest number.
+            "last_tok_s": round(getattr(lm, "last_tok_s", 0.0), 2),
             "quant": lm.quant,     # the quant this model was loaded with (none/int8)
             "kv_quant": getattr(lm, "kv_quant", "none"),     # #172 TurboQuant KV preset (none/turbo2/3/4)
             "tp_size": getattr(lm, "tp_size", 1),            # #88: TP width (1 = pipeline)
@@ -271,6 +275,7 @@ def build_status() -> dict:
                 _lm_by_key[_k] = _ld
     _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "vram_used_gb", "ram_used_gb", "cpu_frac",
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
+                     "last_tok_s", "kv_pos", "active", "queued", "is_embedding", "replica_idx",
                      "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",
                      "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
                      "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe")

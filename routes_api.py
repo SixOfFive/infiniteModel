@@ -76,13 +76,44 @@ def register(app):
             spec = spec_with_measurements(spec, d)
         caps = (["embedding"] if (spec and getattr(spec, "is_embedding", False))
                 else ["completion", "chat"])
+        # #model-detail: surface the RAW on-disk config.json + generation_config.json so the dashboard
+        # detail view can show EVERYTHING about a model (loaded or not) — rope theta, sliding window,
+        # expert counts, sampling defaults, etc. that the curated model_info doesn't carry. Best-effort;
+        # these are small files. Also echo spec-derived sizing so the UI needn't re-derive it.
+        raw_cfg, gen_cfg = {}, {}
+        if d:
+            import os, json as _json
+            for _fn, _is_cfg in (("config.json", True), ("generation_config.json", False)):
+                _p = os.path.join(d, _fn)
+                if os.path.exists(_p):
+                    try:
+                        with open(_p, "r", encoding="utf-8") as _f:
+                            _obj = _json.load(_f)
+                        if _is_cfg:
+                            raw_cfg = _obj
+                        else:
+                            gen_cfg = _obj
+                    except Exception:
+                        pass
+        _arch = (getattr(spec, "arch", "") or "").lower()
+        im = {"target": target, "draft": MODELS[friendly][1], "distributed": True, "engine": VERSION,
+              "default_ctx": getattr(spec, "max_ctx", None),
+              "src_dtype": getattr(spec, "src_dtype", None),
+              "num_params": getattr(spec, "param_count", None),
+              "num_layers": getattr(spec, "num_layers", None),
+              "hidden_size": getattr(spec, "hidden_size", None),
+              "vocab_size": getattr(spec, "vocab_size", None),
+              "num_heads": getattr(spec, "num_heads", None),
+              "num_kv_heads": getattr(spec, "num_kv_heads", None),
+              "is_moe": any(k in _arch for k in ("moe", "mixtral", "minimax", "deepseek_v")),
+              "is_embedding": bool(getattr(spec, "is_embedding", False)),
+              "config": raw_cfg, "generation_config": gen_cfg}
         return JSONResponse({
             "license": "see model card", "modelfile": f"# InfiniteModel distributed\nFROM {target}",
             "parameters": "", "template": "{{ .Prompt }}",
             "details": _details(spec), "model_info": _model_info(spec),
             "capabilities": caps,
-            "infinitemodel": {"target": target, "draft": MODELS[friendly][1],
-                              "distributed": True, "engine": VERSION},
+            "infinitemodel": im,
         })
 
     @app.get("/api/ps")

@@ -261,6 +261,7 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;',
 const gb=v=>(v==null?'—':(Math.round(v*10)/10)+' GB');
 const pc=(a,b)=>b>0?Math.min(100,Math.round(100*a/b)):0;
 let LAST=null;
+let DETAIL_OPEN=null;   // #model-detail: model name whose detail modal is open (live-refreshed each poll)
 
 async function api(path,opts){
   try{const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={ok:r.ok,raw:t}}
@@ -292,6 +293,7 @@ function render(){
   ].join('');
   renderModels(d,cl);
   renderNodes(d);
+  refreshDetailIfOpen();   // #model-detail: live-update the open detail modal's operational section
 }
 function fmt(v){return v==null?'—':(Math.round(v*10)/10)}
 function tile(k,v,extra){return '<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div>'+(extra||'')+'</div>';}
@@ -334,7 +336,11 @@ function modelRow(m,s){
     parts.push('ctx '+(m.ctx||'?'));
     if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
     if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');
-    const _ts=m.tok_s||m.ema_tok_s; if(_ts)parts.push('<span style="color:var(--good)">'+_ts.toFixed(1)+' tok/s</span>');
+    // honest tok/s: LIVE (● green) while generating; when idle show the FROZEN last-run rate
+    // (last_tok_s is never recomputed while idle, so it stays an honest measurement — not a
+    // decaying/averaged value presented as "current").
+    if(m.active>0){ parts.push('<span style="color:var(--good)">● '+(m.tok_s||0).toFixed(1)+' tok/s</span>'); }
+    else { const _lt=m.last_tok_s||m.ema_tok_s||0; if(_lt)parts.push('<span class="em" title="last run — not live">'+_lt.toFixed(1)+' tok/s</span>'); }
     if(m.cpu_frac>=0.5)parts.push('<span style="color:var(--hot)">'+Math.round(m.cpu_frac*100)+'% CPU</span>');
     if(m.active)parts.push(m.active+' active');
     meta=parts.join(' · ');
@@ -390,7 +396,7 @@ function renderNodes(d){
 }
 
 // ---------- actions ----------
-function closeOv(){ $('#ov').classList.remove('show'); }
+function closeOv(){ $('#ov').classList.remove('show'); DETAIL_OPEN=null; }
 function openAdd(){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Add a model</h3>'
    +'<div style="font-size:12px;color:var(--muted);margin-top:4px">Register any Hugging Face id. It downloads in the background.</div>'
@@ -469,34 +475,94 @@ async function unload(name){ closeOv(); try{ await api('/unload?model='+encodeUR
 async function cancelLoad(name){ try{ await api('/cancel_load?model='+encodeURIComponent(name),{method:'POST'}); toast('cancelled load'); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function dl(name,action){ try{ await api('/download'+(action==='start'?'':'/'+action)+'?model='+encodeURIComponent(name),{method:'POST'}); toast(action+' '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 
-function openDetail(name){
-  const m=(LAST.models||[]).find(x=>x.name===name); if(!m)return;
-  const cz=m.cached||{};
-  let rows='';
-  const add=(k,v)=>{ if(v!=null&&v!=='') rows+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
+function dur(sec){ sec=Math.max(0,Math.round(sec||0)); if(sec<60)return sec+'s';
+  const m=Math.floor(sec/60); if(m<60)return m+'m'+(sec%60?' '+(sec%60)+'s':'');
+  const h=Math.floor(m/60); return h+'h'+(m%60?' '+(m%60)+'m':''); }
+// #model-detail: the LIVE section (rebuilt from the fresh /status card every poll while the modal is
+// open). Loaded models get a full operational readout; not-loaded ones get the card summary (the deep
+// architecture/config info is fetched once from /api/show into a separate static section).
+function detailLive(name){
+  const m=(LAST.models||[]).find(x=>x.name===name); if(!m)return '<div class="empty">model gone</div>';
+  const cz=m.cached||{}; const now=Date.now()/1000;
+  let rows=''; const add=(k,v)=>{ if(v!=null&&v!=='') rows+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
   add('HF id',esc(m.target)); add('arch',esc(m.arch||'')); add('status',esc(m.status));
-  add('aliases',(m.aliases||[]).map(esc).join(', ')); add('size',gb(m.size_gb));
-  add('native ctx',m.default_ctx||''); add('cached quants',Object.keys(cz).filter(q=>cz[q]&&cz[q].ok).join(', '));
+  add('aliases',(m.aliases||[]).map(esc).join(', ')); add('weights size',gb(m.size_gb));
+  add('cached quants',Object.keys(cz).filter(q=>cz[q]&&cz[q].ok).map(q=>q+' '+gb(cz[q].size_gb)).join(', '));
+  let out='<table class="kv">'+rows+'</table>';
   if(m.loaded){
-    add('loaded ctx',m.ctx); add('quant',esc(m.quant)+(m.tp_size>1?(' · TP'+m.tp_size):' · pipeline'));
+    let o=''; const oadd=(k,v)=>{ if(v!=null&&v!=='') o+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
+    const gen=(m.active||0)>0;
+    oadd('state', gen?('<span style="color:var(--good)">● generating'+((m.active||0)>1?(' ×'+m.active):'')+'</span>'):'<span class="em">idle</span>');
+    if((m.queued||0)>0) oadd('queue','<span style="color:var(--warn)">'+m.queued+' waiting</span>');
+    // honest tok/s: live while generating, else the FROZEN last-run rate (never recomputed at idle)
+    if(gen) oadd('tok/s (live)','<span style="color:var(--good)">● '+(m.tok_s||0).toFixed(1)+'</span>');
+    else if(m.last_tok_s) oadd('tok/s (last run)','<span class="em">'+(m.last_tok_s||0).toFixed(1)+' · frozen while idle</span>');
+    oadd('tok/s avg · peak','<span class="em">'+(m.ema_tok_s||0).toFixed(1)+' · '+(m.max_tok_s||0).toFixed(1)+' (lifetime)</span>');
+    oadd('quant',esc(m.quant)+(m.tp_size>1?(' · TP'+m.tp_size):' · pipeline'));
     if(m.kv_quant&&m.kv_quant!=='none'){
       const _kvb={turbo2:'~2-bit',turbo3:'~3-bit',turbo4:'~4-bit'}[m.kv_quant]||'';
-      add('<span title="TurboQuant KV-cache quantization: the KV cache (per-token memory the model accumulates) is stored at ~3–4 bits — a data-free random rotation makes the coordinates uniform, then a Lloyd-Max codebook quantizes each; on read it is un-rotated back to normal so the model\'s attention runs UNCHANGED. Effect: ~2× smaller KV cache → you can run longer context, or keep more models loaded at once, on the same VRAM. turbo4 ≈ near-lossless, turbo3 is more aggressive; best on large models (small models degrade). Weights are unaffected — this only shrinks the KV cache.">KV quant&nbsp;ⓘ</span>', esc(m.kv_quant)+(_kvb?(' · '+_kvb+' KV'):''));
+      oadd('<span title="TurboQuant KV-cache quantization: the KV cache (per-token memory the model accumulates) is stored at ~3–4 bits — a data-free random rotation makes the coordinates uniform, then a Lloyd-Max codebook quantizes each; on read it is un-rotated back to normal so the model\'s attention runs UNCHANGED. Effect: ~2× smaller KV cache → longer context or more co-resident models on the same VRAM. turbo4 ≈ near-lossless, turbo3 more aggressive; best on large models.">KV quant&nbsp;ⓘ</span>', esc(m.kv_quant)+(_kvb?(' · '+_kvb+' KV'):''));
     }
-    add('VRAM',gb(m.vram_used_gb)); add('RAM',gb(m.ram_used_gb)+(m.cpu_frac>=0.5?(' <span style="color:var(--hot)">('+Math.round(m.cpu_frac*100)+'% on CPU)</span>'):''));
-    add('KV used / reserved',gb(m.kv_used_gb)+' / '+gb(m.kv_reserved_gb));
-    add('tok/s (live · avg · max)',[(m.tok_s||0).toFixed(1),(m.ema_tok_s||0).toFixed(1),(m.max_tok_s||0).toFixed(1)].join(' · '));
-    add('requests',m.req_total!=null?m.req_total:'');
-    add('tokens in / out',m.tok_in_total!=null?((m.tok_in_total||0)+' / '+(m.tok_out_total||0)):'');
-    add('placement basis',esc(m.plan_basis||''));
+    const used=m.kv_pos||0, ctx=m.ctx||0, pctc=ctx?Math.min(100,Math.round(100*used/ctx)):0;
+    oadd('context','<b>'+used.toLocaleString()+'</b> / '+ctx.toLocaleString()+' tok'+(ctx?(' · '+pctc+'%'):'')+'<div class="miniprog"><i style="width:'+pctc+'%"></i></div>');
+    oadd('VRAM',gb(m.vram_used_gb));
+    oadd('RAM',gb(m.ram_used_gb)+(m.cpu_frac>=0.5?(' <span style="color:var(--hot)">('+Math.round(m.cpu_frac*100)+'% on CPU — slow)</span>'):(m.cpu_frac>0?(' ('+Math.round(m.cpu_frac*100)+'% CPU)'):'')));
+    oadd('KV used / reserved',gb(m.kv_used_gb)+' / '+gb(m.kv_reserved_gb));
+    oadd('layers · params',(m.num_layers||'?')+' · '+esc(m.params||'?'));
+    oadd('requests served',m.req_total!=null?m.req_total:'');
+    oadd('tokens in / out',m.tok_in_total!=null?((m.tok_in_total||0).toLocaleString()+' / '+(m.tok_out_total||0).toLocaleString()):'');
+    if(m.loaded_at_ts) oadd('uptime',dur(now-m.loaded_at_ts)+(m.load_seconds?(' · load took '+m.load_seconds+'s'):''));
+    if(m.last_used_ts) oadd('last request', gen?'now':(dur(now-m.last_used_ts)+' ago'));
+    oadd('placement basis',esc(m.plan_basis||'')+(m.speed_tier?(' · '+esc(m.speed_tier)):''));
+    out+='<h3 style="font-size:13px;margin-top:14px">Operational'+(gen?' · <span style="color:var(--good)">running</span>':'')+'</h3><table class="kv">'+o+'</table>';
   }
-  let stages='';
-  if(m.stages&&m.stages.length) stages='<h3 style="font-size:13px;margin-top:14px">Placement</h3>'
-    +'<table class="kv">'+m.stages.map(s=>'<tr><td>'+esc(s.hostname)+'</td><td class="v">L'+s.layer_start+'-'+s.layer_end+(s.role?(' · '+esc(s.role)):'')+'</td></tr>').join('')+'</table>';
+  if(m.stages&&m.stages.length){
+    out+='<h3 style="font-size:13px;margin-top:14px">Placement · '+m.stages.length+' stage'+(m.stages.length>1?'s':'')+'</h3><table class="kv">'
+      +m.stages.map(s=>{ const dev=(s.gpu_gb>0)?('<span style="color:var(--good)">GPU '+gb(s.gpu_gb)+'</span>'):'<span class="em">CPU</span>';
+        const role=[]; if(s.has_embed)role.push('embed'); if(s.has_head)role.push('head');
+        return '<tr><td>'+esc(s.hostname)+'</td><td class="v">L'+s.layer_start+'–'+s.layer_end+' · '+(s.num_layers||0)+'L · '+dev+(role.length?(' · '+role.join('+')):'')+' · est '+gb(s.est_gb)+'</td></tr>';
+      }).join('')+'</table>';
+  }
+  if((m.warnings||[]).length) out+='<div class="note">⚠ '+m.warnings.map(esc).join('<br>⚠ ')+'</div>';
+  return out;
+}
+function refreshDetailIfOpen(){
+  if(!DETAIL_OPEN)return;
+  const ov=$('#ov'), el=document.getElementById('dlive');
+  if(ov&&ov.classList.contains('show')&&el) el.innerHTML=detailLive(DETAIL_OPEN);
+}
+function _kvtbl(obj){ const ks=Object.keys(obj); if(!ks.length)return '';
+  return '<table class="kv">'+ks.map(k=>{ let v=obj[k]; if(v&&typeof v==='object')v=JSON.stringify(v);
+    if(typeof v==='number'&&Math.abs(v)>=1000)v=v.toLocaleString();
+    return '<tr><td>'+esc(k)+'</td><td class="v" style="word-break:break-word">'+esc(String(v))+'</td></tr>'; }).join('')+'</table>'; }
+// #model-detail: the STATIC deep section from /api/show — architecture, capabilities, and the FULL raw
+// config.json / generation_config.json (everything about the model, whether or not it's loaded).
+function renderShow(sh){
+  if(!sh)return '<div class="note">no model info</div>';
+  const mi=sh.model_info||{}, det=sh.details||{}, im=sh.infinitemodel||{}, caps=sh.capabilities||[];
+  let out='';
+  const skip={'tokenizer.ggml.model':1,'general.file_type':1};
+  let ar=''; for(const k in mi){ if(skip[k])continue; let v=mi[k]; if(typeof v==='number'&&Math.abs(v)>=1000)v=v.toLocaleString();
+    const lbl=k.replace(/^general\./,'').replace(/\./g,' ').replace(/_/g,' '); ar+='<tr><td>'+esc(lbl)+'</td><td class="v">'+esc(String(v))+'</td></tr>'; }
+  if(ar) out+='<h3 style="font-size:13px;margin-top:14px">Architecture</h3><table class="kv">'+ar+'</table>';
+  let dr=''; const dadd=(k,v)=>{ if(v!=null&&v!=='') dr+='<tr><td>'+k+'</td><td class="v">'+esc(String(v))+'</td></tr>'; };
+  dadd('family',det.family); dadd('parameters',det.parameter_size); dadd('format',det.format);
+  dadd('on-disk dtype',im.src_dtype); dadd('native ctx',im.default_ctx?im.default_ctx.toLocaleString():'');
+  dadd('MoE',im.is_moe?'yes':''); dadd('embedding model',im.is_embedding?'yes':'');
+  if(dr) out+='<h3 style="font-size:13px;margin-top:14px">Details</h3><table class="kv">'+dr+'</table>';
+  if(caps.length) out+='<div style="margin-top:8px">capabilities: '+caps.map(c=>'<span class="chip">'+esc(c)+'</span>').join(' ')+'</div>';
+  const cfg=im.config||{}; if(Object.keys(cfg).length) out+='<details style="margin-top:12px"><summary style="cursor:pointer;font-size:13px;color:var(--accent)">raw config.json · '+Object.keys(cfg).length+' keys</summary>'+_kvtbl(cfg)+'</details>';
+  const gc=im.generation_config||{}; if(Object.keys(gc).length) out+='<details style="margin-top:8px"><summary style="cursor:pointer;font-size:13px;color:var(--accent)">generation_config.json · '+Object.keys(gc).length+' keys</summary>'+_kvtbl(gc)+'</details>';
+  if(im.engine) out+='<div style="margin-top:8px;font-size:11px;color:var(--dim)">engine '+esc(im.engine)+'</div>';
+  return out;
+}
+async function openDetail(name){
+  const m=(LAST.models||[]).find(x=>x.name===name); if(!m)return;
+  DETAIL_OPEN=name;
+  const cz=m.cached||{};
   // precache (shard cache): compile int4/int8 so future loads serve from cache instantly.
   let pre='';
-  if(m.ready){
-    let chips='';
+  if(m.ready){ let chips='';
     for(const q of ['int4','int8']){
       if(cz[q]&&cz[q].ok) chips+='<span class="chip al">'+q+' cached '+gb(cz[q].size_gb)+'</span> ';
       else chips+='<button class="btn sm ghost" onclick="compileShards(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
@@ -512,10 +578,13 @@ function openDetail(name){
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<table class="kv">'+rows+'</table>'+stages+pre
-    +((m.warnings||[]).length?'<div class="note">⚠ '+m.warnings.map(esc).join('<br>⚠ ')+'</div>':'')
+    +'<div id="dlive">'+detailLive(name)+'</div>'+pre
+    +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
+  try{ const sh=await api('/api/show',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:name})});
+       const el=document.getElementById('mi_more'); if(el&&DETAIL_OPEN===name) el.innerHTML='<h3 style="font-size:13px;margin-top:14px">Model info</h3>'+renderShow(sh);
+  }catch(e){ const el=document.getElementById('mi_more'); if(el) el.innerHTML='<div class="note">full model info unavailable: '+esc(String(e.message||e))+'</div>'; }
 }
 // Context viewer: one scrollable popup showing the IN/OUT flow of recent requests (newest first).
 // History is kept only while the model is resident (cleared on unload).
