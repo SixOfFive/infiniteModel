@@ -360,6 +360,11 @@ class ShardBuildMixin:
             _lt = getattr(self.cfg, "layer_types", None)
             self._hybrid = bool(_lt) and any(t != "full_attention" for t in _lt)
             self._omni = omni_thinker is not None
+            # #vl-vision: Qwen2.5-VL's rotary (like Omni's) unconditionally indexes 3D position_ids
+            # [3,bs,seq] — even a text-only forward crashes if fed 2D. Flag it so shard_forward builds
+            # 3D rot positions when the controller passes no mRoPE (plain text turns).
+            self._mrope3d = self._omni or str(getattr(self.cfg, "model_type", "")).lower() in (
+                "qwen2_5_vl_text", "qwen2_5_vl")
             self.cfg._attn_implementation = attn
             # gpt-oss attention SINKS (a per-head learned logit concatenated into the softmax, then
             # dropped) are applied ONLY by transformers' eager_attention_forward (s_aux=self.sinks);

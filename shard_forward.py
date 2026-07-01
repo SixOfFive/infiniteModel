@@ -151,7 +151,7 @@ class ShardForwardMixin:
                 rot_pos = torch.as_tensor(position_ids, dtype=torch.long)
                 if rot_pos.dim() == 2:
                     rot_pos = rot_pos.unsqueeze(1)
-            elif self._omni:   # Omni classic mRoPE needs [3,bs,seq]; text = 3x the same positions
+            elif self._omni or getattr(self, "_mrope3d", False):   # Omni/Qwen2.5-VL mRoPE needs [3,bs,seq]; text = 3x the same positions
                 rot_pos = pos_cpu.unsqueeze(0).expand(3, -1, -1).contiguous()
             _rotary = self.model.model.rotary_emb
             _lts = getattr(self.cfg, "layer_types", None)
@@ -236,7 +236,7 @@ class ShardForwardMixin:
 
             cstep = self._prefill_chunk_len(q)
             do_chunk = (q > 1 and cstep < q and not _per_type and not self._hybrid
-                        and not self._omni and position_ids is None)
+                        and not self._omni and not getattr(self, "_mrope3d", False) and position_ids is None)
             if not do_chunk:
                 h = _run_layers(h, 0, q)
             else:
@@ -301,7 +301,7 @@ class ShardForwardMixin:
             rot_pos = torch.as_tensor(position_ids, dtype=torch.long, device=dev)
             if rot_pos.dim() == 2:
                 rot_pos = rot_pos.unsqueeze(1)
-        elif self._omni:   # Omni classic mRoPE needs [3,bs,seq]
+        elif self._omni or getattr(self, "_mrope3d", False):   # Omni/Qwen2.5-VL mRoPE needs [3,bs,seq]
             rot_pos = pos.unsqueeze(0).expand(3, -1, -1).contiguous()
         ref = torch.empty(1, dtype=self.dtype, device=dev)
         _rotary = self.model.model.rotary_emb
@@ -353,7 +353,7 @@ class ShardForwardMixin:
         # original single full pass (do_chunk False -> byte-identical to the pre-chunk behavior).
         cstep = self._prefill_chunk_len(q)
         do_chunk = (q > 1 and cstep < q and not _per_type and not self._hybrid
-                    and not self._omni and position_ids is None)
+                    and not self._omni and not getattr(self, "_mrope3d", False) and position_ids is None)
         if not do_chunk:
             if q > 1:   # prefill: causal among the new tokens; all prior keys visible
                 mask = torch.zeros((q, total), dtype=self.dtype, device=dev)
@@ -450,7 +450,7 @@ class ShardForwardMixin:
                 if (os.environ.get("INFINITEMODEL_CUDA_GRAPH")
                         and ud is not None and getattr(ud, "type", None) == "cuda"
                         and self.has_embed and self.has_head
-                        and not self._hybrid and not self._omni
+                        and not self._hybrid and not self._omni and not getattr(self, "_mrope3d", False)
                         and getattr(self, "kv_quant", "none") == "none"   # #172: graph mirrors a
                         # StaticCache that can't re-quantize TurboQuant KV -> stay eager when active
                         and not getattr(self, "_mm_capable", False)):

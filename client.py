@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c175"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c176"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2595,6 +2595,9 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         # 3D positions [3, bs, seq] even for plain TEXT (all three sections = the same sequential
         # positions). (The 35B's INTERLEAVED mRoPE tolerated 1D; Omni does not.)
         self._omni = omni_thinker is not None
+        # #vl-vision: Qwen2.5-VL rotary needs 3D position_ids [3,bs,seq] even for text (like Omni).
+        self._mrope3d = self._omni or str(getattr(self.cfg, "model_type", "")).lower() in (
+            "qwen2_5_vl_text", "qwen2_5_vl")
         # Attention kernel: 'eager' (additive-mask matmul, bit-exact) or 'sdpa' (fused).
         self.cfg._attn_implementation = attn
         self.dtype = dtype
