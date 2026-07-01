@@ -269,7 +269,7 @@ def build_status() -> dict:
         for _k in (_ld.get("friendly"), _ld.get("display_name")):
             if _k:
                 _lm_by_key[_k] = _ld
-    _RUNTIME_KEYS = ("ctx", "quant", "vram_used_gb", "ram_used_gb", "cpu_frac",
+    _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "vram_used_gb", "ram_used_gb", "cpu_frac",
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
                      "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",
                      "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
