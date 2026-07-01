@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c173"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c174"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1659,6 +1659,72 @@ def _install_fused_moe_forward(experts_mod) -> None:
     experts_mod.forward = types.MethodType(_fused_forward, experts_mod)
 
 
+# --- gpt-oss int4 (#166): transpose-packed fused experts + interleaved clamped SwiGLU + biases -----
+# gpt-oss experts differ from the generic fused-MoE case: gate_up_proj is [E, hidden, 2*inter]
+# (IN-major, applied as `x @ W`, NOT F.linear's [out,in]), the SwiGLU is INTERLEAVED + clamped with
+# per-expert biases, alpha=1.702, limit=7.0. To reuse the w4a16 kernel (F.linear semantics) each
+# expert weight is TRANSPOSE-packed to [E, out, in]; the eager bf16-rematerialize host path (in-major)
+# then can't consume it, so gpt-oss int4 REQUIRES the fused kernel and has NO eager fallback.
+
+def _is_gptoss_experts(module) -> bool:
+    """True if `module` is a gpt-oss fused-expert block (interleaved clamped SwiGLU + expert biases)."""
+    if type(module).__name__ == "GptOssExperts":
+        return True
+    return (hasattr(module, "gate_up_proj_bias") and hasattr(module, "down_proj_bias")
+            and hasattr(module, "alpha") and hasattr(module, "limit"))
+
+
+def _gptoss_fused_ok() -> bool:
+    """gpt-oss int4 needs the fused w4a16 MoE kernel (its experts are transpose-packed out-major, so
+    the eager in-major `x @ W` host path can't consume them). Available on ROCm always, on CUDA with
+    INFINITEMODEL_CUDA_FUSED_MOE=1; never CPU-only (no triton)."""
+    import os, torch
+    if os.environ.get("INFINITEMODEL_NO_FUSED_MOE"):
+        return False
+    if _w4a16_moe_op() is None:
+        return False
+    if getattr(torch.version, "hip", None):
+        return True
+    return bool(os.environ.get("INFINITEMODEL_CUDA_FUSED_MOE"))
+
+
+def _install_gptoss_fused_forward(experts_mod) -> None:
+    """Install gpt-oss's int4 fused-expert forward: transpose-packed gate_up/down (Packed4Tensor3D)
+    through `_w4a16_moe_op`, with the INTERLEAVED clamped SwiGLU (gate=y[...,::2], up=y[...,1::2],
+    clamp +/-limit, h=(up+1)*gate*sigmoid(alpha*gate)) and per-expert biases. Runs for ALL token
+    counts — the eager host path is invalid once weights are transpose-packed, so there is no
+    fallback (the recipe is validated standalone, rel ~ int4 noise). Caller MUST have transpose-packed
+    the experts + confirmed _gptoss_fused_ok()."""
+    import torch, types
+    op = _w4a16_moe_op()
+    alpha = float(getattr(experts_mod, "alpha", 1.702))
+    limit = float(getattr(experts_mod, "limit", 7.0))
+
+    def _forward(self, hidden_states, router_indices=None, routing_weights=None):
+        T = hidden_states.shape[0]
+        top_k = router_indices.shape[1]
+        eid = router_indices.reshape(-1)                          # [B] expert id per (token, slot)
+        w = routing_weights.reshape(-1).to(hidden_states.dtype)   # [B] gate weight
+        xb = hidden_states.repeat_interleave(top_k, dim=0)        # [B, H]
+        guh, dnh = self.gate_up_proj, self.down_proj              # transpose-packed Packed4Tensor3D
+        yb = op(xb, eid, guh.qweight, guh.scale, guh.zero, guh.group_size, guh.in_features)  # [B, 2I]
+        yb = yb + self.gate_up_proj_bias[eid]
+        gate = yb[..., ::2].clamp(max=limit)                      # gpt-oss INTERLEAVED gate/up
+        up = yb[..., 1::2].clamp(min=-limit, max=limit)
+        h = (up + 1) * (gate * torch.sigmoid(gate * alpha))       # [B, I]
+        zb = op(h, eid, dnh.qweight, dnh.scale, dnh.zero, dnh.group_size, dnh.in_features)   # [B, H]
+        zb = (zb + self.down_proj_bias[eid]) * w[:, None]
+        final = torch.zeros_like(hidden_states)
+        tok = torch.arange(T, device=hidden_states.device).repeat_interleave(top_k)
+        final.index_add_(0, tok, zb.to(final.dtype))              # sum the top_k contributions
+        return final
+
+    experts_mod._gptoss_fused_installed = True
+    experts_mod.forward = types.MethodType(_forward, experts_mod)
+    _builtins.print("[int4] gpt-oss fused experts active (transpose-packed w4a16 + interleaved SwiGLU)",
+                    flush=True)
+
+
 # --- MoE intra-layer offload (#moe-offload): attention on GPU, routed experts in CPU RAM ----------
 # The llama.cpp --override-tensor "experts=CPU" strategy, intra-layer: a MoE layer's routed-expert
 # FFN is ~90% of its bytes but each token activates only k of E experts, while the token-mixer
@@ -1779,27 +1845,44 @@ def _quantize_experts4_(module) -> None:
     from torch import nn
     targets = []
     for sub in module.modules():
+        is_go = _is_gptoss_experts(sub)
         for attr in ("gate_up_proj", "down_proj"):
             p = sub._parameters.get(attr)
             if isinstance(p, nn.Parameter) and p.dim() == 3:
-                targets.append((sub, attr))
-    for sub, attr in targets:
+                targets.append((sub, attr, is_go))
+    if any(is_go for _s, _a, is_go in targets) and not _gptoss_fused_ok():
+        raise RuntimeError("gpt-oss int4 requires the fused w4a16 MoE kernel (ROCm, or CUDA with "
+                           "INFINITEMODEL_CUDA_FUSED_MOE=1) — load gpt-oss at quant=none (bf16) here")
+    for sub, attr, is_go in targets:
         p = getattr(sub, attr)
         delattr(sub, attr)                       # drop the bf16 Parameter
-        setattr(sub, attr, _pack4_3d(p.data))    # install the int4 holder (submodule)
+        # gpt-oss experts are IN-major [E,in,out] (applied `x @ W`) -> transpose to [E,out,in] so the
+        # w4a16 kernel's F.linear semantics reproduce it; other MoEs are already [E,out,in].
+        w = p.data.transpose(1, 2).contiguous() if is_go else p.data
+        setattr(sub, attr, _pack4_3d(w))         # install the int4 holder (submodule)
     # Force the EAGER experts forward on the modules we quantized. transformers 5.x dispatches
     # experts via config._experts_implementation; only "eager" indexes self.gate_up_proj[idx]
     # per routed expert (which our per-expert int4 holder supports). The grouped_mm/batched_mm/
     # deepgemm kernels take the WHOLE 3D weight tensor and would break on the holder. Eager loops
     # over hit experts — slower, but correctness/memory win > speed for a model that only fits at int4.
+    # (gpt-oss skips this: its transpose-packed experts have NO valid eager host path — see below.)
     seen = set()
-    for sub, _attr in targets:
+    for sub, _attr, is_go in targets:
+        if is_go:
+            continue
         cfg = getattr(sub, "config", None)
         if cfg is not None and hasattr(cfg, "_experts_implementation") and id(cfg) not in seen:
             cfg._experts_implementation = "eager"
             seen.add(id(cfg))
-    for sub in {id(s): s for s, _a in targets}.values():   # ROCm fused-MoE decode fast path (no-op on CUDA)
-        _install_fused_moe_forward(sub)
+    done = {}
+    for sub, _attr, is_go in targets:
+        if id(sub) in done:
+            continue
+        done[id(sub)] = True
+        if is_go:                                # gpt-oss: dedicated fused forward (all T, no fallback)
+            _install_gptoss_fused_forward(sub)
+        else:                                    # ROCm fused-MoE decode fast path (no-op on CUDA)
+            _install_fused_moe_forward(sub)
 
 
 def _quantize_experts4_streamed(module, layer_idx: int, fetch_experts, dt) -> None:
@@ -1818,19 +1901,29 @@ def _quantize_experts4_streamed(module, layer_idx: int, fetch_experts, dt) -> No
     from torch import nn
     PT = _packed4_3d_cls()
     G = _INT4_GROUP
-    tgt: dict = {}      # attr -> {sub, E, out, in_f, ng, in_pad, qpacked, scale, zero}
+    tgt: dict = {}      # attr -> {sub, E, out, in_f, ng, in_pad, go, qpacked, scale, zero}
+    gptoss_any = False
     for sub in module.modules():
+        is_go = _is_gptoss_experts(sub)
         for attr in ("gate_up_proj", "down_proj"):
             p = sub._parameters.get(attr)
             if isinstance(p, nn.Parameter) and p.dim() == 3:
-                E, out, in_f = int(p.shape[0]), int(p.shape[1]), int(p.shape[2])
+                E, d1, d2 = int(p.shape[0]), int(p.shape[1]), int(p.shape[2])
+                # gpt-oss experts are IN-major [E,in,out]; pack the TRANSPOSE [E,out,in] for the w4a16
+                # kernel (each fetched slice is .t()'d below). Other MoEs are already [E,out,in].
+                out, in_f = (d2, d1) if is_go else (d1, d2)
+                gptoss_any = gptoss_any or is_go
                 ng = (in_f + G - 1) // G
                 tgt[attr] = {"sub": sub, "E": E, "out": out, "in_f": in_f, "ng": ng, "in_pad": ng * G,
+                             "go": is_go,
                              "qpacked": torch.empty((E, out, ng * G // 2), dtype=torch.uint8),
                              "scale": torch.empty((E, out, ng), dtype=dt),
                              "zero": torch.empty((E, out, ng), dtype=dt)}
     if not tgt:
         return
+    if gptoss_any and not _gptoss_fused_ok():
+        raise RuntimeError("gpt-oss int4 requires the fused w4a16 MoE kernel (ROCm, or CUDA with "
+                           "INFINITEMODEL_CUDA_FUSED_MOE=1) — load gpt-oss at quant=none (bf16) here")
     E = next(iter(tgt.values()))["E"]
     gu = tgt.get("gate_up_proj")
     per = max(1, (gu["out"] * gu["in_f"] * 2) if gu else 1)        # one expert's gate_up bf16 bytes
@@ -1862,7 +1955,9 @@ def _quantize_experts4_streamed(module, layer_idx: int, fetch_experts, dt) -> No
                 b = tgt[attr]
                 for le in range(w3.shape[0]):
                     src2d = w3[le]
-                    if tuple(src2d.shape) != (b["out"], b["in_f"]):
+                    if b.get("go"):
+                        src2d = src2d.t()                         # gpt-oss: [in,out]->[out,in] (always, incl. square)
+                    elif tuple(src2d.shape) != (b["out"], b["in_f"]):
                         src2d = src2d.t()                         # orientation auto-detect
                     _pack_into(attr, e + le, src2d.contiguous())
             del blob
@@ -1903,11 +1998,16 @@ def _quantize_experts4_streamed(module, layer_idx: int, fetch_experts, dt) -> No
         delattr(b["sub"], attr)                                   # drop the meta Parameter
         setattr(b["sub"], attr, PT(b["qpacked"], b["scale"], b["zero"], b["in_f"], G))
         subs[id(b["sub"])] = b["sub"]
+        if _is_gptoss_experts(b["sub"]):                          # gpt-oss uses its own fused forward
+            continue
         cfg = getattr(b["sub"], "config", None)                   # force eager experts forward
         if cfg is not None and hasattr(cfg, "_experts_implementation") and id(cfg) not in seen:
             cfg._experts_implementation = "eager"; seen.add(id(cfg))
-    for sub in subs.values():                                     # ROCm fused-MoE decode fast path (no-op on CUDA)
-        _install_fused_moe_forward(sub)
+    for sub in subs.values():
+        if _is_gptoss_experts(sub):                              # gpt-oss: dedicated fused forward (all T)
+            _install_gptoss_fused_forward(sub)
+        else:                                                    # ROCm fused-MoE decode fast path (no-op on CUDA)
+            _install_fused_moe_forward(sub)
     print(f"[load] L{layer_idx}: streamed {E} experts (per-expert int4, chunk {chunk})")
 
 
