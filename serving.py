@@ -12,6 +12,48 @@ from __future__ import annotations
 
 
 
+def _normalize_ollama_images(messages):
+    """#vl-vision: Ollama's NATIVE chat API attaches images as a per-message `images: [<b64>|<url>]`
+    array next to a plain-string `content` — a shape BOTH the HF chat template and `_collect_images`
+    (which read only OpenAI/Anthropic content blocks) ignore, so those images were silently dropped
+    ("model skips images"). Rewrite every such message so each entry becomes an OpenAI `image_url`
+    content block (a data: URL for raw base64) appended to the content — byte-equivalent to the proven
+    /v1/chat/completions path, so the template renders the vision placeholder and `_collect_images`
+    finds the image. Returns a NEW list only when something changed; messages without `images` pass
+    through untouched."""
+    if not messages:
+        return messages
+    out, changed = [], False
+    for m in messages:
+        imgs = m.get("images") if isinstance(m, dict) else None
+        if not imgs or not isinstance(imgs, (list, tuple)):
+            out.append(m)
+            continue
+        changed = True
+        c = m.get("content")
+        blocks = list(c) if isinstance(c, list) else ([{"type": "text", "text": str(c)}] if c else [])
+        for it in imgs:
+            if isinstance(it, dict) and it.get("type") in ("image", "image_url"):
+                blocks.append(it)                       # already a content block
+                continue
+            if isinstance(it, dict):
+                s = it.get("url") or it.get("data")
+            else:
+                s = it
+            if not isinstance(s, str) or not s.strip():
+                continue
+            s = s.strip()
+            if s.startswith(("data:", "http://", "https://")):
+                url = s
+            else:                                        # raw base64 (the Ollama convention)
+                url = "data:image/png;base64," + s       # mime ignored on decode (PIL sniffs the bytes)
+            blocks.append({"type": "image_url", "image_url": {"url": url}})
+        nm = {k: v for k, v in m.items() if k != "images"}
+        nm["content"] = blocks
+        out.append(nm)
+    return out if changed else messages
+
+
 async def _prepare_vision(target_id: str, tok, ids: list, images: list):
     """#vl-vision: shared image splice for the OpenAI (/v1/chat/completions) + Ollama (/api/chat)
     serve path — the same machinery /v1/messages uses. Encodes the images, expands the image
@@ -77,6 +119,7 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
         raise ValueError(f"model '{friendly}' is an embedding model; use /api/embed")
     tok = lm.tokenizer
     if messages is not None:
+        messages = _normalize_ollama_images(messages)   # #vl-vision: Ollama-native images[] -> blocks
         enc = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
     else:
         enc = tok(prompt or "")
