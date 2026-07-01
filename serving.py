@@ -12,6 +12,44 @@ from __future__ import annotations
 
 
 
+async def _prepare_vision(target_id: str, tok, ids: list, images: list):
+    """#vl-vision: shared image splice for the OpenAI (/v1/chat/completions) + Ollama (/api/chat)
+    serve path — the same machinery /v1/messages uses. Encodes the images, expands the image
+    placeholder run in `ids` (injecting the placeholder after BOS if the chat template rendered
+    none), and computes mRoPE positions. Returns (ids, mm, mrope); on no images or ANY failure
+    returns (ids, None, None) so the caller degrades to a clean text-only prompt."""
+    if not images:
+        return ids, None, None
+    try:
+        enc_res = await asyncio.to_thread(_encode_images, target_id, images)
+        embeds = enc_res.get("image_embeds")
+        counts = enc_res.get("counts") or []
+        itid = enc_res.get("image_token_id")
+        n_emb = int(embeds.shape[0]) if embeds is not None else 0
+        if not (itid is not None and n_emb and sum(counts) == n_emb):
+            return ids, None, None
+        if ids.count(int(itid)) != len(counts):   # template rendered no placeholder -> inject after BOS
+            _bos = getattr(tok, "bos_token_id", None)
+            _p = 1 if (ids and _bos is not None and ids[0] == _bos) else 0
+            ids = list(ids[:_p]) + [int(itid)] * len(counts) + list(ids[_p:])
+        new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts)
+        if not (found == len(counts) and len(positions) == n_emb):
+            return ids, None, None
+        mm = (positions, embeds)
+        if enc_res.get("pos_scheme") == "1d":
+            mrope = None    # Pixtral/Mistral3/Gemma: plain 1D positions
+        else:
+            merge = int(enc_res.get("merge") or 1)
+            grid_list = enc_res.get("grid_list") or []
+            mrope = _mrope_position_ids(new_ids, grid_list, int(itid), merge)
+        print(f"[serve] vision: {len(images)} image(s) -> {len(positions)} tokens spliced "
+              f"(counts={counts}, pos={'1d' if mrope is None else 'mrope'})")
+        return new_ids, mm, mrope
+    except Exception as exc:
+        print(f"[serve] vision encode failed ({type(exc).__name__}: {exc}); text-only")
+        return ids, None, None
+
+
 async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     """Resolve+load model, build prompt token ids, and pull sampling options."""
     friendly = resolve_model_name(model)
@@ -43,6 +81,13 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     else:
         enc = tok(prompt or "")
     ids = _to_id_list(enc)
+    # #vl-vision: OpenAI/Ollama image support — extract images from the messages and splice their
+    # embeds (was previously only wired into /v1/messages). No-op for text requests / generate mode.
+    mm = mrope = None
+    if messages is not None:
+        _imgs = _collect_images(messages)
+        if _imgs:
+            ids, mm, mrope = await _prepare_vision(lm.target_id, tok, ids, _imgs)
     opts = body.get("options") or {}
     temperature = float(opts.get("temperature", body.get("temperature", 0.0)))
     top_p = float(opts.get("top_p", body.get("top_p", 1.0)))
@@ -57,7 +102,7 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     if _lc and len(ids) >= _lc:
         raise ValueError(f"prompt is {len(ids)} tokens but model '{friendly}' is loaded with a "
                          f"{_lc}-token context window — shorten the prompt or reload it at a larger ctx")
-    return friendly, tok, ids, temperature, top_p, max_new, stream, speculative, spec_k
+    return friendly, tok, ids, temperature, top_p, max_new, stream, speculative, spec_k, mm, mrope
 
 
 def _ka_is_unload(v) -> bool:
@@ -155,7 +200,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         prev = ""
         try:
             async for tid, reason in engine.generate(friendly, ids, max_new, temperature,
-                                                     top_p, speculative, rec=rec, spec_k=spec_k):
+                                                     top_p, speculative, rec=rec, spec_k=spec_k,
+                                                     mm=P.get("mm"), mrope=P.get("mrope")):
                 if tid is not None:
                     produced.append(tid)
                     state["tokens"] = len(produced)
@@ -188,7 +234,7 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                 msg = json.loads(bytes(res.body).decode()).get("error", msg)
             return msg
         (P["friendly"], P["tok"], P["ids"], P["temperature"], P["top_p"],
-         P["max_new"], _st, P["speculative"], P["spec_k"]) = res
+         P["max_new"], _st, P["speculative"], P["spec_k"], P["mm"], P["mrope"]) = res
         return None
 
     # #cold-contract (BUG-1/2/6/8): LOAD (or fail) BEFORE opening ANY response — for streaming too.
