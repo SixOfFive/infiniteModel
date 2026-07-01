@@ -8,11 +8,12 @@ Each node spans TWO rows: a stats line topped by a GREEN download sparkline, and
 upload sparkline beneath it.
 
   DOWN / UP  - current in / out rate (DOWN green, UP red)
-  NEXT       - where this node sends its activations, INFERRED from the loaded models'
-               pipeline placement (controller -> stage0 -> ... -> head -> controller).
-               'ctrl' = back to the controller (a head stage or a single-node model);
-               'mesh' = a tensor-parallel stage (within-stage all-reduce, no single hop);
-               a node serving >1 model shows the first destination + a count
+  FROM→…→NEXT- the node's place in the ROUND TRIP, INFERRED from the loaded models' pipeline
+               placement: where its data comes FROM and goes NEXT (from→node→next). The train
+               leaves 'home' (the controller), runs out through the nodes, DROPS OFF at the head,
+               and returns all the way back to 'home'. So a head reads '…→node→home', stage 0
+               reads 'home→node→…', and the controller row pivots the loop ('head→home→stage0').
+               'mesh' = a tensor-parallel stage (no single hop); blank = not in a loaded pipeline
   RESIDENT   - what's loaded ON this machine: <models>m <layers>L <GB> (summed across every
                model that has a stage here)
   MAX        - peak rate within the DISPLAYED sparkline window (the busier direction); both
@@ -105,12 +106,16 @@ def build_edges(st):
       down  - hostname -> [downstream hostname, ...]  (insertion order, de-duped)
       mesh  - hostnames in a tensor-parallel stage (within-stage all-reduce; no single downstream)
     Hostnames are truncated like the table's row keys so they match. Pure /status reader."""
-    down = defaultdict(list)
+    down = defaultdict(list)                  # node -> downstream (where its data GOES next)
+    up = defaultdict(list)                     # node -> upstream (where its data comes FROM)
     mesh = set()
 
     def add(a, b):
-        if a and b and b not in down[a]:
-            down[a].append(b)
+        if a and b:
+            if b not in down[a]:
+                down[a].append(b)
+            if a not in up[b]:
+                up[b].append(a)
 
     cl = (st or {}).get("cluster") or {}
     seen = set()
@@ -137,20 +142,27 @@ def build_edges(st):
         for h in chain:
             add(prev, h)
             prev = h
-        add(prev, CTRL)                       # ... and the head returns logits to the controller
-    return down, mesh
+        add(prev, CTRL)                       # ... and the head returns logits to the controller (home)
+    return down, up, mesh
 
 
-def next_label(host, down, mesh):
-    """Compact '->destination' tag for a node's UP column. 'ctrl' = back to the controller;
-    'mesh' = a tensor-parallel stage; >1 destination shows the first + a count."""
-    dl = down.get(host) or []
-    if not dl:
+def route_label(host, up, down, mesh):
+    """The node's place in the round trip: 'FROM→node→NEXT' — where its data comes from and where
+    it goes. 'home' = the controller (the train's origin AND where the head drops off back to).
+    A head stage reads '…→node→home'; stage 0 reads 'home→node→…'; the controller row pivots the
+    loop ('head→home→stage0'). Blank when the node holds no loaded pipeline; 'mesh' for TP."""
+    frm = (up.get(host) or [None])[0]
+    nxt = (down.get(host) or [None])[0]
+    if frm is None and nxt is None:
         return "mesh" if host in mesh else ""
-    names = ["ctrl" if d == CTRL else d for d in dl]
-    if len(names) == 1:
-        return "→" + names[0][:7]
-    return "→" + names[0][:5] + "+%d" % (len(names) - 1)
+
+    def nm(x):
+        if x is None:
+            return "·"
+        return "home" if x == CTRL else x[:6]
+
+    self_s = "home" if host == CTRL else host[:6]
+    return (nm(frm) + "→" + self_s + "→" + nm(nxt))[:20]
 
 
 def build_resident(st):
@@ -183,8 +195,8 @@ def resid_label(v):
     return f"{nm}m {nl}L {g}G"
 
 
-# Columns: NODE DOWN UP NEXT RESIDENT MAX XFER. DOWN is idx 1 (green), UP idx 2 (red).
-COLW = ((11, "<"), (9, ">"), (9, ">"), (8, "<"), (13, "<"), (9, ">"), (9, ">"))
+# Columns: NODE DOWN UP ROUTE RESIDENT MAX XFER. DOWN is idx 1 (green), UP idx 2 (red).
+COLW = ((10, "<"), (9, ">"), (9, ">"), (20, "<"), (12, "<"), (9, ">"), (9, ">"))
 PREFIX_W = 1 + sum(w for w, _ in COLW) + (len(COLW) - 1)    # leading sp + cells + single-space gaps
 
 
@@ -264,14 +276,14 @@ def render():
     except Exception as e:
         st, err = None, str(e)
 
-    title = (f" FLEET BANDWIDTH  node → next hop   (MAX·XFER = last {win_s}s shown)"
+    title = (f" FLEET BANDWIDTH  round trip: home → node → home   (MAX·XFER = last {win_s}s shown)"
              f"   poll {POLL:.0f}s   {now}")
     out.append(f"\033[1;36m{title[:cols].ljust(cols)}\033[0m")
 
     if err:
         out.append(f"\033[31m controller {CTRL_IP} unreachable: {err}\033[0m"[:cols + 9])
     else:
-        down, mesh = build_edges(st)                   # inferred node -> downstream-node edges
+        down, up, mesh = build_edges(st)               # forward + reverse node edges (round trip)
         res, fleet_models = build_resident(st)
         cur = {}                                       # name -> (in, out) this poll
         ti = to = 0.0
@@ -293,20 +305,20 @@ def render():
         node_names = [nm for nm in cur if nm not in ("controller", "__total__")]
         node_names.sort(key=lambda nm: stat[nm][1], reverse=True)   # busiest-in-window first
 
-        out.append(DIM + fmt_prefix(("NODE", "DOWN", "UP", "NEXT", "RESIDENT", "MAX", "XFER"))
+        out.append(DIM + fmt_prefix(("NODE", "DOWN", "UP", "FROM→…→NEXT", "RESIDENT", "MAX", "XFER"))
                    + "  ↓ download / ↑ upload" + RST)
         budget = max(1, (lines - 7) // 2)              # 2 rows per node; reserve header/ctrl/total/legend
         shown = node_names[:budget]
         for name in shown:
             i, o = cur[name]
             peak, winx = stat[name]
-            out.extend(node_lines(name, i, o, next_label(name, down, mesh),
+            out.extend(node_lines(name, i, o, route_label(name, up, down, mesh),
                                   resid_label(res.get(name)), peak, winx, "", color, cols, sw))
         if len(node_names) > len(shown):
             out.append(f"{DIM}   …{len(node_names) - len(shown)} more node(s){RST}")
 
         cpeak, cwinx = stat["controller"]
-        out.extend(node_lines("controller", ci, co, next_label("controller", down, mesh),
+        out.extend(node_lines("controller", ci, co, route_label("controller", up, down, mesh),
                               "", cpeak, cwinx, MAG, color, cols, sw))
         tpeak, twinx = stat["__total__"]
         fleet_gb = sum(v[2] for v in res.values())
@@ -315,8 +327,9 @@ def render():
         out.append(BOLD + fmt_prefix((f"TOTAL {len(node_names)}", human(ti), human(to), "",
                                       tresid, human(tpeak), human_bytes(twinx)),
                                      base=BOLD, color=color) + RST)
-        out.append(f"  {GRN}██{RST} download    {RED}██{RST} upload    "
-                   f"{DIM}stacked per node: ↓ green = download · ↑ red = upload (scaled to MAX){RST}")
+        out.append(f"  {GRN}██{RST} download  {RED}██{RST} upload   "
+                   f"{DIM}↓green=download ↑red=upload (scaled to MAX) · "
+                   f"FROM→node→NEXT: 'home'=controller (drop-off → home){RST}")
         log_csv(time.time(), [(nm, *cur[nm]) for nm in node_names] + [("controller", ci, co)])
 
     sys.stdout.write("\033[H")
