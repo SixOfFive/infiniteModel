@@ -61,6 +61,22 @@ def set_local_dir_resolver(fn):
 _TOK_CACHE: dict = {}   # target_id -> tokenizer; the build is slow (minutes) for big
 
 
+def _tok_bytelevel_ok(tok) -> bool:
+    """Round-trip health probe for a byte-level BPE tokenizer. A mis-reconstructed backend
+    (a Metaspace/SentencePiece decoder imposed on a Ġ-convention vocab — see #detok-bytelevel in
+    _get_tokenizer) either DROPS spaces on encode or LEAKS the byte markers (Ġ/Ċ/▁) into the decoded
+    text. Returns False on either symptom; True when it can't probe (don't second-guess a tokenizer
+    that at least loaded)."""
+    try:
+        s = "The quick brown fox\njumps over"
+        out = tok.decode(tok.encode(s, add_special_tokens=False), skip_special_tokens=True)
+    except Exception:
+        return True
+    if any(m in out for m in ("Ġ", "Ċ", "▁")):   # Ġ / Ċ / ▁ leaked as literal text
+        return False
+    return " " in out            # spaces must survive the round-trip
+
+
 def _get_tokenizer(target_id: str):
     """Load a model's tokenizer, cached by target_id. AutoTokenizer.from_pretrained can
     take minutes for large models (the slow 'finalization' after a load); caching makes
@@ -74,12 +90,16 @@ def _get_tokenizer(target_id: str):
         # have no usable tokenizer (a GGUF-only repo ships .gguf, so from_pretrained(repo) would try to
         # build a slow tokenizer and fail without sentencepiece/tiktoken). Fall back to the repo id.
         sources = []
+        local_srcs = []   # #detok-bytelevel: local dirs that ship a tokenizer.json (verbatim-reload targets)
         if _LOCAL_DIR_FN is not None:
             try:
                 d = _LOCAL_DIR_FN(target_id)
-                if d and (os.path.exists(os.path.join(d, "tokenizer.json"))
-                          or os.path.exists(os.path.join(d, "tokenizer_config.json"))):
-                    sources.append(d)
+                if d:
+                    has_json = os.path.exists(os.path.join(d, "tokenizer.json"))
+                    if has_json or os.path.exists(os.path.join(d, "tokenizer_config.json")):
+                        sources.append(d)
+                    if has_json:
+                        local_srcs.append(d)
             except Exception:
                 pass
         sources.append(target_id)
@@ -103,6 +123,36 @@ def _get_tokenizer(target_id: str):
                 break
         if tok is None:
             raise last if last is not None else RuntimeError(f"no tokenizer for {target_id}")
+        # #detok-bytelevel: AutoTokenizer can pick a class (e.g. LlamaTokenizerFast) that REBUILDS a
+        # SentencePiece/Metaspace backend and IGNORES a perfectly-good ByteLevel tokenizer.json. This
+        # hits Llama-3-vocab models whose tokenizer_config declares tokenizer_class 'LlamaTokenizerFast'
+        # (DeepSeek-R1-Distill-Llama-70B, Nemotron-70B, …): the vocab uses the Ġ space convention but
+        # the rebuilt Metaspace backend hunts for '▁', so encode DROPS every space (the model gets a
+        # spaceless prompt) and decode LEAKS the byte marker Ġ/Ċ into the text. If the round-trip is
+        # broken AND the dir ships a tokenizer.json, reload it VERBATIM as PreTrainedTokenizerFast
+        # (loads tokenizer.json as-is, still reads the config for chat_template + special tokens) —
+        # accepted ONLY if it actually repairs the round-trip, so a genuinely-fine tokenizer is untouched.
+        if not _tok_bytelevel_ok(tok):
+            _orig_cls = type(tok).__name__
+            fixed = None
+            for src in local_srcs:
+                try:
+                    from transformers import PreTrainedTokenizerFast
+                    cand = PreTrainedTokenizerFast.from_pretrained(src, trust_remote_code=True)
+                except Exception as exc:
+                    print(f"[tokenizer] {target_id}: verbatim reload from {src} failed: {exc!r}")
+                    continue
+                if _tok_bytelevel_ok(cand):
+                    fixed = cand
+                    break
+            if fixed is not None:
+                print(f"[tokenizer] {target_id}: byte-level backend was mis-reconstructed as "
+                      f"{_orig_cls} (Ġ/space round-trip broken) — reloaded tokenizer.json verbatim")
+                tok = fixed
+            else:
+                print(f"[tokenizer] WARNING {target_id}: byte-level round-trip looks broken "
+                      f"({_orig_cls}) and no verbatim tokenizer.json repaired it — "
+                      f"output may show Ġ/▁ markers")
         _TOK_CACHE[target_id] = tok
     return tok
 
