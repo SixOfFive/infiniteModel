@@ -151,10 +151,25 @@ def register(app):
                           proportional=(mode == "proportional"),
                           gpu_spread=(mode == "all-gpu" and not cpu_only))
         d = p.to_dict()
+        # #mem-preview: ALWAYS surface the memory footprint the chosen quant+ctx needs, so the
+        # Load/Preview dialog shows weights + KV(ctx) + the est VRAM/RAM split BEFORE committing —
+        # even when the plan does NOT fit (then est_vram/est_ram are absent, but weights+KV explain why).
+        _wt_gb = spec.total_weight_bytes / GB
+        _kv_gb = spec.kv_bytes_per_layer(ctx) * spec.num_layers / GB
+        d["mem"] = {"quant": (quant if quant in ("int8", "int4") else "none"), "ctx": ctx,
+                    "weights_gb": round(_wt_gb, 2), "kv_gb": round(_kv_gb, 2),
+                    "kv_per_1k_gb": round(_kv_gb / max(1, ctx) * 1000, 3),
+                    "total_gb": round(_wt_gb + _kv_gb, 2)}
         if p.ok:   # #60/#76: surface the basis + pre-load assessment so a Preview matches the load
             d["basis"] = _describe_plan(p.stages, node_by_id, cpu_only, (pv and not cpu_only), quant,
                                         gpu_spread=(mode == "all-gpu" and not cpu_only))
             d["assess"] = _assess_placement(spec, ctx, mems, p.stages, cpu_only=cpu_only)
+            # #mem-preview: split the footprint into est VRAM vs RAM using the assessment's weights-
+            # and-KV-in-RAM figures (the rest of weights+KV lands in VRAM). Mirrors the live fill order.
+            _a = d["assess"]
+            _ram = (_a.get("cpu_weight_gb", 0.0) or 0.0) + (_a.get("kv_ram_gb", 0.0) or 0.0)
+            d["mem"]["est_ram_gb"] = round(_ram, 2)
+            d["mem"]["est_vram_gb"] = round(max(0.0, (_wt_gb + _kv_gb) - _ram), 2)
             # #78 guardrail: a CONSOLIDATING mode (auto/single) can pile a heavy shard onto the
             # controller's co-located worker, which must ALSO serve the whole stream -> it OOM-drops
             # mid-load (the beast minimax crash). Flag it so the dashboard offers 'proportional'

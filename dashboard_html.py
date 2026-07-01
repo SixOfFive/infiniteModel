@@ -426,19 +426,20 @@ function openLoad(name){
   const ctxDefault = dc>=131072 ? 16384 : (dc||8192);
   const qopt=q=>'<option value="'+q+'">'+q+(cz[q]&&cz[q].ok?' · '+gb(cz[q].size_gb)+' cached':'')+'</option>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load '+esc(name)+'</h3>'
-   +'<div class="grid2"><div><label>Quant</label><select id="l-q">'+qopt('int4')+qopt('int8')+'<option value="none">none (bf16)</option></select></div>'
-   +'<div><label>Context length</label><input id="l-ctx" type="number" value="'+ctxDefault+'"></div></div>'
-   +'<label>Placement</label><select id="l-place" onchange="_placeChg()">'
+   +'<div class="grid2"><div><label>Quant</label><select id="l-q" onchange="previewSoon(\''+esc(name)+'\')">'+qopt('int4')+qopt('int8')+'<option value="none">none (bf16)</option></select></div>'
+   +'<div><label>Context length</label><input id="l-ctx" type="number" value="'+ctxDefault+'" oninput="previewSoon(\''+esc(name)+'\')"></div></div>'
+   +'<label>Placement</label><select id="l-place" onchange="_placeChg();previewSoon(\''+esc(name)+'\')">'
    +'<optgroup label="Auto / distribute"><option value="m:auto">auto · GPU-first</option><option value="m:all-gpu">all-GPU</option>'
    +'<option value="m:distribute">distribute (CPU+GPU)</option><option value="m:proportional">proportional</option></optgroup>'
    +_devOpts()
    +'<optgroup label="Tensor-parallel"><option value="tp:gpu">GPU tensor-parallel</option><option value="tp:cpu">CPU tensor-parallel (RAM)</option></optgroup></select>'
-   +'<div id="l-tpwrap" style="display:none;margin-top:8px"><label>TP width (number of nodes)</label><input id="l-tpn" type="number" min="2" value="2"></div>'
+   +'<div id="l-tpwrap" style="display:none;margin-top:8px"><label>TP width (number of nodes)</label><input id="l-tpn" type="number" min="2" value="2" oninput="previewSoon(\''+esc(name)+'\')"></div>'
    +(dc>=131072?'<div class="note">⚠ native ctx is '+(Math.round(dc/1024))+'k — a huge KV cache. Keep ctx modest (8–16k) unless you need more.</div>':'')
    +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
    +'<button class="btn pri" onclick="doLoad(\''+esc(name)+'\')">Load</button></div>'
    +'<div id="l-out" style="font-size:12px;color:var(--muted);margin-top:10px"></div>';
   $('#ov').classList.add('show');
+  previewSoon(name);   // #mem-preview: show the est VRAM/RAM + KV-at-ctx footprint immediately
 }
 function _placeChg(){ $('#l-tpwrap').style.display=$('#l-place').value.indexOf('tp:')===0?'block':'none'; }
 function placeParams(name){
@@ -450,17 +451,39 @@ function placeParams(name){
   else if(v==='tp:cpu'){ p.tp=$('#l-tpn').value||2; p.cpu_only='true'; }
   return p;
 }
+let _pvTimer=null;
+// #mem-preview: debounce the /plan estimate so typing a ctx / flipping quant re-estimates without a
+// request per keystroke. Called on dialog open + on every quant/ctx/placement change.
+function previewSoon(name){ clearTimeout(_pvTimer); const el=$('#l-out'); if(el)el.textContent='estimating…'; _pvTimer=setTimeout(()=>preview(name),350); }
 async function preview(name){
   const p=placeParams(name); const q=new URLSearchParams({model:p.model,quant:p.quant,ctx:p.ctx});
   if(p.mode)q.set('mode',p.mode); if(p.node)q.set('node',p.node); if(p.cpu_only)q.set('cpu_only',p.cpu_only);
-  $('#l-out').textContent='planning…';
-  try{ const r=await (await fetch('/plan?'+q.toString())).json();
-    if(!r.ok){ $('#l-out').innerHTML='<span class="err">'+esc(r.error||'cannot place')+'</span>'; return; }
-    const st=(r.stages||[]).map(s=>esc(s.hostname)+' L'+s.layer_start+'-'+s.layer_end).join(', ');
-    $('#l-out').innerHTML='<b>plan:</b> '+(esc(r.basis||''))+'<br>'+st
-      +(p.tp?'<div class="note">TP preview is approximate (planned as pipeline)</div>':'')
-      +(r.overload?'<div class="note">⚠ '+esc(r.overload.reason)+' — suggest '+esc(r.overload.suggest||'proportional')+'</div>':''); }
-  catch(e){ $('#l-out').innerHTML='<span class="err">'+esc(String(e.message||e))+'</span>'; }
+  const out=$('#l-out'); if(!out)return; out.textContent='estimating…';
+  let r; try{ r=await (await fetch('/plan?'+q.toString())).json(); }
+  catch(e){ out.innerHTML='<span class="err">'+esc(String(e.message||e))+'</span>'; return; }
+  const mem=r.mem||{}, a=r.assess||{};
+  let html='';
+  // Estimated footprint: weights + KV-at-ctx (+ per-1k scaling) + the est VRAM/RAM split.
+  if(mem.weights_gb!=null){
+    const split=(mem.est_vram_gb!=null)
+      ? ('<span style="color:var(--good)">~'+gb(mem.est_vram_gb)+' VRAM</span> · <span class="em">~'+gb(mem.est_ram_gb)+' RAM</span>')
+      : '<span class="em">— (does not fit; see below)</span>';
+    html+='<div style="margin:2px 0"><b>Estimated footprint</b> · '+esc(mem.quant)+' · ctx '+(mem.ctx||0).toLocaleString()+'</div>'
+      +'<table class="kv">'
+      +'<tr><td>weights</td><td class="v">'+gb(mem.weights_gb)+'</td></tr>'
+      +'<tr><td>KV cache @ '+(mem.ctx||0).toLocaleString()+'</td><td class="v">'+gb(mem.kv_gb)+' <span class="em">(~'+gb(mem.kv_per_1k_gb)+' / 1k tok)</span></td></tr>'
+      +'<tr><td>total</td><td class="v"><b>'+gb(mem.total_gb)+'</b></td></tr>'
+      +'<tr><td>placement</td><td class="v">'+split+'</td></tr>'
+      +'</table>';
+  }
+  if(!r.ok){ html+='<div class="err" style="margin-top:6px">⚠ '+esc(r.error||'does not fit the fleet at these settings')+'</div>'; out.innerHTML=html; return; }
+  const st=(r.stages||[]).map(s=>esc(s.hostname)+' L'+s.layer_start+'-'+s.layer_end).join(', ');
+  html+='<div style="margin-top:6px"><b>plan:</b> '+esc(r.basis||'')+'<br>'+st+'</div>';
+  (a.warnings||[]).forEach(w=>html+='<div class="note">⚠ '+esc(w)+'</div>');
+  if(a.suggested_ctx&&(a.kv_ram_gb||0)>0.1) html+='<div class="note">tip: ctx ≤ '+a.suggested_ctx.toLocaleString()+' keeps the KV cache in VRAM</div>';
+  if(p.tp)html+='<div class="note">TP preview is approximate (planned as pipeline)</div>';
+  if(r.overload)html+='<div class="note">⚠ '+esc(r.overload.reason)+' — suggest '+esc(r.overload.suggest||'proportional')+'</div>';
+  out.innerHTML=html;
 }
 async function doLoad(name){
   const q=new URLSearchParams(placeParams(name));
