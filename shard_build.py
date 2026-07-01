@@ -404,6 +404,21 @@ class ShardBuildMixin:
                         Qwen2_5OmniThinkerTextModel(self.cfg),
                         torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False))
                 model = model.to(dt)
+            elif str(getattr(self.cfg, "model_type", "")).lower() in ("qwen2_5_vl_text", "qwen2_5_vl"):
+                # Qwen2.5-VL: AutoModelForCausalLM has no mapping for Qwen2_5_VLTextConfig, so the
+                # generic build below raises. Build ONLY the text decoder (the worker never holds the
+                # vision tower — the controller runs it and splices image embeds at stage 0), wrapped as
+                # .model + .lm_head to match the served 'model.*'/'lm_head' weights. Mirrors the Omni
+                # special-case above. (#vl-vision)
+                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLTextModel
+                class _VLTextCausalLM(torch.nn.Module):
+                    def __init__(self, m, h):
+                        super().__init__(); self.model = m; self.lm_head = h
+                with torch.device("meta"):
+                    model = _VLTextCausalLM(
+                        Qwen2_5_VLTextModel(self.cfg),
+                        torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False))
+                model = model.to(dt)
             elif _trust:
                 try:
                     from accelerate import init_empty_weights

@@ -194,6 +194,17 @@ def _skeleton_from_cfg(cfg):
     if (getattr(cfg, "thinker_config", None) is not None
             or getattr(cfg, "text_config", None) is not None):
         cfg = cfg.get_text_config()
+    if str(getattr(cfg, "model_type", "")).lower() in ("qwen2_5_vl_text", "qwen2_5_vl"):
+        # #vl-vision: AutoModelForCausalLM can't build Qwen2_5_VLTextConfig; build the text-decoder
+        # skeleton directly so the compile/pack scope matches the worker's cold build exactly.
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLTextModel
+        class _VLTextCausalLM(torch.nn.Module):
+            def __init__(self, m, h):
+                super().__init__(); self.model = m; self.lm_head = h
+        _ctx0 = init_empty_weights() if init_empty_weights is not None else torch.device("meta")
+        with _ctx0:
+            return _VLTextCausalLM(Qwen2_5_VLTextModel(cfg),
+                                   torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False))
     try:
         cfg._attn_implementation = "eager"   # some remote-code archs abort on sdpa at from_config
     except Exception:

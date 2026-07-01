@@ -605,9 +605,54 @@ def _get_image_processor(target_id: str):
     p = _IMGPROC_CACHE.get(target_id)
     if p is None:
         from transformers import AutoImageProcessor
-        p = AutoImageProcessor.from_pretrained(target_id, use_fast=False)
+        try:
+            p = AutoImageProcessor.from_pretrained(target_id, use_fast=False)
+        except Exception as exc:
+            # #vl-vision: some arches (Qwen2-VL / Qwen2.5-VL) register ONLY a torchvision-backed image
+            # processor with AutoImageProcessor, so even use_fast=False ImportErrors when torchvision is
+            # absent. Installing torchvision risks clobbering the pinned ROCm/CUDA torch, so instead
+            # construct the CONCRETE processor class — transformers transparently swaps in its PIL
+            # backend (e.g. Qwen2VLImageProcessorPil) when torchvision is missing (PIL-only, no video proc).
+            p = _pil_image_processor(target_id, exc)
         _IMGPROC_CACHE[target_id] = p
     return p
+
+
+def _pil_image_processor(target_id: str, orig_exc: Exception):
+    """Torchvision-free image processor for a model whose AutoImageProcessor pulls a torchvision-only
+    class. Resolve the concrete class from the model's preprocessor_config `image_processor_type`
+    (dropping the deprecated `Fast` suffix and trying a `Pil` variant), plus a known-good Qwen2-VL
+    fallback; each concrete class auto-falls-back to its PIL backend when torchvision is unavailable."""
+    import os, json as _json
+    import transformers as _T
+    src, itype = None, None
+    try:
+        d = _LOCAL_DIR_FN(target_id) if _LOCAL_DIR_FN is not None else None
+        pc = os.path.join(d, "preprocessor_config.json") if d else None
+        if pc and os.path.exists(pc):
+            src = d
+            with open(pc, "r", encoding="utf-8") as _f:
+                itype = (_json.load(_f) or {}).get("image_processor_type")
+    except Exception:
+        pass
+    cands = []
+    if itype:
+        base = itype[:-4] if itype.endswith("Fast") else itype
+        cands += [base, base + "Pil", itype]
+    cands += ["Qwen2VLImageProcessorPil", "Qwen2VLImageProcessor"]   # known PIL-capable fallback
+    seen = set()
+    for nm in cands:
+        if not nm or nm in seen:
+            continue
+        seen.add(nm)
+        C = getattr(_T, nm, None)
+        if C is None:
+            continue
+        try:
+            return C.from_pretrained(src or target_id)
+        except Exception:
+            continue
+    raise orig_exc
 
 
 def _as_feature_tensor(feats):

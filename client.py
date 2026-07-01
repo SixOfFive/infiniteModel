@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c174"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c175"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2613,6 +2613,16 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
                 text_model = Qwen2_5OmniThinkerTextModel(self.cfg)
                 lm_head = torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False)
                 model = _OmniTextCausalLM(text_model, lm_head)
+            elif str(getattr(self.cfg, "model_type", "")).lower() in ("qwen2_5_vl_text", "qwen2_5_vl"):
+                # Qwen2.5-VL text decoder only (controller runs the vision tower). AutoModelForCausalLM
+                # has no Qwen2_5_VLTextConfig mapping. (#vl-vision)
+                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLTextModel
+                class _VLTextCausalLM(torch.nn.Module):
+                    def __init__(self, m, h):
+                        super().__init__(); self.model = m; self.lm_head = h
+                model = _VLTextCausalLM(
+                    Qwen2_5_VLTextModel(self.cfg),
+                    torch.nn.Linear(self.cfg.hidden_size, self.cfg.vocab_size, bias=False))
             else:
                 model = AutoModelForCausalLM.from_config(self.cfg)
         model = model.to(dtype)
