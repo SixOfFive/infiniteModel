@@ -330,6 +330,7 @@ function modelRow(m,s){
   if(s.k==='loaded'){
     const parts=[];
     if(m.quant)parts.push(esc(m.quant));
+    if(m.kv_quant&&m.kv_quant!=='none')parts.push('<span class="em" title="TurboQuant KV-cache quantization ('+esc(m.kv_quant)+'): keys/values stored at ~3–4 bits instead of bf16 (data-free rotation + Lloyd-Max, un-rotated on read so attention is unchanged) → ~2× smaller KV cache, so longer context and more co-resident models on the same VRAM. turbo4 ≈ near-lossless, turbo3 more aggressive; best on large models.">KV:'+esc(m.kv_quant)+'</span>');
     parts.push('ctx '+(m.ctx||'?'));
     if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
     if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');
@@ -478,6 +479,10 @@ function openDetail(name){
   add('native ctx',m.default_ctx||''); add('cached quants',Object.keys(cz).filter(q=>cz[q]&&cz[q].ok).join(', '));
   if(m.loaded){
     add('loaded ctx',m.ctx); add('quant',esc(m.quant)+(m.tp_size>1?(' · TP'+m.tp_size):' · pipeline'));
+    if(m.kv_quant&&m.kv_quant!=='none'){
+      const _kvb={turbo2:'~2-bit',turbo3:'~3-bit',turbo4:'~4-bit'}[m.kv_quant]||'';
+      add('<span title="TurboQuant KV-cache quantization: the KV cache (per-token memory the model accumulates) is stored at ~3–4 bits — a data-free random rotation makes the coordinates uniform, then a Lloyd-Max codebook quantizes each; on read it is un-rotated back to normal so the model\'s attention runs UNCHANGED. Effect: ~2× smaller KV cache → you can run longer context, or keep more models loaded at once, on the same VRAM. turbo4 ≈ near-lossless, turbo3 is more aggressive; best on large models (small models degrade). Weights are unaffected — this only shrinks the KV cache.">KV quant&nbsp;ⓘ</span>', esc(m.kv_quant)+(_kvb?(' · '+_kvb+' KV'):''));
+    }
     add('VRAM',gb(m.vram_used_gb)); add('RAM',gb(m.ram_used_gb)+(m.cpu_frac>=0.5?(' <span style="color:var(--hot)">('+Math.round(m.cpu_frac*100)+'% on CPU)</span>'):''));
     add('KV used / reserved',gb(m.kv_used_gb)+' / '+gb(m.kv_reserved_gb));
     add('tok/s (live · avg · max)',[(m.tok_s||0).toFixed(1),(m.ema_tok_s||0).toFixed(1),(m.max_tok_s||0).toFixed(1)].join(' · '));

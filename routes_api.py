@@ -120,6 +120,7 @@ def register(app):
                 "context_length": lm.ctx,   # Ollama-standard field (loaded context window)
                 "infinitemodel": {
                     "ctx": lm.ctx, "pool_usable_gb": round(lm.plan.pool_usable_gb, 2),
+                    "kv_quant": getattr(lm, "kv_quant", "none"),   # #172 TurboQuant KV preset
                     "stages": [{"host": s.hostname, "layers": [s.layer_start, s.layer_end],
                                 "embed": s.has_embed, "head": s.has_head,
                                 "est_gb": round(s.est_gb, 2)} for s in lm.plan.stages]},

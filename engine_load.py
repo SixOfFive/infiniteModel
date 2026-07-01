@@ -341,7 +341,8 @@ class EngineLoadMixin:
                                 await self._unload_model_locked(reg_key, "reload (auto-tp)")
                             await self._await_free_refresh()
                             return await self._load_tp_locked(friendly, target_id, spec, ctx,
-                                                              auto_t, quant, cpu_only=True)
+                                                              auto_t, quant, cpu_only=True,
+                                                              kv_quant=kv_quant)
                         except Exception as exc:
                             log_activity(f"{friendly}: auto-TP failed ({exc!r}) -> pipeline fallback")
 
@@ -354,7 +355,7 @@ class EngineLoadMixin:
                     await self._unload_model_locked(reg_key, "reload (tp)")
                 await self._await_free_refresh()
                 return await self._load_tp_locked(friendly, target_id, spec, ctx, tp, quant,
-                                                  cpu_only=cpu_only)
+                                                  cpu_only=cpu_only, kv_quant=kv_quant)
 
             # FIT-AS-MANY + NODE-SHARING (Inc 3a/3b): keep other resident models and place this
             # one wherever there's room — INCLUDING nodes already serving a model. Each node is
@@ -820,7 +821,7 @@ class EngineLoadMixin:
             lm = LoadedModel(
                 reg_key, target_id, spec, ctx, plan,
                 [s.node_id for s in stages], tok, eos, now,
-                quant=quant, stage0_writer=stage0_writer, last_used=now,
+                quant=quant, kv_quant=kv_quant, stage0_writer=stage0_writer, last_used=now,
                 stage0_dial=_s0_dial, last_send_ts=now)   # #stage0-stale-reconnect: how to re-dial + freshness clock
             lm.base, lm.replica_idx = friendly, replica_idx   # data-parallel grouping (#39)
             lm.plan_basis = basis                             # placement basis (#65)
@@ -1006,7 +1007,8 @@ class EngineLoadMixin:
                     nd.load_state = "idle"
 
     async def _load_tp_locked(self, friendly: str, target_id: str, spec: ModelSpec,
-                              ctx: int, tp: int, quant: str, cpu_only: bool = False) -> LoadedModel:
+                              ctx: int, tp: int, quant: str, cpu_only: bool = False,
+                              kv_quant: str = "none") -> LoadedModel:
         """M4 tensor-parallel load. Every node in the group holds 1/tp of each layer
         (full embed/head/norm); rank 0 is the SINGLE pipeline stage the controller talks to
         and drives the peers over the all-reduce mesh. TP-v2 (per-rank streaming): each rank
@@ -1228,6 +1230,7 @@ class EngineLoadMixin:
             msg = {"type": "load", "model_id": target_id,
                    "layer_start": 0, "layer_end": L, "has_embed": True, "has_head": True,
                    "stage": 0, "num_stages": 1, "dtype": "bfloat16",
+                   "kv_quant": kv_quant,   # #172 TurboQuant KV preset (per-rank shard honors it)
                    "controller_http_port": ARGS.http_port,
                    # per-rank device from THIS node's tier (#87): a GPU rank gets its load_device()
                    # ("" -> worker cpu+gpu default, or "gpu"); a CPU rank gets explicit 'cpu'.
@@ -1303,7 +1306,7 @@ class EngineLoadMixin:
         now = time.time()
         lm = LoadedModel(friendly, target_id, spec, ctx, plan,
                          [n.node_id for n in tp_nodes], tok, eos, now,
-                         quant=quant, stage0_writer=stage0_writer, last_used=now,
+                         quant=quant, kv_quant=kv_quant, stage0_writer=stage0_writer, last_used=now,
                          stage0_dial=_tp_dial, last_send_ts=now)
         lm.plan_basis = tp_basis                          # placement basis (#65)
         lm.tp_size = tp                                    # #88: record TP width for the card + /reconfigure

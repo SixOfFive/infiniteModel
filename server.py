@@ -1431,6 +1431,7 @@ class LoadedModel:
     eos_ids: set
     loaded_at: float
     quant: str = "none"   # the quant this model was loaded with, so an auto-reload keeps it
+    kv_quant: str = "none"  # #172 TurboQuant KV-cache preset (none|turbo2|turbo3|turbo4); shown on the card
     tp_size: int = 1      # tensor-parallel width (1 = pipeline/single-node); set by _load_tp_locked.
                           # Surfaced on the card + used by #88 /reconfigure (managed-reload to/from TP).
     stage0_writer: Optional[asyncio.StreamWriter] = None  # per-model pipeline conn (controller -> first stage)

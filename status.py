@@ -136,6 +136,7 @@ def build_status() -> dict:
             "tok_s": round(lm.last_tok_s if lm.active > 0 else 0.0, 2),   # decode tok/s, live (#46)
             "ema_tok_s": round(lm.ema_tok_s, 2),     # smoothed decode tok/s across gens, historical (#46)
             "quant": lm.quant,     # the quant this model was loaded with (none/int8)
+            "kv_quant": getattr(lm, "kv_quant", "none"),     # #172 TurboQuant KV preset (none/turbo2/3/4)
             "tp_size": getattr(lm, "tp_size", 1),            # #88: TP width (1 = pipeline)
             "is_tp": getattr(lm, "tp_size", 1) > 1,          # #88: card shows TP vs pipeline + reconfigure
             "num_layers": lm.spec.num_layers, "params": _human_params(lm.spec),
