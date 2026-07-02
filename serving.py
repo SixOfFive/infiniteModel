@@ -98,11 +98,18 @@ def _render_chat_ids(tok, chat, hf_tools):
     no tool support still SEES the tools and can emit <tool_call> markup we parse back out."""
     if not hf_tools:
         return _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True))
+    # A template WITHOUT tool handling doesn't throw on tools= — it silently renders without them
+    # (e.g. Qwen2.5-VL's vision-only template), so the model never sees the defs. Detect that up
+    # front and go straight to the text tool instruction.
+    _tmpl = getattr(tok, "chat_template", None) or ""
+    _native = isinstance(_tmpl, str) and ("tools" in _tmpl or "tool_call" in _tmpl)
     try:
+        if not _native:
+            raise ValueError("chat template has no tool support")
         return _to_id_list(tok.apply_chat_template(chat, tools=hf_tools,
                            add_generation_prompt=True, tokenize=True))
     except Exception as exc:
-        print(f"[serve] chat-template rejected tools= ({type(exc).__name__}: {exc}); "
+        print(f"[serve] no native template tools ({type(exc).__name__}: {exc}); "
               f"injecting a text tool instruction instead")
         instr = _tool_instruction(hf_tools)
         if chat and chat[0].get("role") == "system":
