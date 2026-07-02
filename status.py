@@ -379,6 +379,13 @@ def _dir_supports_tools(d) -> bool:
             if os.path.exists(jj):
                 with open(jj, encoding="utf-8") as fh:
                     t = fh.read()
+        if not t:
+            cj = os.path.join(d, "chat_template.json")    # Qwen2.5-VL (processor-level template)
+            if os.path.exists(cj):
+                with open(cj, encoding="utf-8") as fh:
+                    ct = _json.load(fh).get("chat_template")
+                if isinstance(ct, str):
+                    t = ct
         return bool(t) and (("tool_call" in t) or ("tools" in t))
     except Exception:
         return False
