@@ -125,10 +125,17 @@ class ShardForwardMixin:
                 # still runs on-device. Only meaningful when layers sit on GPU (a CPU shard's KV
                 # is already in RAM); ANY failure (no CUDA, transformers API drift) falls back to
                 # a plain DynamicCache so generation never breaks.
+                # ROCm/HIP: offloading is DISABLED — live-validated GARBLED on gfx1151 (TheRock
+                # torch 2.12a): the side-stream H2D prefetch races the compute stream, so decode
+                # was corrupted AND nondeterministic at temperature 0 (plain load: bit-identical).
+                # An APU's "VRAM" is unified system RAM anyway, so offload buys nothing there.
                 self.kv = None
                 try:
-                    if any(getattr(d, "type", "") == "cuda"
-                           for d in (getattr(self, "layer_devices", None) or [])):
+                    if getattr(self.torch.version, "hip", None):
+                        print("[kv_offload] ROCm/HIP: offloaded-KV prefetch garbles decode "
+                              "(stream race, validated live) -> plain on-device KV", flush=True)
+                    elif any(getattr(d, "type", "") == "cuda"
+                             for d in (getattr(self, "layer_devices", None) or [])):
                         self.kv = DynamicCache(offloading=True)
                 except Exception as exc:
                     print(f"[kv_offload] unavailable ({exc!r}) -> plain bf16 KV on device", flush=True)
