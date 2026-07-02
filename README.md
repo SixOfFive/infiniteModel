@@ -43,9 +43,14 @@ dashboard.
   distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3): image/audio → text.
 - **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
   object args), OpenAI `/v1/chat/completions` (`tool_calls` + `finish_reason:"tool_calls"`), and
-  Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming. Tool defs render
-  through the model's chat template (text-instruction fallback for templates without native tool
-  support); per-model support surfaces as a `tools` capability in `/api/show`.
+  Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming, including the full
+  reply loop (assistant `tool_calls` turns + `role:"tool"` results in either dialect's shape).
+  Tool defs render through the model's chat template (text-instruction fallback for templates
+  without native tool support); `tool_choice` honored (`none` / forced function best-effort);
+  per-model support surfaces as a `tools` capability in `/api/show`.
+- **API compatibility extras.** JSON mode (Ollama `format:"json"`/schema, OpenAI
+  `response_format` — best-effort instruction + fence-stripping), OpenAI text-part list content,
+  Ollama-native per-message `images:[b64]` and `/api/generate` top-level `images`.
 - **Multi-model & ops.** N models resident at once, node-sharing, concurrency + queueing,
   auto-load/unload, a live dashboard (placement preview, per-load progress, fleet memory/throughput,
   bandwidth), curl-able fleet logs, and idle-gated self-update.

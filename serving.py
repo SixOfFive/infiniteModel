@@ -88,40 +88,178 @@ def _ollama_tool_calls(calls: list) -> list:
     return [{"function": {"name": c.get("name"), "arguments": _tool_args(c)}} for c in calls]
 
 
+def _merge_system(chat, text):
+    """Prepend `text` into the chat's system prompt (merging with an existing leading system
+    message, else inserting one). Returns a NEW list; never mutates the caller's messages."""
+    if not text:
+        return chat
+    if chat and isinstance(chat[0], dict) and chat[0].get("role") == "system":
+        return ([{"role": "system", "content": str(chat[0].get("content", "")) + "\n\n" + text}]
+                + list(chat[1:]))
+    return [{"role": "system", "content": text}] + list(chat)
+
+
+def _normalize_tool_messages(messages):
+    """#tools: normalize the tool-calling REPLY turns Ollama/OpenAI clients send back so the HF
+    chat template renders them correctly (the 2nd half of the agent loop):
+    - assistant `tool_calls`: OpenAI carries function.arguments as a JSON STRING; HF templates
+      expect a dict (Qwen does `| tojson` — a string would double-encode). Parse it, and force the
+      {"type":"function","function":{name,arguments}} wrapper shape both conventions map onto.
+    - `content: null` (OpenAI's tool-call turns) -> "" — templates do string ops on content.
+    - all-TEXT list content (OpenAI content parts) -> joined string — plain-text templates choke on
+      lists; lists holding image/audio blocks pass through untouched (the vision path needs them).
+    - role "tool" results: coerce non-string content (clients send dict/list JSON) to a JSON string.
+    Copy-on-write: returns a new list only when something changed."""
+    if not messages:
+        return messages
+    out, changed = [], False
+    for m in messages:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        nm = m
+
+        def _mut():
+            nonlocal nm, changed
+            if nm is m:
+                nm = dict(m)
+                changed = True
+            return nm
+        c = m.get("content")
+        if c is None:
+            _mut()["content"] = ""
+        elif isinstance(c, list) and c and all(isinstance(b, dict) and b.get("type") == "text"
+                                               for b in c):
+            _mut()["content"] = "\n".join(str(b.get("text", "")) for b in c)
+        elif m.get("role") == "tool" and not isinstance(c, (str, list)) and c is not None:
+            with contextlib.suppress(Exception):
+                _mut()["content"] = json.dumps(c)
+        tcs = m.get("tool_calls")
+        if tcs and isinstance(tcs, list):
+            ntc = []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                if not isinstance(args, dict):
+                    args = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+                e = {"type": "function", "function": {"name": fn.get("name"), "arguments": args}}
+                if tc.get("id"):
+                    e["id"] = tc["id"]
+                ntc.append(e)
+            if ntc != tcs:
+                _mut()["tool_calls"] = ntc
+        out.append(nm)
+    return out if changed else messages
+
+
+def _flatten_tool_roles(chat):
+    """#tools: rewrite tool-loop turns into plain user/assistant text for templates that can't
+    render them natively: assistant tool_calls -> literal <tool_call>{json}</tool_call> text
+    (matching the instruction format the model was shown), tool results -> a user turn wrapped in
+    <tool_response> tags (Qwen's own convention for tool results). Lossless for the model."""
+    out = []
+    for m in chat:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            txt = str(m.get("content") or "")
+            for tc in m["tool_calls"]:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                txt += (("\n" if txt else "")
+                        + "<tool_call>" + json.dumps({"name": fn.get("name"),
+                                                      "arguments": fn.get("arguments") or {}})
+                        + "</tool_call>")
+            out.append({"role": "assistant", "content": txt})
+        elif m.get("role") == "tool":
+            body = m.get("content")
+            if not isinstance(body, str):
+                body = json.dumps(body)
+            out.append({"role": "user",
+                        "content": "<tool_response>\n" + body + "\n</tool_response>"})
+        else:
+            out.append(m)
+    return out
+
+
 def _render_chat_ids(tok, chat, hf_tools):
     """#tools: tokenize a chat, injecting tool definitions when present. `hf_tools` is the
     OpenAI/HF shape ([{type:function, function:{name,description,parameters}}]) that /api/chat and
     /v1/chat/completions already send, passed straight to apply_chat_template(tools=). With NO tools
-    this is byte-identical to the old plain render. 3-tier fallback mirrors _serve_anthropic._render_ids:
-    native tools -> a text tool instruction in the system prompt (templates that reject tools=) ->
-    a flat text join (templates that reject the chat entirely). So even a model whose HF template has
-    no tool support still SEES the tools and can emit <tool_call> markup we parse back out."""
-    if not hf_tools:
-        return _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True))
-    # A template WITHOUT tool handling doesn't throw on tools= — it silently renders without them
-    # (e.g. Qwen2.5-VL's vision-only template), so the model never sees the defs. Detect that up
-    # front and go straight to the text tool instruction.
+    (and no tool-loop turns) this is byte-identical to the old plain render. Tiers:
+    native tools= -> text tool instruction + flattened tool turns (templates without tool support
+    SILENTLY ignore tools= — probe tok.chat_template up front, don't wait for an exception) ->
+    flatten-and-retry on any template exception (e.g. a template that rejects the 'tool' role) ->
+    a flat text join. So every model SEES the tools + results, whatever its template supports."""
     _tmpl = getattr(tok, "chat_template", None) or ""
     _native = isinstance(_tmpl, str) and ("tools" in _tmpl or "tool_call" in _tmpl)
+    if hf_tools and not _native:
+        # template would silently drop tools= AND likely rejects tool turns: flatten + instruct
+        chat = _merge_system(_flatten_tool_roles(chat), _tool_instruction(hf_tools))
+        hf_tools = None
+        print("[serve] no native template tools; injected a text tool instruction")
     try:
-        if not _native:
-            raise ValueError("chat template has no tool support")
-        return _to_id_list(tok.apply_chat_template(chat, tools=hf_tools,
-                           add_generation_prompt=True, tokenize=True))
+        if hf_tools:
+            return _to_id_list(tok.apply_chat_template(chat, tools=hf_tools,
+                               add_generation_prompt=True, tokenize=True))
+        return _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True))
     except Exception as exc:
-        print(f"[serve] no native template tools ({type(exc).__name__}: {exc}); "
-              f"injecting a text tool instruction instead")
-        instr = _tool_instruction(hf_tools)
-        if chat and chat[0].get("role") == "system":
-            chat2 = [{"role": "system",
-                      "content": str(chat[0].get("content", "")) + "\n\n" + instr}] + list(chat[1:])
-        else:
-            chat2 = [{"role": "system", "content": instr}] + list(chat)
+        print(f"[serve] chat-template failed ({type(exc).__name__}: {exc}); "
+              f"flattening tool turns" + (" + tool instruction" if hf_tools else ""))
+        chat2 = _flatten_tool_roles(chat)
+        if hf_tools:
+            chat2 = _merge_system(chat2, _tool_instruction(hf_tools))
         try:
             return _to_id_list(tok.apply_chat_template(chat2, add_generation_prompt=True, tokenize=True))
         except Exception:
             flat = "\n\n".join(f"{m.get('role')}: {m.get('content', '')}" for m in chat2)
             return _to_id_list(tok(flat + "\n\nassistant:"))
+
+
+def _json_mode_instruction(body):
+    """#json-mode: Ollama `format:"json"` / `format:{<JSON Schema>}` and OpenAI
+    `response_format:{type:"json_object"|"json_schema"}` -> a best-effort system instruction
+    (no constrained decoding yet). Returns None when the request doesn't ask for JSON."""
+    want, schema = False, None
+    fmt = body.get("format")
+    if fmt == "json":
+        want = True
+    elif isinstance(fmt, dict) and fmt:
+        want, schema = True, fmt
+    rf = body.get("response_format")
+    if isinstance(rf, dict):
+        t = rf.get("type")
+        if t == "json_object":
+            want = True
+        elif t == "json_schema":
+            want = True
+            js = rf.get("json_schema") or {}
+            schema = js.get("schema") or js or None
+    if not want:
+        return None
+    s = "Respond with VALID JSON only — no prose, no markdown code fences."
+    if schema:
+        with contextlib.suppress(Exception):
+            s += " The JSON MUST conform to this JSON Schema:\n" + json.dumps(schema)
+    return s
+
+
+def _strip_json_fences(text: str) -> str:
+    """#json-mode: models often wrap JSON in ```json fences despite instructions; strip a single
+    leading/trailing fence pair so clients that json.loads() the content directly succeed."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else ""
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()
 
 
 async def _prepare_vision(target_id: str, tok, ids: list, images: list):
@@ -188,12 +326,32 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     if getattr(lm.spec, "is_embedding", False):
         raise ValueError(f"model '{friendly}' is an embedding model; use /api/embed")
     tok = lm.tokenizer
+    # #vl-vision: Ollama /api/generate vision — TOP-LEVEL `images:[b64]` next to `prompt`. Convert
+    # to a single-user chat (+ optional Ollama `system`) so the template renders the image
+    # placeholder and the vision path fires, matching Ollama semantics (generate applies the model
+    # template). Text-only generate is untouched (stays the raw-prompt path).
+    if messages is None and body.get("images"):
+        messages = (([{"role": "system", "content": body["system"]}] if body.get("system") else [])
+                    + [{"role": "user", "content": prompt or "", "images": body.get("images")}])
     if messages is not None:
         messages = _normalize_ollama_images(messages)   # #vl-vision: Ollama-native images[] -> blocks
-        _tc = body.get("tools") if body.get("tool_choice") != "none" else None
+        messages = _normalize_tool_messages(messages)   # #tools: normalize reply-loop turns for the template
+        _jm = _json_mode_instruction(body)              # #json-mode: format / response_format best-effort
+        if _jm:
+            messages = _merge_system(messages, _jm)
+        _tch = body.get("tool_choice")
+        _tc = body.get("tools") if _tch != "none" else None
+        if _tc and (_tch == "required" or isinstance(_tch, dict)):   # OpenAI forced tool choice
+            _fname = (_tch.get("function") or {}).get("name") if isinstance(_tch, dict) else None
+            messages = _merge_system(messages,
+                f"TOOL POLICY: your ENTIRE next reply must be exactly one call to the "
+                f"{_fname or 'most appropriate'} tool — no plain text, no explanation, even if a "
+                f"tool call seems unnecessary for this message. Use sensible defaults for any "
+                f"missing arguments.")
         ids = _render_chat_ids(tok, messages, _tc)       # #tools: inject tool defs when the request sends them
     else:
-        ids = _to_id_list(tok(prompt or ""))
+        _jm = _json_mode_instruction(body)
+        ids = _to_id_list(tok((prompt or "") + (("\n\n" + _jm) if _jm else "")))
     # #vl-vision: OpenAI/Ollama image support — extract images from the messages and splice their
     # embeds (was previously only wired into /v1/messages). No-op for text requests / generate mode.
     mm = mrope = None
@@ -565,6 +723,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     tcalls = []
     if tools_req:
         text, tcalls = _extract_tools(text)
+    if _json_mode_instruction(body) is not None:   # #json-mode: strip md fences so json.loads() works
+        text = _strip_json_fences(text)
 
     if mode in ("openai", "openai_text"):
         usage = {"prompt_tokens": len(P["ids"]), "completion_tokens": n,

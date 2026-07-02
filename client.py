@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c176"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c177"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -73,6 +73,33 @@ try:
 except Exception:
     triton = None
     tl = None
+# #triton-race: triton's Autotuner is NOT thread-safe — run() stashes the call's args in
+# `self.nargs` (read by _bench/prune during autotuning) and sets it back to None on exit, and
+# mutates self.cache/best_config/configs_timings with no lock. Our @triton.autotune'd kernels
+# (`_ksk` dense decode GEMV, `_mk` fused MoE) are process-wide singletons shared by EVERY shard
+# on this worker, so two models decoding concurrently race: model A's run() nulls `nargs` while
+# model B is mid-benchmark for a new (N,K)/(B,N,K) key -> TypeError("'NoneType' object is not a
+# mapping") at autotuner._bench — a deterministic crash whenever a new shape key benches while
+# ANY other int4 model decodes (hit live on om3nbox with qwen3-30b + qwen2.5-vl:3b resident).
+# Fix: serialize Autotuner.run with ONE process-wide lock. Steady-state cost is a lock acquire
+# per int4 GEMM launch (~100ns vs ms-scale decode — the GPU executes async either way); during a
+# bench window other int4 launches briefly WAIT instead of crashing. RLock in case a pre/post
+# hook re-enters an autotuned kernel. Idempotent (guarded by _im_serialized) so a re-imported
+# module never double-wraps.
+if triton is not None:
+    try:
+        from triton.runtime.autotuner import Autotuner as _TritonAutotuner
+        if not getattr(_TritonAutotuner, "_im_serialized", False):
+            _TRITON_RUN_LOCK = threading.RLock()
+            _tt_orig_run = _TritonAutotuner.run
+
+            def _tt_locked_run(self, *a, **k):
+                with _TRITON_RUN_LOCK:
+                    return _tt_orig_run(self, *a, **k)
+            _TritonAutotuner.run = _tt_locked_run
+            _TritonAutotuner._im_serialized = True
+    except Exception:
+        pass                 # unexpected triton layout: keep the unpatched behavior
 # Fused-dequant int4 GEMM (torch tinygemm _weight_int4pack_mm): ~3.6x faster int4 decode by
 # dequantizing INSIDE the matmul instead of re-expanding the whole weight every token. Built per
 # QuantLinear4 at placement, self-checked vs the naive dequant, naive fallback on any mismatch /
@@ -1101,15 +1128,29 @@ def _quant4_linear_cls():
 # prepare_fused). Lazily built on first use; ROCm-only — never touches the NVIDIA/CPU paths.
 _W4A16_OP = None
 _W4A16_TRIED = False
+# #triton-race: one lock for all three lazy kernel/class builders below. The old pattern set
+# _TRIED=True BEFORE building — a second shard-install thread arriving mid-build saw
+# (_TRIED=True, _OP=None) and captured the naive 5-20x-slower path PERMANENTLY (ops are bound at
+# prepare time). Under the lock, _TRIED flips only after _OP is final, and a waiting racer
+# re-checks and returns the finished op.
+_W4A16_BUILD_LOCK = threading.RLock()   # RLock: _w4a16_expert_cls builds INSIDE it and calls
+                                        # _w4a16_triton_op, which takes the same lock (re-entry)
 
 
 def _w4a16_triton_op():
     """Callable op(x[M,Kpad] bf16, qweight uint8[N,Kpad//2], group, (scale,zero) bf16[N,ng]) ->
-    y[M,N] bf16, or None if triton is unavailable / fails to build."""
+    y[M,N] bf16, or None if triton is unavailable / fails to build. Thread-safe lazy build."""
     global _W4A16_OP, _W4A16_TRIED
     if _W4A16_TRIED:
         return _W4A16_OP
-    _W4A16_TRIED = True
+    with _W4A16_BUILD_LOCK:
+        return _w4a16_triton_op_locked()
+
+
+def _w4a16_triton_op_locked():
+    global _W4A16_OP, _W4A16_TRIED
+    if _W4A16_TRIED:         # a racer built it while we waited on the lock
+        return _W4A16_OP
     try:
         import torch
         if triton is None:                # module-level import (see top); None on no-triton workers
@@ -1226,6 +1267,7 @@ def _w4a16_triton_op():
     except Exception as exc:
         _builtins.print(f"[int4] triton w4a16 unavailable ({exc!r}) -> naive int4", flush=True)
         _W4A16_OP = None
+    _W4A16_TRIED = True      # #triton-race: only AFTER _W4A16_OP is final (see _W4A16_BUILD_LOCK)
     return _W4A16_OP
 
 
@@ -1254,7 +1296,14 @@ def _w4a16_moe_op():
     global _W4A16_MOE_OP, _W4A16_MOE_TRIED
     if _W4A16_MOE_TRIED:
         return _W4A16_MOE_OP
-    _W4A16_MOE_TRIED = True
+    with _W4A16_BUILD_LOCK:      # #triton-race: thread-safe lazy build (see _w4a16_triton_op)
+        return _w4a16_moe_op_locked()
+
+
+def _w4a16_moe_op_locked():
+    global _W4A16_MOE_OP, _W4A16_MOE_TRIED
+    if _W4A16_MOE_TRIED:         # a racer built it while we waited on the lock
+        return _W4A16_MOE_OP
     try:
         import torch
         if triton is None:                # module-level import (see top); None on no-triton workers
@@ -1350,6 +1399,7 @@ def _w4a16_moe_op():
     except Exception as exc:
         _builtins.print(f"[int4] fused-MoE w4a16 unavailable ({exc!r}) -> per-expert path", flush=True)
         _W4A16_MOE_OP = None
+    _W4A16_MOE_TRIED = True      # #triton-race: only AFTER _W4A16_MOE_OP is final
     return _W4A16_MOE_OP
 
 
@@ -1362,10 +1412,20 @@ def _w4a16_expert_cls():
     via __torch_function__ and routes to the Triton w4a16 kernel (reads int4 directly — no
     per-expert full-weight bf16 rematerialization), and materializes to bf16 for ANY other op so
     nothing breaks. The MoE host calls F.linear(state, gate_up_proj[e]) / (state, down_proj[e]),
-    so this fuses the routed-expert GEMMs. None if triton is unavailable."""
+    so this fuses the routed-expert GEMMs. None if triton is unavailable.
+    Thread-safe lazy build (#triton-race): two shard-install threads racing here previously built
+    two distinct subclass types (benign per-instance, but confusing) — now one wins under the lock."""
     global _W4A16_EXPERT
     if _W4A16_EXPERT is not None:
         return _W4A16_EXPERT
+    with _W4A16_BUILD_LOCK:
+        if _W4A16_EXPERT is not None:   # a racer built it while we waited
+            return _W4A16_EXPERT
+        return _w4a16_expert_cls_locked()
+
+
+def _w4a16_expert_cls_locked():
+    global _W4A16_EXPERT
     op = _w4a16_triton_op()
     if op is None:
         return None

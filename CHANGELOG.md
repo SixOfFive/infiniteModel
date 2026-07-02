@@ -112,6 +112,17 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   the cache. A reclaimed generation can no longer corrupt the next one. (A defensive per-decode KV
   length "reconcile" was tried and reverted — `DynamicCache.get_seq_length()` inspects layer 0, which a
   mid/tail pipeline stage doesn't own, so it false-tripped on every multi-stage decode.)
+- **Thread-safe Triton autotuning (multi-model concurrency):** triton's `Autotuner.run()` keeps the
+  call's args in unsynchronized instance state (`self.nargs`, set on entry / `None` on exit) and the
+  int4 w4a16 kernels (dense GEMV + fused MoE) are process-wide singletons shared by every shard — so
+  with TWO models resident, any decode that autotune-benchmarks a NEW shape key while the other model
+  decodes crashed (`TypeError: 'NoneType' object is not a mapping` in `autotuner._bench`),
+  deterministically. Fixed three ways: (1) `Autotuner.run` is serialized behind one process-wide RLock
+  (a lock acquire per launch — negligible vs ms-scale decodes; during a bench window other int4
+  launches briefly wait instead of crashing); (2) the lazy kernel **builders** are built under a lock
+  with their tried-flag set only AFTER the op is final (a racing shard-install could previously capture
+  a permanent naive 5-20x-slower fallback mid-build); (3) the expert tensor-subclass is single-built
+  under the same lock.
 - **Wedged-gen auto-recovery:** a distributed generation whose mid-pipeline hop dies never gets an
   error frame upstream (the data chain is one-way), so it used to sit ACTIVE at 0 tok/s until the
   600s timeout and needed a manual client restart. Two fixes: the gen-stall watchdog now (a) cancels
