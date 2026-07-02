@@ -53,7 +53,9 @@ dashboard.
   Ollama-native per-message `images:[b64]` and `/api/generate` top-level `images`.
 - **Multi-model & ops.** N models resident at once, node-sharing, concurrency + queueing,
   auto-load/unload, a live dashboard (placement preview, per-load progress, fleet memory/throughput,
-  bandwidth), curl-able fleet logs, and idle-gated self-update.
+  bandwidth), curl-able fleet logs, and idle-gated self-update. Per-load knobs: KV-cache placement
+  (**GPU or system RAM** — offloading frees the VRAM KV reserve for model layers, for long context
+  on small cards) and a **per-model default temperature** (used when a request doesn't send one).
 
 ## How it works
 

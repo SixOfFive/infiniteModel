@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c178"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c179"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2618,10 +2618,11 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
                  device: str = "cpu", gpu_mem_gb: float = 0.0,
                  attn: str = "eager", quant: str = "none",
                  tp_rank: int = 0, tp_size: int = 1, tp_allreduce=None,
-                 kv_quant: str = "none") -> None:
+                 kv_quant: str = "none", kv_offload: bool = False) -> None:
         import torch
         from transformers import AutoModelForCausalLM
         self.torch = torch
+        self.kv_offload = bool(kv_offload)   # #kv-offload: KV in system RAM (OffloadedCache)
         # Qwen2.5-Omni: AutoModelForCausalLM can't build Qwen2_5OmniTextConfig. Build ONLY the
         # Thinker TEXT decoder (Qwen2_5OmniThinkerTextModel) + a fresh lm_head, wrapped so
         # .model.layers / .lm_head match the served 'model.*'/'lm_head' weights (controller

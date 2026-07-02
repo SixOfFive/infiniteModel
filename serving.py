@@ -360,7 +360,11 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
         if _imgs:
             ids, mm, mrope = await _prepare_vision(lm.target_id, tok, ids, _imgs)
     opts = body.get("options") or {}
-    temperature = float(opts.get("temperature", body.get("temperature", 0.0)))
+    # #load-temp: the model's per-load DEFAULT temperature applies only when the request sends
+    # none (explicit request values — including an explicit 0 — always win).
+    _dt = getattr(lm, "default_temperature", None)
+    _t = opts.get("temperature", body.get("temperature", None))
+    temperature = float(_t) if _t is not None else float(_dt if _dt is not None else 0.0)
     top_p = float(opts.get("top_p", body.get("top_p", 1.0)))
     max_new = int(opts.get("num_predict", body.get("max_tokens", 256)))
     stream = bool(body.get("stream", True))
@@ -947,7 +951,10 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         starts_in_think = "<think>" in tail and "</think>" not in tail.split("<think>")[-1]
 
     max_new = int(body.get("max_tokens", 512) or 512)
-    temperature = float(body.get("temperature", 0.0) or 0.0)
+    # #load-temp: fall back to the model's per-load default temperature when the request sends none.
+    _bt = body.get("temperature", None)
+    _dt = getattr(lm, "default_temperature", None)
+    temperature = float(_bt) if _bt is not None else float(_dt if _dt is not None else 0.0)
     top_p = float(body.get("top_p", 1.0) or 1.0)
     stream = bool(body.get("stream", False))
     state = {"tokens": 0}

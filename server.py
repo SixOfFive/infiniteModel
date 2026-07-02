@@ -825,6 +825,12 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # to the worker shard at load; the quantized cache (TurboQuantCache) activates in
                        # shard_forward. (#172)
                        "kv_quant": "none",
+                       # #kv-offload: default for loads that don't pass kv_offload= — KV cache in
+                       # system RAM (transformers OffloadedCache, per-layer prefetch) instead of
+                       # VRAM. Frees the GPU KV reserve for model layers (long-ctx on small cards)
+                       # at a decode-speed cost. Per-load kv_offload=1 overrides. Exclusive with
+                       # kv_quant (offload wins nothing; kv_quant takes precedence when both set).
+                       "kv_offload": False,
                        # #vram-weights-first: budget a NEW model's WEIGHTS against PHYSICALLY-free VRAM
                        # (live: total - actually-used), letting them use resident models' RESERVED-but-
                        # unfaulted full-ctx KV headroom — so a model lands on GPU when VRAM is physically
@@ -1453,6 +1459,10 @@ class LoadedModel:
     loaded_at: float
     quant: str = "none"   # the quant this model was loaded with, so an auto-reload keeps it
     kv_quant: str = "none"  # #172 TurboQuant KV-cache preset (none|turbo2|turbo3|turbo4); shown on the card
+    kv_offload: bool = False  # #kv-offload: KV cache in system RAM (OffloadedCache) instead of VRAM
+    # #load-temp: per-model DEFAULT sampling temperature — applied when a request doesn't send one
+    # (explicit request values always win). None = unset (requests keep the global 0.0 default).
+    default_temperature: Optional[float] = None
     tp_size: int = 1      # tensor-parallel width (1 = pipeline/single-node); set by _load_tp_locked.
                           # Surfaced on the card + used by #88 /reconfigure (managed-reload to/from TP).
     stage0_writer: Optional[asyncio.StreamWriter] = None  # per-model pipeline conn (controller -> first stage)

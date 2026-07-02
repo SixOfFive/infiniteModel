@@ -333,6 +333,8 @@ function modelRow(m,s){
     const parts=[];
     if(m.quant)parts.push(esc(m.quant));
     if(m.kv_quant&&m.kv_quant!=='none')parts.push('<span class="em" title="TurboQuant KV-cache quantization ('+esc(m.kv_quant)+'): keys/values stored at ~3–4 bits instead of bf16 (data-free rotation + Lloyd-Max, un-rotated on read so attention is unchanged) → ~2× smaller KV cache, so longer context and more co-resident models on the same VRAM. turbo4 ≈ near-lossless, turbo3 more aggressive; best on large models.">KV:'+esc(m.kv_quant)+'</span>');
+    if(m.kv_offload)parts.push('<span class="em" title="KV cache offloaded to system RAM (OffloadedCache, per-layer prefetch): the VRAM the KV would reserve goes to model layers instead. Slower decode; useful for long context on small cards.">KV:RAM</span>');
+    if(m.def_temperature!=null)parts.push('<span class="em" title="Default sampling temperature for this model — applied when a request does not send its own (explicit request values always win).">t='+esc(String(m.def_temperature))+'</span>');
     parts.push('ctx '+(m.ctx||'?'));
     if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
     if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');
@@ -434,6 +436,11 @@ function openLoad(name){
    +_devOpts()
    +'<optgroup label="Tensor-parallel"><option value="tp:gpu">GPU tensor-parallel</option><option value="tp:cpu">CPU tensor-parallel (RAM)</option></optgroup></select>'
    +'<div id="l-tpwrap" style="display:none;margin-top:8px"><label>TP width (number of nodes)</label><input id="l-tpn" type="number" min="2" value="2" oninput="previewSoon(\''+esc(name)+'\')"></div>'
+   +'<div class="grid2" style="margin-top:8px">'
+   +'<div><label title="Where the KV cache (the conversation scratchpad — grows with context) lives. GPU = fastest. System RAM (OffloadedCache, per-layer prefetch) frees that VRAM for model layers — useful when pushing context past what the card holds; decode is slower.">KV cache</label>'
+   +'<select id="l-kvo"><option value="">GPU (fastest)</option><option value="1">System RAM (frees VRAM)</option></select></div>'
+   +'<div><label title="Default sampling temperature for this model: used when a request does not send its own (explicit request values always win). Empty = greedy (0). ~0.7 leans creative, 0 = deterministic.">Default temperature</label>'
+   +'<input id="l-temp" type="number" min="0" max="2" step="0.1" placeholder="0 (greedy)"></div></div>'
    +(dc>=131072?'<div class="note">⚠ native ctx is '+(Math.round(dc/1024))+'k — a huge KV cache. Keep ctx modest (8–16k) unless you need more.</div>':'')
    +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
    +'<button class="btn pri" onclick="doLoad(\''+esc(name)+'\')">Load</button></div>'
@@ -449,6 +456,8 @@ function placeParams(name){
   else if(v.indexOf('c:')===0){ p.node=v.slice(2); p.cpu_only='true'; }
   else if(v==='tp:gpu'){ p.tp=$('#l-tpn').value||2; }
   else if(v==='tp:cpu'){ p.tp=$('#l-tpn').value||2; p.cpu_only='true'; }
+  const kvo=$('#l-kvo'); if(kvo&&kvo.value)p.kv_offload='true';      // #kv-offload: KV in system RAM
+  const tmp=$('#l-temp'); if(tmp&&tmp.value!=='')p.temperature=tmp.value;  // #load-temp: default temp
   return p;
 }
 let _pvTimer=null;

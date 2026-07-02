@@ -141,6 +141,9 @@ def build_status() -> dict:
             "last_tok_s": round(getattr(lm, "last_tok_s", 0.0), 2),
             "quant": lm.quant,     # the quant this model was loaded with (none/int8)
             "kv_quant": getattr(lm, "kv_quant", "none"),     # #172 TurboQuant KV preset (none/turbo2/3/4)
+            "kv_offload": bool(getattr(lm, "kv_offload", False)),  # #kv-offload: KV cache in system RAM
+            # #load-temp: per-model default temperature (None = unset -> requests default to 0.0)
+            "def_temperature": getattr(lm, "default_temperature", None),
             "tp_size": getattr(lm, "tp_size", 1),            # #88: TP width (1 = pipeline)
             "is_tp": getattr(lm, "tp_size", 1) > 1,          # #88: card shows TP vs pipeline + reconfigure
             "num_layers": lm.spec.num_layers, "params": _human_params(lm.spec),
@@ -273,7 +276,8 @@ def build_status() -> dict:
         for _k in (_ld.get("friendly"), _ld.get("display_name")):
             if _k:
                 _lm_by_key[_k] = _ld
-    _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "vram_used_gb", "ram_used_gb", "cpu_frac",
+    _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "kv_offload", "def_temperature",
+                     "vram_used_gb", "ram_used_gb", "cpu_frac",
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
                      "last_tok_s", "kv_pos", "active", "queued", "is_embedding", "replica_idx",
                      "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",

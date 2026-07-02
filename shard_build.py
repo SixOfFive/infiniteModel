@@ -109,6 +109,10 @@ class ShardBuildMixin:
             free = min(int(free), int(gpu_budget_gb * GB))
         GPU_SAFETY = int(0.4 * GB)
         kv_per_layer = self._kv_bytes_per_layer(ctx)
+        # #kv-offload: the KV cache lives in system RAM (OffloadedCache), so NO per-layer KV is
+        # reserved against VRAM — that headroom goes to model layers instead (the feature's point).
+        if getattr(self, "kv_offload", False):
+            kv_per_layer = 0
         # #7: only full-attention layers grow a full-ctx KV; hybrid linear-attn layers don't.
         # kv_lyr[i] = the KV bytes owned layer i actually reserves (kv_per_layer or 0). For a
         # dense model this is kv_per_layer for every layer (unchanged). Mirrors kv_reserve_probe.
@@ -318,7 +322,8 @@ class ShardBuildMixin:
                     tp_rank: int = 0, tp_size: int = 1, tp_allreduce=None,
                     plan_ram_bytes: int = 0, tp_weights=None, ctx: int = 0,
                     gpu_budget_gb: float = -1.0, moe_offload: bool = False,
-                    cache: str = "", kv_quant: str = "none") -> "Shard":
+                    cache: str = "", kv_quant: str = "none",
+                    kv_offload: bool = False) -> "Shard":
         """Build a shard by STREAMING weights one layer at a time straight into RAM — no temp
         file, no disk. `fetch(start, end, embed, head) -> bytes` returns a safetensors blob for
         that slice. Each layer is fetched, loaded, quantized and FREED before the next, so peak
@@ -392,6 +397,10 @@ class ShardBuildMixin:
             self.tp_rank, self.tp_size, self.tp_allreduce = tp_rank, tp_size, tp_allreduce
             self.quant = quant
             self.kv_quant = kv_quant   # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4); read in shard_forward
+            # #kv-offload: KV cache lives in system RAM (transformers OffloadedCache, per-layer
+            # prefetch) instead of VRAM — frees the GPU KV reserve for actual model layers. Read in
+            # shard_forward (cache build) + _place_modules/kv_reserve_probe (no GPU KV reserve).
+            self.kv_offload = bool(kv_offload)
             # Build the meta skeleton WHILE the config dir (with the remote .py) is alive so
             # from_config can resolve a trust_remote_code class. For a remote-code model keep BUFFERS
             # REAL (accelerate include_buffers=False) — per-layer computed buffers (rotary inv_freq …)
@@ -956,6 +965,11 @@ class ShardBuildMixin:
         for d, holds_kv in zip(self.layer_devices, kv_mask):
             if holds_kv:
                 by_dev[d] = by_dev.get(d, 0) + per_layer
+        # #kv-offload: the KV lives in system RAM regardless of where the layers sit, so probe the
+        # WHOLE reservation against CPU RAM (allocate+free there) instead of the layer devices —
+        # a GPU that can't hold the KV is exactly the case this mode exists for.
+        if getattr(self, "kv_offload", False) and by_dev:
+            by_dev = {self.cpu: sum(by_dev.values())}
         held = []
         try:
             for dev, nbytes in by_dev.items():

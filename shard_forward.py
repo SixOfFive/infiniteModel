@@ -118,6 +118,22 @@ class ShardForwardMixin:
             elif _kvq and _kvq != "none":
                 # #172 TurboQuant: quantized resting KV (un-rotated on read -> attention unchanged).
                 self.kv = self._make_kv_quant_cache(_kvq)
+            elif getattr(self, "kv_offload", False):
+                # #kv-offload: KV lives in system RAM; transformers 5.x folded cache offloading
+                # into DynamicCache(offloading=True) — each layer's K/V rests on CPU and is
+                # prefetched to the compute device on a side stream during forward, so attention
+                # still runs on-device. Only meaningful when layers sit on GPU (a CPU shard's KV
+                # is already in RAM); ANY failure (no CUDA, transformers API drift) falls back to
+                # a plain DynamicCache so generation never breaks.
+                self.kv = None
+                try:
+                    if any(getattr(d, "type", "") == "cuda"
+                           for d in (getattr(self, "layer_devices", None) or [])):
+                        self.kv = DynamicCache(offloading=True)
+                except Exception as exc:
+                    print(f"[kv_offload] unavailable ({exc!r}) -> plain bf16 KV on device", flush=True)
+                if self.kv is None:
+                    self.kv = DynamicCache()
             else:
                 self.kv = DynamicCache()
             # #cudagraph: a new sequence invalidates the graph's StaticCache mirror (it must be
@@ -453,6 +469,8 @@ class ShardForwardMixin:
                         and not self._hybrid and not self._omni and not getattr(self, "_mrope3d", False)
                         and getattr(self, "kv_quant", "none") == "none"   # #172: graph mirrors a
                         # StaticCache that can't re-quantize TurboQuant KV -> stay eager when active
+                        and not getattr(self, "kv_offload", False)   # #kv-offload: graph can't mirror
+                        # a CPU-resident OffloadedCache -> stay eager when active
                         and not getattr(self, "_mm_capable", False)):
                     _lts = getattr(self.cfg, "layer_types", None)
                     _rot = self.model.model.rotary_emb
