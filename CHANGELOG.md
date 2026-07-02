@@ -112,6 +112,19 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   the cache. A reclaimed generation can no longer corrupt the next one. (A defensive per-decode KV
   length "reconcile" was tried and reverted — `DynamicCache.get_seq_length()` inspects layer 0, which a
   mid/tail pipeline stage doesn't own, so it false-tripped on every multi-stage decode.)
+- **Per-load KV-cache placement + per-model default temperature.** `/load?kv_offload=1` (or the
+  Load dialog's "KV cache: System RAM" option) rests the KV cache in system RAM — transformers 5.x
+  `DynamicCache(offloading=True)`, per-layer side-stream prefetch — so the VRAM the full-ctx KV
+  would reserve goes to model LAYERS instead (long context on small cards, at a decode-speed
+  cost). The worker stops reserving per-layer KV against VRAM, probes the reservation against RAM,
+  and reports `gpu_kv_bytes=0` so the multi-model coexistence reserve stays honest; cudagraph
+  decode is gated off; mutually exclusive with `kv_quant`. CUDA-only: on ROCm/HIP the offloaded
+  prefetch was live-validated GARBLING decode (nondeterministic at temperature 0 — a side-stream
+  race in the TheRock stack) and an APU's "VRAM" is unified RAM anyway, so HIP falls back loudly
+  to the plain on-device cache. `/load?temperature=0.7` stores a per-model DEFAULT sampling
+  temperature (0-2), used only when a request sends none — explicit request values, including an
+  explicit 0, always win; applied across the Ollama/OpenAI/Anthropic serve paths and badged on
+  the model card.
 - **Thread-safe Triton autotuning (multi-model concurrency):** triton's `Autotuner.run()` keeps the
   call's args in unsynchronized instance state (`self.nargs`, set on entry / `None` on exit) and the
   int4 w4a16 kernels (dense GEMV + fused MoE) are process-wide singletons shared by every shard — so
