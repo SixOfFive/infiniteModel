@@ -356,6 +356,34 @@ def build_status() -> dict:
 _CAPS_CACHE: dict = {}
 
 
+def _dir_supports_tools(d) -> bool:
+    """#tools: True when the model's chat template NATIVELY renders tool definitions — the honest
+    per-model 'tools' capability signal (Qwen2.5/3, Llama-3.1+, Mistral, Hermes, gpt-oss, …). Reads
+    the template from tokenizer_config.json['chat_template'] or a standalone chat_template.jinja
+    (config-only; no model load). Models WITHOUT native support still work via the serve layer's text
+    tool-instruction fallback, but the badge reflects genuine template support (what Ollama reports)."""
+    import os
+    import json as _json
+    try:
+        t = ""
+        tc = os.path.join(d, "tokenizer_config.json")
+        if os.path.exists(tc):
+            with open(tc, encoding="utf-8") as fh:
+                ct = _json.load(fh).get("chat_template")
+            if isinstance(ct, str):
+                t = ct
+            elif isinstance(ct, list):   # some tokenizers ship a list of {name, template} entries
+                t = " ".join(x.get("template", "") for x in ct if isinstance(x, dict))
+        if not t:
+            jj = os.path.join(d, "chat_template.jinja")   # Mistral3/Devstral ship it standalone
+            if os.path.exists(jj):
+                with open(jj, encoding="utf-8") as fh:
+                    t = fh.read()
+        return bool(t) and (("tool_call" in t) or ("tools" in t))
+    except Exception:
+        return False
+
+
 def _model_caps(tgt: str, spec=None) -> list:
     """Modality capabilities for the dashboard badge line, inferred from the model's local
     config.json (cached per target — configs don't change). Returns a subset of: embedding,
@@ -398,6 +426,11 @@ def _model_caps(tgt: str, spec=None) -> list:
                 caps.append("tts")
         if not caps and spec is not None and getattr(spec, "is_embedding", False):
             caps = ["embedding"]
+        # #tools: native tool-calling badge (from the chat template). A causal chat LM whose template
+        # renders tool defs gets 'tools'; embeddings never do. Serve-layer still supports tools on
+        # non-native models via a text-instruction fallback — the badge just marks first-class support.
+        if d and "embedding" not in caps and _dir_supports_tools(d):
+            caps.append("tools")
     except Exception:
         pass
     _CAPS_CACHE[tgt] = caps

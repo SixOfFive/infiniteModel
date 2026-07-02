@@ -40,7 +40,12 @@ dashboard.
   loads stream small **pre-packed** int4/int8 layers instead of bf16 + re-quantizing — for dense
   models *and* MoE (fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load.
 - **MoE & multimodal.** Mixture-of-Experts (incl. attention-on-GPU / experts-in-CPU-RAM offload), and
-  distributed vision + audio (Qwen2.5-Omni): image/audio → text.
+  distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3): image/audio → text.
+- **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
+  object args), OpenAI `/v1/chat/completions` (`tool_calls` + `finish_reason:"tool_calls"`), and
+  Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming. Tool defs render
+  through the model's chat template (text-instruction fallback for templates without native tool
+  support); per-model support surfaces as a `tools` capability in `/api/show`.
 - **Multi-model & ops.** N models resident at once, node-sharing, concurrency + queueing,
   auto-load/unload, a live dashboard (placement preview, per-load progress, fleet memory/throughput,
   bandwidth), curl-able fleet logs, and idle-gated self-update.

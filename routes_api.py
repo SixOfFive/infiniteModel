@@ -74,8 +74,18 @@ def register(app):
         d = _local_model_dir(target)             # real measured params/size (MoE-correct)
         if d and spec:
             spec = spec_with_measurements(spec, d)
-        caps = (["embedding"] if (spec and getattr(spec, "is_embedding", False))
-                else ["completion", "chat"])
+        # Ollama-style capabilities list. Single-sourced from status._model_caps (config-only:
+        # image/video/stt/tts/embedding/tools) so /api/show, /status badges, and the dashboard agree.
+        import status as _status
+        _mcaps = _status._model_caps(target, spec)
+        if "embedding" in _mcaps:
+            caps = ["embedding"]
+        else:
+            caps = ["completion", "chat"]
+            if "tools" in _mcaps:            # #tools: native tool-calling (Ollama reports "tools")
+                caps.append("tools")
+            if "image" in _mcaps:            # Ollama names the vision capability "vision"
+                caps.append("vision")
         # #model-detail: surface the RAW on-disk config.json + generation_config.json so the dashboard
         # detail view can show EVERYTHING about a model (loaded or not) — rope theta, sliding window,
         # expert counts, sampling defaults, etc. that the curated model_info doesn't carry. Best-effort;

@@ -54,6 +54,69 @@ def _normalize_ollama_images(messages):
     return out if changed else messages
 
 
+def _tool_args(call: dict) -> dict:
+    """Normalize a parsed tool call's arguments to a dict — the parser may key them 'arguments'
+    or 'parameters', or leave a JSON string (some models emit the args as a quoted string)."""
+    a = call.get("arguments")
+    if isinstance(a, dict):
+        return a
+    if isinstance(call.get("parameters"), dict):
+        return call["parameters"]
+    if isinstance(a, str):
+        with contextlib.suppress(Exception):
+            v = json.loads(a)
+            if isinstance(v, dict):
+                return v
+    return {}
+
+
+def _openai_tool_calls(calls: list, with_index: bool = False) -> list:
+    """[{name,arguments}] -> OpenAI tool_calls [{id,type,function:{name,arguments:<JSON str>}}].
+    OpenAI carries `arguments` as a JSON STRING (unlike Ollama, which uses an object)."""
+    out = []
+    for i, c in enumerate(calls):
+        tc = {"id": _anth_id("call"), "type": "function",
+              "function": {"name": c.get("name"), "arguments": json.dumps(_tool_args(c))}}
+        if with_index:
+            tc["index"] = i
+        out.append(tc)
+    return out
+
+
+def _ollama_tool_calls(calls: list) -> list:
+    """[{name,arguments}] -> Ollama tool_calls [{function:{name,arguments:<object>}}]."""
+    return [{"function": {"name": c.get("name"), "arguments": _tool_args(c)}} for c in calls]
+
+
+def _render_chat_ids(tok, chat, hf_tools):
+    """#tools: tokenize a chat, injecting tool definitions when present. `hf_tools` is the
+    OpenAI/HF shape ([{type:function, function:{name,description,parameters}}]) that /api/chat and
+    /v1/chat/completions already send, passed straight to apply_chat_template(tools=). With NO tools
+    this is byte-identical to the old plain render. 3-tier fallback mirrors _serve_anthropic._render_ids:
+    native tools -> a text tool instruction in the system prompt (templates that reject tools=) ->
+    a flat text join (templates that reject the chat entirely). So even a model whose HF template has
+    no tool support still SEES the tools and can emit <tool_call> markup we parse back out."""
+    if not hf_tools:
+        return _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True))
+    try:
+        return _to_id_list(tok.apply_chat_template(chat, tools=hf_tools,
+                           add_generation_prompt=True, tokenize=True))
+    except Exception as exc:
+        print(f"[serve] chat-template rejected tools= ({type(exc).__name__}: {exc}); "
+              f"injecting a text tool instruction instead")
+        instr = _tool_instruction(hf_tools)
+        if chat and chat[0].get("role") == "system":
+            chat2 = [{"role": "system",
+                      "content": str(chat[0].get("content", "")) + "\n\n" + instr}] + list(chat[1:])
+        else:
+            chat2 = [{"role": "system", "content": instr}] + list(chat)
+        try:
+            return _to_id_list(tok.apply_chat_template(chat2, add_generation_prompt=True, tokenize=True))
+        except Exception:
+            flat = "\n\n".join(f"{m.get('role')}: {m.get('content', '')}" for m in chat2)
+            return _to_id_list(tok(flat + "\n\nassistant:"))
+
+
 async def _prepare_vision(target_id: str, tok, ids: list, images: list):
     """#vl-vision: shared image splice for the OpenAI (/v1/chat/completions) + Ollama (/api/chat)
     serve path — the same machinery /v1/messages uses. Encodes the images, expands the image
@@ -120,10 +183,10 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     tok = lm.tokenizer
     if messages is not None:
         messages = _normalize_ollama_images(messages)   # #vl-vision: Ollama-native images[] -> blocks
-        enc = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        _tc = body.get("tools") if body.get("tool_choice") != "none" else None
+        ids = _render_chat_ids(tok, messages, _tc)       # #tools: inject tool defs when the request sends them
     else:
-        enc = tok(prompt or "")
-    ids = _to_id_list(enc)
+        ids = _to_id_list(tok(prompt or ""))
     # #vl-vision: OpenAI/Ollama image support — extract images from the messages and splice their
     # embeds (was previously only wired into /v1/messages). No-op for text requests / generate mode.
     mm = mrope = None
@@ -312,8 +375,96 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         return JSONResponse({"model": friendly, "error": emsg, "state": "loading"},
                             status_code=503, headers={"Retry-After": "3"})
 
+    # #tools: native tool-calling for /api/chat + /v1/chat/completions. Opt-in — only when the request
+    # carries `tools` (and tool_choice != "none") — so the text/vision fast paths stay byte-unchanged.
+    # The tool defs were injected into the prompt by _prepare/_render_chat_ids; here we parse the model's
+    # emitted <tool_call>/<invoke>/<function> markup back into structured tool_calls (the same
+    # format-agnostic parser the Anthropic path uses). openai_text (legacy completions) has no tools.
+    tools_req = bool(body.get("tools")) and body.get("tool_choice") != "none" and mode in ("chat", "openai")
+    starts_in_think = False   # reasoning template opened <think> in the prompt -> hold reasoning back
+    if tools_req:
+        with contextlib.suppress(Exception):
+            _tail = P["tok"].decode(P["ids"][-24:])
+            starts_in_think = "<think>" in _tail and "</think>" not in _tail.split("<think>")[-1]
+
     # ---------- streaming ----------
     if stream:
+        # #tools: tool-aware streamers (used only when the request sent tools) — emit visible text as
+        # normal content deltas and each COMPLETE tool call as a structured delta, mirroring the proven
+        # Anthropic SSE segmentation (_segment_tools holds back partial markup + reasoning).
+        async def openai_tool_stream():
+            yield "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}) + "\n\n"
+            raw = ""; emitted_plain = 0; emitted_tools = 0; finish = "stop"
+            try:
+                async for piece, reason in run():
+                    if piece:
+                        raw += piece
+                        plain, tools = _segment_tools(raw, starts_in_think)
+                        if len(plain) > emitted_plain:
+                            delta = plain[emitted_plain:]; emitted_plain = len(plain)
+                            s = "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
+                                "created": created, "model": model, "choices": [{"index": 0,
+                                "delta": {"content": delta}, "finish_reason": None}]}) + "\n\n"
+                            METRICS["api_out"] += len(s); yield s
+                        while emitted_tools < len(tools):
+                            tc = _openai_tool_calls([tools[emitted_tools]], with_index=True)
+                            tc[0]["index"] = emitted_tools; emitted_tools += 1
+                            s = "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
+                                "created": created, "model": model, "choices": [{"index": 0,
+                                "delta": {"tool_calls": tc}, "finish_reason": None}]}) + "\n\n"
+                            METRICS["api_out"] += len(s); yield s
+                    if reason:
+                        finish = reason
+            except Exception:
+                pass
+            fr = "tool_calls" if emitted_tools else _map_finish(finish)
+            s = "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": fr}]}) + "\n\n"
+            s += "data: [DONE]\n\n"
+            METRICS["api_out"] += len(s); yield s
+
+        async def ollama_tool_stream():
+            t0 = time.perf_counter_ns(); done_reason = "stop"; err = None
+            raw = ""; emitted_plain = 0; emitted_tools = 0
+            try:
+                async for piece, reason in run():
+                    if piece:
+                        raw += piece
+                        plain, tools = _segment_tools(raw, starts_in_think)
+                        if len(plain) > emitted_plain:
+                            delta = plain[emitted_plain:]; emitted_plain = len(plain)
+                            s = json.dumps({"model": model, "created_at": _iso(),
+                                "message": {"role": "assistant", "content": delta}, "done": False}) + "\n"
+                            METRICS["api_out"] += len(s); yield s
+                        while emitted_tools < len(tools):
+                            tc = _ollama_tool_calls([tools[emitted_tools]]); emitted_tools += 1
+                            s = json.dumps({"model": model, "created_at": _iso(),
+                                "message": {"role": "assistant", "content": "", "tool_calls": tc},
+                                "done": False}) + "\n"
+                            METRICS["api_out"] += len(s); yield s
+                    if reason:
+                        done_reason = reason
+            except Exception as exc:
+                err, done_reason = str(exc), "error"
+            dur = time.perf_counter_ns() - t0
+            final = {"model": model, "created_at": _iso(), "done": True, "done_reason": done_reason,
+                     "total_duration": dur, "load_duration": 0,
+                     "prompt_eval_count": len(P.get("ids", [])), "prompt_eval_duration": 0,
+                     "eval_count": state["tokens"], "eval_duration": dur,
+                     "message": {"role": "assistant", "content": ""}}
+            if err:
+                final["error"] = err
+            s = json.dumps(final) + "\n"
+            METRICS["api_out"] += len(s); yield s
+
+        if tools_req:
+            if mode == "openai":
+                return StreamingResponse(openai_tool_stream(), media_type="text/event-stream")
+            return StreamingResponse(ollama_tool_stream(), media_type="application/x-ndjson")
+
         async def ollama_stream():
             t0 = time.perf_counter_ns()
             done_reason = "stop"
@@ -403,21 +554,28 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                             status_code=500)
     dur = time.perf_counter_ns() - t0
     n = state["tokens"]
+    # #tools: split the raw generation into visible text + structured calls (only when tools were sent)
+    tcalls = []
+    if tools_req:
+        text, tcalls = _extract_tools(text)
 
     if mode in ("openai", "openai_text"):
         usage = {"prompt_tokens": len(P["ids"]), "completion_tokens": n,
                  "total_tokens": len(P["ids"]) + n}
-        if mode == "openai_text":   # OpenAI legacy text completion
+        if mode == "openai_text":   # OpenAI legacy text completion (no tools)
             payload = {
                 "id": cmpl_id, "object": "text_completion", "created": created, "model": model,
                 "choices": [{"text": text, "index": 0, "logprobs": None,
                              "finish_reason": _map_finish(done_reason)}],
                 "usage": usage}
         else:
+            msg = {"role": "assistant", "content": (text or None) if tcalls else text}
+            if tcalls:
+                msg["tool_calls"] = _openai_tool_calls(tcalls)
             payload = {
                 "id": cmpl_id, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                             "finish_reason": _map_finish(done_reason)}],
+                "choices": [{"index": 0, "message": msg,
+                             "finish_reason": "tool_calls" if tcalls else _map_finish(done_reason)}],
                 "usage": usage}
         METRICS["api_out"] += len(json.dumps(payload))
         return JSONResponse(payload)
@@ -425,7 +583,10 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
            "total_duration": dur, "load_duration": 0, "prompt_eval_count": len(P["ids"]),
            "prompt_eval_duration": 0, "eval_count": n, "eval_duration": dur}
     if mode == "chat":
-        out["message"] = {"role": "assistant", "content": text}
+        msg = {"role": "assistant", "content": text}
+        if tcalls:
+            msg["tool_calls"] = _ollama_tool_calls(tcalls)   # Ollama: arguments as an object
+        out["message"] = msg
     else:
         out["response"] = text
     METRICS["api_out"] += len(json.dumps(out))
