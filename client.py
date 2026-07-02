@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c177"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c178"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2920,6 +2920,14 @@ def _extract_version(blob: bytes) -> str:
         return ""
 
 
+def _ver_ordinal(v: str):
+    """#no-downgrade: natural-sort key for VERSION tags ('0.2-m4c177') — digit runs compare
+    NUMERICALLY, alpha runs lexicographically, so m4c9 < m4c176 (string compare gets this wrong)
+    and m4bz < m4c0. Type-tagged tuples keep int/str comparisons well-defined at any divergence."""
+    import re
+    return [(0, int(t)) if t.isdigit() else (1, t) for t in re.findall(r"\d+|\D+", v or "")]
+
+
 def _fetch_repo_file(fname: str):
     # Self-update fetches each file's latest bytes from the PUBLIC GitHub repo's raw endpoint
     # (repo_raw_url, owner/branch from config.json) — NO auth/token, so no secret is in the source
@@ -2985,6 +2993,17 @@ def _self_update_check(fname: str, is_idle) -> None:
     # #4: only RESTART on a VERSION bump in the primary file. Stage same-VERSION content changes to disk
     # (atomic, picked up on the next natural restart) but don't bounce the worker for a doc/comment commit.
     remote_ver = _extract_version(fetched.get(fname, b""))
+    # #no-downgrade: after a git push the raw CDN lags per-file by 1-5 min, so a worker running
+    # code AHEAD of the CDN (pscp deploy, or restarting mid-propagation) used to see "content
+    # differs" -> overwrite its files with the STALE repo copy and restart into a DOWNGRADE (live
+    # hit: m4c177 -> m4c176 minutes after the m4c177 push, silently un-deploying the triton-race
+    # fix). Refuse to apply a remote whose primary VERSION is strictly OLDER than the running one
+    # — skipping the writes too, so stale extras never land on disk. (The worker loop is always
+    # automatic; deliberate rollbacks go through the controller's forced /update.)
+    if remote_ver and _ver_ordinal(remote_ver) < _ver_ordinal(VERSION):
+        print(f"[update] repo VERSION {remote_ver} is OLDER than running {VERSION} - "
+              f"ignoring (CDN lag / local ahead); re-check next poll")
+        return
     version_bumped = bool(remote_ver) and remote_ver != VERSION
     for fn in changed:                           # write all .new first, then atomic-replace each
         path = os.path.join(here, fn)
