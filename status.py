@@ -324,6 +324,7 @@ def build_status() -> dict:
         "controller": {
             "hostname": platform.node(), "os": f"{platform.system()} {platform.release()}",
             "version": VERSION, "uptime_s": round(time.time() - START_TIME, 1),
+            "code_date": CODE_DATE,   # newest self-update-set file mtime at process start
             "wire": ("wire" in sys.modules),   # True once wire.py is imported (not the fallback)
             "dash": ("dashboard_html" in sys.modules),   # True once dashboard_html.py is imported
             "http_port": ARGS.http_port, "control_port": ARGS.control_port,

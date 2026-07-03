@@ -136,6 +136,24 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py",
                                  "config.json"]   # central cluster config — synced like a module
 
 
+def _code_date() -> str:
+    """Newest mtime across the running build's self-update file set, as YYYY-MM-DD — the
+    honest "when did this controller's code last change" stamp for the dashboard header
+    (the VERSION string is a false tell: controller-only changes never bump it). Computed
+    ONCE at import on purpose: the idle self-updater rewrites files on disk WITHOUT
+    restarting for controller-only fetches, so a live mtime read would date code NEWER
+    than what this process is actually running."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    ts = []
+    for f in ["server.py"] + EXTRA_UPDATE_FILES:
+        with contextlib.suppress(Exception):
+            ts.append(os.path.getmtime(os.path.join(base, f)))
+    return time.strftime("%Y-%m-%d", time.localtime(max(ts))) if ts else ""
+
+
+CODE_DATE = _code_date()
+
+
 def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
     """Multi-file self-update: fetch the primary file + EXTRA_UPDATE_FILES, and if ANY changed
     (and we're idle, OR force=True) stage ALL changed files together. RESTART only when the fetched

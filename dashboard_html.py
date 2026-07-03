@@ -268,6 +268,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
 const gb=v=>(v==null?'—':(Math.round(v*10)/10)+' GB');
 const pc=(a,b)=>b>0?Math.min(100,Math.round(100*a/b)):0;
 let LAST=null;
@@ -288,7 +289,7 @@ async function tick(){
 function render(){
   const d=LAST; if(!d)return;
   const c=d.controller||{}, p=d.pool||{}, comp=d.compute||{}, cl=d.cluster||{};
-  if(!(window._toastUntil>Date.now())) $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');  // don't clobber an active toast
+  if(!(window._toastUntil>Date.now())) $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');  // don't clobber an active toast
   // fleet tiles
   const loaded=(d.models||[]).filter(m=>m.loaded).length, reg=(d.models||[]).length;
   // pool bars: PHYSICAL used (total - free) against PHYSICAL total, one base (#pool-base).
@@ -852,14 +853,20 @@ CONFIG_HTML = r"""<!doctype html>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
 const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s','idle_unload_m'];
 const TOGS=['auto_unload','auto_load','vram_weights_first'];
+// #cfg-dirty: fields the user touched since the last successful save. The 5s /status poll
+// used to overwrite EVERY field wholesale, silently reverting an in-progress edit before
+// the user could click Save. A dirty field is never overwritten by the poll; Save clears
+// the set so server values show through again.
+const DIRTY=new Set();
 let NODES=[];
 async function load(){
   let d; try{ d=await (await fetch('/status')).json(); }catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; return; }
-  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
-  FIELDS.forEach(k=>{ if($('#'+k)&&c[k]!=null)$('#'+k).value=c[k]; });
-  TOGS.forEach(k=>{ if($('#'+k))$('#'+k).checked=!!c[k]; });
+  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');
+  FIELDS.forEach(k=>{ const el=$('#'+k); if(el&&c[k]!=null&&!DIRTY.has(k)&&el!==document.activeElement)el.value=c[k]; });
+  TOGS.forEach(k=>{ const el=$('#'+k); if(el&&!DIRTY.has(k))el.checked=!!c[k]; });
   NODES=d.nodes||[]; renderNodes();
 }
 function renderNodes(){
@@ -878,11 +885,12 @@ async function save(){
   const q=new URLSearchParams();
   FIELDS.forEach(k=>{ const v=$('#'+k).value; if(v!=='')q.set(k,v); });
   TOGS.forEach(k=>{ q.set(k,$('#'+k).checked?'true':'false'); });
-  try{ await post('/config?'+q.toString()); msg('#cfg-msg','saved'); load(); }catch(e){ msg('#cfg-msg',String(e.message||e),1); }
+  try{ await post('/config?'+q.toString()); DIRTY.clear(); msg('#cfg-msg','saved'); load(); }catch(e){ msg('#cfg-msg',String(e.message||e),1); }
 }
 async function setTier(host,tier,on){ try{ await post('/nodeconfig?host='+encodeURIComponent(host)+'&'+tier+'='+(on?'true':'false')); msg('#node-msg',host+' '+tier+'='+on); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
 async function bulk(tier,on){ try{ await post('/nodeconfig_all?tier='+tier+'&enabled='+(on?'true':'false')); msg('#node-msg','all '+tier+'='+on); load(); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
 async function ctlAct(path,confirmMsg){ if(!confirm(confirmMsg))return; try{ await post(path); msg('#ctl-msg','sent — controller restarting if applicable'); }catch(e){ msg('#ctl-msg',String(e.message||e),1);} }
+FIELDS.concat(TOGS).forEach(k=>{ const el=$('#'+k); if(el){ el.addEventListener('input',()=>DIRTY.add(k)); el.addEventListener('change',()=>DIRTY.add(k)); } });
 load(); setInterval(load,5000);
 </script>
 </body></html>
@@ -937,18 +945,26 @@ CHAT_HTML = r"""<!doctype html>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
 const qp=new URLSearchParams(location.search);
 let MODELS=[], cur='', msgs=[], live='', busy=false, abort=null;
 function aborter(){ if(abort){ try{abort.abort();}catch(e){} abort=null; } }
 async function loadModels(){
   let d; try{ d=await (await fetch('/status',{cache:'no-store'})).json(); }
   catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; return; }
-  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
+  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');
   MODELS=(d.models||[]).filter(m=>m.loaded).map(m=>m.name);
   const sel=$('#model'); const want=cur||qp.get('model')||MODELS[0]||'';
-  sel.innerHTML=MODELS.length
-    ? MODELS.map(n=>'<option value="'+esc(n)+'"'+(n===want?' selected':'')+'>'+esc(n)+'</option>').join('')
-    : '<option value="">(no models loaded)</option>';
+  // #cfg-dirty sibling: don't rebuild the option list while the dropdown is focused/open
+  // (the 5s poll would snap the native popup shut mid-selection), and skip no-op rebuilds
+  // when the loaded-model set hasn't changed.
+  const mkey=MODELS.join('\u0001');
+  if(sel!==document.activeElement&&sel.dataset.mkey!==mkey){
+    sel.dataset.mkey=mkey;
+    sel.innerHTML=MODELS.length
+      ? MODELS.map(n=>'<option value="'+esc(n)+'"'+(n===want?' selected':'')+'>'+esc(n)+'</option>').join('')
+      : '<option value="">(no models loaded)</option>';
+  }
   if(MODELS.length){ cur=sel.value; $('#mhint').textContent=''; $('#send').disabled=false; $('#in').disabled=false; }
   else { cur=''; $('#mhint').innerHTML='no models loaded — <a href="/">load one on the Models tab</a>'; $('#send').disabled=true; $('#in').disabled=true; }
 }
@@ -1031,10 +1047,11 @@ LOGS_HTML = r"""<!doctype html>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
 let AUTO=true, SRCS=false;
 async function srcList(){
   try{ const d=await (await fetch('/status')).json();
-    const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?');
+    const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');
     if(!SRCS){ const sel=$('#src'); const cur=sel.value;
       sel.innerHTML='<option value="">controller</option>'+(d.nodes||[]).map(n=>'<option value="'+esc(n.hostname)+'">'+esc(n.hostname)+(n.has_gpu?' (GPU)':'')+'</option>').join('');
       if(cur)sel.value=cur; SRCS=true; }
