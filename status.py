@@ -116,7 +116,13 @@ def build_status() -> dict:
         #   KV: reserved for the full ctx vs actually used so far (from kv_pos). KV is
         #       allocated lazily during generation, so at ctx 0 it's ~empty.
         vram_used = sum(s.gpu_bytes for s in lm.plan.stages)
-        ram_weights = max(0, lm.spec.total_weight_bytes - vram_used)
+        # #real-stats: RAM-resident weights = worker-MEASURED total minus measured on-GPU. The old
+        # basis (spec.total_weight_bytes, a formulaic quant ESTIMATE) overshoots real packed MoE
+        # int4 by ~10%, which fabricated a phantom "1.9 GB RAM / cpu_frac 0.106" on a fully-GPU
+        # qwen3-30b-a3b. Spec fallback only when no stage reported loaded_bytes (old worker).
+        weights_total = (sum(getattr(s, "loaded_bytes", 0) or 0 for s in lm.plan.stages)
+                         or lm.spec.total_weight_bytes)
+        ram_weights = max(0, weights_total - vram_used)
         kv_reserved = lm.spec.kv_bytes_per_layer(lm.ctx) * lm.spec.num_layers
         kv_used = lm.spec.kv_bytes_per_layer(lm.kv_pos) * lm.spec.num_layers
         _arch = (getattr(lm.spec, "arch", "") or "").lower()
@@ -160,7 +166,7 @@ def build_status() -> dict:
             # not the pre-load estimate). A high value = the model is CPU-bound and will decode SLOWLY
             # (CPU layers are ~50-100x a GPU layer) — the dashboard badges it so "slow" isn't read as
             # "hung/wedged". This is the real cause of a multi-model fleet's later loads crawling.
-            "cpu_frac": round(ram_weights / lm.spec.total_weight_bytes, 3) if lm.spec.total_weight_bytes else 0.0,
+            "cpu_frac": round(ram_weights / weights_total, 3) if weights_total else 0.0,
             "kv_reserved_gb": round(kv_reserved / GB, 2),    # KV space reserved for the full ctx
             "kv_used_gb": round(kv_used / GB, 2),            # KV actually used so far (kv_pos)
             "loaded_at": _iso(lm.loaded_at),

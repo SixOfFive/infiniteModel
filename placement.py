@@ -229,6 +229,12 @@ class StageAssign:
     usable_bytes: int
     gpu_bytes: int = 0          # worker-reported VRAM this stage actually placed (filled at load)
     gpu_kv_bytes: int = 0       # worker-reported full-ctx KV reserved on GPU (coexistence VRAM reserve)
+    # #real-stats: worker-MEASURED total weight bytes of this stage (params+buffers, post-quant).
+    # 0 = not reported (old worker) -> consumers fall back to the spec ESTIMATE. Needed because
+    # spec.total_weight_bytes is a formulaic quant estimate that can overshoot the real packed
+    # size by ~10% on MoE int4 — subtracting measured gpu_bytes from it fabricated a phantom
+    # "weights on CPU" (1.9 GB / cpu_frac 0.106 on a fully-GPU-resident qwen3-30b-a3b).
+    loaded_bytes: int = 0
 
     @property
     def num_layers(self) -> int:

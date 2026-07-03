@@ -829,6 +829,8 @@ class EngineLoadMixin:
                     if nid in stage_by_id:
                         stage_by_id[nid].gpu_bytes = gpu_b
                         stage_by_id[nid].gpu_kv_bytes = gpu_kv   # reserve this model's KV vs coexisting loads
+                        # #real-stats: the stage's MEASURED weight bytes (vs the spec estimate)
+                        stage_by_id[nid].loaded_bytes = int(r.get("loaded_bytes", 0)) if isinstance(r, dict) else 0
                 break  # all stages loaded
             else:
                 await self._free_partial_stages(target_id, futs.keys(), node_by_id)   # #98: free any built shards
@@ -856,8 +858,11 @@ class EngineLoadMixin:
             # and looking "busy but network-idle"), append a LOUD persistent warning + log it, so a
             # ~0.1 tok/s CPU-bound model is never mistaken for a hang.
             _vram_b = sum(s.gpu_bytes for s in stages)
-            _cpu_frac = ((spec.total_weight_bytes - _vram_b) / spec.total_weight_bytes
-                         if spec.total_weight_bytes else 0.0)
+            # #real-stats: judge the split against the worker-MEASURED weight total, not the spec
+            # estimate — the int4 estimate overshoots real packed MoE size ~10%, which fabricated a
+            # phantom CPU fraction on fully-GPU-resident models. Spec fallback = old workers only.
+            _wtotal_b = sum(getattr(s, "loaded_bytes", 0) or 0 for s in stages) or spec.total_weight_bytes
+            _cpu_frac = ((_wtotal_b - _vram_b) / _wtotal_b if _wtotal_b else 0.0)
             if _cpu_frac > 0.30:
                 _sev = "SEVERE " if _cpu_frac > 0.6 else ""
                 _wmsg = (f"{_cpu_frac*100:.0f}% of weights on CPU ({_sev}— GPU pool full) -> CPU-bound, "
@@ -945,12 +950,14 @@ class EngineLoadMixin:
             self.loadings.pop(reg_key, None)
             raise RuntimeError(f"embedding load on {node.hostname} failed: {r.get('error')}")
         gpu_b = int(r.get("gpu_bytes", 0)) if isinstance(r, dict) else 0
+        tot_b = int(r.get("loaded_bytes", 0)) if isinstance(r, dict) else 0
         # Minimal single-stage plan so build_status / /api/ps / the card render unchanged.
         stage = StageAssign(node_id=node.node_id, hostname=node.hostname,
                             layer_start=0, layer_end=spec.num_layers,
                             has_embed=True, has_head=True,
                             est_bytes=spec.total_weight_bytes,
-                            usable_bytes=int(node.usable_total_gb * GB), gpu_bytes=gpu_b)
+                            usable_bytes=int(node.usable_total_gb * GB), gpu_bytes=gpu_b,
+                            loaded_bytes=tot_b)
         plan = PlanResult(ok=True, model=spec.name, ctx_len=spec.max_ctx,
                           num_layers=spec.num_layers,
                           pool_usable_gb=node.usable_total_gb,
@@ -1303,6 +1310,7 @@ class EngineLoadMixin:
             *[asyncio.wait_for(f, timeout=tp_load_timeout) for f in futs.values()], return_exceptions=True)
         tp_gpu_bytes = 0   # #69: total on-GPU bytes ACROSS all ranks (each reports its own)
         tp_gpu_kv_bytes = 0   # total full-ctx KV reserved on GPU across ranks (coexistence reserve)
+        tp_loaded_bytes = 0   # #real-stats: worker-MEASURED weight bytes across ranks (vs spec estimate)
         for nid, r in zip(futs.keys(), results):
             err = (repr(r) if isinstance(r, Exception)
                    else r.get("error") if isinstance(r, dict) and r.get("type") == "error" else None)
@@ -1317,6 +1325,7 @@ class EngineLoadMixin:
                     nd.shard_gpu_bytes = int(r.get("gpu_bytes", 0))
                     tp_gpu_bytes += int(r.get("gpu_bytes", 0))
                     tp_gpu_kv_bytes += int(r.get("gpu_kv_bytes", 0))
+                    tp_loaded_bytes += int(r.get("loaded_bytes", 0))
                 _tcard = self.loadings.get(friendly)   # bump the node counter ("A/B nodes loaded")
                 if _tcard is not None:
                     _tcard["stages_ready"] = _tcard.get("stages_ready", 0) + 1
@@ -1331,7 +1340,8 @@ class EngineLoadMixin:
         # plan has one stage representing the whole group, so the aggregate belongs here.
         stage = StageAssign(root.node_id, root.hostname, 0, L, True, True,
                             int(spec.total_weight_bytes / tp), int(root.usable_total_gb * GB),
-                            gpu_bytes=int(tp_gpu_bytes), gpu_kv_bytes=int(tp_gpu_kv_bytes))
+                            gpu_bytes=int(tp_gpu_bytes), gpu_kv_bytes=int(tp_gpu_kv_bytes),
+                            loaded_bytes=int(tp_loaded_bytes))
         plan = PlanResult(ok=True, model=spec.name, ctx_len=ctx, num_layers=L,
                           pool_usable_gb=round(sum(n.usable_total_gb for n in tp_nodes), 2),
                           required_gb=round(full_gb, 2), stages=[stage])
