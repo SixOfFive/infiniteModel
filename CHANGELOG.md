@@ -124,7 +124,13 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   to the plain on-device cache. `/load?temperature=0.7` stores a per-model DEFAULT sampling
   temperature (0-2), used only when a request sends none — explicit request values, including an
   explicit 0, always win; applied across the Ollama/OpenAI/Anthropic serve paths and badged on
-  the model card.
+  the model card. **min-p sampling** rides the same paths: applied after temperature and before
+  top-p, it keeps only tokens with `p >= min_p * p_max` and renormalizes — per-request (Ollama
+  `options.min_p`, OpenAI/Anthropic top-level `min_p`) or as a per-model default via
+  `/load?min_p=` (0-1, badged `mp=` on the card). Both defaults are runtime-mutable on a LOADED
+  model with **`POST /model_config?model=...&temperature=...&min_p=...`** (absent = keep, empty
+  string = clear, applies to all replicas), surfaced as a "Runtime settings" panel in the
+  model-detail modal — no reload needed to tune a resident model's sampling.
 - **Thread-safe Triton autotuning (multi-model concurrency):** triton's `Autotuner.run()` keeps the
   call's args in unsynchronized instance state (`self.nargs`, set on entry / `None` on exit) and the
   int4 w4a16 kernels (dense GEMV + fused MoE) are process-wide singletons shared by every shard — so
