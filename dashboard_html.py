@@ -552,6 +552,12 @@ function detailLive(name){
     if(m.loaded_at_ts) oadd('uptime',dur(now-m.loaded_at_ts)+(m.load_seconds?(' · load took '+m.load_seconds+'s'):''));
     if(m.last_used_ts) oadd('last request', gen?'now':(dur(now-m.last_used_ts)+' ago'));
     oadd('placement basis',esc(m.plan_basis||'')+(m.speed_tier?(' · '+esc(m.speed_tier)):''));
+    // #runtime-config: live view of the sampling defaults (edited via the static form below —
+    // this row just reflects the current values each poll, so an Apply shows up immediately)
+    if(m.def_temperature!=null||m.def_min_p!=null)
+      oadd('sampling defaults',(m.def_temperature!=null?('t='+esc(String(m.def_temperature))):'')
+        +(m.def_temperature!=null&&m.def_min_p!=null?' · ':'')
+        +(m.def_min_p!=null?('min-p='+esc(String(m.def_min_p))):''));
     out+='<h3 style="font-size:13px;margin-top:14px">Operational'+(gen?' · <span style="color:var(--good)">running</span>':'')+'</h3><table class="kv">'+o+'</table>';
   }
   if(m.stages&&m.stages.length){
@@ -607,6 +613,21 @@ async function openDetail(name){
     }
     pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
   }
+  // #runtime-config: editable RUNTIME settings for a loaded model — everything changeable without
+  // a reload lives here. STATIC section (outside #dlive) so the per-poll live refresh can't clobber
+  // the inputs mid-typing. Values apply instantly via POST /model_config; the next request uses them.
+  let rt='';
+  if(m.loaded){
+    const tv=(m.def_temperature!=null)?String(m.def_temperature):'';
+    const mv=(m.def_min_p!=null)?String(m.def_min_p):'';
+    rt='<h3 style="font-size:13px;margin-top:14px">Runtime settings <span class="em" style="font-weight:normal">· apply instantly, no reload</span></h3>'
+      +'<div class="grid2"><div><label title="Default sampling temperature: used when a request does not send its own (explicit request values always win). Empty = unset (greedy).">Default temperature</label>'
+      +'<input id="rt-temp" type="number" min="0" max="2" step="0.1" value="'+esc(tv)+'" placeholder="unset (greedy)"></div>'
+      +'<div><label title="Default min-p sampling floor: drops tokens below this fraction of the top token\'s probability — confidence-adaptive, pairs with high temperature (0.05-0.1 at temp >= 1.0). Empty = unset (off).">Default min-p</label>'
+      +'<input id="rt-minp" type="number" min="0" max="1" step="0.01" value="'+esc(mv)+'" placeholder="unset (off)"></div></div>'
+      +'<div style="margin-top:8px"><button class="btn sm pri" onclick="applyRt(\''+esc(name)+'\')">Apply</button> '
+      +'<span class="em" style="font-size:11px">quant · ctx · KV placement need a reload (Load…) — these two don\'t</span></div>';
+  }
   let acts='';
   if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
@@ -616,13 +637,23 @@ async function openDetail(name){
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<div id="dlive">'+detailLive(name)+'</div>'+pre
+    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+pre
     +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
   try{ const sh=await api('/api/show',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:name})});
        const el=document.getElementById('mi_more'); if(el&&DETAIL_OPEN===name) el.innerHTML='<h3 style="font-size:13px;margin-top:14px">Model info</h3>'+renderShow(sh);
   }catch(e){ const el=document.getElementById('mi_more'); if(el) el.innerHTML='<div class="note">full model info unavailable: '+esc(String(e.message||e))+'</div>'; }
+}
+// #runtime-config: push the detail modal's runtime-settings inputs to the controller. The UI always
+// sends BOTH fields; an EMPTY input clears that default back to unset. Applies to all replicas.
+async function applyRt(name){
+  const t=$('#rt-temp')?$('#rt-temp').value:'', mp=$('#rt-minp')?$('#rt-minp').value:'';
+  const q=new URLSearchParams({model:name, temperature:t, min_p:mp});
+  try{ const r=await api('/model_config?'+q.toString(),{method:'POST'});
+       toast('runtime settings applied · t='+(r.def_temperature!=null?r.def_temperature:'unset')
+             +' min-p='+(r.def_min_p!=null?r.def_min_p:'unset')); tick(); }
+  catch(e){ toast(String(e.message||e),1); }
 }
 // Context viewer: one scrollable popup showing the IN/OUT flow of recent requests (newest first).
 // History is kept only while the model is resident (cleared on unload).

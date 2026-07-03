@@ -544,6 +544,53 @@ def register(app):
             log_activity(f"load {model}: FAILED — {exc}")
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
+    @app.post("/model_config")
+    async def model_config(model: str, temperature: Optional[str] = None,
+                           min_p: Optional[str] = None) -> JSONResponse:
+        """#runtime-config: change a LOADED model's runtime-adjustable sampling defaults IN PLACE —
+        no reload; the very next request picks them up (the sampler reads them off the LoadedModel
+        per request). Currently: default_temperature (0-2), default_min_p (0-1). Param absent =
+        leave unchanged; empty string = CLEAR back to unset. Applied to every replica of the base
+        so data-parallel copies stay consistent. Load-time-only knobs (quant/ctx/kv_quant/
+        kv_offload/placement) are rejected by omission — they need a reload/reconfigure."""
+        try:
+            friendly = resolve_model_name(model)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        lms = engine.replicas_of(friendly)
+        if not lms:
+            return JSONResponse({"ok": False, "error": f"'{friendly}' is not loaded "
+                                 "(runtime settings live on the loaded model — load it first)"},
+                                status_code=409)
+
+        def _parse(val, lo, hi, label):
+            if val is None:
+                return False, None       # absent -> unchanged
+            if not str(val).strip():
+                return True, None        # "" -> clear to unset
+            f = float(val)               # ValueError -> caught below
+            if not (lo <= f <= hi):
+                raise ValueError(f"{label} out of range ({lo} - {hi})")
+            return True, f
+        try:
+            set_t, new_t = _parse(temperature, 0.0, 2.0, "temperature")
+            set_m, new_m = _parse(min_p, 0.0, 1.0, "min_p")
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        for lm in lms:
+            if set_t:
+                lm.default_temperature = new_t
+            if set_m:
+                lm.default_min_p = new_m
+        log_activity(f"{_ollama_name(friendly)}: runtime settings -> "
+                     f"default_temp={lms[0].default_temperature} "
+                     f"default_min_p={lms[0].default_min_p}"
+                     + (f" ({len(lms)} replicas)" if len(lms) > 1 else ""))
+        return JSONResponse({"ok": True, "model": friendly,
+                             "def_temperature": lms[0].default_temperature,
+                             "def_min_p": lms[0].default_min_p,
+                             "replicas": len(lms)})
+
     @app.post("/cancel")           # dashboard: disconnect/kill one in-flight request (#48)
     async def cancel(id: int) -> JSONResponse:
         rec = INFLIGHT.get(id)
