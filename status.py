@@ -322,6 +322,8 @@ def build_status() -> dict:
             "gen_stall_s": ENGINE_CONFIG.get("gen_stall_s", GEN_STALL_S),
             "gen_stall_decode_s": ENGINE_CONFIG.get("gen_stall_decode_s", GEN_STALL_DECODE_S),
             "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH),
+            # #idle-unload: minutes with no requests before a model is unloaded (0 = keep forever)
+            "idle_unload_m": ENGINE_CONFIG.get("idle_unload_m", 0.0),
         },
         "pool": {"nodes": len(nodes), "total_gb": round(pool_total, 2),
                  "used_gb": round(pool_used, 2), "free_gb": round(pool_free, 2),  # LIVE physical

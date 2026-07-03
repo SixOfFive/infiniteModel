@@ -767,7 +767,7 @@ CONFIG_HTML = r"""<!doctype html>
     <div class="fld"><label>Auto-load placement mode</label><select id="autoload_mode"><option>auto</option><option>all-gpu</option><option>distribute</option><option>proportional</option><option>single</option></select></div>
     <div class="fld"><label>Prefill stall-watchdog (s, 0=off)</label><input id="gen_stall_s" type="number" min="0"></div>
     <div class="fld"><label>Decode stall-watchdog (s, 0=off)</label><input id="gen_stall_decode_s" type="number" min="0"></div>
-    <div class="fld"></div>
+    <div class="fld"><label title="Unload any model that has served no requests for this many minutes. 0 = keep every model loaded forever (the default). Pinned (📌) models and models with an active or queued request are never idle-unloaded.">Idle unload (min, 0 = keep forever)</label><input id="idle_unload_m" type="number" min="0" step="any" list="dl-idleu"><datalist id="dl-idleu"><option value="0"></option><option value="5"></option><option value="15"></option><option value="60"></option><option value="240"></option><option value="1440"></option></datalist></div>
     <div class="fld tog"><input type="checkbox" id="auto_unload"><label for="auto_unload">LRU auto-unload</label></div>
     <div class="fld tog"><input type="checkbox" id="auto_load"><label for="auto_load">Auto-load on request</label></div>
     <div class="fld tog"><input type="checkbox" id="vram_weights_first"><label for="vram_weights_first">Budget weights vs physical-free VRAM</label></div>
@@ -801,7 +801,7 @@ CONFIG_HTML = r"""<!doctype html>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s'];
+const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s','idle_unload_m'];
 const TOGS=['auto_unload','auto_load','vram_weights_first'];
 let NODES=[];
 async function load(){

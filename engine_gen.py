@@ -508,6 +508,10 @@ class EngineGenMixin:
         while produced < max_new:
             if model.friendly not in self.models or model.stage0_writer is None:
                 raise RuntimeError("pipeline went down mid-generation")
+            # #idle-unload: this path doesn't hold model.lock or bump active (unlike generate),
+            # so stamp per-step progress — the idle-unload reaper reads last_token_ts and must
+            # never call a mid-thinker speech/diag request "idle".
+            model.last_token_ts = time.time()
             row = logits[0, -1]
             if ntok and ntok < int(row.shape[-1]):
                 row = row.clone()

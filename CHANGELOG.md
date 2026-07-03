@@ -147,6 +147,18 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   a malformed value fails as a clean pre-stream 400 — never a post-stream empty-200 (the
   cold-contract rule); the stored seed is capped at 2^53-1 so it round-trips JSON/JS float64
   losslessly (per-request seeds go to int64 max).
+- **Idle unload (#idle-unload).** New engine setting (`/config?idle_unload_m=`, dashboard
+  "Idle unload"): a model that served NO requests for N minutes is unloaded automatically.
+  Default 0 = the long-standing behavior — every model stays loaded forever. Judged GROUP-wise
+  across data-parallel replicas (unload(base) cascades, and the base carries last_used while the
+  routed replica carries active/last_token_ts — judging one key alone could reap a group whose
+  sibling is mid-decode); models with an active or queued request, a held per-model lock
+  (embeddings), or a 📌 pin (persist_models) are never idle-unloaded, and the speech thinker
+  stamps per-step progress so long TTS runs aren't reaped. Replaces the old hidden coupling
+  where the LRU auto-unload checkbox also enabled a hardcoded 60-min idle unload. Ollama
+  `/api/ps` `expires_at` is now honest: last activity + the idle window when the knob is on.
+  The knob is clamped to a finite [0, ~1 year] (an `inf` would persist and 500 /status +
+  /api/ps).
 - **Honest RAM/CPU weight split (#real-stats).** `ram_used_gb` / `cpu_frac` (and the load-time
   "X% of weights on CPU" warning) were `spec_estimate − measured_gpu_bytes`; the spec's formulaic
   int4 estimate overshoots real packed MoE size ~10%, fabricating a phantom "1.9 GB RAM / 10.6%

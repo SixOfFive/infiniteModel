@@ -850,12 +850,16 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # when the controller link drops, so recovery = re-stream on startup (after the
                        # fleet settles, so GPU models land on the GPU, not CPU). Opt-in (default empty);
                        # set via /config?persist=<model> / the dashboard 📌 toggle.
-                       "persist_models": {}}
-# A loaded model stays resident FOREVER by default (auto_unload off): a request never unloads it,
-# and a new load that doesn't fit simply fails (unload one first). The ONLY automatic unload is
-# when auto_unload is on — then a model idle (no requests) for IDLE_UNLOAD_S is unloaded, and an
-# idle model may be evicted to make room for a new load. The countdown is shown by the checkbox.
-IDLE_UNLOAD_S = 3600.0   # 60 min idle -> auto-unload (only when auto_unload is enabled)
+                       "persist_models": {},
+                       # #idle-unload: unload a model after this many minutes with NO requests.
+                       # 0 (default) = loaded forever. Independent of auto_unload (that knob is
+                       # about evicting to make ROOM for a new load; this one reclaims memory on a
+                       # quiet fleet). Pinned (persist_models) models and models with an active or
+                       # queued request are never idle-unloaded.
+                       "idle_unload_m": 0.0}
+# A loaded model stays resident FOREVER by default: a request never unloads it, and a new load
+# that doesn't fit simply fails (unload one first) unless auto_unload lets it LRU-evict an idle
+# model for room. Time-BASED reclaim is the separate idle_unload_m knob above (0 = off).
 
 # #logs: per-node log tails relayed by workers on their heartbeat (node_id -> list[str], trimmed).
 # Served via GET /logs?node=<host|node_id>; the controller's OWN log ring lives in wire (tail_logs).
@@ -2100,6 +2104,9 @@ class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin):
         # 1) distributed thinker with hidden-state capture
         gen_ids, prefill_hidden, step_hiddens, stop = await self.capture_thinker(
             friendly, prompt_ids, max_new)
+        # #idle-unload: restart the idle clock before the (potentially minutes-long, CPU-bound)
+        # talker+vocoder tail — capture_thinker stamped per step, this covers the assembly phase.
+        model.last_token_ts = time.time()
         info = {"prompt_len": len(prompt_ids), "gen_tokens": len(gen_ids),
                 "captured_steps": len(step_hiddens), "text_stop": stop}
 
@@ -2891,18 +2898,48 @@ def build_app() -> FastAPI:
         sampler = asyncio.create_task(metrics_sampler())
         stall_wd = asyncio.create_task(gen_stall_watchdog())   # #gen-stall-watchdog: reclaim wedged-gen slots
         async def _idle_unload_loop():
-            # When auto_unload is on, unload any model idle (no requests) for > IDLE_UNLOAD_S. A
-            # model mid-generation refreshes last_used every token (engine.generate), so it never
-            # looks idle and is never yanked mid-request. Off (default) -> models stay forever.
+            # #idle-unload: unload any model with NO requests for > idle_unload_m minutes
+            # (ENGINE_CONFIG knob, dashboard "Idle unload"; 0 = the default = loaded forever).
+            # Read fresh each cycle so /config applies without a restart. Safety gates:
+            #   - active/queued request -> never touched (last_used is stamped at request START,
+            #     so a generation LONGER than a small threshold would otherwise look idle);
+            #   - idleness counts from the freshest signal (max of last_used / last_token_ts);
+            #   - 📌 pinned (persist_models) models are exempt — pinning means "keep resident".
             while True:
                 await asyncio.sleep(60)
-                if not bool(ENGINE_CONFIG.get("auto_unload", False)):
+                try:
+                    _im = float(ENGINE_CONFIG.get("idle_unload_m", 0) or 0)
+                except (TypeError, ValueError):
+                    _im = 0.0
+                if _im <= 0:
                     continue
                 now = time.time()
-                stale = [fr for fr, m in list(engine.models.items())
-                         if now - m.last_used > IDLE_UNLOAD_S]
+                pinned = set(ENGINE_CONFIG.get("persist_models") or {})
+                # GROUP-wise judgment (review #idle-unload): engine.unload(base) CASCADES to every
+                # data-parallel replica (base + base#N), and the serving path stamps last_used on
+                # the BASE at arrival while the routed REPLICA carries active/last_token_ts — so
+                # judging any single registry key can call a group "idle" while a sibling is
+                # mid-decode. A group is stale only when EVERY member is quiet. lock.locked()
+                # covers requests that don't bump active/queued (engine.embed holds model.lock
+                # for its whole forward). Residual: a speech request's talker/vocoder TAIL longer
+                # than the whole window (thinker steps stamp last_token_ts; the tail restamps once).
+                groups: dict = {}
+                for fr, m in list(engine.models.items()):
+                    groups.setdefault(getattr(m, "base", fr) or fr, []).append(m)
+                stale = []
+                for base, ms in groups.items():
+                    if base in pinned:
+                        continue
+                    if any((m.active or 0) > 0 or (m.queued or 0) > 0
+                           or (getattr(m, "lock", None) is not None and m.lock.locked())
+                           for m in ms):
+                        continue
+                    last = max(max(m.last_used or 0.0, getattr(m, "last_token_ts", 0.0) or 0.0)
+                               for m in ms)
+                    if now - last > _im * 60.0:
+                        stale.append(base)
                 for fr in stale:
-                    log_activity(f"auto-unload {fr}: idle > {int(IDLE_UNLOAD_S // 60)} min")
+                    log_activity(f"idle-unload {fr}: no requests for > {_im:g} min (idle_unload_m)")
                     with contextlib.suppress(Exception):
                         await engine.unload(fr)
         idle_unloader = asyncio.create_task(_idle_unload_loop())

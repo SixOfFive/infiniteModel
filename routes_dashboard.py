@@ -284,6 +284,7 @@ def register(app):
                          vram_weights_first: Optional[bool] = None,
                          gen_stall_s: Optional[float] = None,
                          gen_stall_decode_s: Optional[float] = None,
+                         idle_unload_m: Optional[float] = None,
                          persist: Optional[str] = None,
                          unpersist: Optional[str] = None) -> JSONResponse:
         if persist is not None:                          # #77: keep this model across restarts
@@ -330,6 +331,11 @@ def register(app):
             ENGINE_CONFIG["gen_stall_s"] = max(0.0, float(gen_stall_s))
         if gen_stall_decode_s is not None:                # #active-decode-stall: tighter post-first-token stall (0=off)
             ENGINE_CONFIG["gen_stall_decode_s"] = max(0.0, float(gen_stall_decode_s))
+        if idle_unload_m is not None:                     # #idle-unload: minutes idle -> unload (0 = keep forever)
+            # clamp to [0, ~1 year] FINITE: pydantic accepts 'inf'/huge exponents, which would
+            # persist through engine_config.json and 500 /status (non-JSON float) + /api/ps
+            # (fromtimestamp overflow in expires_at). max(0.0, nan) -> 0.0 by argument order.
+            ENGINE_CONFIG["idle_unload_m"] = min(max(0.0, float(idle_unload_m)), 527040.0)
         save_engine_config()
         log_activity(f"config: max_loaded={ENGINE_CONFIG['max_loaded']} "
                      f"auto_unload={ENGINE_CONFIG['auto_unload']} "

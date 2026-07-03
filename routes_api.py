@@ -132,6 +132,21 @@ def register(app):
         gpus = [n for n in nodes if n.vram_total_gb > 0]
         vram_total = int(sum(n.vram_total_gb for n in gpus) * GB)
 
+        def _expires_at(lm: LoadedModel) -> float:
+            # #idle-unload: when the knob is on, a model expires idle_unload_m minutes after its
+            # last activity — unless pinned (persist_models), which idle-unload exempts.
+            try:
+                # min() also drops a hand-edited/legacy inf from engine_config.json — an infinite
+                # window would overflow datetime.fromtimestamp below and 500 the whole /api/ps
+                _im = min(float(ENGINE_CONFIG.get("idle_unload_m", 0) or 0), 527040.0)
+            except (TypeError, ValueError):
+                _im = 0.0
+            pinned = set(ENGINE_CONFIG.get("persist_models") or {})
+            if _im <= 0 or lm.friendly in pinned or getattr(lm, "base", lm.friendly) in pinned:
+                return time.time() + 365 * 86400
+            last = max(lm.last_used or 0.0, getattr(lm, "last_token_ts", 0.0) or 0.0)
+            return last + _im * 60.0
+
         def _model_vram(lm: LoadedModel) -> int:
             # per-STAGE gpu_bytes (survives node-sharing; the node's single shard_gpu_bytes
             # would be overwritten when a 2nd model lands on it)
@@ -157,7 +172,10 @@ def register(app):
                 "name": _ollama_name(lm.friendly), "model": _ollama_name(lm.friendly),
                 "size": lm.spec.total_weight_bytes, "size_vram": _model_vram(lm),
                 "digest": _digest(lm.target_id), "details": _details(lm.spec),
-                "expires_at": _iso(time.time() + 365 * 86400),
+                # #idle-unload: honest Ollama expires_at — last activity + the idle window when
+                # the knob is on (pinned models are exempt from idle-unload -> "forever");
+                # idle_unload_m 0/off keeps the old effectively-never (+1y) value.
+                "expires_at": _iso(_expires_at(lm)),
                 "context_length": lm.ctx,   # Ollama-standard field (loaded context window)
                 "infinitemodel": {
                     "ctx": lm.ctx, "pool_usable_gb": round(lm.plan.pool_usable_gb, 2),
