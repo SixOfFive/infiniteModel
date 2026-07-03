@@ -147,7 +147,14 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   a malformed value fails as a clean pre-stream 400 — never a post-stream empty-200 (the
   cold-contract rule); the stored seed is capped at 2^53-1 so it round-trips JSON/JS float64
   losslessly (per-request seeds go to int64 max).
-- **Thread-safe Triton autotuning (multi-model concurrency):** triton's `Autotuner.run()` keeps the
+- **Honest RAM/CPU weight split (#real-stats).** `ram_used_gb` / `cpu_frac` (and the load-time
+  "X% of weights on CPU" warning) were `spec_estimate − measured_gpu_bytes`; the spec's formulaic
+  int4 estimate overshoots real packed MoE size ~10%, fabricating a phantom "1.9 GB RAM / 10.6%
+  CPU" on a fully-GPU-resident Qwen3-30B-A3B (verified per-tensor: everything on cuda). The
+  worker has always reported its MEASURED post-quant weight bytes in the load result — the stage
+  now carries it and both numbers are computed measured-vs-measured (spec fallback only for
+  workers that predate the field). The model-detail placement row also now reads
+  "on GPU x of <node total> VRAM" instead of a bare "GPU x GB" that looked like a device spec. triton's `Autotuner.run()` keeps the
   call's args in unsynchronized instance state (`self.nargs`, set on entry / `None` on exit) and the
   int4 w4a16 kernels (dense GEMV + fused MoE) are process-wide singletons shared by every shard — so
   with TWO models resident, any decode that autotune-benchmarks a NEW shape key while the other model
