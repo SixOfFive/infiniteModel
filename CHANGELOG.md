@@ -81,6 +81,22 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   whose template emits none. devstral image→text: *"The image contains a red circle and a blue square."*
   Covers Devstral / Ministral. (`[IMG_BREAK]`/`[IMG_END]` row-structure tokens are still flat — a tracked
   refinement.)
+- **Gemma 4 unified vision** (#143, validated end-to-end on gemma-4:12b-it, 2026-07-03): the
+  encoder-free arch — no vision tower at all; `model.embed_vision` (LN → Dense → +factorized-2D-posemb
+  → RMSNorm → Linear) projects raw merged pixel patches straight into LM space. The HF image processor
+  hard-requires torchvision (which would clobber the pinned ROCm/CUDA torch), so preprocessing is a
+  pure-PIL/torch reimplementation of the exact algorithm: aspect-ratio-preserving resize to a multiple
+  of `pool*patch`=48 px (`F.interpolate` bicubic+antialias ≡ `tvF.resize`), 16 px teacher patchify,
+  3×3 `patches_merge` into ≤280 model patches of 6912 values, pad with (-1,-1) positions. The raw
+  safetensors keys are stored RENAMED (`vision_embedder.*`, un-nested projection) — the loader applies
+  transformers' WeightRenaming table during collection. `get_image_features(pixel_values,
+  image_position_ids)` returns padding-stripped LM-ready embeds; each template-rendered `<|image|>` is
+  bracketed `boi + n×image + eoi` (processor parity) then expanded to its REAL per-image count and
+  spliced with plain 1D positions. Multi-image attribution exact; works on all three APIs. Known gap:
+  the reference runs bidirectional attention across each image block — we ship causal-first (minor
+  location imprecision observed). Side-fix: gemma-4's `chat_template.jinja` was missing from the model
+  dir, so even TEXT prompts had been served through the flat fallback — with it in place the native
+  `<|turn>` form renders (and `<turn|>`=106 was already a registered stop).
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8
