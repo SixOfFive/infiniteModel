@@ -147,6 +147,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   a malformed value fails as a clean pre-stream 400 — never a post-stream empty-200 (the
   cold-contract rule); the stored seed is capped at 2^53-1 so it round-trips JSON/JS float64
   losslessly (per-request seeds go to int64 max).
+- **Connections panel (#connections).** The dashboard's models page gains a bottom section
+  listing every connected client (by IP): connected-for, idle-for (an active stream is never
+  "idle" — activity is stamped per chunk), REAL bytes in/out counted at the ASGI layer (streamed
+  responses grow the counter live; worker `/weights` slice-pulls are excluded), token totals
+  in/out, request count, what the client is using or loading RIGHT NOW (in-flight join + the
+  load card's `requested_by`), and a **Terminate** button — `POST /terminate?ip=` cancels every
+  in-flight request from that client. Browser tabs that only watch the dashboard are chipped
+  "dashboard"; a row is a real API client only once it hits a generation/embedding endpoint.
+  X-Forwarded-For is charset-validated on BOTH derivation paths before it becomes a client key
+  (it renders in HTML and an onclick — arbitrary header text would be an XSS vector).
 - **Idle unload (#idle-unload).** New engine setting (`/config?idle_unload_m=`, dashboard
   "Idle unload"): a model that served NO requests for N minutes is unloaded automatically.
   Default 0 = the long-standing behavior — every model stays loaded forever. Judged GROUP-wise
