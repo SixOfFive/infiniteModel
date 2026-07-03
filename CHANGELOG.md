@@ -300,7 +300,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   held by an orphaned forward, node-drop recovery races) now return `503 + Retry-After`
   (Ollama/OpenAI) or `529 overloaded_error` (Anthropic) instead of bare 500s, and a watchdog-reclaimed
   in-flight request gets a clean retryable response instead of an aborted socket. User-initiated
-  `/cancel` and `/terminate` keep their kill semantics (never invite a retry).
+  `/cancel` and `/terminate` keep their kill semantics (never invite a retry). **Streaming paths**
+  get the same honesty: a mid-stream reclaim or contention failure emits a typed TERMINAL error
+  frame in each protocol's idiom — Ollama `done_reason:"error"` + `retryable:true`, OpenAI a
+  `{"error":…}` object (no longer a clean `finish_reason:"stop"` that presented a truncated answer
+  as complete — the worst of the pre-fix cases), Anthropic an `overloaded_error` event — rather than
+  a silently truncated stream; a genuine client disconnect or user cancel still drops the connection.
 - **Idle-unload accepts `-1` as "keep forever":** the Ollama-style sentinel round-trips (saves and
   displays as -1) instead of silently resetting to 0; -1 and 0 mean the same thing — the reaper is
   off and `/api/ps` reports effectively-never expiry.

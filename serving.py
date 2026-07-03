@@ -20,6 +20,12 @@ def _transient_gen_exc(exc: BaseException) -> bool:
     timeouts as TimeoutError; a shard still held by an orphaned forward as RuntimeError('shard
     busy … re-prefill required'). Anything else (shape/dtype/template bugs) stays a real 500 so
     genuine defects aren't hidden behind retries."""
+    # Deterministic filesystem OSError subclasses (a missing/again-missing tokenizer file, a
+    # permission error) are NOT contention — a retry can't fix them, so they stay a real 500/error
+    # rather than inviting a retry storm. Socket/pipe OSErrors (dropped data plane) fall through to
+    # the retryable branch below (ConnectionError/BrokenPipeError are ConnectionError subclasses).
+    if isinstance(exc, (FileNotFoundError, IsADirectoryError, NotADirectoryError, PermissionError)):
+        return False
     if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
         return True
     s = str(exc).lower()
@@ -28,6 +34,21 @@ def _transient_gen_exc(exc: BaseException) -> bool:
                                 # node-drop/recovery races: the model is being replanned and a
                                 # retry lands on the recovered pipeline
                                 "no model loaded", "not connected", "went down"))
+
+
+def _stream_fail(exc, rec):
+    """#endpoint-weather (streaming): classify a MID-STREAM generation failure for the terminal
+    error frame. Returns (retryable, message). A 200 + SSE is already open, so the HTTP status can
+    no longer change — the only honest signal left is a typed TERMINAL frame. A watchdog reclaim
+    (CancelledError once rec['reclaimed'] is set) and any _transient_gen_exc are RETRYABLE overload;
+    everything else is a hard error the client must NOT retry. Each streamer formats this into its
+    protocol's idiom (Ollama done_reason=error + retryable; OpenAI error object w/ overloaded_error;
+    Anthropic `error` event w/ overloaded_error) — never a clean finish that hides the truncation."""
+    if isinstance(exc, asyncio.CancelledError):
+        return True, "generation reclaimed under backend contention — retry with backoff"
+    if _transient_gen_exc(exc):
+        return True, f"transient backend contention ({type(exc).__name__}: {exc}) — retry with backoff"
+    return False, f"{type(exc).__name__}: {exc}"
 
 
 def _normalize_ollama_images(messages):
@@ -680,8 +701,26 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                             METRICS["api_out"] += len(s); yield s
                     if reason:
                         finish = reason
-            except Exception:
-                pass
+            except asyncio.CancelledError:
+                # #endpoint-weather (streaming): watchdog reclaim mid-stream. Emit a RETRYABLE
+                # error object (not a silent "stop") so a fan-out client backs off; uncancel() so
+                # the frame flushes on 3.11+. A genuine client disconnect / user cancel re-raises.
+                if not (rec is not None and rec.get("reclaimed")):
+                    raise
+                with contextlib.suppress(Exception):
+                    asyncio.current_task().uncancel()
+                s = "data: " + json.dumps({"error": {"message": "generation reclaimed under "
+                    "backend contention — retry with backoff", "type": "overloaded_error",
+                    "code": "overloaded"}}) + "\n\ndata: [DONE]\n\n"
+                METRICS["api_out"] += len(s); yield s; return
+            except Exception as exc:
+                # #endpoint-weather: a mid-stream failure used to be swallowed and reported as a
+                # clean finish — a fan-out/quorum client then counts a TRUNCATED answer as a valid
+                # vote. Emit an error object instead (overloaded_error = retryable).
+                _retry, _msg = _stream_fail(exc, rec)
+                s = "data: " + json.dumps({"error": {"message": _msg,
+                    "type": "overloaded_error" if _retry else "api_error"}}) + "\n\ndata: [DONE]\n\n"
+                METRICS["api_out"] += len(s); yield s; return
             fr = "tool_calls" if emitted_tools else _map_finish(finish)
             s = "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
@@ -690,7 +729,7 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             METRICS["api_out"] += len(s); yield s
 
         async def ollama_tool_stream():
-            t0 = time.perf_counter_ns(); done_reason = "stop"; err = None
+            t0 = time.perf_counter_ns(); done_reason = "stop"; err = None; retryable = False
             raw = ""; emitted_plain = 0; emitted_tools = 0
             try:
                 async for piece, reason in run():
@@ -710,8 +749,15 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                             METRICS["api_out"] += len(s); yield s
                     if reason:
                         done_reason = reason
+            except asyncio.CancelledError:   # #endpoint-weather: watchdog reclaim mid-stream
+                if not (rec is not None and rec.get("reclaimed")):
+                    raise
+                with contextlib.suppress(Exception):
+                    asyncio.current_task().uncancel()
+                err, done_reason, retryable = ("generation reclaimed under backend contention — "
+                                               "retry with backoff"), "error", True
             except Exception as exc:
-                err, done_reason = str(exc), "error"
+                retryable, err = _stream_fail(exc, rec); done_reason = "error"
             dur = time.perf_counter_ns() - t0
             final = {"model": model, "created_at": _iso(), "done": True, "done_reason": done_reason,
                      "total_duration": dur, "load_duration": 0,
@@ -720,6 +766,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                      "message": {"role": "assistant", "content": ""}}
             if err:
                 final["error"] = err
+            if retryable:                    # #endpoint-weather: contention -> client should retry
+                final["retryable"] = True
             s = json.dumps(final) + "\n"
             METRICS["api_out"] += len(s); yield s
 
@@ -732,6 +780,7 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             t0 = time.perf_counter_ns()
             done_reason = "stop"
             err = None
+            retryable = False
             body_key = "message" if mode == "chat" else "response"
             empty_val = {"role": "assistant", "content": ""} if mode == "chat" else ""
             # Model already loaded above (#cold-contract): stream the decode directly — no in-stream
@@ -747,8 +796,15 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                         yield s
                     if reason:
                         done_reason = reason
+            except asyncio.CancelledError:   # #endpoint-weather: watchdog reclaim mid-stream
+                if not (rec is not None and rec.get("reclaimed")):
+                    raise
+                with contextlib.suppress(Exception):
+                    asyncio.current_task().uncancel()
+                err, done_reason, retryable = ("generation reclaimed under backend contention — "
+                                               "retry with backoff"), "error", True
             except Exception as exc:  # generation failed mid-stream (model WAS ready); run() frees rec
-                err, done_reason = str(exc), "error"
+                retryable, err = _stream_fail(exc, rec); done_reason = "error"
             dur = time.perf_counter_ns() - t0
             final = {"model": model, "created_at": _iso(), "done": True,
                      "done_reason": done_reason, "total_duration": dur, "load_duration": 0,
@@ -757,6 +813,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             final[body_key] = empty_val
             if err:
                 final["error"] = err
+            if retryable:                    # #endpoint-weather: contention -> client should retry
+                final["retryable"] = True
             s = json.dumps(final) + "\n"
             METRICS["api_out"] += len(s)
             yield s
@@ -785,8 +843,25 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                         yield s
                     if reason:
                         finish = _map_finish(reason)
-            except Exception:
-                finish = "stop"
+            except asyncio.CancelledError:
+                # #endpoint-weather: watchdog reclaim mid-stream — emit a RETRYABLE error object,
+                # NOT a clean finish_reason:"stop" (which hid the truncation as a valid answer).
+                if not (rec is not None and rec.get("reclaimed")):
+                    raise
+                with contextlib.suppress(Exception):
+                    asyncio.current_task().uncancel()
+                s = "data: " + json.dumps({"error": {"message": "generation reclaimed under "
+                    "backend contention — retry with backoff", "type": "overloaded_error",
+                    "code": "overloaded"}}) + "\n\ndata: [DONE]\n\n"
+                METRICS["api_out"] += len(s); yield s; return
+            except Exception as exc:
+                # #endpoint-weather: was `finish="stop"` — a mid-stream failure presented as a
+                # clean stop, so a fan-out/quorum client scored a truncated answer as complete.
+                # Emit an error object (overloaded_error = retryable) before [DONE] instead.
+                _retry, _msg = _stream_fail(exc, rec)
+                s = "data: " + json.dumps({"error": {"message": _msg,
+                    "type": "overloaded_error" if _retry else "api_error"}}) + "\n\ndata: [DONE]\n\n"
+                METRICS["api_out"] += len(s); yield s; return
             s = "data: " + json.dumps(_chunk("", finish)) + "\n\n"
             s += "data: [DONE]\n\n"
             METRICS["api_out"] += len(s)
@@ -1187,14 +1262,32 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                                 "type": "content_block_stop", "index": idx})
                     if reason:
                         finish = reason
-            except Exception as exc:
-                # mid-stream failure: close any open block, then signal end
+            except asyncio.CancelledError:
+                # #endpoint-weather: watchdog reclaim mid-stream -> Anthropic `overloaded_error`
+                # (what Claude Code / Anthropic SDKs back off on). uncancel() so the event flushes;
+                # a genuine client disconnect / user cancel re-raises (no retry invite).
+                if not (rec is not None and rec.get("reclaimed")):
+                    raise
+                with contextlib.suppress(Exception):
+                    asyncio.current_task().uncancel()
                 if text_open:
                     yield ev("content_block_stop", {"type": "content_block_stop",
                                                     "index": text_index})
                     text_open = False
-                yield ev("error", {"type": "error",
-                                   "error": {"type": "api_error", "message": str(exc)}})
+                yield ev("error", {"type": "error", "error": {"type": "overloaded_error",
+                    "message": "generation reclaimed under backend contention — retry with backoff"}})
+                return
+            except Exception as exc:
+                # mid-stream failure: close any open block, then signal end. #endpoint-weather:
+                # contention-class -> overloaded_error (retryable) so Claude Code backs off instead
+                # of surfacing a hard api_error on a transient squeeze.
+                if text_open:
+                    yield ev("content_block_stop", {"type": "content_block_stop",
+                                                    "index": text_index})
+                    text_open = False
+                _retry, _msg = _stream_fail(exc, rec)
+                yield ev("error", {"type": "error", "error": {
+                    "type": "overloaded_error" if _retry else "api_error", "message": _msg}})
                 return
             if text_open:
                 yield ev("content_block_stop", {"type": "content_block_stop",
