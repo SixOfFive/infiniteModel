@@ -113,7 +113,8 @@ class EngineLoadMixin:
                    gpu_spread: bool = False, pin_host: str = "",
                    kv_quant: str = "", kv_offload: bool = False,
                    default_temp: Optional[float] = None,
-                   default_min_p: Optional[float] = None) -> LoadedModel:
+                   default_min_p: Optional[float] = None,
+                   requested_by: str = "") -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -134,7 +135,8 @@ class EngineLoadMixin:
                                          moe_offload=moe_offload, gpu_spread=gpu_spread,
                                          pin_host=pin_host, kv_quant=kv_quant,
                                          kv_offload=kv_offload, default_temp=default_temp,
-                                         default_min_p=default_min_p, _own=_own)
+                                         default_min_p=default_min_p,
+                                         requested_by=requested_by, _own=_own)
         finally:
             if _own["v"]:
                 self._reservations.pop(rk, None)
@@ -154,6 +156,7 @@ class EngineLoadMixin:
                    kv_quant: str = "", kv_offload: bool = False,
                    default_temp: Optional[float] = None,
                    default_min_p: Optional[float] = None,
+                   requested_by: str = "",
                    _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
@@ -203,7 +206,9 @@ class EngineLoadMixin:
                     "model": friendly, "display_model": _ollama_name(friendly),
                     "target": MODELS[friendly][0] if friendly in MODELS else friendly,
                     "ready": 0, "total": 0, "stages_total": 0, "stages_ready": 0,
-                    "basis": "planning…", "warnings": [], "started": time.time()}
+                    "basis": "planning…", "warnings": [], "started": time.time(),
+                    # #connections: which client asked for this load ("" = internal/auto)
+                    "requested_by": requested_by or ""}
                 if _own is not None:
                     _own["v"] = True
                     self._loading_tasks[reg_key] = asyncio.current_task()   # cancel handle for force override
@@ -595,13 +600,17 @@ class EngineLoadMixin:
                 log_activity(f"{friendly}: handing out {total_shards} shard(s) across "
                              f"{n_stages} node(s) -> " + ", ".join(
                     f"{s.hostname}(L{s.layer_start}-{s.layer_end})" for s in stages))
-                _started0 = (self.loadings.get(reg_key) or {}).get("started")  # keep the load-start time
+                _card0 = self.loadings.get(reg_key) or {}   # keep load-start time + requester
                 self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
                                 "target": target_id, "total": total_shards,
                                 "ready": 0, "stages_total": n_stages, "stages_ready": 0,
                                 "basis": basis, "warnings": load_warnings,
                                 "node_ids": [s.node_id for s in stages],   # reaper grace for builders
-                                "started": _started0 or time.time()}   # #76 guardrail + load-card timer
+                                "started": _card0.get("started") or time.time(),   # #76 guardrail + load-card timer
+                                # #connections: carry the requester across the dispatch rebuild —
+                                # the streaming phase (the visible bulk of a load) is what the
+                                # Connections panel attributes to the client
+                                "requested_by": _card0.get("requested_by", "")}
                 # #shard-cache Inc 2 (serve-from-cache): if a VERIFIED int4 cache exists, tell every
                 # worker to fetch PRE-PACKED int4 layers (cache=int4) instead of streaming the full
                 # bf16 + re-quantizing — the big win for MoE/large loads (e.g. ~18 GB cache vs ~70 GB
@@ -925,7 +934,9 @@ class EngineLoadMixin:
                         "stages_total": 1, "stages_ready": 0,
                         "basis": f"embedding: single-node ({node.hostname})", "warnings": [],
                         "node_ids": [node.node_id],
-                        "started": (self.loadings.get(reg_key) or {}).get("started") or time.time()}
+                        "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
+                        # #connections: keep the requester across the rebuild (panel attribution)
+                        "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
         link = self.links.get(node.node_id)
         if link is None:
             self.loadings.pop(reg_key, None)
@@ -1252,7 +1263,9 @@ class EngineLoadMixin:
                         "total": tp * (L + 2), "ready": 0,
                         "stages_total": tp, "stages_ready": 0, "basis": tp_basis,
                         "node_ids": [n.node_id for n in tp_nodes],
-                        "started": (self.loadings.get(friendly) or {}).get("started") or time.time()}
+                        "started": (self.loadings.get(friendly) or {}).get("started") or time.time(),
+                        # #connections: keep the requester across the rebuild (panel attribution)
+                        "requested_by": (self.loadings.get(friendly) or {}).get("requested_by", "")}
         loop = asyncio.get_event_loop()
         futs: dict[str, asyncio.Future] = {}
         for rank, n in enumerate(tp_nodes):

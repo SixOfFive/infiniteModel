@@ -277,6 +277,24 @@ def build_status() -> dict:
     queue = [{"id": r["id"], "ip": r["ip"], "model": r["model"],
               "waiting_s": round(now - r["enqueued"], 1)}
              for r in _inflight if r["state"] == "queued"]
+    # #connections: per-client rows for the dashboard's Connections panel — live accounting
+    # (bytes from the ASGI counter, tokens from the serving paths) JOINED with this client's
+    # in-flight requests (which model it is using/loading right now) and any model load it
+    # explicitly requested (loading-card requested_by).
+    clients = []
+    for r in sorted(CLIENTS.values(), key=lambda x: -x["last_seen"]):
+        acts = [{"id": q["id"], "model": q["model"], "state": q["state"],
+                 "s": round(now - (q["started"] or q["enqueued"]), 1)}
+                for q in _inflight if q["ip"] == r["ip"]]
+        lds = [c.get("display_model") or c.get("model") for c in engine.loadings.values()
+               if c.get("requested_by") == r["ip"]]
+        clients.append({"ip": r["ip"], "api": bool(r["api"]), "reqs": r["reqs"],
+                        "bytes_in": r["bytes_in"], "bytes_out": r["bytes_out"],
+                        "tok_in": r["tok_in"], "tok_out": r["tok_out"],
+                        "last_model": r["last_model"],
+                        "connected_s": round(now - r["first_seen"], 1),
+                        "idle_s": round(now - r["last_seen"], 1),
+                        "active": acts, "loading": lds})
     # #model-detail: build the per-model registry cards, then fold each RESIDENT model's RUNTIME
     # fields (ctx / quant / VRAM / RAM / KV / tok-s / placement stages / lifetime totals) into its
     # card. _model_entry alone knows only name/size/cached/loaded; the runtime lives in
@@ -363,6 +381,7 @@ def build_status() -> dict:
                     "reconfiguring": getattr(engine, "reconfiguring", None),   # #88 managed reload
                     "slots": slots, "queue": queue,
                     "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH)},
+        "clients": clients,      # #connections: per-client accounting + activity (dashboard panel)
         "models": model_cards,   # registry cards enriched with resident runtime (#model-detail)
         "nodes": [n.to_dict() for n in nodes],
         "activity": list(ACTIVITY),   # newest-first controller activity (dashboard panel)

@@ -915,11 +915,117 @@ def _inflight_release(rec) -> None:
         INFLIGHT.pop(rec["id"], None)
 
 
+# --- Per-client connection registry (#connections) ------------------------------
+# Every HTTP client (keyed by IP) gets a live accounting row for the dashboard's
+# Connections panel: first/last activity, REAL bytes on the wire both directions
+# (counted at the ASGI layer so streamed responses grow the counter chunk-by-chunk),
+# token totals (bumped by the serving paths at request end), and the last model
+# touched. In-memory only (resets with the controller). /weights is EXCLUDED —
+# those are worker slice-pulls during a load, not client traffic (they would dwarf
+# every real client with tens of GB of transfer).
+CLIENTS: dict = {}
+CLIENTS_MAX = 64
+# X-Forwarded-For values must LOOK like an IP before they become a CLIENTS key (they render
+# in dashboard HTML + a /terminate onclick — arbitrary header text would be an XSS vector)
+_IP_RE = re.compile(r"^[0-9A-Fa-f.:]{2,45}$")
+# generation/embedding endpoints — hitting one marks the row as a real API client
+# (vs a browser that only watches the dashboard; the dashboard itself calls /api/show
+# and /api/ps, so "starts with /api/" would mislabel it)
+_CLIENT_API_PATHS = ("/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
+                     "/v1/chat/completions", "/v1/completions", "/v1/messages",
+                     "/v1/embeddings", "/v1/audio")
+
+
+def _client_row(ip: str) -> dict:
+    row = CLIENTS.get(ip)
+    if row is None:
+        if len(CLIENTS) >= CLIENTS_MAX:      # trim the longest-idle row
+            oldest = min(CLIENTS.values(), key=lambda r: r["last_seen"])
+            CLIENTS.pop(oldest["ip"], None)
+        now = time.time()
+        row = CLIENTS[ip] = {"ip": ip, "first_seen": now, "last_seen": now,
+                             "bytes_in": 0, "bytes_out": 0, "tok_in": 0, "tok_out": 0,
+                             "reqs": 0, "api": False, "last_model": None}
+    return row
+
+
+def _client_tokens(ip: str, tok_in: int = 0, tok_out: int = 0, model: str = "") -> None:
+    """Serving paths report a finished request's token counts (engine.generate's finally +
+    _serve_embed) so the Connections panel shows real per-client token totals."""
+    try:
+        row = _client_row(ip or "?")
+        row["tok_in"] += int(tok_in or 0)
+        row["tok_out"] += int(tok_out or 0)
+        if model:
+            row["last_model"] = model
+    except Exception:
+        pass
+
+
+class _ClientAccounting:
+    """#connections: count REAL bytes per client at the ASGI layer. An
+    @app.middleware('http') only sees Response objects — a StreamingResponse's bytes
+    are invisible there — while wrapping receive/send counts every chunk as it crosses
+    the wire, so a minutes-long SSE stream shows a live, growing bytes_out. last_seen
+    is stamped on every chunk, so an ACTIVE stream is never 'idle'."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path", "") or ""
+        if path.startswith("/weights"):       # worker slice-pulls, not client traffic
+            return await self.app(scope, receive, send)
+        ip = None
+        try:                                   # honor X-Forwarded-For like _client_ip
+            for k, v in scope.get("headers") or []:
+                if k == b"x-forwarded-for":
+                    ip = v.decode("latin-1").split(",")[0].strip()
+                    break
+        except Exception:
+            pass
+        # X-Forwarded-For is CLIENT-CONTROLLED text that ends up in the dashboard's HTML and
+        # in a /terminate onclick — accept only something that LOOKS like an IP (v4/v6 charset,
+        # bounded length); anything else falls back to the socket address.
+        if ip and not _IP_RE.match(ip):
+            ip = None
+        if not ip:
+            ip = (scope.get("client") or ("?",))[0] or "?"
+        row = _client_row(ip)
+        row["reqs"] += 1
+        row["last_seen"] = time.time()
+        if not row["api"] and path.startswith(_CLIENT_API_PATHS):
+            row["api"] = True
+
+        async def _recv():
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                row["bytes_in"] += len(msg.get("body") or b"")
+                row["last_seen"] = time.time()
+            return msg
+
+        async def _send(msg):
+            if msg.get("type") == "http.response.body":
+                row["bytes_out"] += len(msg.get("body") or b"")
+                row["last_seen"] = time.time()
+            await send(msg)
+
+        return await self.app(scope, _recv, _send)
+
+
 def _client_ip(req) -> str:
-    """Best-effort client IP for slot/queue display (honors a proxy's X-Forwarded-For)."""
+    """Best-effort client IP for slot/queue display (honors a proxy's X-Forwarded-For).
+    #connections: the SAME _IP_RE validation as the accounting middleware — INFLIGHT rec.ip,
+    load requested_by and the token bumps all JOIN against the middleware-keyed CLIENTS row,
+    so both derivations must agree (a malformed XFF would otherwise split one client's stats
+    across a real row and a ghost row keyed by raw header text, which also renders in HTML)."""
     xff = req.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
+        cand = xff.split(",")[0].strip()
+        if _IP_RE.match(cand):
+            return cand
     return req.client.host if req.client else "?"
 
 
@@ -3044,6 +3150,7 @@ def build_app() -> FastAPI:
             print("[*] controller stopped")
 
     app = FastAPI(title="InfiniteModel Controller", version=VERSION, lifespan=lifespan)
+    app.add_middleware(_ClientAccounting)   # #connections: per-client byte/activity accounting
 
     @app.middleware("http")            # #error-log: capture every 4xx/5xx response for the Logs UI
     async def _capture_errors(request, call_next):
@@ -3125,6 +3232,7 @@ def build_app() -> FastAPI:
             _inflight_release(rec)
         display = _ollama_name(friendly)
         n_tok = int(attn.sum())
+        _client_tokens(ip, tok_in=n_tok, model=display)   # #connections: per-client token totals
         if mode == "openai":
             return JSONResponse({
                 "object": "list",

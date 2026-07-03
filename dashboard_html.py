@@ -173,6 +173,12 @@ DASHBOARD_HTML = r"""<!doctype html>
   /* legend */
   .legend{display:flex;gap:15px;font-size:12px;color:var(--muted);margin-bottom:9px;flex-wrap:wrap}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:1px}
+  /* connections rows (#connections — same shape as the Config page's node rows) */
+  .nrow{display:flex;align-items:center;gap:14px;padding:9px 15px;border-bottom:1px solid var(--border);font-size:13px}
+  .nrow:last-child{border-bottom:none}
+  .nrow .nn{min-width:220px;font-weight:600}
+  .nrow .nn small{font-weight:400;color:var(--dim);font-size:11px}
+  .nrow .em{color:var(--dim)}
   /* model list */
   .list{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
   .row{display:flex;align-items:center;gap:12px;padding:11px 15px;border-bottom:1px solid var(--border)}
@@ -251,6 +257,10 @@ DASHBOARD_HTML = r"""<!doctype html>
 <div class="sec"><h2>Nodes</h2><span class="hint" id="ncount"></span></div>
 <div class="list" id="nodes"></div>
 
+<!-- CONNECTIONS (#connections) -->
+<div class="sec"><h2>Connections</h2><span class="hint" id="ccount"></span></div>
+<div class="list" id="conns"><div class="empty">no clients yet</div></div>
+
 </div>
 
 <div class="ov" id="ov" onclick="if(event.target===this)closeOv()"><div class="modal" id="modal"></div></div>
@@ -293,7 +303,48 @@ function render(){
   ].join('');
   renderModels(d,cl);
   renderNodes(d);
+  renderConns(d);          // #connections: per-client accounting panel (bottom of the page)
   refreshDetailIfOpen();   // #model-detail: live-update the open detail modal's operational section
+}
+function fmtB(b){ if(b==null)return '—'; if(b<1024)return b+' B'; if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  if(b<1073741824)return (b/1048576).toFixed(1)+' MB'; return (b/1073741824).toFixed(2)+' GB'; }
+// #connections: one row per client IP — connected-for, idle-for, real bytes both ways (ASGI
+// counter, so an active stream's bytes grow live), token totals, what it is using/loading
+// RIGHT NOW (INFLIGHT join + loading-card requested_by), and a Terminate button that kills
+// every in-flight request from that client (POST /terminate).
+function renderConns(d){
+  const cs=(d.clients||[]);
+  $('#ccount').textContent=cs.length+' client'+(cs.length==1?'':'s');
+  if(!cs.length){ $('#conns').innerHTML='<div class="empty">no connections yet</div>'; return; }
+  // both name forms: loading cards carry the Ollama display name (colons) AND the friendly
+  // key (dashes) — active[].model is the FRIENDLY key, so match against both (review-caught)
+  const lnames=((d.cluster||{}).loadings||[]).flatMap(l=>[l.model,l.display_model]).filter(Boolean);
+  $('#conns').innerHTML=cs.map(c=>{
+    const acts=(c.active||[]).map(a=>{
+      const lbl=a.state==='running'?(lnames.includes(a.model)?'loading':'generating'):'queued';
+      const col=a.state==='running'?'var(--good)':'var(--warn)';
+      return '<span class="chip" style="color:'+col+'">'+esc(a.model)+' · '+lbl+' '+dur(a.s)+'</span>';
+    });
+    (c.loading||[]).forEach(m=>acts.push('<span class="chip" style="color:var(--warn)">'+esc(m)+' · loading</span>'));
+    const act=acts.length?acts.join(' '):(c.last_model?('<span class="em">last: '+esc(c.last_model)+'</span>'):'<span class="em">—</span>');
+    const kind=c.api?'':' <span class="chip">dashboard</span>';
+    const idle=(c.active||[]).length?'<span style="color:var(--good)">active</span>':('idle '+dur(c.idle_s));
+    const term=(c.active||[]).length
+      ?' <button class="btn sm ghost" onclick="termClient(\''+esc(c.ip)+'\')">Terminate</button>':'';
+    return '<div class="nrow"><div class="nn">'+esc(c.ip)+kind
+      +' <small>· connected '+dur(c.connected_s)+' · '+idle+'</small></div>'
+      +'<div style="font-size:12px;color:var(--muted)">'
+      +fmtB(c.bytes_in)+' in / '+fmtB(c.bytes_out)+' out · '
+      +(c.tok_in||0).toLocaleString()+' / '+(c.tok_out||0).toLocaleString()+' tok · '
+      +(c.reqs||0)+' req</div>'
+      +'<div style="flex:1;text-align:right">'+act+term+'</div></div>';
+  }).join('');
+}
+async function termClient(ip){
+  if(!confirm('Terminate every in-flight request from '+ip+'?'))return;
+  try{ const r=await api('/terminate?ip='+encodeURIComponent(ip),{method:'POST'});
+       toast('terminated '+ip+' · '+r.cancelled+' request(s) cancelled'); tick(); }
+  catch(e){ toast(String(e.message||e),1); }
 }
 function fmt(v){return v==null?'—':(Math.round(v*10)/10)}
 function tile(k,v,extra){return '<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div>'+(extra||'')+'</div>';}

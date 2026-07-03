@@ -390,6 +390,12 @@ class EngineGenMixin:
                     model.req_total += 1
                     model.tok_in_total += len(prompt_ids)
                     model.tok_out_total += _ntoks
+                    # #connections: attribute this request's tokens to its client (rec carries the
+                    # ip) — ONE spot covers every generate entry point (Ollama/OpenAI/Anthropic +
+                    # the tools reply loop). rec is None for internal callers (warmup probes).
+                    if rec is not None:
+                        with contextlib.suppress(Exception):
+                            _client_tokens(rec.get("ip"), len(prompt_ids), _ntoks, model.friendly)
                     with contextlib.suppress(Exception):   # #ctx-history: capture this request's in/out
                         _record_ctx_history(model.friendly, prompt_ids, _out_ids,
                                             len(prompt_ids), _ntoks)
