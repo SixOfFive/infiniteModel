@@ -3074,7 +3074,9 @@ def build_app() -> FastAPI:
 
     async def _serve_embed(model: str, inputs, mode: str, ip: str = "?") -> JSONResponse:
         """Shared embedding serve for /api/embed, /api/embeddings (legacy) and /v1/embeddings.
-        No auto-load (match the generate policy: 404 if the model isn't resident). Tokenizes on
+        AUTO-LOADS a known-but-not-resident encoder (same policy as the generate paths, gated by
+        the same ENGINE_CONFIG auto_load) — a cold embed request just works, and the #idle-unload
+        knob reaps the encoder back off after the idle window like any other model. Tokenizes on
         the controller (NO chat template, NO task-prefix), runs one encoder forward on the node,
         and shapes the response per `mode` ('ollama' | 'legacy' | 'openai')."""
         try:
@@ -3082,9 +3084,13 @@ def build_app() -> FastAPI:
         except Exception:
             return _not_found_json(model, mode)   # unknown model -> 404 (OpenAI envelope|Ollama shape)
         try:
-            lm = await engine.ensure_loaded(friendly, 0)
-        except ValueError as exc:   # not loaded -> 404 (no auto-load)
+            lm = await engine.ensure_loaded(friendly, 0, auto_load=True)
+        except ValueError as exc:   # not loaded AND auto-load off/updating -> 404
             return JSONResponse({"error": str(exc), "model": model}, status_code=404)
+        except Exception as exc:    # auto-load FAILED (capacity/node) -> retryable 503, not a 500
+            log_activity(f"embed {model}: auto-load failed — {exc!r}")
+            return JSONResponse({"error": f"embedding model load failed: {exc}", "model": model},
+                                status_code=503, headers={"Retry-After": "3"})
         if not getattr(lm.spec, "is_embedding", False):
             return JSONResponse(
                 {"error": f"model '{friendly}' is not an embedding model; use /api/chat"},
