@@ -277,6 +277,33 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   going silently half-open. Rank 0 now pings the peers (a tiny round-trip that keeps both directions
   warm) whenever the mesh has been idle a few seconds, so TP stays alive across idle periods instead
   of needing a reload after the first request.
+- **One-click int4 precache from the models list:** every on-disk model without an int4 shard cache
+  shows a clickable `⚡ int4` chip (on registered AND loaded rows) — hover for what the compile costs
+  (estimated cache size on disk, source dtype, controller free-disk check) and what it buys (int4
+  loads then serve from cache instantly); click fires the same `/compile_shards` as the detail
+  modal's Precache button. Compiling rows show live progress (`done/total · elapsed · ETA` + bar)
+  instead of a static "compiling…". Embedding encoders never show the chip (their serve path is a
+  whole-model float32 load that doesn't read shard caches), and uncached models no longer display a
+  misleading "cache ready".
+- **Endpoint weather — contention is survivable and honestly retryable.** Under GPU contention,
+  healthy-but-slow prefills used to be reclaimed by the gen-stall watchdog at the threshold (~4 min),
+  and every client retry re-entered the same slow prefill and died again — a fan-out harness measured
+  a 21% run-abort rate, all from this class. Three-part fix: **(1) prefill-progress liveness** —
+  workers already stamp per-layer forward progress for their local watchdog; that signal now rides
+  the existing heartbeat (`fwd_progress`, request-id-attributed so an orphaned forward can never
+  shield a live generation), and the controller watchdog's PREFILL branch treats advancing progress
+  as liveness. True wedges (no layer completed for `gen_stall_s`) still reclaim on the old schedule;
+  decode stall detection is unchanged (tokens only). **(2) Adaptive prefill wait** — the controller's
+  per-frame generation timeout no longer hard-kills a prefill at 600 s: the wait extends in slices
+  while worker progress advances (absolute 1 h ceiling as the backstop). **(3) Retryable errors** —
+  contention-class failures (watchdog reclaim, dropped data-plane sockets, hop timeouts, a shard
+  held by an orphaned forward, node-drop recovery races) now return `503 + Retry-After`
+  (Ollama/OpenAI) or `529 overloaded_error` (Anthropic) instead of bare 500s, and a watchdog-reclaimed
+  in-flight request gets a clean retryable response instead of an aborted socket. User-initiated
+  `/cancel` and `/terminate` keep their kill semantics (never invite a retry).
+- **Idle-unload accepts `-1` as "keep forever":** the Ollama-style sentinel round-trips (saves and
+  displays as -1) instead of silently resetting to 0; -1 and 0 mean the same thing — the reaper is
+  off and `/api/ps` reports effectively-never expiry.
 
 ## Public release
 - Central `config.json` (all hosts/ports + the self-update source; no addresses baked into code);

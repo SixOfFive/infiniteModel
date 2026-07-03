@@ -38,7 +38,10 @@ dashboard.
   ([docs/ROCM.md](docs/ROCM.md)).
 - **Pre-compiled shard cache.** The controller quantizes a model once to `_shards/<quant>/`, so later
   loads stream small **pre-packed** int4/int8 layers instead of bf16 + re-quantizing — for dense
-  models *and* MoE (fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load.
+  models *and* MoE (fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load. Any model
+  without an int4 cache shows a one-click **`⚡ int4` compile badge** on the models page (hover for
+  the estimated on-disk size and free-disk check); compiles run in a background subprocess with live
+  progress on the model's row.
 - **MoE & multimodal.** Mixture-of-Experts (incl. attention-on-GPU / experts-in-CPU-RAM offload), and
   distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3): image/audio → text.
 - **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
@@ -55,8 +58,13 @@ dashboard.
   auto-load/unload, a live dashboard (placement preview, per-load progress, fleet memory/throughput,
   bandwidth), curl-able fleet logs, and idle-gated self-update. **Idle unload** (settings page /
   `/config?idle_unload_m=`): unload any model that served no requests for N minutes — default 0 =
-  every model stays loaded forever; pinned (📌) models and models with an active or queued request
-  are never idle-unloaded. Per-load knobs: KV-cache placement
+  every model stays loaded forever (`-1`, the Ollama-style spelling, is accepted and saves as -1
+  with the same meaning); pinned (📌) models and models with an active or queued request are never
+  idle-unloaded. **Honest overload behavior:** under GPU contention the endpoint degrades into
+  *retryable* backpressure, not failures — slow-but-advancing prefills are never reclaimed as wedged
+  (workers report per-layer forward progress over their heartbeat), the prefill wait extends while
+  progress advances, and contention-class failures return `503 + Retry-After` (Ollama/OpenAI) or
+  `529 overloaded_error` (Anthropic) instead of bare 500s or dropped sockets. Per-load knobs: KV-cache placement
   (**GPU or system RAM** — offloading frees the VRAM KV reserve for model layers, for long context
   on small cards) and **per-model default temperature + min-p** (used when a request doesn't send
   its own). **Min-p sampling** is supported per-request too (Ollama `options.min_p`, top-level
