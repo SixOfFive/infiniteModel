@@ -300,6 +300,30 @@ async def _prepare_vision(target_id: str, tok, ids: list, images: list):
         return ids, None, None
 
 
+def _coerce_knobs(knob) -> dict:
+    """#runtime-knobs: build the extended-sampling dict from a lookup fn, coercing every value
+    AT PARSE TIME (exactly like temperature/top_p above/below) so a malformed value raises HERE
+    — pre-stream, where the #cold-contract handler turns it into a clean 400 — and never inside
+    the decode loop after the SSE 200 is already open (a post-stream crash surfaces as the
+    silent empty-200 that handler exists to prevent). Also normalizes the seed: llama.cpp /
+    SillyTavern / Ollama's own client default send seed=-1 meaning "random", so ANY negative
+    seed = unset; values past int64 max are rejected (torch manual_seed would overflow)."""
+    sampling = {}
+    for k, cast, v in (("top_k", int, knob("top_k")),
+                       ("repeat_penalty", float, knob("repeat_penalty", "repetition_penalty")),
+                       ("repeat_last_n", int, knob("repeat_last_n")),
+                       ("presence_penalty", float, knob("presence_penalty")),
+                       ("frequency_penalty", float, knob("frequency_penalty")),
+                       ("seed", int, knob("seed"))):
+        if v is not None:
+            sampling[k] = cast(v)   # ValueError/TypeError -> the caller's clean 400 path
+    if "seed" in sampling and sampling["seed"] < 0:
+        del sampling["seed"]        # negative = the "random" sentinel -> unset
+    if sampling.get("seed", 0) > 2**63 - 1:
+        raise ValueError("seed out of range (0 - 2^63-1)")
+    return sampling
+
+
 async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     """Resolve+load model, build prompt token ids, and pull sampling options."""
     friendly = resolve_model_name(model)
@@ -370,8 +394,27 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     _dmp = getattr(lm, "default_min_p", None)
     _mp = opts.get("min_p", body.get("min_p", None))
     min_p = float(_mp) if _mp is not None else float(_dmp if _dmp is not None else 0.0)
-    top_p = float(opts.get("top_p", body.get("top_p", 1.0)))
-    max_new = int(opts.get("num_predict", body.get("max_tokens", 256)))
+    # #runtime-knobs: the extended sampling family — per-request (Ollama options.* / OpenAI
+    # top-level; `repetition_penalty` accepted as the vLLM/HF spelling of repeat_penalty, in
+    # EITHER location), else the model's runtime default (POST /model_config, stored in
+    # lm.sampling_defaults), else off. Same precedence rule as temperature: an explicit request
+    # value always wins.
+    _sdef = getattr(lm, "sampling_defaults", None) or {}
+
+    def _knob(k, alt=None):
+        # layered lookup stepping each level with `is None` — dict.get(k, default) would let an
+        # explicit JSON null on the primary spelling shadow the alias next to it
+        for _src, _key in ((opts, k), (opts, alt), (body, k), (body, alt)):
+            if _key is not None:
+                v = _src.get(_key)
+                if v is not None:
+                    return v
+        return _sdef.get(k)
+    _tp = opts.get("top_p", body.get("top_p", None))
+    top_p = float(_tp) if _tp is not None else float(_sdef.get("top_p") or 1.0)
+    _mx = opts.get("num_predict", body.get("max_tokens", None))
+    max_new = int(_mx) if _mx is not None else int(_sdef.get("num_predict") or 256)
+    sampling = _coerce_knobs(_knob)
     stream = bool(body.get("stream", True))
     speculative = bool(opts.get("speculative", body.get("speculative", False)))
     spec_k = int(opts.get("spec_k", body.get("spec_k", 0)) or 0)   # per-request SPEC_K override (0=default)
@@ -383,7 +426,7 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
         raise ValueError(f"prompt is {len(ids)} tokens but model '{friendly}' is loaded with a "
                          f"{_lc}-token context window — shorten the prompt or reload it at a larger ctx")
     return (friendly, tok, ids, temperature, top_p, max_new, stream, speculative, spec_k,
-            mm, mrope, min_p)
+            mm, mrope, min_p, sampling)
 
 
 def _ka_is_unload(v) -> bool:
@@ -483,7 +526,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             async for tid, reason in engine.generate(friendly, ids, max_new, temperature,
                                                      top_p, speculative, rec=rec, spec_k=spec_k,
                                                      mm=P.get("mm"), mrope=P.get("mrope"),
-                                                     min_p=P.get("min_p", 0.0)):
+                                                     min_p=P.get("min_p", 0.0),
+                                                     sampling=P.get("sampling")):
                 if tid is not None:
                     produced.append(tid)
                     state["tokens"] = len(produced)
@@ -517,7 +561,7 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             return msg
         (P["friendly"], P["tok"], P["ids"], P["temperature"], P["top_p"],
          P["max_new"], _st, P["speculative"], P["spec_k"], P["mm"], P["mrope"],
-         P["min_p"]) = res
+         P["min_p"], P["sampling"]) = res
         return None
 
     # #cold-contract (BUG-1/2/6/8): LOAD (or fail) BEFORE opening ANY response — for streaming too.
@@ -958,7 +1002,11 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         tail = tok.decode(ids[-24:])
         starts_in_think = "<think>" in tail and "</think>" not in tail.split("<think>")[-1]
 
-    max_new = int(body.get("max_tokens", 512) or 512)
+    # #runtime-knobs: same fallback chain as the Ollama/OpenAI path — request value, else the
+    # model's runtime default (POST /model_config), else off. top_k is NATIVE Anthropic API;
+    # the penalties/seed/min_p are cross-endpoint extensions accepted for parity.
+    _sdef = getattr(lm, "sampling_defaults", None) or {}
+    max_new = int(body.get("max_tokens") or _sdef.get("num_predict") or 512)
     # #load-temp: fall back to the model's per-load default temperature when the request sends none.
     _bt = body.get("temperature", None)
     _dt = getattr(lm, "default_temperature", None)
@@ -967,7 +1015,18 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
     _bmp = body.get("min_p", None)
     _dmp = getattr(lm, "default_min_p", None)
     min_p = float(_bmp) if _bmp is not None else float(_dmp if _dmp is not None else 0.0)
-    top_p = float(body.get("top_p", 1.0) or 1.0)
+    _btp = body.get("top_p", None)
+    top_p = float(_btp) if _btp is not None else float(_sdef.get("top_p") or 1.0)
+
+    def _bknob(k, alt=None):
+        # step with `is None` so an explicit JSON null on the primary spelling can't shadow the alias
+        for _key in (k, alt):
+            if _key is not None:
+                v = body.get(_key)
+                if v is not None:
+                    return v
+        return _sdef.get(k)
+    sampling = _coerce_knobs(_bknob)   # parse-time coercion -> malformed values fail pre-stream
     stream = bool(body.get("stream", False))
     state = {"tokens": 0}
     msg_id = _anth_id("msg")
@@ -985,7 +1044,7 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         try:
           async for tid, reason in engine.generate(friendly, ids, max_new,
                                                    temperature, top_p, False, rec=rec, mm=mm,
-                                                   mrope=mrope, min_p=min_p):
+                                                   mrope=mrope, min_p=min_p, sampling=sampling):
             if tid is not None:
                 produced.append(tid)
                 state["tokens"] = len(produced)

@@ -84,7 +84,8 @@ class EngineGenMixin:
                 ids.add(int(ret))
         return {i for i in ids if isinstance(i, int) and i >= 0}
 
-    def _sample(self, row, temperature: float, top_p: float, min_p: float = 0.0) -> int:
+    def _sample(self, row, temperature: float, top_p: float, min_p: float = 0.0,
+                top_k: int = 0, gen=None) -> int:
         import torch
         row = row.float()
         if not temperature or temperature <= 0:
@@ -100,14 +101,54 @@ class EngineGenMixin:
             keep = probs >= (min_p * probs.max())
             probs = probs * keep
             probs = probs / probs.sum()
+        # #runtime-knobs top_k: keep only the k most-probable tokens (0 = off). After min-p (both
+        # are absolute filters), before top-p — the usual llama.cpp chain. top_k=1 forces the top
+        # token regardless of temperature (the determinism probe used by the validation battery).
+        if top_k and 0 < top_k < probs.shape[-1]:
+            kv, ki = torch.topk(probs, top_k)
+            probs = torch.zeros_like(probs).scatter_(0, ki, kv)
+            probs = probs / probs.sum()
         if top_p and 0 < top_p < 1:
             sp, idx = torch.sort(probs, descending=True)
             cdf = torch.cumsum(sp, 0)
             keep = cdf - sp <= top_p
             sp = sp * keep
             sp = sp / sp.sum()
-            return int(idx[int(torch.multinomial(sp, 1))])
-        return int(torch.multinomial(probs, 1))
+            return int(idx[int(torch.multinomial(sp, 1, generator=gen))])
+        return int(torch.multinomial(probs, 1, generator=gen))
+
+    def _penalized(self, row, prompt_ids, out_ids, sp):
+        """#runtime-knobs: apply repetition penalties to a logits row BEFORE sampling — pre-argmax,
+        so they steer greedy decode too. Conventions match vLLM/llama.cpp: `repeat_penalty`
+        (multiplicative; positive logits divided, negative multiplied) looks at the last
+        `repeat_last_n` tokens of PROMPT+OUTPUT (default 64; -1 = everything; 0 = off);
+        `presence_penalty` (flat, once per distinct token) and `frequency_penalty` (x occurrence
+        count) are OpenAI-style additive penalties over the OUTPUT so far only. Returns the row
+        untouched when every knob is off; clones before mutating (the caller may hand a view)."""
+        import torch
+        rp = float(sp.get("repeat_penalty") or 1.0)
+        pp = float(sp.get("presence_penalty") or 0.0)
+        fp = float(sp.get("frequency_penalty") or 0.0)
+        if (rp <= 0 or rp == 1.0) and not pp and not fp:
+            return row
+        row = row.float().clone()
+        if rp > 0 and rp != 1.0:
+            n = sp.get("repeat_last_n")
+            n = 64 if n is None else int(n)
+            hist = prompt_ids + out_ids
+            window = hist if n < 0 else (hist[-n:] if n else [])
+            uniq = list({int(i) for i in window})
+            if uniq:
+                t = torch.tensor(uniq, dtype=torch.long)
+                vals = row[t]
+                row[t] = torch.where(vals > 0, vals / rp, vals * rp)
+        if (pp or fp) and out_ids:
+            from collections import Counter
+            cnt = Counter(int(i) for i in out_ids)
+            t = torch.tensor(list(cnt.keys()), dtype=torch.long)
+            c = torch.tensor([float(v) for v in cnt.values()], dtype=row.dtype)
+            row[t] = row[t] - pp - fp * c
+        return row
 
     async def _freshen_stage0(self, model: LoadedModel, force: bool = False) -> None:
         """#stage0-stale-reconnect: rebuild model.stage0_writer FRESH if it may be stale. The
@@ -241,12 +282,16 @@ class EngineGenMixin:
     async def generate(self, friendly: str, prompt_ids: list[int], max_new: int,
                        temperature: float, top_p: float, speculative: bool = False,
                        rec=None, mm=None, mrope=None, spec_k: int = 0,
-                       min_p: float = 0.0):
+                       min_p: float = 0.0, sampling=None):
         """Dispatch generation for model `friendly`: speculative-greedy decode only when
         explicitly requested AND a draft is loaded AND decoding is greedy; otherwise plain
         KV-cache decode (M2e). Speculative is opt-in because it only wins when the target's
         per-traversal cost dwarfs the local draft cost (big model / many nodes) — on small
-        targets it measures SLOWER, so it must never silently replace the fast default."""
+        targets it measures SLOWER, so it must never silently replace the fast default.
+        `sampling` (#runtime-knobs) bundles the extended knob family (top_k / repeat_penalty /
+        repeat_last_n / presence_penalty / frequency_penalty / seed) for the PLAIN decode path;
+        the speculative paths are greedy-only by construction and ignore it (penalties would
+        break draft/target logit agreement)."""
         model = self._pick_replica(friendly)   # data-parallel: least-loaded replica (#39)
         if model is None or model.stage0_writer is None:
             raise RuntimeError("no model loaded")
@@ -326,7 +371,7 @@ class EngineGenMixin:
                     else:
                         async for item in self._decode_plain(model, prompt_ids, max_new,
                                                              temperature, top_p, mm=mm, mrope=mrope,
-                                                             min_p=min_p):
+                                                             min_p=min_p, sampling=sampling):
                             if item[0] is not None:
                                 _ntoks += 1
                                 _out_ids.append(item[0])   # #ctx-history
@@ -365,12 +410,23 @@ class EngineGenMixin:
                 model.queued -= 1
 
     async def _decode_plain(self, model, prompt_ids, max_new, temperature, top_p, mm=None,
-                            mrope=None, min_p: float = 0.0):
+                            mrope=None, min_p: float = 0.0, sampling=None):
         """Prefill-once + one-token-at-a-time KV-cache decode (M2e). mm=(positions, embeds)
         (#22 inc 3) splices multimodal embeds into the PREFILL only; decode steps are plain.
         mrope=(prefill_position_ids [3][q], base) (#22 inc 4) carries 3D image positions:
         the prefill uses the full layout; each decode token uses [base+step] on all 3 dims."""
         import torch
+        # #runtime-knobs: unpack the extended sampling family once, outside the token loop.
+        _sp = sampling or {}
+        _top_k = int(_sp.get("top_k") or 0)
+        _gen = None
+        if _sp.get("seed") is not None:
+            # FRESH per-request generator: same prompt + same seed + same knobs => same output,
+            # independent of concurrent generations (never touches the global torch RNG).
+            _gen = torch.Generator().manual_seed(int(_sp["seed"]))
+        _pen = (float(_sp.get("repeat_penalty") or 1.0) not in (0.0, 1.0)
+                or bool(_sp.get("presence_penalty")) or bool(_sp.get("frequency_penalty")))
+        _hist: list[int] = []   # tokens emitted so far (the penalties' output window)
         # Empty prompt (a keep-warm/health probe whose text tokenizes to []) has nothing to
         # prefill: torch.tensor([[]]) is shape [1,0] and an empty forward crashes the worker's
         # tensor unpack. Short-circuit with zero generated tokens BEFORE any wire send.
@@ -400,7 +456,10 @@ class EngineGenMixin:
             if ntok and ntok < int(row.shape[-1]):
                 row = row.clone()
                 row[ntok:] = float("-inf")
-            tok_id = self._sample(row, temperature, top_p, min_p)
+            if _pen:   # #runtime-knobs: repetition penalties reshape the logits pre-sampling
+                row = self._penalized(row, prompt_ids, _hist, _sp)
+            tok_id = self._sample(row, temperature, top_p, min_p, top_k=_top_k, gen=_gen)
+            _hist.append(tok_id)
             if produced == 0:
                 with contextlib.suppress(Exception):
                     print(f"[gen] {model.friendly}: first token id={tok_id} "

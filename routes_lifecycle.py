@@ -546,13 +546,23 @@ def register(app):
 
     @app.post("/model_config")
     async def model_config(model: str, temperature: Optional[str] = None,
-                           min_p: Optional[str] = None) -> JSONResponse:
+                           min_p: Optional[str] = None, top_p: Optional[str] = None,
+                           top_k: Optional[str] = None,
+                           repeat_penalty: Optional[str] = None,
+                           repeat_last_n: Optional[str] = None,
+                           presence_penalty: Optional[str] = None,
+                           frequency_penalty: Optional[str] = None,
+                           seed: Optional[str] = None,
+                           num_predict: Optional[str] = None) -> JSONResponse:
         """#runtime-config: change a LOADED model's runtime-adjustable sampling defaults IN PLACE —
         no reload; the very next request picks them up (the sampler reads them off the LoadedModel
-        per request). Currently: default_temperature (0-2), default_min_p (0-1). Param absent =
-        leave unchanged; empty string = CLEAR back to unset. Applied to every replica of the base
-        so data-parallel copies stay consistent. Load-time-only knobs (quant/ctx/kv_quant/
-        kv_offload/placement) are rejected by omission — they need a reload/reconfigure."""
+        per request). temperature (0-2) + min_p (0-1) live as dedicated fields (they predate the
+        dict); the #runtime-knobs family — top_p / top_k / repeat_penalty / repeat_last_n /
+        presence_penalty / frequency_penalty / seed / num_predict — lives in lm.sampling_defaults.
+        Param absent = leave unchanged; empty string = CLEAR back to unset. Applied to every
+        replica of the base so data-parallel copies stay consistent. Load-time-only knobs
+        (quant/ctx/kv_quant/kv_offload/placement) are rejected by omission — they need a
+        reload/reconfigure."""
         try:
             friendly = resolve_model_name(model)
         except Exception as exc:
@@ -563,18 +573,38 @@ def register(app):
                                  "(runtime settings live on the loaded model — load it first)"},
                                 status_code=409)
 
-        def _parse(val, lo, hi, label):
+        def _parse(val, lo, hi, label, as_int=False):
             if val is None:
                 return False, None       # absent -> unchanged
             if not str(val).strip():
                 return True, None        # "" -> clear to unset
-            f = float(val)               # ValueError -> caught below
+            f = int(val) if as_int else float(val)   # ValueError -> caught below
             if not (lo <= f <= hi):
                 raise ValueError(f"{label} out of range ({lo} - {hi})")
             return True, f
         try:
             set_t, new_t = _parse(temperature, 0.0, 2.0, "temperature")
             set_m, new_m = _parse(min_p, 0.0, 1.0, "min_p")
+            # #runtime-knobs: the dict family. Ranges: top_p (0,1]; top_k 0-1000 (0=off);
+            # repeat_penalty 0.5-2 (llama.cpp multiplicative; 1=off); repeat_last_n -1-32768
+            # (-1=whole ctx, 0=off, default 64); presence/frequency -2-2 (OpenAI additive);
+            # seed 0-2^53-1 (the stored default round-trips JSON -> JS float64 -> dashboard
+            # Apply, so it must stay in float64-exact range or the panel re-sends a rounded
+            # value; per-REQUEST seeds go up to int64 max); num_predict 1-131072 (fills a
+            # request that sends none).
+            knobs = {}
+            for key, val, lo, hi, as_int in (
+                    ("top_p", top_p, 0.01, 1.0, False),
+                    ("top_k", top_k, 0, 1000, True),
+                    ("repeat_penalty", repeat_penalty, 0.5, 2.0, False),
+                    ("repeat_last_n", repeat_last_n, -1, 32768, True),
+                    ("presence_penalty", presence_penalty, -2.0, 2.0, False),
+                    ("frequency_penalty", frequency_penalty, -2.0, 2.0, False),
+                    ("seed", seed, 0, 2**53 - 1, True),
+                    ("num_predict", num_predict, 1, 131072, True)):
+                was_set, new = _parse(val, lo, hi, key, as_int=as_int)
+                if was_set:
+                    knobs[key] = new     # None = clear this key
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         for lm in lms:
@@ -582,13 +612,27 @@ def register(app):
                 lm.default_temperature = new_t
             if set_m:
                 lm.default_min_p = new_m
+            if knobs:
+                sd = getattr(lm, "sampling_defaults", None)
+                if sd is None:
+                    sd = lm.sampling_defaults = {}
+                for key, new in knobs.items():
+                    if new is None:
+                        sd.pop(key, None)
+                    else:
+                        sd[key] = new
+        _sd0 = getattr(lms[0], "sampling_defaults", None) or {}
+        # one merged view of every set default (unset keys omitted) — what the dashboard shows
+        defaults = {k: v for k, v in {"temperature": lms[0].default_temperature,
+                                      "min_p": lms[0].default_min_p, **_sd0}.items()
+                    if v is not None}
         log_activity(f"{_ollama_name(friendly)}: runtime settings -> "
-                     f"default_temp={lms[0].default_temperature} "
-                     f"default_min_p={lms[0].default_min_p}"
+                     + (" ".join(f"{k}={v}" for k, v in defaults.items()) or "all unset")
                      + (f" ({len(lms)} replicas)" if len(lms) > 1 else ""))
         return JSONResponse({"ok": True, "model": friendly,
                              "def_temperature": lms[0].default_temperature,
                              "def_min_p": lms[0].default_min_p,
+                             "defaults": defaults,
                              "replicas": len(lms)})
 
     @app.post("/cancel")           # dashboard: disconnect/kill one in-flight request (#48)

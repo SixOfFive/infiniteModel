@@ -131,6 +131,22 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   model with **`POST /model_config?model=...&temperature=...&min_p=...`** (absent = keep, empty
   string = clear, applies to all replicas), surfaced as a "Runtime settings" panel in the
   model-detail modal — no reload needed to tune a resident model's sampling.
+- **The full sampling-knob family (#runtime-knobs).** `top_k` (post-min-p top-k filter),
+  `repeat_penalty` + `repeat_last_n` (llama.cpp multiplicative penalty over the last-N window of
+  prompt+output; -1 = whole context), `presence_penalty` / `frequency_penalty` (OpenAI additive,
+  output-only), and `seed` (reproducible sampling via a fresh per-request `torch.Generator` —
+  concurrency-safe, never touches the global RNG; negative = the llama.cpp/Ollama "random"
+  sentinel = unset) — per-request on all three APIs (Ollama `options.*` / OpenAI+Anthropic
+  top-level; `repetition_penalty` accepted as the vLLM/HF alias in either location). Penalties
+  apply to the logits pre-argmax, so they steer greedy decode too; the speculative path is
+  greedy-only and ignores them by design. Every knob — plus `top_p` and a default `num_predict`
+  for requests that send no length cap — is also a runtime-mutable per-model default on
+  `POST /model_config`, stored in one `sampling_defaults` dict, reported on `/status`, and
+  editable in the dashboard's Runtime settings panel (10 fields with suggested-value dropdowns;
+  empty = unset; Apply sends the whole panel state). All knob values are coerced at PARSE time so
+  a malformed value fails as a clean pre-stream 400 — never a post-stream empty-200 (the
+  cold-contract rule); the stored seed is capped at 2^53-1 so it round-trips JSON/JS float64
+  losslessly (per-request seeds go to int64 max).
 - **Thread-safe Triton autotuning (multi-model concurrency):** triton's `Autotuner.run()` keeps the
   call's args in unsynchronized instance state (`self.nargs`, set on entry / `None` on exit) and the
   int4 w4a16 kernels (dense GEMV + fused MoE) are process-wide singletons shared by every shard — so

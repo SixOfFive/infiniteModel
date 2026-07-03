@@ -146,6 +146,10 @@ def build_status() -> dict:
             "def_temperature": getattr(lm, "default_temperature", None),
             # #min-p: per-model default min-p sampling floor (None = unset -> off)
             "def_min_p": getattr(lm, "default_min_p", None),
+            # #runtime-knobs: the extended runtime-mutable sampling defaults (only SET keys:
+            # top_p/top_k/repeat_penalty/repeat_last_n/presence_penalty/frequency_penalty/
+            # seed/num_predict) — edited via POST /model_config, shown in the detail modal
+            "sampling_defaults": dict(getattr(lm, "sampling_defaults", None) or {}),
             "tp_size": getattr(lm, "tp_size", 1),            # #88: TP width (1 = pipeline)
             "is_tp": getattr(lm, "tp_size", 1) > 1,          # #88: card shows TP vs pipeline + reconfigure
             "num_layers": lm.spec.num_layers, "params": _human_params(lm.spec),
@@ -279,7 +283,7 @@ def build_status() -> dict:
             if _k:
                 _lm_by_key[_k] = _ld
     _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "kv_offload", "def_temperature", "def_min_p",
-                     "vram_used_gb", "ram_used_gb", "cpu_frac",
+                     "sampling_defaults", "vram_used_gb", "ram_used_gb", "cpu_frac",
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
                      "last_tok_s", "kv_pos", "active", "queued", "is_embedding", "replica_idx",
                      "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",

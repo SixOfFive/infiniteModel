@@ -1467,6 +1467,12 @@ class LoadedModel:
     # confidence-adaptive, pairs with high default temperature — useful band 0.05-0.1 at temp>=1).
     # Same precedence: only applied when the request sends no min_p. None = unset (0 = off).
     default_min_p: Optional[float] = None
+    # #runtime-knobs: the REST of the runtime-mutable sampling defaults, one dict so signatures
+    # stay stable as knobs accrue — top_p / top_k / repeat_penalty / repeat_last_n /
+    # presence_penalty / frequency_penalty / seed / num_predict. Set via POST /model_config
+    # (runtime, no reload; key absent = unset). Same precedence as temperature: the serving layer
+    # reads a key only when the request itself doesn't carry that knob.
+    sampling_defaults: dict = field(default_factory=dict)
     tp_size: int = 1      # tensor-parallel width (1 = pipeline/single-node); set by _load_tp_locked.
                           # Surfaced on the card + used by #88 /reconfigure (managed-reload to/from TP).
     stage0_writer: Optional[asyncio.StreamWriter] = None  # per-model pipeline conn (controller -> first stage)

@@ -554,10 +554,11 @@ function detailLive(name){
     oadd('placement basis',esc(m.plan_basis||'')+(m.speed_tier?(' · '+esc(m.speed_tier)):''));
     // #runtime-config: live view of the sampling defaults (edited via the static form below —
     // this row just reflects the current values each poll, so an Apply shows up immediately)
-    if(m.def_temperature!=null||m.def_min_p!=null)
-      oadd('sampling defaults',(m.def_temperature!=null?('t='+esc(String(m.def_temperature))):'')
-        +(m.def_temperature!=null&&m.def_min_p!=null?' · ':'')
-        +(m.def_min_p!=null?('min-p='+esc(String(m.def_min_p))):''));
+    {const sd=m.sampling_defaults||{}, sdp=[];
+     if(m.def_temperature!=null)sdp.push('t='+esc(String(m.def_temperature)));
+     if(m.def_min_p!=null)sdp.push('min-p='+esc(String(m.def_min_p)));
+     for(const k in sd)if(sd[k]!=null)sdp.push(esc(k)+'='+esc(String(sd[k])));
+     if(sdp.length)oadd('sampling defaults',sdp.join(' · '));}
     out+='<h3 style="font-size:13px;margin-top:14px">Operational'+(gen?' · <span style="color:var(--good)">running</span>':'')+'</h3><table class="kv">'+o+'</table>';
   }
   if(m.stages&&m.stages.length){
@@ -618,15 +619,34 @@ async function openDetail(name){
   // the inputs mid-typing. Values apply instantly via POST /model_config; the next request uses them.
   let rt='';
   if(m.loaded){
-    const tv=(m.def_temperature!=null)?String(m.def_temperature):'';
-    const mv=(m.def_min_p!=null)?String(m.def_min_p):'';
-    rt='<h3 style="font-size:13px;margin-top:14px">Runtime settings <span class="em" style="font-weight:normal">· apply instantly, no reload</span></h3>'
-      +'<div class="grid2"><div><label title="Default sampling temperature: used when a request does not send its own (explicit request values always win). Empty = unset (greedy).">Default temperature</label>'
-      +'<input id="rt-temp" type="number" min="0" max="2" step="0.1" value="'+esc(tv)+'" placeholder="unset (greedy)"></div>'
-      +'<div><label title="Default min-p sampling floor: drops tokens below this fraction of the top token\'s probability — confidence-adaptive, pairs with high temperature (0.05-0.1 at temp >= 1.0). Empty = unset (off).">Default min-p</label>'
-      +'<input id="rt-minp" type="number" min="0" max="1" step="0.01" value="'+esc(mv)+'" placeholder="unset (off)"></div></div>'
+    const sd=m.sampling_defaults||{};
+    const _v=x=>(x!=null)?String(x):'';
+    // #runtime-knobs: [input id, label, current value, placeholder-when-unset, suggested values
+    // (datalist dropdown — free text still allowed), tooltip]. Every knob a request can send has
+    // a runtime default here; empty input = unset (requests fall back to the built-in behavior).
+    const RTF=[
+      ['rt-temp','Temperature',_v(m.def_temperature),'unset (greedy)',['0','0.3','0.7','1','1.2','1.5'],'Default sampling temperature (0-2), used when a request does not send its own — explicit request values (including 0) always win. Empty = unset (greedy).'],
+      ['rt-minp','Min-p',_v(m.def_min_p),'unset (off)',['0.03','0.05','0.08','0.1'],'Min-p floor (0-1): drops tokens below this fraction of the top token\'s probability — confidence-adaptive; pairs with high temperature (useful band 0.05-0.1 at temp >= 1). Empty = off.'],
+      ['rt-topp','Top-p',_v(sd.top_p),'unset (1 = off)',['0.8','0.9','0.95','1'],'Nucleus sampling (0-1): keep the smallest set of top tokens whose probabilities sum to top-p, drop the tail. 1 = off.'],
+      ['rt-topk','Top-k',_v(sd.top_k),'unset (off)',['1','20','40','100'],'Keep only the k most-probable tokens (0-1000). 1 = always the single top token (deterministic at any temperature). 0 or empty = off.'],
+      ['rt-rp','Repeat penalty',_v(sd.repeat_penalty),'unset (1 = off)',['1.05','1.1','1.15','1.3'],'Penalize tokens already present in the recent window (0.5-2, llama.cpp convention: >1 discourages repetition, <1 encourages it). 1 = off.'],
+      ['rt-rln','Repeat window',_v(sd.repeat_last_n),'64 tokens',['64','256','1024','-1'],'How many recent tokens (prompt+output) the repeat penalty scans. -1 = the whole context, 0 = disable the window (penalty off). Default 64.'],
+      ['rt-pp','Presence penalty',_v(sd.presence_penalty),'unset (0 = off)',['0.5','1','1.5'],'Flat penalty on any token that has already appeared in the OUTPUT (-2 to 2, OpenAI convention; negative values encourage reuse). 0 = off.'],
+      ['rt-fp','Frequency penalty',_v(sd.frequency_penalty),'unset (0 = off)',['0.5','1','1.5'],'Penalty scaled by how OFTEN a token has appeared in the output so far (-2 to 2, OpenAI convention). 0 = off.'],
+      ['rt-seed','Seed',_v(sd.seed),'unset (random)',[],'Fix the sampling RNG: same prompt + same seed + same settings = same output every time. Empty = random per request.'],
+      ['rt-np','Max tokens',_v(sd.num_predict),'unset (256)',['256','512','1024','4096','8192'],'Default response-length cap used when a request sends no num_predict / max_tokens of its own. Explicit request values always win.']];
+    let rtf='', rtd='';
+    RTF.forEach((f,i)=>{
+      const dl='rtdl'+i;
+      if(f[4].length)rtd+='<datalist id="'+dl+'">'+f[4].map(o=>'<option value="'+o+'"></option>').join('')+'</datalist>';
+      rtf+='<div><label title="'+esc(f[5])+'">'+esc(f[1])+'</label>'
+        +'<input id="'+f[0]+'" type="number" step="any"'+(f[4].length?(' list="'+dl+'"'):'')
+        +' value="'+esc(f[2])+'" placeholder="'+esc(f[3])+'"></div>';
+    });
+    rt='<h3 style="font-size:13px;margin-top:14px">Runtime settings <span class="em" style="font-weight:normal">· sampling defaults — apply instantly, no reload; requests that send their own values always win</span></h3>'
+      +'<div class="grid2">'+rtf+'</div>'+rtd
       +'<div style="margin-top:8px"><button class="btn sm pri" onclick="applyRt(\''+esc(name)+'\')">Apply</button> '
-      +'<span class="em" style="font-size:11px">quant · ctx · KV placement need a reload (Load…) — these two don\'t</span></div>';
+      +'<span class="em" style="font-size:11px">empty = unset · each box\'s dropdown lists common values (free typing works too) · quant / ctx / KV placement still need a reload</span></div>';
   }
   let acts='';
   if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
@@ -646,13 +666,17 @@ async function openDetail(name){
   }catch(e){ const el=document.getElementById('mi_more'); if(el) el.innerHTML='<div class="note">full model info unavailable: '+esc(String(e.message||e))+'</div>'; }
 }
 // #runtime-config: push the detail modal's runtime-settings inputs to the controller. The UI always
-// sends BOTH fields; an EMPTY input clears that default back to unset. Applies to all replicas.
+// sends EVERY field; an EMPTY input clears that default back to unset. Applies to all replicas.
 async function applyRt(name){
-  const t=$('#rt-temp')?$('#rt-temp').value:'', mp=$('#rt-minp')?$('#rt-minp').value:'';
-  const q=new URLSearchParams({model:name, temperature:t, min_p:mp});
+  const F={temperature:'rt-temp',min_p:'rt-minp',top_p:'rt-topp',top_k:'rt-topk',
+           repeat_penalty:'rt-rp',repeat_last_n:'rt-rln',presence_penalty:'rt-pp',
+           frequency_penalty:'rt-fp',seed:'rt-seed',num_predict:'rt-np'};
+  const q=new URLSearchParams({model:name});
+  for(const k in F){ const el=$('#'+F[k]); q.set(k, el?el.value:''); }
   try{ const r=await api('/model_config?'+q.toString(),{method:'POST'});
-       toast('runtime settings applied · t='+(r.def_temperature!=null?r.def_temperature:'unset')
-             +' min-p='+(r.def_min_p!=null?r.def_min_p:'unset')); tick(); }
+       const d=r.defaults||{}, ks=Object.keys(d);
+       toast('runtime settings applied · '+(ks.length?ks.map(k=>k+'='+d[k]).join(' · '):'all unset'));
+       tick(); }
   catch(e){ toast(String(e.message||e),1); }
 }
 // Context viewer: one scrollable popup showing the IN/OUT flow of recent requests (newest first).

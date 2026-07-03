@@ -59,6 +59,15 @@ dashboard.
   its own). **Min-p sampling** is supported per-request too (Ollama `options.min_p`, top-level
   `min_p` on the OpenAI/Anthropic endpoints): tokens below `min_p` × the top token's probability
   are dropped — a confidence-adaptive floor that pairs well with high temperature.
+- **The full sampling-knob family, per-request and runtime-tunable.** `top_p`, `top_k`,
+  `repeat_penalty` (+ `repeat_last_n` window), `presence_penalty`, `frequency_penalty` and
+  `seed` (reproducible sampling) work per-request on all three APIs (Ollama `options.*`;
+  top-level on OpenAI/Anthropic, `repetition_penalty` accepted as an alias). Every knob — plus
+  a default `num_predict` for requests that send no length cap — is also a **runtime-mutable
+  per-model default**: `POST /model_config?model=...&top_k=40&repeat_penalty=1.1...` applies
+  instantly to a loaded model (empty string clears; explicit request values always win), and the
+  dashboard's model-detail **Runtime settings** panel edits all of them with suggested-value
+  dropdowns.
 
 ## How it works
 
