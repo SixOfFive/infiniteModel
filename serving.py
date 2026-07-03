@@ -262,6 +262,24 @@ def _strip_json_fences(text: str) -> str:
     return t.strip()
 
 
+def _wrap_image_runs(ids: list, itid: int, wrap) -> list:
+    """#143 gemma4: reproduce the HF processor's replace_image_token — each bare image
+    placeholder becomes boi + placeholder + eoi BEFORE expansion (the chat template renders
+    only the bare <|image|>; the model was trained with the bracketed run). No-op when the
+    encoder doesn't request wrapping (`wrap` falsy — every other arch) or a placeholder is
+    already preceded by boi (template-evolution guard against double-wrapping)."""
+    if not wrap:
+        return ids
+    boi, eoi = int(wrap[0]), int(wrap[1])
+    out: list = []
+    for tid in ids:
+        if tid == itid and (not out or out[-1] != boi):
+            out += [boi, tid, eoi]
+        else:
+            out.append(tid)
+    return out
+
+
 async def _prepare_vision(target_id: str, tok, ids: list, images: list):
     """#vl-vision: shared image splice for the OpenAI (/v1/chat/completions) + Ollama (/api/chat)
     serve path — the same machinery /v1/messages uses. Encodes the images, expands the image
@@ -270,6 +288,7 @@ async def _prepare_vision(target_id: str, tok, ids: list, images: list):
     returns (ids, None, None) so the caller degrades to a clean text-only prompt."""
     if not images:
         return ids, None, None
+    _orig = list(ids)   # pre-mutation snapshot: every failure path degrades from THIS
     try:
         enc_res = await asyncio.to_thread(_encode_images, target_id, images)
         embeds = enc_res.get("image_embeds")
@@ -277,14 +296,19 @@ async def _prepare_vision(target_id: str, tok, ids: list, images: list):
         itid = enc_res.get("image_token_id")
         n_emb = int(embeds.shape[0]) if embeds is not None else 0
         if not (itid is not None and n_emb and sum(counts) == n_emb):
-            return ids, None, None
+            return _orig, None, None
         if ids.count(int(itid)) != len(counts):   # template rendered no placeholder -> inject after BOS
             _bos = getattr(tok, "bos_token_id", None)
             _p = 1 if (ids and _bos is not None and ids[0] == _bos) else 0
             ids = list(ids[:_p]) + [int(itid)] * len(counts) + list(ids[_p:])
+        ids = _wrap_image_runs(ids, int(itid), enc_res.get("wrap"))   # gemma4 boi/eoi bracket
         new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts)
         if not (found == len(counts) and len(positions) == n_emb):
-            return ids, None, None
+            # Degrade from the SNAPSHOT, stripped of any template-rendered bare placeholders —
+            # returning the mutated ids here would serve injected placeholders + boi/eoi wrap
+            # tokens with no embeds behind them (review-caught; mirrors /v1/messages'
+            # keep_images=False rebuild).
+            return [t for t in _orig if t != int(itid)], None, None
         mm = (positions, embeds)
         if enc_res.get("pos_scheme") == "1d":
             mrope = None    # Pixtral/Mistral3/Gemma: plain 1D positions
@@ -297,7 +321,7 @@ async def _prepare_vision(target_id: str, tok, ids: list, images: list):
         return new_ids, mm, mrope
     except Exception as exc:
         print(f"[serve] vision encode failed ({type(exc).__name__}: {exc}); text-only")
-        return ids, None, None
+        return _orig, None, None
 
 
 def _coerce_knobs(knob) -> dict:
@@ -960,6 +984,7 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                     ids = list(ids[:_p]) + [int(itid)] * len(counts) + list(ids[_p:])
                     print(f"[v1/messages] injected {len(counts)} image placeholder(s) (id "
                           f"{int(itid)}) — tokenizer rendered none (no chat template)")
+                ids = _wrap_image_runs(ids, int(itid), enc_res.get("wrap"))   # gemma4 boi/eoi
                 new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts)
                 if found == len(counts) and len(positions) == n_emb:
                     ids, mm = new_ids, (positions, embeds)

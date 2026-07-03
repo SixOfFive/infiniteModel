@@ -1684,6 +1684,7 @@ from multimodal import (_get_tokenizer, _get_processor, _decode_image, _collect_
                         _audio_bytes_to_waveform, _decode_audio, _collect_audio,
                         _vlog, _materialize_meta_tensors, _pick_vision_device, _resolve_visual,
                         _vision_cfg_and_token, _load_vision_encoder, _get_image_processor,
+                        _gemma4_preprocess,
                         _as_feature_tensor, _pick_merged_embeds, _pick_audio_device,
                         _load_audio_encoder, _get_audio_feature_extractor, _omni_audio_token_id,
                         _audio_out_lengths, _resolve_speaker, _encode_audio_response,
@@ -1709,10 +1710,56 @@ def _encode_images(target_id: str, images: list) -> dict:
     ENCODING += 1   # guard: keep the self-update idle gate closed while we encode
     try:
         t0 = time.time()
-        ip = _get_image_processor(target_id)
         model, dev = _load_vision_encoder(target_id)
-        t_load = time.time()
         mtype = getattr(getattr(model, "config", None), "model_type", "") or ""
+        if mtype == "gemma4_unified":
+            # #143 Gemma 4 unified: encoder-free vision — the embedder projects raw merged
+            # pixel patches straight into LM space. The HF image processor hard-requires
+            # torchvision, so preprocessing is the pure-torch reimplementation in
+            # multimodal._gemma4_preprocess. get_image_features(pixel_values,
+            # image_position_ids) returns pooler_output ALREADY padding-stripped
+            # [total_valid_patches, text_hidden] — LM-ready, splice as-is. counts are the
+            # REAL per-image soft-token counts (the reference processor expands each
+            # <|image|> to exactly that many). Plain 1D positions; 'wrap' tells the serve
+            # path to bracket each expanded run in boi/eoi (replace_image_token parity).
+            # NOTE: the reference runs BIDIRECTIONAL attention across each image block
+            # (use_bidirectional_attention='vision'); our pipeline is causal-only — shipped
+            # causal-first, quality validated empirically.
+            t_load = time.time()
+            pre = _gemma4_preprocess(images, target_id)
+            pv = pre["pixel_values"].to(dev)
+            ipos = pre["image_position_ids"].to(dev)
+            counts = [int(c) for c in pre["num_soft_tokens_per_image"]]
+            info = {"device": dev, "pixel_values_shape": list(pv.shape),
+                    "load_s": round(t_load - t0, 1)}
+            t_fwd = time.time()
+            with torch.inference_mode():
+                feats = model.get_image_features(pixel_values=pv, image_position_ids=ipos)
+            emb = getattr(feats, "pooler_output", None)
+            if emb is None:
+                emb = _as_feature_tensor(feats)
+            emb = emb.reshape(-1, emb.shape[-1])
+            cfg = model.config
+            itid = getattr(cfg, "image_token_id", None)
+            tcfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") \
+                else getattr(cfg, "text_config", cfg)
+            out_hidden = getattr(tcfg, "hidden_size", None) or int(emb.shape[-1])
+            boi = getattr(cfg, "boi_token_id", None)
+            eoi = getattr(cfg, "eoi_token_id", None)
+            info.update({"arch": "gemma4_unified", "forward_s": round(time.time() - t_fwd, 1),
+                         "raw_return_type": type(feats).__name__,
+                         "embeds_shape": list(emb.shape),
+                         "path": "get_image_features(pixel_values, image_position_ids)"})
+            print(f"[vision] encoded {len(images)} image(s) on {dev} [gemma4_unified]: "
+                  f"load={info['load_s']}s forward={info['forward_s']}s -> {list(emb.shape)} "
+                  f"counts={counts} itid={itid}")
+            return {"image_embeds": emb, "grid_thw": None, "info": info, "counts": counts,
+                    "image_token_id": itid, "out_hidden": out_hidden, "merge": 1,
+                    "grid_list": [], "pos_scheme": "1d",
+                    "wrap": ((int(boi), int(eoi))
+                             if (boi is not None and eoi is not None) else None)}
+        ip = _get_image_processor(target_id)
+        t_load = time.time()
         if mtype == "mistral3":
             # Pixtral resizes/pads to the MERGED patch grid (vision patch_size * spatial_merge_size
             # = 32); the bare PixtralImageProcessor defaults to 16, so pass the merged size

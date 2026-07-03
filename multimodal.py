@@ -494,6 +494,12 @@ def _visual_modules(model):
     """The vision submodule(s) to materialize, as (submodule, full_weight_prefix) pairs — a LIST
     so an arch with a SPLIT tower materializes every piece:
       * Qwen2.5-Omni:        thinker.visual                         ('thinker.visual.')
+      * Gemma 4 unified (#143): model.model.embed_vision — encoder-free (embed_vision
+                             WITHOUT a vision_tower); ALL vision params live in the
+                             Gemma4UnifiedVisionEmbedder. NOTE the gemma4 TOWER variant
+                             defines BOTH embed_vision and vision_tower — it must NOT
+                             match here (its tower path is a future increment), hence
+                             the vision_tower-is-absent gate.
       * standard image-text: model.model.visual                    ('model.visual.')
       * Mistral3 / Pixtral / Llava-style: model.model.vision_tower PLUS the SEPARATE
                              model.model.multi_modal_projector      (two prefixes)
@@ -503,11 +509,33 @@ def _visual_modules(model):
     if th is not None and getattr(th, "visual", None) is not None:
         return [(th.visual, "thinker.visual.")]
     inner = getattr(model, "model", None)
+    ev = getattr(inner, "embed_vision", None) if inner is not None else None
+    if ev is not None and getattr(inner, "vision_tower", None) is None:
+        return [(ev, "model.embed_vision.")]
     if inner is not None and getattr(inner, "vision_tower", None) is not None \
             and getattr(inner, "multi_modal_projector", None) is not None:
         return [(inner.vision_tower, "model.vision_tower."),
                 (inner.multi_modal_projector, "model.multi_modal_projector.")]
     return [(model.model.visual, "model.visual.")]
+
+
+def _vision_ckpt_renames(model):
+    """Checkpoint-key -> module-tree renames for arches whose vision weights are STORED under
+    different names than the built module. transformers bridges these with its WeightRenaming
+    conversion table at a normal from_pretrained; we read RAW safetensors keys, so the same
+    renames must be applied here or the collection finds (almost) nothing. Returns
+    [(src_prefix, dst_prefix)] — empty for arches whose keys already match (the collection
+    loop is then a pure pass-through)."""
+    mtype = getattr(getattr(model, "config", None), "model_type", "") or ""
+    if mtype == "gemma4_unified":
+        # transformers conversion_mapping.py 'gemma4_unified': the embedder body is stored as
+        # vision_embedder.* and the final projection is stored WITHOUT its multimodal_embedder
+        # nesting — verified against the real google/gemma-4-12B-it checkpoint (13 non-layer
+        # keys; only embedding_projection sits under model.embed_vision.*).
+        return [("model.vision_embedder.", "model.embed_vision."),
+                ("model.embed_vision.embedding_projection.",
+                 "model.embed_vision.multimodal_embedder.embedding_projection.")]
+    return []
 
 
 def _vision_cfg_and_token(model):
@@ -554,21 +582,29 @@ def _load_vision_encoder(target_id: str):
     _vlog(f"[vision] {len(mods)} vision submodule(s) to materialize "
           f"({', '.join(p for _, p in mods)}); scanning {len(files)} shard(s); device={dev}")
     total, mat_all = 0, []
+    renames = _vision_ckpt_renames(model)
     for submod, prefix in mods:
         # The checkpoint may store this submodule under the in-memory qualified prefix
         # ('model.vision_tower.') OR the raw original prefix without the 'model.' wrapper
         # ('vision_tower.' — e.g. Devstral/Mistral3, whose checkpoint keys are vision_tower.* /
         # multi_modal_projector.* / language_model.*). transformers bridges these via
         # _checkpoint_conversion_mapping at a normal load; we read RAW safetensors keys, so try
-        # both candidates and use whichever the checkpoint actually has.
+        # both candidates and use whichever the checkpoint actually has. Per-arch stored-name
+        # renames (gemma4's vision_embedder.* — see _vision_ckpt_renames) are applied to each
+        # raw key BEFORE prefix-matching, mirroring transformers' WeightRenaming pass.
         cands = [prefix] + ([prefix[len("model."):]] if prefix.startswith("model.") else [])
         sd, used = {}, None
         for cand in cands:
             for fn in files:
                 with safe_open(fn, framework="pt") as fh:
-                    hits = [k for k in fh.keys() if k.startswith(cand)]
-                    for k in hits:
-                        sd[k[len(cand):]] = fh.get_tensor(k)
+                    for k in fh.keys():
+                        keff = k
+                        for _src, _dst in renames:
+                            if k.startswith(_src):
+                                keff = _dst + k[len(_src):]
+                                break
+                        if keff.startswith(cand):
+                            sd[keff[len(cand):]] = fh.get_tensor(k)
             if sd:
                 used = cand
                 break
@@ -653,6 +689,154 @@ def _pil_image_processor(target_id: str, orig_exc: Exception):
         except Exception:
             continue
     raise orig_exc
+
+
+# ================= Gemma 4 unified (#143): pure-torch image preprocess =================
+# The HF Gemma4UnifiedImageProcessor HARD-requires torchvision (TorchvisionBackend, no PIL
+# fallback — even importing the bundled Gemma4UnifiedProcessor raises), and installing
+# torchvision would clobber the pinned ROCm/CUDA torch. The algorithm below is the HF
+# image_processing_gemma4_unified.py code copied verbatim — it is pure torch EXCEPT the
+# resize, where tvF.resize(bicubic, antialias=True) is replaced by the equivalent
+# F.interpolate(mode='bicubic', antialias=True). Validated against the real
+# google/gemma-4-12B-it: 336x336 -> 256 soft tokens, 640x400 -> 273, embeds [total, 3840].
+
+def _g4_aspect_size(height, width, patch_size, max_patches, pooling_kernel_size):
+    """Largest (h, w) that yields <= max_patches teacher patches AND is divisible by
+    pooling_kernel_size * patch_size on both sides (aspect-ratio preserving)."""
+    import math
+    total_px = height * width
+    target_px = max_patches * (patch_size ** 2)
+    factor = math.sqrt(target_px / total_px)
+    ideal_height = factor * height
+    ideal_width = factor * width
+    side_mult = pooling_kernel_size * patch_size
+    target_height = int(math.floor(ideal_height / side_mult)) * side_mult
+    target_width = int(math.floor(ideal_width / side_mult)) * side_mult
+    if target_height == 0 and target_width == 0:
+        raise ValueError(f"resize target is 0x0 (input {height}x{width})")
+    max_side_length = (max_patches // pooling_kernel_size ** 2) * side_mult
+    if target_height == 0:      # extreme aspect ratios: pin the short side to one multiple
+        target_height = side_mult
+        target_width = min(int(math.floor(width / height)) * side_mult, max_side_length)
+    elif target_width == 0:
+        target_width = side_mult
+        target_height = min(int(math.floor(height / width)) * side_mult, max_side_length)
+    if target_height * target_width > target_px:
+        raise ValueError(f"resize [{height}x{width}]->[{target_height}x{target_width}] "
+                         f"exceeds {max_patches} patches (patch {patch_size})")
+    return target_height, target_width
+
+
+def _g4_to_patches(image, patch_size):
+    """(C, H, W) image -> (H//p * W//p, p*p*C) row-major teacher patches."""
+    num_channels, image_height, image_width = image.shape
+    nph = image_height // patch_size
+    npw = image_width // patch_size
+    p = image.reshape(num_channels, nph, patch_size, npw, patch_size)
+    p = p.permute(1, 3, 2, 4, 0)
+    return p.reshape(nph * npw, -1)
+
+
+def _g4_pad_first(image, positions, target_length):
+    """Pad patches with 0 and positions with -1 along dim 0 up to target_length (the model's
+    padding convention: position (-1,-1) marks a pad patch, stripped by get_image_features)."""
+    import torch
+    padn = target_length - image.shape[0]
+    if padn > 0:
+        padding = [0, 0] * (image.ndim - 1) + [0, padn]
+        image = torch.nn.functional.pad(image, padding, mode="constant", value=0)
+        positions = torch.nn.functional.pad(positions, (0, 0, 0, padn), mode="constant", value=-1)
+    return image, positions
+
+
+def _g4_patches_merge(patches, positions_xy, length):
+    """Merge k x k spatially-adjacent teacher patches into `length` model patches: (*, L, D) ->
+    (*, length, k^2*D), with merged XY positions = min over each kernel // k. Verbatim HF
+    patches_merge (kernel-grouped reorder via argsort of the target ordering, then reshape)."""
+    import math
+    import torch
+    patch_size = math.isqrt(patches.shape[-1] // 3)
+    if patches.shape[-1] != patch_size * patch_size * 3:
+        raise ValueError(f"patch dim {patches.shape[-1]} is not patch_size^2*3")
+    k = math.isqrt(patches.shape[-2] // length)
+    if k * k * length != patches.shape[-2]:
+        raise ValueError(f"cannot merge {tuple(patches.shape)} to {length}")
+    max_x = positions_xy[..., 0].max(dim=-1, keepdim=True)[0] + 1
+    kernel_idxs = torch.div(positions_xy, k, rounding_mode="floor")
+    num_from_tl = k * k * kernel_idxs[..., 0] + k * max_x * kernel_idxs[..., 1]
+    pos_in_kernel = torch.remainder(positions_xy, k)
+    num_from_tl_of_kernel = pos_in_kernel[..., 0] + pos_in_kernel[..., 1] * k
+    target_ordering = num_from_tl_of_kernel + num_from_tl
+    perm = target_ordering.long().argsort(dim=-1)
+    kop = patches.gather(-2, perm.unsqueeze(-1).expand_as(patches))
+    batch_shape = patches.shape[:-2]
+    kop = kop.reshape(*batch_shape, length, k, k, patch_size, patch_size, 3)
+    kop = kop.permute(*range(len(batch_shape)), -6, -5, -3, -4, -2, -1)
+    merged = kop.reshape(*batch_shape, length, k * patch_size * k * patch_size * 3)
+    kopos = positions_xy.float().gather(-2, perm.unsqueeze(-1).expand_as(positions_xy).long())
+    padding = (positions_xy == -1).all(dim=-1, keepdim=True)
+    kopos = kopos * (~padding).float() + positions_xy.float() * padding.float()
+    kopos = kopos.reshape(*batch_shape, length, k * k, 2)
+    newpos = torch.div(kopos, k, rounding_mode="floor").min(dim=-2)[0].to(torch.long)
+    return merged, newpos
+
+
+def _gemma4_preprocess(images, target_id: str) -> dict:
+    """[PIL.Image] -> the Gemma4UnifiedImageProcessor outputs, torchvision-free:
+    pixel_values [B, max_soft, model_patch^2*3], image_position_ids [B, max_soft, 2]
+    (pads at (-1,-1)), num_soft_tokens_per_image [B] (the REAL per-image counts — what each
+    <|image|> placeholder expands to). Config comes from processor_config.json's
+    'image_processor' section (this arch has NO preprocessor_config.json); shipped defaults
+    otherwise (patch 16, pool 3, max_soft 280, rescale 1/255, no normalize, bicubic)."""
+    import json
+    import numpy as np
+    import torch
+    ipcfg = {}
+    for _res in (_LOCAL_DIR_FN, _MODEL_DIR_FN):
+        if _res is None:
+            continue
+        with contextlib.suppress(Exception):
+            d = _res(target_id)
+            pc = os.path.join(d, "processor_config.json") if d else None
+            if pc and os.path.exists(pc):
+                with open(pc, "r", encoding="utf-8") as f:
+                    ipcfg = (json.load(f) or {}).get("image_processor") or {}
+                break
+    patch = int(ipcfg.get("patch_size", 16) or 16)
+    pool = int(ipcfg.get("pooling_kernel_size", 3) or 3)
+    max_soft = int(ipcfg.get("max_soft_tokens", 280) or 280)
+    resc = float(ipcfg.get("rescale_factor", 1.0 / 255.0) or (1.0 / 255.0))
+    mode = {2: "bilinear", 3: "bicubic"}.get(int(ipcfg.get("resample", 3) or 3), "bicubic")
+    max_patches = max_soft * pool * pool
+    pvs, poss, counts = [], [], []
+    for im in images:
+        x = torch.from_numpy(np.asarray(im.convert("RGB"), dtype=np.float32)).permute(2, 0, 1)
+        th, tw = _g4_aspect_size(x.shape[-2], x.shape[-1], patch, max_patches, pool)
+        if (th, tw) != (x.shape[-2], x.shape[-1]):
+            x = torch.nn.functional.interpolate(x[None], size=[th, tw], mode=mode,
+                                                antialias=True)[0]
+            # torchvision resizes the uint8 tensor and rounds back to uint8 before the
+            # rescale; round here so the two paths stay bit-comparable.
+            x = x.clamp_(0.0, 255.0).round_()
+        if ipcfg.get("do_rescale", True):
+            x = x * resc
+        if ipcfg.get("do_normalize", False):
+            mean = torch.tensor(ipcfg.get("image_mean") or [0.0] * 3).view(3, 1, 1)
+            std = torch.tensor(ipcfg.get("image_std") or [1.0] * 3).view(3, 1, 1)
+            x = (x - mean) / std
+        teacher = _g4_to_patches(x, patch)
+        ph, pw = th // patch, tw // patch
+        grid = torch.meshgrid(torch.arange(pw), torch.arange(ph), indexing="xy")
+        tpos = torch.stack(grid, dim=-1).reshape(teacher.shape[0], 2)
+        n_model = teacher.shape[0] // (pool * pool)
+        merged, mpos = _g4_patches_merge(teacher.unsqueeze(0), tpos.unsqueeze(0), n_model)
+        merged, mpos = merged.squeeze(0), mpos.squeeze(0)
+        counts.append(int(merged.shape[0]))
+        merged, mpos = _g4_pad_first(merged, mpos, max_soft)
+        pvs.append(merged)
+        poss.append(mpos)
+    return {"pixel_values": torch.stack(pvs, 0), "image_position_ids": torch.stack(poss, 0),
+            "num_soft_tokens_per_image": counts}
 
 
 def _as_feature_tensor(feats):
