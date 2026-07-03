@@ -332,10 +332,16 @@ def register(app):
         if gen_stall_decode_s is not None:                # #active-decode-stall: tighter post-first-token stall (0=off)
             ENGINE_CONFIG["gen_stall_decode_s"] = max(0.0, float(gen_stall_decode_s))
         if idle_unload_m is not None:                     # #idle-unload: minutes idle -> unload (0 = keep forever)
-            # clamp to [0, ~1 year] FINITE: pydantic accepts 'inf'/huge exponents, which would
+            # clamp to FINITE [-1, ~1 year]: pydantic accepts 'inf'/huge exponents, which would
             # persist through engine_config.json and 500 /status (non-JSON float) + /api/ps
-            # (fromtimestamp overflow in expires_at). max(0.0, nan) -> 0.0 by argument order.
-            ENGINE_CONFIG["idle_unload_m"] = min(max(0.0, float(idle_unload_m)), 527040.0)
+            # (fromtimestamp overflow in expires_at). NaN -> 0. Any NEGATIVE normalizes to -1 —
+            # the Ollama-style "keep forever" sentinel. It means exactly what 0 means (every
+            # consumer gates on <= 0: the reaper skips, /api/ps says +1y) but ROUND-TRIPS, so a
+            # user who types -1 sees -1 after save instead of a silent reset to 0.
+            _v = float(idle_unload_m)
+            if _v != _v:
+                _v = 0.0
+            ENGINE_CONFIG["idle_unload_m"] = -1.0 if _v < 0 else min(_v, 527040.0)
         save_engine_config()
         log_activity(f"config: max_loaded={ENGINE_CONFIG['max_loaded']} "
                      f"auto_unload={ENGINE_CONFIG['auto_unload']} "

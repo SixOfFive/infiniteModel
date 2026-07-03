@@ -188,6 +188,8 @@ DASHBOARD_HTML = r"""<!doctype html>
   .row .nm b{font-weight:600}
   .chip{font-size:10.5px;color:var(--muted);border:1px solid var(--border2);border-radius:9px;padding:1px 7px;margin-left:6px}
   .chip.al{color:var(--dim);border-style:dashed}
+  .chip.q4{color:var(--accent);border-color:var(--accent);cursor:pointer;white-space:nowrap}
+  .chip.q4:hover{background:var(--accent);color:#0a0e14}
   .row .meta{flex:1;font-size:12.5px;color:var(--muted);min-width:0}
   .row .meta .em{color:var(--text)}
   .row .acts{display:flex;align-items:center;gap:7px}
@@ -357,7 +359,8 @@ function mstate(m,cl){
   const loadings=(cl.loadings||[]), compiling=(cl.compiling||[]);
   const ld=loadings.find(x=>x.model===id||x.display_model===m.name);
   if(ld) return {k:'loading',c:'var(--warn)',rank:1,ld};
-  if(compiling.find(x=>x.model===id||x.display_model===m.name)) return {k:'compiling',c:'var(--warn)',rank:1};
+  const cp=compiling.find(x=>x.model===id||x.display_model===m.name);
+  if(cp) return {k:'compiling',c:'var(--warn)',rank:1,ld:cp};
   if((m.status||'')==='downloading') return {k:'downloading',c:'var(--accent)',rank:2};
   if(m.loaded) return {k:'loaded',c:'var(--good)',rank:0};
   if(m.ready) return {k:'registered',c:'var(--dim)',rank:3};
@@ -398,6 +401,7 @@ function modelRow(m,s){
     else { const _lt=m.last_tok_s||m.ema_tok_s||0; if(_lt)parts.push('<span class="em" title="last run — not live">'+_lt.toFixed(1)+' tok/s</span>'); }
     if(m.cpu_frac>=0.5)parts.push('<span style="color:var(--hot)">'+Math.round(m.cpu_frac*100)+'% CPU</span>');
     if(m.active)parts.push(m.active+' active');
+    const b4=int4Badge(m); if(b4)parts.push(b4);   // #int4-badge: loaded but no int4 cache yet
     meta=parts.join(' · ');
     acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
   } else if(s.k==='loading'){
@@ -406,7 +410,11 @@ function modelRow(m,s){
         +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
     acts='<button class="btn sm ghost" onclick="cancelLoad(\''+esc(m.name)+'\')">Cancel</button>';
   } else if(s.k==='compiling'){
-    meta='compiling shard cache…'; acts='<button class="btn sm ghost" disabled>…</button>';
+    const cp=s.ld||{}; const r=pc(cp.ready||0,cp.total||1);
+    meta='compiling shard cache · '+(cp.ready||0)+'/'+(cp.total||'?')
+        +(cp.elapsed_s!=null?' · '+Math.round(cp.elapsed_s)+'s':'')+(cp.eta_s?' · eta '+Math.round(cp.eta_s)+'s':'')
+        +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
+    acts='<button class="btn sm ghost" disabled>…</button>';
   } else if(s.k==='downloading'){
     meta='downloading weights…'; acts='<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'stop\')">Stop</button>';
   } else if(s.k==='registered'){
@@ -425,12 +433,37 @@ function archChip(m){
   return m.arch?('<span class="chip">'+esc(m.arch)+'</span>'):'';
 }
 function fitMeta(m){
-  const cz=m.cached||{}; const q=cz.int4&&cz.int4.ok?'int4 '+gb(cz.int4.size_gb):(m.size_gb?gb(m.size_gb):'on disk');
+  const cz=m.cached||{};
+  // int4 cached -> serve-from-cache ready; else honest "weights on disk" + the compile badge
+  // (the old text claimed "cache ready" for uncached models — misleading).
+  const q=cz.int4&&cz.int4.ok?('int4 '+gb(cz.int4.size_gb)+' cache ready')
+        :((m.size_gb?gb(m.size_gb):'on disk')+int4Badge(m));
   let warn='';
   // surface the devstral-style giant-ctx trap
   const dc=m.default_ctx||0;
   if(dc>=131072) warn=' · <span style="color:var(--hot)">⚠ native ctx '+(dc>=1000?Math.round(dc/1024)+'k':dc)+' — set ctx on load</span>';
-  return q+' cache ready'+warn;
+  return q+warn;
+}
+// #int4-badge: one-click int4 shard-cache compile for any on-disk model without one. Tooltip =
+// the cost (est. cache size on disk — disk.models' bf16-normalized int4 estimate — and the
+// controller's free disk) + the payoff (int4 loads serve from cache instantly). Click fires the
+// same compileShards() as the detail modal's Precache button; the row flips to Compiling with a
+// progress bar on the next poll. m.ready gate: can't compile weights that aren't downloaded.
+function int4Badge(m){
+  const cz=m.cached||{};
+  // embedding encoders load whole-model float32 (_load_embedding_locked) and NEVER read the
+  // shard cache — a compile would fail (decoder-shaped packer) and the payoff is false. No badge.
+  if(!m.ready||(cz.int4&&cz.int4.ok)||(m.capabilities||[]).includes('embedding'))return '';
+  const dk=(((LAST||{}).disk||{}).models||[]).find(x=>x.name===m.name||x.internal_name===m.internal_name)||{};
+  const est=(dk.quant_gb||{}).int4, free=((LAST||{}).disk||{}).controller_free_gb;
+  const tip='Compile the int4 shard cache for '+m.name
+    +'\n• est. size on disk: '+(est!=null?'~'+gb(est):'unknown')+(dk.src_dtype?' (packed from '+dk.src_dtype+' weights, group 128)':'')
+    +'\n• writes to the controller’s _shards/int4 cache · free disk '+(free!=null?gb(free):'—')
+    +((est!=null&&free!=null&&est>free)?' ⚠ may not fit':'')
+    +'\n• runs as a background subprocess (below-normal priority) — serving is unaffected'
+    +'\n• once cached: int4 loads serve from cache instantly, no on-the-fly quantize'
+    +'\n\nClick to compile now.';
+  return ' <span class="chip q4" title="'+esc(tip)+'" onclick="compileShards(\''+esc(m.name)+'\',\'int4\')">⚡ int4</span>';
 }
 
 function renderNodes(d){
@@ -819,7 +852,7 @@ CONFIG_HTML = r"""<!doctype html>
     <div class="fld"><label>Auto-load placement mode</label><select id="autoload_mode"><option>auto</option><option>all-gpu</option><option>distribute</option><option>proportional</option><option>single</option></select></div>
     <div class="fld"><label>Prefill stall-watchdog (s, 0=off)</label><input id="gen_stall_s" type="number" min="0"></div>
     <div class="fld"><label>Decode stall-watchdog (s, 0=off)</label><input id="gen_stall_decode_s" type="number" min="0"></div>
-    <div class="fld"><label title="Unload any model that has served no requests for this many minutes. 0 = keep every model loaded forever (the default). Pinned (📌) models and models with an active or queued request are never idle-unloaded.">Idle unload (min, 0 = keep forever)</label><input id="idle_unload_m" type="number" min="0" step="any" list="dl-idleu"><datalist id="dl-idleu"><option value="0"></option><option value="5"></option><option value="15"></option><option value="60"></option><option value="240"></option><option value="1440"></option></datalist></div>
+    <div class="fld"><label title="Unload any model that has served no requests for this many minutes. 0 or -1 = keep every model loaded forever (the default; -1 is the Ollama-style spelling and saves as -1). Pinned (📌) models and models with an active or queued request are never idle-unloaded.">Idle unload (min, 0/-1 = keep forever)</label><input id="idle_unload_m" type="number" min="-1" step="any" list="dl-idleu"><datalist id="dl-idleu"><option value="-1"></option><option value="0"></option><option value="5"></option><option value="15"></option><option value="60"></option><option value="240"></option><option value="1440"></option></datalist></div>
     <div class="fld tog"><input type="checkbox" id="auto_unload"><label for="auto_unload">LRU auto-unload</label></div>
     <div class="fld tog"><input type="checkbox" id="auto_load"><label for="auto_load">Auto-load on request</label></div>
     <div class="fld tog"><input type="checkbox" id="vram_weights_first"><label for="vram_weights_first">Budget weights vs physical-free VRAM</label></div>
