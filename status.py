@@ -144,6 +144,8 @@ def build_status() -> dict:
             "kv_offload": bool(getattr(lm, "kv_offload", False)),  # #kv-offload: KV cache in system RAM
             # #load-temp: per-model default temperature (None = unset -> requests default to 0.0)
             "def_temperature": getattr(lm, "default_temperature", None),
+            # #min-p: per-model default min-p sampling floor (None = unset -> off)
+            "def_min_p": getattr(lm, "default_min_p", None),
             "tp_size": getattr(lm, "tp_size", 1),            # #88: TP width (1 = pipeline)
             "is_tp": getattr(lm, "tp_size", 1) > 1,          # #88: card shows TP vs pipeline + reconfigure
             "num_layers": lm.spec.num_layers, "params": _human_params(lm.spec),
@@ -276,7 +278,7 @@ def build_status() -> dict:
         for _k in (_ld.get("friendly"), _ld.get("display_name")):
             if _k:
                 _lm_by_key[_k] = _ld
-    _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "kv_offload", "def_temperature",
+    _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "kv_offload", "def_temperature", "def_min_p",
                      "vram_used_gb", "ram_used_gb", "cpu_frac",
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
                      "last_tok_s", "kv_pos", "active", "queued", "is_embedding", "replica_idx",

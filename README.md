@@ -55,7 +55,10 @@ dashboard.
   auto-load/unload, a live dashboard (placement preview, per-load progress, fleet memory/throughput,
   bandwidth), curl-able fleet logs, and idle-gated self-update. Per-load knobs: KV-cache placement
   (**GPU or system RAM** — offloading frees the VRAM KV reserve for model layers, for long context
-  on small cards) and a **per-model default temperature** (used when a request doesn't send one).
+  on small cards) and **per-model default temperature + min-p** (used when a request doesn't send
+  its own). **Min-p sampling** is supported per-request too (Ollama `options.min_p`, top-level
+  `min_p` on the OpenAI/Anthropic endpoints): tokens below `min_p` × the top token's probability
+  are dropped — a confidence-adaptive floor that pairs well with high temperature.
 
 ## How it works
 

@@ -84,12 +84,22 @@ class EngineGenMixin:
                 ids.add(int(ret))
         return {i for i in ids if isinstance(i, int) and i >= 0}
 
-    def _sample(self, row, temperature: float, top_p: float) -> int:
+    def _sample(self, row, temperature: float, top_p: float, min_p: float = 0.0) -> int:
         import torch
         row = row.float()
         if not temperature or temperature <= 0:
             return int(row.argmax())
         probs = torch.softmax(row / temperature, dim=-1)
+        # #min-p: confidence-ADAPTIVE floor — drop any token whose prob is below min_p x the top
+        # token's prob (llama.cpp/vLLM convention: applied on the temperature-scaled probs, before
+        # top_p). When the model is confident the filter is strict (few survivors); when it's
+        # uncertain (flat distribution) it loosens up — which is why it pairs with HIGH temperature:
+        # temp flattens the distribution and lets junk tokens in, min_p cuts them first. Useful
+        # range ~0.05-0.1 at temperature >= 1.0.
+        if min_p and 0 < min_p <= 1:
+            keep = probs >= (min_p * probs.max())
+            probs = probs * keep
+            probs = probs / probs.sum()
         if top_p and 0 < top_p < 1:
             sp, idx = torch.sort(probs, descending=True)
             cdf = torch.cumsum(sp, 0)
@@ -230,7 +240,8 @@ class EngineGenMixin:
 
     async def generate(self, friendly: str, prompt_ids: list[int], max_new: int,
                        temperature: float, top_p: float, speculative: bool = False,
-                       rec=None, mm=None, mrope=None, spec_k: int = 0):
+                       rec=None, mm=None, mrope=None, spec_k: int = 0,
+                       min_p: float = 0.0):
         """Dispatch generation for model `friendly`: speculative-greedy decode only when
         explicitly requested AND a draft is loaded AND decoding is greedy; otherwise plain
         KV-cache decode (M2e). Speculative is opt-in because it only wins when the target's
@@ -314,7 +325,8 @@ class EngineGenMixin:
                             yield item
                     else:
                         async for item in self._decode_plain(model, prompt_ids, max_new,
-                                                             temperature, top_p, mm=mm, mrope=mrope):
+                                                             temperature, top_p, mm=mm, mrope=mrope,
+                                                             min_p=min_p):
                             if item[0] is not None:
                                 _ntoks += 1
                                 _out_ids.append(item[0])   # #ctx-history
@@ -353,7 +365,7 @@ class EngineGenMixin:
                 model.queued -= 1
 
     async def _decode_plain(self, model, prompt_ids, max_new, temperature, top_p, mm=None,
-                            mrope=None):
+                            mrope=None, min_p: float = 0.0):
         """Prefill-once + one-token-at-a-time KV-cache decode (M2e). mm=(positions, embeds)
         (#22 inc 3) splices multimodal embeds into the PREFILL only; decode steps are plain.
         mrope=(prefill_position_ids [3][q], base) (#22 inc 4) carries 3D image positions:
@@ -388,7 +400,7 @@ class EngineGenMixin:
             if ntok and ntok < int(row.shape[-1]):
                 row = row.clone()
                 row[ntok:] = float("-inf")
-            tok_id = self._sample(row, temperature, top_p)
+            tok_id = self._sample(row, temperature, top_p, min_p)
             if produced == 0:
                 with contextlib.suppress(Exception):
                     print(f"[gen] {model.friendly}: first token id={tok_id} "

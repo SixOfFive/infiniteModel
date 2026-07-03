@@ -365,6 +365,11 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     _dt = getattr(lm, "default_temperature", None)
     _t = opts.get("temperature", body.get("temperature", None))
     temperature = float(_t) if _t is not None else float(_dt if _dt is not None else 0.0)
+    # #min-p: Ollama options.min_p / OpenAI-compat top-level min_p (llama.cpp/vLLM convention);
+    # falls back to the model's per-load default. Same precedence rule as temperature.
+    _dmp = getattr(lm, "default_min_p", None)
+    _mp = opts.get("min_p", body.get("min_p", None))
+    min_p = float(_mp) if _mp is not None else float(_dmp if _dmp is not None else 0.0)
     top_p = float(opts.get("top_p", body.get("top_p", 1.0)))
     max_new = int(opts.get("num_predict", body.get("max_tokens", 256)))
     stream = bool(body.get("stream", True))
@@ -377,7 +382,8 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
     if _lc and len(ids) >= _lc:
         raise ValueError(f"prompt is {len(ids)} tokens but model '{friendly}' is loaded with a "
                          f"{_lc}-token context window — shorten the prompt or reload it at a larger ctx")
-    return friendly, tok, ids, temperature, top_p, max_new, stream, speculative, spec_k, mm, mrope
+    return (friendly, tok, ids, temperature, top_p, max_new, stream, speculative, spec_k,
+            mm, mrope, min_p)
 
 
 def _ka_is_unload(v) -> bool:
@@ -476,7 +482,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         try:
             async for tid, reason in engine.generate(friendly, ids, max_new, temperature,
                                                      top_p, speculative, rec=rec, spec_k=spec_k,
-                                                     mm=P.get("mm"), mrope=P.get("mrope")):
+                                                     mm=P.get("mm"), mrope=P.get("mrope"),
+                                                     min_p=P.get("min_p", 0.0)):
                 if tid is not None:
                     produced.append(tid)
                     state["tokens"] = len(produced)
@@ -509,7 +516,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                 msg = json.loads(bytes(res.body).decode()).get("error", msg)
             return msg
         (P["friendly"], P["tok"], P["ids"], P["temperature"], P["top_p"],
-         P["max_new"], _st, P["speculative"], P["spec_k"], P["mm"], P["mrope"]) = res
+         P["max_new"], _st, P["speculative"], P["spec_k"], P["mm"], P["mrope"],
+         P["min_p"]) = res
         return None
 
     # #cold-contract (BUG-1/2/6/8): LOAD (or fail) BEFORE opening ANY response — for streaming too.
@@ -955,6 +963,10 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
     _bt = body.get("temperature", None)
     _dt = getattr(lm, "default_temperature", None)
     temperature = float(_bt) if _bt is not None else float(_dt if _dt is not None else 0.0)
+    # #min-p (extension: not in the Anthropic API, accepted for parity with the other endpoints)
+    _bmp = body.get("min_p", None)
+    _dmp = getattr(lm, "default_min_p", None)
+    min_p = float(_bmp) if _bmp is not None else float(_dmp if _dmp is not None else 0.0)
     top_p = float(body.get("top_p", 1.0) or 1.0)
     stream = bool(body.get("stream", False))
     state = {"tokens": 0}
@@ -973,7 +985,7 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         try:
           async for tid, reason in engine.generate(friendly, ids, max_new,
                                                    temperature, top_p, False, rec=rec, mm=mm,
-                                                   mrope=mrope):
+                                                   mrope=mrope, min_p=min_p):
             if tid is not None:
                 produced.append(tid)
                 state["tokens"] = len(produced)

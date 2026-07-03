@@ -417,7 +417,8 @@ def register(app):
                    replicas: int = 1, cpu_only: bool = False,
                    moe_offload: bool = False, force: bool = False,
                    node: str = "", kv_quant: str = "",
-                   kv_offload: bool = False, temperature: str = "") -> JSONResponse:
+                   kv_offload: bool = False, temperature: str = "",
+                   min_p: str = "") -> JSONResponse:
         # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
         # it. Also reloads an already-resident copy (skips the idempotent no-op). Without force, a
@@ -466,6 +467,19 @@ def register(app):
                 return JSONResponse({"ok": False,
                                      "error": "temperature out of range (0.0 - 2.0)"},
                                     status_code=400)
+        # #min-p: per-model DEFAULT min-p (confidence-adaptive sampling floor; pairs with a high
+        # default temperature — 0.05-0.1 is the useful band at temperature >= 1.0). Same precedence
+        # as temperature: applied only when a request sends no min_p of its own.
+        default_min_p = None
+        if str(min_p).strip():
+            try:
+                default_min_p = float(min_p)
+            except ValueError:
+                return JSONResponse({"ok": False,
+                                     "error": f"bad min_p '{min_p}' (float)"}, status_code=400)
+            if not (0.0 <= default_min_p <= 1.0):
+                return JSONResponse({"ok": False,
+                                     "error": "min_p out of range (0.0 - 1.0)"}, status_code=400)
         cons, pv = LOAD_MODES.get(mode, LOAD_MODES["auto"])
         if mode == "auto" and not consolidate:   # back-compat with the old checkbox
             cons, pv = False, True
@@ -498,7 +512,8 @@ def register(app):
                 lms = await engine.replicate(friendly, ctx, replicas,
                                              consolidate=cons, prefer_vram=pv, quant=quant,
                                              kv_quant=kv_quant, kv_offload=kv_offload,
-                                             default_temp=default_temp)
+                                             default_temp=default_temp,
+                                             default_min_p=default_min_p)
                 return JSONResponse({"ok": True, "model": friendly, "ctx": lms[0].ctx,
                                      "mode": mode, "quant": quant, "replicas": len(lms),
                                      "placements": [{"key": m.friendly,
@@ -513,7 +528,7 @@ def register(app):
                                    gpu_spread=(mode == "all-gpu"),
                                    moe_offload=moe_offload, force=force, pin_host=node,
                                    kv_quant=kv_quant, kv_offload=kv_offload,
-                                   default_temp=default_temp)
+                                   default_temp=default_temp, default_min_p=default_min_p)
             _modelbl = ("pin:%s/%s" % (node, "cpu" if cpu_only else "gpu")) if node else \
                        (((("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp)) if tp > 1 else mode))
             return JSONResponse({"ok": True, "model": lm.friendly, "ctx": lm.ctx,

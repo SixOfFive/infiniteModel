@@ -335,6 +335,7 @@ function modelRow(m,s){
     if(m.kv_quant&&m.kv_quant!=='none')parts.push('<span class="em" title="TurboQuant KV-cache quantization ('+esc(m.kv_quant)+'): keys/values stored at ~3–4 bits instead of bf16 (data-free rotation + Lloyd-Max, un-rotated on read so attention is unchanged) → ~2× smaller KV cache, so longer context and more co-resident models on the same VRAM. turbo4 ≈ near-lossless, turbo3 more aggressive; best on large models.">KV:'+esc(m.kv_quant)+'</span>');
     if(m.kv_offload)parts.push('<span class="em" title="KV cache offloaded to system RAM (OffloadedCache, per-layer prefetch): the VRAM the KV would reserve goes to model layers instead. Slower decode; useful for long context on small cards.">KV:RAM</span>');
     if(m.def_temperature!=null)parts.push('<span class="em" title="Default sampling temperature for this model — applied when a request does not send its own (explicit request values always win).">t='+esc(String(m.def_temperature))+'</span>');
+    if(m.def_min_p!=null)parts.push('<span class="em" title="Default min-p sampling floor — drops tokens below this fraction of the top token\'s probability; confidence-adaptive, pairs with high temperature. Applied when a request sends no min_p.">mp='+esc(String(m.def_min_p))+'</span>');
     parts.push('ctx '+(m.ctx||'?'));
     if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
     if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');
@@ -441,6 +442,10 @@ function openLoad(name){
    +'<select id="l-kvo"><option value="">GPU (fastest)</option><option value="1">System RAM (frees VRAM)</option></select></div>'
    +'<div><label title="Default sampling temperature for this model: used when a request does not send its own (explicit request values always win). Empty = greedy (0). ~0.7 leans creative, 0 = deterministic.">Default temperature</label>'
    +'<input id="l-temp" type="number" min="0" max="2" step="0.1" placeholder="0 (greedy)"></div></div>'
+   +'<div class="grid2" style="margin-top:8px">'
+   +'<div><label title="Min-p sampling floor: drops any token whose probability is below this fraction of the top token\'s. Confidence-adaptive — strict when the model is sure, looser when it isn\'t — so it pairs well with HIGH temperature (temp flattens the distribution and lets weird tokens in; min-p cuts them first). At temperature >= 1.0 use 0.05-0.1: lower barely filters, higher eats the variety you raised temperature for. Used when a request sends no min_p of its own.">Default min-p</label>'
+   +'<input id="l-minp" type="number" min="0" max="1" step="0.01" placeholder="0 (off)"></div>'
+   +'<div></div></div>'
    +(dc>=131072?'<div class="note">⚠ native ctx is '+(Math.round(dc/1024))+'k — a huge KV cache. Keep ctx modest (8–16k) unless you need more.</div>':'')
    +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
    +'<button class="btn pri" onclick="doLoad(\''+esc(name)+'\')">Load</button></div>'
@@ -458,6 +463,7 @@ function placeParams(name){
   else if(v==='tp:cpu'){ p.tp=$('#l-tpn').value||2; p.cpu_only='true'; }
   const kvo=$('#l-kvo'); if(kvo&&kvo.value)p.kv_offload='true';      // #kv-offload: KV in system RAM
   const tmp=$('#l-temp'); if(tmp&&tmp.value!=='')p.temperature=tmp.value;  // #load-temp: default temp
+  const mp=$('#l-minp'); if(mp&&mp.value!=='')p.min_p=mp.value;            // #min-p: default floor
   return p;
 }
 let _pvTimer=null;

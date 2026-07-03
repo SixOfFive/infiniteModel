@@ -112,7 +112,8 @@ class EngineLoadMixin:
                    force: bool = False, moe_offload: bool = False,
                    gpu_spread: bool = False, pin_host: str = "",
                    kv_quant: str = "", kv_offload: bool = False,
-                   default_temp: Optional[float] = None) -> LoadedModel:
+                   default_temp: Optional[float] = None,
+                   default_min_p: Optional[float] = None) -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -133,7 +134,7 @@ class EngineLoadMixin:
                                          moe_offload=moe_offload, gpu_spread=gpu_spread,
                                          pin_host=pin_host, kv_quant=kv_quant,
                                          kv_offload=kv_offload, default_temp=default_temp,
-                                         _own=_own)
+                                         default_min_p=default_min_p, _own=_own)
         finally:
             if _own["v"]:
                 self._reservations.pop(rk, None)
@@ -152,6 +153,7 @@ class EngineLoadMixin:
                    gpu_spread: bool = False, pin_host: str = "",
                    kv_quant: str = "", kv_offload: bool = False,
                    default_temp: Optional[float] = None,
+                   default_min_p: Optional[float] = None,
                    _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
@@ -305,6 +307,7 @@ class EngineLoadMixin:
                          + (f", kv_quant={kv_quant}" if kv_quant != "none" else "")
                          + (", KV-OFFLOAD (KV cache in system RAM)" if kv_offload else "")
                          + (f", default_temp={default_temp}" if default_temp is not None else "")
+                         + (f", default_min_p={default_min_p}" if default_min_p is not None else "")
                          + (f", tp={tp}" if tp > 1 else "")
                          + (", CPU-ONLY (RAM, no VRAM)" if cpu_only else "") + ")")
 
@@ -356,7 +359,8 @@ class EngineLoadMixin:
                                                               auto_t, quant, cpu_only=True,
                                                               kv_quant=kv_quant,
                                                               kv_offload=kv_offload,
-                                                              default_temp=default_temp)
+                                                              default_temp=default_temp,
+                                                              default_min_p=default_min_p)
                         except Exception as exc:
                             log_activity(f"{friendly}: auto-TP failed ({exc!r}) -> pipeline fallback")
 
@@ -371,7 +375,8 @@ class EngineLoadMixin:
                 return await self._load_tp_locked(friendly, target_id, spec, ctx, tp, quant,
                                                   cpu_only=cpu_only, kv_quant=kv_quant,
                                                   kv_offload=kv_offload,
-                                                  default_temp=default_temp)
+                                                  default_temp=default_temp,
+                                                  default_min_p=default_min_p)
 
             # FIT-AS-MANY + NODE-SHARING (Inc 3a/3b): keep other resident models and place this
             # one wherever there's room — INCLUDING nodes already serving a model. Each node is
@@ -839,7 +844,7 @@ class EngineLoadMixin:
                 reg_key, target_id, spec, ctx, plan,
                 [s.node_id for s in stages], tok, eos, now,
                 quant=quant, kv_quant=kv_quant, kv_offload=kv_offload,
-                default_temperature=default_temp,
+                default_temperature=default_temp, default_min_p=default_min_p,
                 stage0_writer=stage0_writer, last_used=now,
                 stage0_dial=_s0_dial, last_send_ts=now)   # #stage0-stale-reconnect: how to re-dial + freshness clock
             lm.base, lm.replica_idx = friendly, replica_idx   # data-parallel grouping (#39)
@@ -974,7 +979,8 @@ class EngineLoadMixin:
                         consolidate: bool = True, prefer_vram: bool = True,
                         quant: str = "none", kv_quant: str = "",
                         kv_offload: bool = False,
-                        default_temp: Optional[float] = None) -> list["LoadedModel"]:
+                        default_temp: Optional[float] = None,
+                        default_min_p: Optional[float] = None) -> list["LoadedModel"]:
         """Load `count` full copies of `friendly` on DISJOINT node sets — the small-model
         throughput lever (#39). Replica 0 is keyed `friendly`; replica i (i>=1) is keyed
         `friendly#i`. Requests for `friendly` are then least-loaded / round-robin routed
@@ -994,6 +1000,7 @@ class EngineLoadMixin:
                     lm = await self.load(friendly, ctx, consolidate=consolidate,
                                          prefer_vram=prefer_vram, quant=quant, kv_quant=kv_quant,
                                          kv_offload=kv_offload, default_temp=default_temp,
+                                         default_min_p=default_min_p,
                                          reg_key=key, exclude_nodes=set(used), replica_idx=i)
                 except Exception as exc:
                     if i == 0:
@@ -1031,7 +1038,8 @@ class EngineLoadMixin:
     async def _load_tp_locked(self, friendly: str, target_id: str, spec: ModelSpec,
                               ctx: int, tp: int, quant: str, cpu_only: bool = False,
                               kv_quant: str = "none", kv_offload: bool = False,
-                              default_temp: Optional[float] = None) -> LoadedModel:
+                              default_temp: Optional[float] = None,
+                              default_min_p: Optional[float] = None) -> LoadedModel:
         """M4 tensor-parallel load. Every node in the group holds 1/tp of each layer
         (full embed/head/norm); rank 0 is the SINGLE pipeline stage the controller talks to
         and drives the peers over the all-reduce mesh. TP-v2 (per-rank streaming): each rank
@@ -1331,7 +1339,7 @@ class EngineLoadMixin:
         lm = LoadedModel(friendly, target_id, spec, ctx, plan,
                          [n.node_id for n in tp_nodes], tok, eos, now,
                          quant=quant, kv_quant=kv_quant, kv_offload=kv_offload,
-                         default_temperature=default_temp,
+                         default_temperature=default_temp, default_min_p=default_min_p,
                          stage0_writer=stage0_writer, last_used=now,
                          stage0_dial=_tp_dial, last_send_ts=now)
         lm.plan_basis = tp_basis                          # placement basis (#65)

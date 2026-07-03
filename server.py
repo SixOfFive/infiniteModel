@@ -1463,6 +1463,10 @@ class LoadedModel:
     # #load-temp: per-model DEFAULT sampling temperature — applied when a request doesn't send one
     # (explicit request values always win). None = unset (requests keep the global 0.0 default).
     default_temperature: Optional[float] = None
+    # #min-p: per-model DEFAULT min-p sampling floor (drop tokens with p < min_p x top-token p;
+    # confidence-adaptive, pairs with high default temperature — useful band 0.05-0.1 at temp>=1).
+    # Same precedence: only applied when the request sends no min_p. None = unset (0 = off).
+    default_min_p: Optional[float] = None
     tp_size: int = 1      # tensor-parallel width (1 = pipeline/single-node); set by _load_tp_locked.
                           # Surfaced on the card + used by #88 /reconfigure (managed-reload to/from TP).
     stage0_writer: Optional[asyncio.StreamWriter] = None  # per-model pipeline conn (controller -> first stage)
