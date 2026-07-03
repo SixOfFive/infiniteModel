@@ -1643,6 +1643,11 @@ class LoadedModel:
     # at load so a fresh model isn't flagged before its first generate.
     last_token_ts: float = 0.0
     gen_started_ts: float = 0.0   # #active-decode-stall: gen-begin time; last_token_ts advances past it on token 1
+    # #prefill-progress: controller-clock ts of the latest WORKER-reported per-layer forward
+    # progress for this model (heartbeat "fwd_progress"). The watchdog's PREFILL branch counts it
+    # as liveness so a slow-but-advancing prefill under GPU contention isn't reclaimed as wedged
+    # (the endpoint-weather run-abort class); DECODE stays tokens-only so a dead hop reclaims fast.
+    fwd_progress_ts: float = 0.0
     # Data-parallel replication (#39): `base` is the user-facing model name shared by all
     # copies; `friendly` is the unique registry key (base, then base#1, base#2 ...). Requests
     # for `base` are least-loaded / round-robin routed across its replicas. Each copy is a
@@ -2824,6 +2829,7 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                   f"recovered {n_rec} model(s) the restart invalidated")
 
         link = engine.links[node.node_id]
+        _fwd_seen: dict = {}   # #prefill-progress: last fwd ts seen per model on THIS connection
         while True:
             line = await reader.readline()
             if not line:
@@ -2847,6 +2853,50 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     node.gpu_util = float(msg.get("gpu_util", 0.0))
                 if "net_peers" in msg:      # worker per-peer data-plane bytes (bandwidth page)
                     node.peer_bytes = msg.get("net_peers") or {}
+                if msg.get("fwd_progress"):
+                    # #prefill-progress: {model_id (HF target): worker-clock ts of the last
+                    # completed layer}. Only an ADVANCING ts counts — compared against the SAME
+                    # worker's previous report (skew-safe, and a wedged forward's frozen ts can't
+                    # keep its gen alive). Stamp the matching ACTIVE model(s) that have a stage on
+                    # THIS node with the CONTROLLER clock; the gen-stall watchdog's prefill branch
+                    # reads it as liveness.
+                    _hb_now = time.time()
+                    for _mid, _v in dict(msg["fwd_progress"]).items():
+                        # [rid, ts] (m4c181+) or bare ts (older worker). With a rid, credit the
+                        # progress ONLY while that request is still pending — an orphaned
+                        # forward (its rid already failed/removed) can't shield a newer gen.
+                        _rid = None
+                        try:
+                            if isinstance(_v, (list, tuple)) and len(_v) == 2:
+                                _rid, _ts = _v[0], float(_v[1])
+                            else:
+                                _ts = float(_v)
+                        except (TypeError, ValueError):
+                            continue
+                        if _ts <= _fwd_seen.get(_mid, 0.0):
+                            continue
+                        _fwd_seen[_mid] = _ts
+                        if _rid not in (None, ""):
+                            # engine.pending is keyed by next_req()'s INT rids (JSON preserves the
+                            # int end-to-end) — compare RAW, with an int-coercion fallback so a
+                            # str-serialized rid from any future transport still matches. A rid
+                            # that matches nothing is an orphaned/finished forward: real progress,
+                            # wrong owner — never let it shield a live gen.
+                            _live = _rid in engine.pending
+                            if not _live:
+                                try:
+                                    _live = int(_rid) in engine.pending
+                                except (TypeError, ValueError):
+                                    _live = False
+                            if not _live:
+                                continue
+                        for _lm in list(engine.models.values()):
+                            if (getattr(_lm, "target_id", None) == _mid
+                                    and getattr(_lm, "active", 0) > 0
+                                    and any(getattr(_s, "node_id", None) == node.node_id
+                                            for _s in getattr(getattr(_lm, "plan", None),
+                                                              "stages", None) or [])):
+                                _lm.fwd_progress_ts = _hb_now
                 if msg.get("logs"):         # #logs: worker relayed its new stdout/stderr lines
                     _lb = NODE_LOGS.setdefault(node.node_id, [])
                     _lb.extend(str(x) for x in msg["logs"])
@@ -2971,9 +3021,15 @@ async def gen_stall_watchdog() -> None:
                     _ds = GEN_STALL_DECODE_S
                 if _ds > 0:
                     _eff = min(_eff, _ds)
-            if last <= 0 or (now - last) <= _eff:
+            # #prefill-progress: in PREFILL (no token yet) count worker-reported per-layer forward
+            # progress as liveness — a slow-but-advancing prefill under GPU contention is NOT a
+            # wedge and must not be reclaimed (the endpoint-weather 21% run-abort class: every
+            # client retry re-entered the same slow prefill and died at the threshold again).
+            # DECODE stays tokens-only so a wedged mid-pipeline hop still reclaims fast.
+            _basis = last if _decoding else max(last, getattr(m, "fwd_progress_ts", 0.0) or 0.0)
+            if _basis <= 0 or (now - _basis) <= _eff:
                 continue
-            idle = int(now - last)
+            idle = int(now - _basis)
             cancelled = 0
             for r in list(INFLIGHT.values()):
                 try:
@@ -2982,6 +3038,11 @@ async def gen_stall_watchdog() -> None:
                     rf = r.get("model")
                 if rf in (key, getattr(m, "base", "") or key, getattr(m, "friendly", key)):
                     r["cancel"] = True
+                    # #endpoint-weather: mark WHY — serving's CancelledError catch returns a
+                    # RETRYABLE 503/529 only for a watchdog reclaim; a user /cancel or /terminate
+                    # (which also set "cancel") keeps today's dropped-connection behavior so a
+                    # deliberately-killed client isn't told to retry.
+                    r["reclaimed"] = True
                     t = r.get("task")
                     if t is not None and not t.done():
                         with contextlib.suppress(Exception):
@@ -2993,6 +3054,7 @@ async def gen_stall_watchdog() -> None:
             m.queued = 0
             m.last_tok_s = 0.0
             m.last_token_ts = now
+            m.fwd_progress_ts = 0.0   # #prefill-progress: stale stamps must not shield the NEXT gen
             # #recovery: a mid-pipeline hop death never delivers an error frame upstream (the data
             # chain is one-way), so the orphaned generate() is blocked in _send's wait_for(fut,
             # GEN_TIMEOUT). Fail this model's leaked controller-side pending futures NOW so _send

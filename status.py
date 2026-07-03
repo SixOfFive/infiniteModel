@@ -136,6 +136,11 @@ def build_status() -> dict:
             "base": lm.base or lm.friendly, "replica_idx": lm.replica_idx,  # data-parallel (#39)
             "active": lm.active, "queued": lm.queued,   # per-replica live load (#39 routing)
             "kv_pos": lm.kv_pos,   # tokens in the current/last generation's KV context
+            # #prefill-progress: seconds since the last worker-reported per-layer forward progress
+            # (heartbeat fwd_progress). Small + shrinking during a healthy prefill under load;
+            # None = no report yet this gen. Observability for the endpoint-weather liveness path.
+            "fwd_prog_age_s": (round(time.time() - lm.fwd_progress_ts, 1)
+                               if getattr(lm, "fwd_progress_ts", 0.0) > 0 else None),
             # LIVE decode tok/s: the most-recent-gen rate WHILE generating, else 0 when idle —
             # last_tok_s lingers at its last value forever otherwise (card looked "busy" when idle).
             # The historical rate stays visible as ema_tok_s ("avg"). active==0 => idle => 0.
@@ -309,7 +314,8 @@ def build_status() -> dict:
     _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "kv_offload", "def_temperature", "def_min_p",
                      "sampling_defaults", "vram_used_gb", "ram_used_gb", "cpu_frac",
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
-                     "last_tok_s", "kv_pos", "active", "queued", "is_embedding", "replica_idx",
+                     "last_tok_s", "kv_pos", "fwd_prog_age_s", "active", "queued",
+                     "is_embedding", "replica_idx",
                      "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",
                      "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
                      "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe")

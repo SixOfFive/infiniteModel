@@ -53,6 +53,10 @@ class ShardForwardMixin:
         # #fwd-watchdog: stamp start + a per-layer progress heartbeat (updated in the layer loops).
         # The worker watchdog escalates a forward whose progress ts goes STALE (stuck inside one
         # un-yieldable op, where cooperative cancel can't help) to a supervisor relaunch.
+        # #prefill-progress: adopt the req_id staged by worker_net AFTER winning the lock, so the
+        # heartbeat's progress report names the forward that is ACTUALLY running (an orphaned
+        # forward keeps its original rid — the controller ignores rids no longer pending).
+        self._fwd_cur_rid = getattr(self, "_fwd_next_rid", None)
         self._fwd_started_ts = self._fwd_progress_ts = time.time()
         try:
             return self._forward_impl(x, cache_start, reset, all_logits, inject,

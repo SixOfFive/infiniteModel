@@ -184,6 +184,11 @@ class WorkerNetMixin:
                     # #91 MTP: capture_pre_norm rides the same chain as capture_hidden but the head
                     # returns the PRE-final-norm trunk hidden (what the MTP head consumes).
                     capture_pre_norm = bool(hdr.get("capture_pre_norm", False))
+                    # #prefill-progress: hand the frame's req_id to the shard so its per-layer
+                    # progress heartbeat is ATTRIBUTED to this request (shard_forward copies it to
+                    # _fwd_cur_rid once it OWNS _fwd_lock, so an orphaned forward keeps its own
+                    # rid and can never shield a newer gen from the controller's watchdog).
+                    shard._fwd_next_rid = hdr.get("req_id")
                     out = await asyncio.to_thread(self._run_stage, model_id, x, cache_start,
                                                   reset, all_logits, inject, position_ids,
                                                   capture_hidden, capture_pre_norm)

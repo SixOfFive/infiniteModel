@@ -226,7 +226,31 @@ class EngineGenMixin:
                 await self._freshen_stage0(model, force=True)
                 await _flush(model.stage0_writer)
             model.last_send_ts = time.time()
-            return await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
+            if not reset:   # decode/verify step: classic single-budget wait
+                return await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
+            # #endpoint-weather: a PREFILL is ONE frame/future for the whole prompt, so under GPU
+            # contention a healthy prefill can legitimately outlast GEN_TIMEOUT_S — and dying here
+            # re-enters the same slow prefill on every client retry (the 21% run-abort class).
+            # Wait in slices and KEEP WAITING while workers report ADVANCING per-layer progress
+            # (model.fwd_progress_ts, heartbeat-fed); bail only when the classic budget is spent
+            # AND progress has gone quiet. True wedges die much earlier via the gen-stall
+            # watchdog (which cancels this task); the hard ceiling below is the backstop for a
+            # disabled watchdog so this can never hang forever.
+            _PROG_QUIET_S = 120.0
+            _PREFILL_HARD_S = max(3600.0, GEN_TIMEOUT_S)
+            _t0 = time.time()
+            while True:
+                _left = _PREFILL_HARD_S - (time.time() - _t0)
+                if _left <= 0:
+                    raise TimeoutError(f"prefill exceeded the {int(_PREFILL_HARD_S)}s hard ceiling")
+                try:
+                    return await asyncio.wait_for(asyncio.shield(fut), timeout=min(30.0, _left))
+                except asyncio.TimeoutError:
+                    if fut.done():        # raced the timeout: result/exception landed — take it
+                        return fut.result()
+                    _fp = max(getattr(model, "fwd_progress_ts", 0.0) or 0.0, model.last_send_ts)
+                    if (time.time() - _t0) >= GEN_TIMEOUT_S and (time.time() - _fp) > _PROG_QUIET_S:
+                        raise
         finally:
             self.pending.pop(rid, None)  # never leak the future
             self.pending_model.pop(rid, None)

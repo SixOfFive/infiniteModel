@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c180"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c181"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -3088,7 +3088,8 @@ class Worker(WorkerLoadMixin, WorkerNetMixin):
 # ---------------------------------------------------------------------------
 
 async def _heartbeat_loop(writer: asyncio.StreamWriter, lock: asyncio.Lock,
-                          node_id: str, interval: float, gpu: bool = False) -> None:
+                          node_id: str, interval: float, gpu: bool = False,
+                          worker=None) -> None:
     psutil.cpu_percent(interval=None)
     proc = psutil.Process()   # this worker's own process, for RSS reporting
     hist: deque = deque()  # (t, net_in, net_out) over the last 10 s
@@ -3115,6 +3116,26 @@ async def _heartbeat_loop(writer: asyncio.StreamWriter, lock: asyncio.Lock,
               # cumulative per-peer data-plane bytes (bandwidth page): node<->node hops the
               # controller can't see, plus this node's <->controller bytes (deduped server-side).
               "net_peers": {p: dict(c) for p, c in NET_PEERS.items()}}
+        # #prefill-progress: report per-model forward liveness — shards whose forward is RUNNING
+        # (_fwd_lock held) with a recent per-layer progress stamp (same signal the local
+        # fwd-watchdog uses). The controller's gen-stall watchdog reads this to tell a
+        # slow-but-advancing prefill (GPU contention) from a true wedge, so healthy long prefills
+        # stop being reclaimed at the threshold while real wedges still are.
+        fp = {}
+        if worker is not None:
+            for _mid, _sh in list(getattr(worker, "shards", {}).items()):
+                try:
+                    _lk = getattr(_sh, "_fwd_lock", None)
+                    _ts = getattr(_sh, "_fwd_progress_ts", 0.0) or 0.0
+                    if _lk is not None and _lk.locked() and (now - _ts) < 120.0:
+                        # [rid, ts]: rid = the request this forward belongs to, so the controller
+                        # credits progress only to a LIVE (still-pending) request — an orphaned
+                        # forward's stamps can't keep a newer wedged gen alive.
+                        fp[_mid] = [getattr(_sh, "_fwd_cur_rid", None) or "", round(_ts, 2)]
+                except Exception:
+                    pass
+        if fp:
+            hb["fwd_progress"] = fp
         _log_cursor, _new_logs = drain_new_logs(_log_cursor)
         if _new_logs:
             hb["logs"] = _new_logs[-300:]   # #logs: relay new log lines (capped per beat)
@@ -3266,7 +3287,8 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     os._exit(42)
 
         hb = asyncio.create_task(
-            _heartbeat_loop(writer, wlock, node_id, args.heartbeat_interval, _using_gpu(args)))
+            _heartbeat_loop(writer, wlock, node_id, args.heartbeat_interval, _using_gpu(args),
+                            worker=worker))
         cmd = asyncio.create_task(command_loop())
         done, pending = await asyncio.wait({hb, cmd}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:

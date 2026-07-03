@@ -12,6 +12,24 @@ from __future__ import annotations
 
 
 
+def _transient_gen_exc(exc: BaseException) -> bool:
+    """#endpoint-weather: True when a generation failure is CONTENTION-class — the box is busy or
+    a data-plane hop flaked — so the client should RETRY with backoff (503/529 + Retry-After),
+    never receive a bare 500. Watchdog reclaim surfaces as ConnectionError('gen-stall watchdog
+    reclaim'); half-open/dropped data-plane sockets as the OSError family; hop deaths and send
+    timeouts as TimeoutError; a shard still held by an orphaned forward as RuntimeError('shard
+    busy … re-prefill required'). Anything else (shape/dtype/template bugs) stays a real 500 so
+    genuine defects aren't hidden behind retries."""
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    s = str(exc).lower()
+    return any(t in s for t in ("reclaim", "shard busy", "re-prefill", "connection closed",
+                                "connection reset", "timed out", "no control link",
+                                # node-drop/recovery races: the model is being replanned and a
+                                # retry lands on the recovered pipeline
+                                "no model loaded", "not connected", "went down"))
+
+
 def _normalize_ollama_images(messages):
     """#vl-vision: Ollama's NATIVE chat API attaches images as a per-message `images: [<b64>|<url>]`
     array next to a plain-string `content` — a shape BOTH the HF chat template and `_collect_images`
@@ -788,6 +806,18 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             text += piece
             if reason:
                 done_reason = reason
+    except asyncio.CancelledError:
+        # #endpoint-weather: the gen-stall watchdog reclaimed this request (rec["reclaimed"] set
+        # before task.cancel()) — hand the client a clean RETRYABLE 503 instead of an aborted
+        # socket. A user /cancel-/terminate (sets only "cancel"), a client disconnect, and server
+        # shutdown all re-raise: those must NOT invite a retry.
+        if rec is not None and rec.get("reclaimed"):
+            log_activity(f"generate {model}: reclaimed under contention — returned retryable 503")
+            return JSONResponse({"error": "generation reclaimed under backend contention — "
+                                 "endpoint under load, retry with backoff",
+                                 "model": model, "retryable": True},
+                                status_code=503, headers={"Retry-After": "15"})
+        raise
     except Exception as exc:
         import traceback as _tb
         # Surface the cause: a TP forward error (broken all-reduce mesh, shape/quant bug) often has
@@ -795,6 +825,14 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         # hint. Log repr + traceback to the activity feed (and console) and return the type name.
         log_activity(f"generate {model}: FAILED — {exc!r}")
         print(f"[generate] {model} FAILED: {exc!r}\n{_tb.format_exc()}", flush=True)
+        if _transient_gen_exc(exc):
+            # #endpoint-weather: contention-class failure (watchdog reclaim, dropped data-plane
+            # socket, hop timeout, orphaned-forward shard) -> RETRYABLE 503 + Retry-After, never a
+            # bare 500 — a fan-out/agent client must know to back off and ride it out.
+            return JSONResponse({"error": f"transient backend contention "
+                                 f"({type(exc).__name__}: {exc}) — retry with backoff",
+                                 "model": model, "retryable": True},
+                                status_code=503, headers={"Retry-After": "15"})
         return JSONResponse({"error": f"{type(exc).__name__}: {exc}", "model": model},
                             status_code=500)
     dur = time.perf_counter_ns() - t0
@@ -1179,7 +1217,23 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
             full += piece
             if reason:
                 finish = reason
+    except asyncio.CancelledError:
+        # #endpoint-weather: watchdog reclaim (rec["reclaimed"]) -> Anthropic-typed retryable
+        # overload (529 + overloaded_error is what Anthropic SDKs/Claude Code back off on).
+        # User /cancel-/terminate, client disconnects and shutdown re-raise — no retry invite.
+        if rec is not None and rec.get("reclaimed"):
+            return JSONResponse({"type": "error", "error": {"type": "overloaded_error",
+                                 "message": "generation reclaimed under backend contention — "
+                                            "retry with backoff"}},
+                                status_code=529, headers={"Retry-After": "15"})
+        raise
     except Exception as exc:
+        if _transient_gen_exc(exc):
+            # #endpoint-weather: contention-class failure -> retryable overloaded_error, not a 500.
+            return JSONResponse({"type": "error", "error": {"type": "overloaded_error",
+                                 "message": f"transient backend contention "
+                                            f"({type(exc).__name__}: {exc}) — retry with backoff"}},
+                                status_code=529, headers={"Retry-After": "15"})
         return JSONResponse({"type": "error",
                              "error": {"type": "api_error", "message": str(exc)}},
                             status_code=500)
