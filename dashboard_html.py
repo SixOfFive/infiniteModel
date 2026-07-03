@@ -562,8 +562,16 @@ function detailLive(name){
     out+='<h3 style="font-size:13px;margin-top:14px">Operational'+(gen?' · <span style="color:var(--good)">running</span>':'')+'</h3><table class="kv">'+o+'</table>';
   }
   if(m.stages&&m.stages.length){
+    // #real-stats: "on GPU x of NODE-VRAM-total" — gpu_gb is the VRAM this stage MEASURED-placed
+    // (the old bare "GPU 16 GB" read as the card's capacity); the node's real total is pulled
+    // live from the nodes list so nothing about the hardware is assumed. NOTE est includes the
+    // KV reserve, so est-minus-gpu is NOT the CPU-resident weight — don't render that.
+    const _nodes=(LAST.nodes||[]);
     out+='<h3 style="font-size:13px;margin-top:14px">Placement · '+m.stages.length+' stage'+(m.stages.length>1?'s':'')+'</h3><table class="kv">'
-      +m.stages.map(s=>{ const dev=(s.gpu_gb>0)?('<span style="color:var(--good)">GPU '+gb(s.gpu_gb)+'</span>'):'<span class="em">CPU</span>';
+      +m.stages.map(s=>{ const _n=_nodes.find(n=>n.hostname===s.hostname);
+        const cap=(_n&&_n.vram_total_gb)?(' of '+gb(_n.vram_total_gb)+' VRAM'):'';
+        const dev=(s.gpu_gb>0)?('<span style="color:var(--good)">on GPU '+gb(s.gpu_gb)+cap+'</span>')
+                              :'<span class="em">CPU</span>';
         const role=[]; if(s.has_embed)role.push('embed'); if(s.has_head)role.push('head');
         return '<tr><td>'+esc(s.hostname)+'</td><td class="v">L'+s.layer_start+'–'+s.layer_end+' · '+(s.num_layers||0)+'L · '+dev+(role.length?(' · '+role.join('+')):'')+' · est '+gb(s.est_gb)+'</td></tr>';
       }).join('')+'</table>';
