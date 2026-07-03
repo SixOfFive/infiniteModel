@@ -480,7 +480,7 @@ function openLoad(name){
   const ctxDefault = dc>=131072 ? 16384 : (dc||8192);
   const qopt=q=>'<option value="'+q+'">'+q+(cz[q]&&cz[q].ok?' · '+gb(cz[q].size_gb)+' cached':'')+'</option>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load '+esc(name)+'</h3>'
-   +'<div class="grid2"><div><label>Quant</label><select id="l-q" onchange="previewSoon(\''+esc(name)+'\')">'+qopt('int4')+qopt('int8')+'<option value="none">none (bf16)</option></select></div>'
+   +'<div class="grid2"><div><label>Quant</label><select id="l-q" onchange="previewSoon(\''+esc(name)+'\')">'+qopt('int4')+qopt('int8')+'<option value="none">none (bf16)'+(cz.none&&cz.none.ok?' · '+gb(cz.none.size_gb)+' cached':(m.size_gb?' · '+gb(m.size_gb):''))+'</option></select></div>'
    +'<div><label>Context length</label><input id="l-ctx" type="number" value="'+ctxDefault+'" oninput="previewSoon(\''+esc(name)+'\')"></div></div>'
    +'<label>Placement</label><select id="l-place" onchange="_placeChg();previewSoon(\''+esc(name)+'\')">'
    +'<optgroup label="Auto / distribute"><option value="m:auto">auto · GPU-first</option><option value="m:all-gpu">all-GPU</option>'
