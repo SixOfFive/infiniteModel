@@ -163,6 +163,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   .bar{height:5px;background:#0a0e14;border:1px solid var(--border);border-radius:4px;margin-top:7px;overflow:hidden}
   .bar > i{display:block;height:100%;background:var(--accent)}
   .bar.warn > i{background:var(--warn)} .bar.hot > i{background:var(--hot)}
+  /* #pool-split: GPU/RAM pool bars show iM's own usage (green) vs other processes (blue) */
+  .poolbar{display:flex}
+  .poolbar > i{display:block;height:100%}
+  .poolbar > i.prog{background:var(--good)} .poolbar > i.oth{background:var(--accent)}
+  .poolbar.warn{border-color:var(--warn)} .poolbar.hot{border-color:var(--hot)}
   /* section */
   .sec{display:flex;align-items:baseline;gap:10px;margin:22px 0 9px}
   .sec h2{font-size:16px;font-weight:600;margin:0}
@@ -297,11 +302,17 @@ function render(){
   // pool bars: PHYSICAL used (total - free) against PHYSICAL total, one base (#pool-base).
   const vT=p.vram_total_gb||0, rT=p.ram_total_gb||0;
   const vU=Math.max(0,vT-(p.vram_free_gb||0)), rU=Math.max(0,rT-(p.ram_free_gb||0));
+  // #pool-split: GREEN = what InfiniteModel itself uses (sum of loaded models' MEASURED VRAM/RAM),
+  // BLUE = the rest of the physical usage = OTHER processes on the nodes. So any blue beyond the
+  // green tells you something else is holding pool memory. Clamp iM's share to physical-used.
+  const _lm=(d.models||[]).filter(m=>m.loaded);
+  const vProg=Math.min(vU,_lm.reduce((s,m)=>s+(m.vram_used_gb||0),0));
+  const rProg=Math.min(rU,_lm.reduce((s,m)=>s+(m.ram_used_gb||0),0));
   $('#fleet').innerHTML=[
     tile('Nodes', (p.nodes||0)+' <small>· '+(comp.gpus||0)+' GPU</small>'),
     tile('Loaded', loaded+' <small>/ '+reg+' registered</small>'),
-    tile('GPU pool', fmt(vU)+'<small> / '+fmt(vT)+' GB</small>', bar(vU,vT)),
-    tile('RAM pool', fmt(rU)+'<small> / '+fmt(rT)+' GB</small>', bar(rU,rT)),
+    tile('GPU pool', fmt(vU)+'<small> / '+fmt(vT)+' GB</small>', poolbar(vProg,vU-vProg,vT,'InfiniteModel '+fmt(vProg)+' GB (green) · other processes '+fmt(vU-vProg)+' GB (blue) · '+fmt(vT-vU)+' GB free')),
+    tile('RAM pool', fmt(rU)+'<small> / '+fmt(rT)+' GB</small>', poolbar(rProg,rU-rProg,rT,'InfiniteModel '+fmt(rProg)+' GB (green) · other processes '+fmt(rU-rProg)+' GB (blue) · '+fmt(rT-rU)+' GB free')),
     tile('Throughput', ((d.metrics||{}).tokens_per_s||0).toFixed(1)+' <small>tok/s · '+Math.round(comp.overall_pct||0)+'% busy</small>'),
   ].join('');
   renderModels(d,cl);
@@ -352,6 +363,10 @@ async function termClient(ip){
 function fmt(v){return v==null?'—':(Math.round(v*10)/10)}
 function tile(k,v,extra){return '<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div>'+(extra||'')+'</div>';}
 function bar(a,b){const r=pc(a,b);const cls=r>=90?'hot':(r>=70?'warn':'');return '<div class="bar '+cls+'"><i style="width:'+r+'%"></i></div>';}
+// #pool-split: two-segment bar — prog (green, iM's own usage) then other (blue, everything else),
+// both against total. Fullness (green+blue) tints the BORDER warn/hot so the segment colors stay
+// meaningful. tip = hover breakdown.
+function poolbar(prog,other,total,tip){const pp=pc(prog,total),po=pc(Math.max(0,other),total);const cls=(pp+po)>=90?'hot':((pp+po)>=70?'warn':'');return '<div class="bar poolbar '+cls+'" title="'+tip+'"><i class="prog" style="width:'+pp+'%"></i><i class="oth" style="width:'+po+'%"></i></div>';}
 
 // ---- model state derivation: the one source of truth ----
 function mstate(m,cl){
