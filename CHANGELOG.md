@@ -79,8 +79,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   prompt fell back to a flat `user:/assistant:` form, and the model degenerated; with it the native
   `<s>[INST][IMG]…[/INST]` renders. (2) the serving path injects the image placeholder for any tokenizer
   whose template emits none. devstral image→text: *"The image contains a red circle and a blue square."*
-  Covers Devstral / Ministral. (`[IMG_BREAK]`/`[IMG_END]` row-structure tokens are still flat — a tracked
-  refinement.)
+  Covers Devstral / Ministral. **Row structure (#150):** the `[IMG]` run now carries the trained Pixtral
+  layout — `[IMG]×W` per patch row followed by `[IMG_BREAK]`, the last row closed with `[IMG_END]`
+  (ids resolved from the tokenizer, verified by round-trip) — instead of a flat run, so the LM sees where
+  each patch row ends. The per-image `(rows, cols)` grid is derived from `image_sizes` at the same merged
+  cell the processor used; image embeds still splice only into the `[IMG]` slots (break/end keep their own
+  embeddings), and any image whose grid doesn't match its token count falls back to the flat run.
 - **Gemma 4 unified vision** (#143, validated end-to-end on gemma-4:12b-it, 2026-07-03): the
   encoder-free arch — no vision tower at all; `model.embed_vision` (LN → Dense → +factorized-2D-posemb
   → RMSNorm → Linear) projects raw merged pixel patches straight into LM space. The HF image processor

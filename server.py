@@ -1839,12 +1839,31 @@ def _encode_images(target_id: str, images: list) -> dict:
             info.update({"arch": "mistral3", "forward_s": round(time.time() - t_fwd, 1),
                          "raw_return_type": type(feats).__name__, "embeds_shape": list(emb.shape),
                          "path": "get_image_features(pixel_values, image_sizes)"})
+            # #150 Pixtral row structure: per-image merged (H_tok, W_tok) grid so the serve path
+            # can insert [IMG_BREAK] between rows + [IMG_END] at the end (the layout Pixtral/
+            # Mistral3 was trained with). Reuse the EXACT merged cell the image processor was
+            # called with (_ps * _sm, above) so image_sizes — which are multiples of that cell —
+            # divide cleanly; a divergent fallback would silently disable the feature. Emit a grid
+            # ONLY when H·W == this image's count; else [] there (expander falls back to the flat
+            # run for that image — no behavior change).
+            _cell = int(_ps) * int(_sm)
+            grid_rc: list = []
+            try:
+                _sl = sizes.tolist() if hasattr(sizes, "tolist") else (list(sizes) if sizes is not None else [])
+                for i, hw in enumerate(_sl):
+                    h, w = int(hw[0]), int(hw[1])
+                    r, cc = (h // _cell, w // _cell) if _cell > 0 else (0, 0)
+                    grid_rc.append([r, cc] if (i < len(counts) and r * cc == counts[i]) else None)
+                if all(g is None for g in grid_rc):
+                    grid_rc = []
+            except Exception:
+                grid_rc = []
             print(f"[vision] encoded {len(images)} image(s) on {dev} [mistral3]: "
                   f"load={info['load_s']}s forward={info['forward_s']}s -> {list(emb.shape)} "
-                  f"counts={counts} itid={itid}")
+                  f"counts={counts} itid={itid} grid_rc={grid_rc}")
             return {"image_embeds": emb, "grid_thw": None, "info": info, "counts": counts,
                     "image_token_id": itid, "out_hidden": out_hidden, "merge": 1,
-                    "grid_list": [], "pos_scheme": "1d"}
+                    "grid_list": [], "pos_scheme": "1d", "grid_rc": grid_rc}
         visual, _prefix = _resolve_visual(model)
         t_fwd = time.time()
         with torch.inference_mode():

@@ -319,6 +319,29 @@ def _wrap_image_runs(ids: list, itid: int, wrap) -> list:
     return out
 
 
+def _pixtral_break_end(tok, grid_rc):
+    """#150: resolve the [IMG_BREAK]/[IMG_END] ids from the tokenizer for a Pixtral/Mistral3 image
+    run. Returns (grid_rc, break_id, end_id) to pass to _expand_image_placeholders so it inserts
+    the trained row structure — or (None, None, None) when there is no grid (every other arch) or
+    the tokens don't exist in this vocab, so the expander emits the flat run (unchanged)."""
+    if not grid_rc:
+        return None, None, None
+    try:
+        bk = tok.convert_tokens_to_ids("[IMG_BREAK]")
+        ei = tok.convert_tokens_to_ids("[IMG_END]")
+        # Round-trip: the ids MUST map back to the exact control tokens. A vocab without these
+        # tokens resolves them to unk / None / an unrelated id — inserting THAT between rows would
+        # corrupt the run — so verify rather than trust the forward lookup (covers unk_token_id
+        # being None or 0, which a bare `== unk` guard would miss).
+        if not (isinstance(bk, int) and isinstance(ei, int) and bk >= 0 and ei >= 0
+                and tok.convert_ids_to_tokens(bk) == "[IMG_BREAK]"
+                and tok.convert_ids_to_tokens(ei) == "[IMG_END]"):
+            return None, None, None
+    except Exception:
+        return None, None, None
+    return grid_rc, int(bk), int(ei)
+
+
 async def _prepare_vision(target_id: str, tok, ids: list, images: list):
     """#vl-vision: shared image splice for the OpenAI (/v1/chat/completions) + Ollama (/api/chat)
     serve path — the same machinery /v1/messages uses. Encodes the images, expands the image
@@ -341,7 +364,9 @@ async def _prepare_vision(target_id: str, tok, ids: list, images: list):
             _p = 1 if (ids and _bos is not None and ids[0] == _bos) else 0
             ids = list(ids[:_p]) + [int(itid)] * len(counts) + list(ids[_p:])
         ids = _wrap_image_runs(ids, int(itid), enc_res.get("wrap"))   # gemma4 boi/eoi bracket
-        new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts)
+        _grc, _bk, _ei = _pixtral_break_end(tok, enc_res.get("grid_rc"))   # #150 Pixtral rows
+        new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts,
+                                                               grid_rc=_grc, break_id=_bk, end_id=_ei)
         if not (found == len(counts) and len(positions) == n_emb):
             # Degrade from the SNAPSHOT, stripped of any template-rendered bare placeholders —
             # returning the mutated ids here would serve injected placeholders + boi/eoi wrap
@@ -1098,7 +1123,9 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                     print(f"[v1/messages] injected {len(counts)} image placeholder(s) (id "
                           f"{int(itid)}) — tokenizer rendered none (no chat template)")
                 ids = _wrap_image_runs(ids, int(itid), enc_res.get("wrap"))   # gemma4 boi/eoi
-                new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts)
+                _grc, _bk, _ei = _pixtral_break_end(tok, enc_res.get("grid_rc"))   # #150 Pixtral rows
+                new_ids, positions, found = _expand_image_placeholders(ids, int(itid), counts,
+                                                                       grid_rc=_grc, break_id=_bk, end_id=_ei)
                 if found == len(counts) and len(positions) == n_emb:
                     ids, mm = new_ids, (positions, embeds)
                     if enc_res.get("pos_scheme") == "1d":

@@ -351,21 +351,41 @@ def _anthropic_messages_to_chat(system, messages, keep_images: bool = False,
     return chat
 
 
-def _expand_image_placeholders(ids, image_token_id, counts):
+def _expand_image_placeholders(ids, image_token_id, counts,
+                               grid_rc=None, break_id=None, end_id=None):
     """The vision chat template emits ONE image_token (image_token_id) per image; the LM
     needs `counts[i]` of them for image i (= its merged-token count). Replace each single
     placeholder with a run of that many and record the absolute positions (which align, in
-    order, with the rows of the encoder's image_embeds). Returns (new_ids, positions, found)."""
+    order, with the rows of the encoder's image_embeds). Returns (new_ids, positions, found).
+
+    #150 Pixtral/Mistral3 row structure: when grid_rc=[(H,W),...] AND break_id/end_id are given,
+    image i's run is emitted with the layout the model was TRAINED with — [IMG]×W then a
+    [IMG_BREAK] after each patch row, the LAST row's break replaced by [IMG_END] — instead of a
+    flat [IMG]×(H·W) run. `positions` still lists ONLY the image_token_id (embed) slots, row-major
+    and 1:1 with the encoder's image_embeds rows; the break/end tokens are ordinary vocab ids that
+    keep their own learned embeddings (never spliced). Without grid_rc — or if a grid doesn't match
+    its count (safety fallback) — the flat run is emitted, byte-identical to before (every other
+    arch, and the audio path, are untouched)."""
     out: list[int] = []
     positions: list[int] = []
     ci = 0
     for tid in ids:
         if tid == image_token_id:
             c = counts[ci] if ci < len(counts) else 1
+            rc = grid_rc[ci] if (grid_rc and ci < len(grid_rc)) else None
             ci += 1
-            start = len(out)
-            out.extend([image_token_id] * c)
-            positions.extend(range(start, start + c))
+            if (rc and break_id is not None and end_id is not None
+                    and len(rc) == 2 and int(rc[0]) * int(rc[1]) == c and c > 0):
+                H, W = int(rc[0]), int(rc[1])
+                for r in range(H):
+                    start = len(out)
+                    out.extend([image_token_id] * W)
+                    positions.extend(range(start, start + W))
+                    out.append(int(end_id) if r == H - 1 else int(break_id))
+            else:
+                start = len(out)
+                out.extend([image_token_id] * c)
+                positions.extend(range(start, start + c))
         else:
             out.append(tid)
     return out, positions, ci
