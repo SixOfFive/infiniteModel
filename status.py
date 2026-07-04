@@ -125,6 +125,22 @@ def build_status() -> dict:
         ram_weights = max(0, weights_total - vram_used)
         kv_reserved = lm.spec.kv_bytes_per_layer(lm.ctx) * lm.spec.num_layers
         kv_used = lm.spec.kv_bytes_per_layer(lm.kv_pos) * lm.spec.num_layers
+        # #172: under TurboQuant KV the worker RESERVES the bit-packed footprint, not bf16 — so report
+        # the honest reserved/used (packed all-layers + one bf16 dequant transient for reserved) instead
+        # of the bf16 spec estimate, which would overstate the card ~4-5x. Falls back to the bf16
+        # estimate on any error. kv_quant='none' leaves both untouched (bit-identical).
+        _kvq = (getattr(lm, "kv_quant", "none") or "none")
+        if _kvq != "none":
+            try:
+                import kv_quant
+                _pt = kv_quant.kv_quant_bytes_per_token_per_layer(
+                    _kvq, lm.spec.num_kv_heads, lm.spec.head_dim)
+                if _pt > 0:
+                    kv_reserved = _pt * lm.ctx * lm.spec.num_layers \
+                        + lm.spec.kv_bytes_per_layer(lm.ctx)   # + one bf16 transient (mirrors worker)
+                    kv_used = _pt * lm.kv_pos * lm.spec.num_layers
+            except Exception:
+                pass   # keep the bf16 spec estimate (conservative)
         _arch = (getattr(lm.spec, "arch", "") or "").lower()
         # best-effort MoE flag for the detail modal: fused/per-expert MoE arches all contain one of
         # these tokens ('moe' covers olmoe/qwen3*_moe; mixtral/minimax/deepseek_v2,v3 named directly).
