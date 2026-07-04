@@ -1079,14 +1079,28 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
             atid = enc_res.get("audio_token_id")
             n_emb = int(embeds.shape[0]) if embeds is not None else 0
             if atid is not None and n_emb and sum(counts) == n_emb:
+                # #144 gemma4 audio: the chat template may render no audio placeholder (like the
+                # Mistral3 vision case) — inject one audio token per clip after any leading BOS so
+                # the run can be expanded + spliced. Archs whose template already emits it are as-is.
+                if ids.count(int(atid)) != len(counts):
+                    _bos = getattr(tok, "bos_token_id", None)
+                    _p = 1 if (ids and _bos is not None and ids[0] == _bos) else 0
+                    ids = list(ids[:_p]) + [int(atid)] * len(counts) + list(ids[_p:])
+                    print(f"[v1/messages] injected {len(counts)} audio placeholder(s) (id {int(atid)})")
+                ids = _wrap_image_runs(ids, int(atid), enc_res.get("wrap"))   # #144 gemma4 boa/eoa
                 new_ids, positions, found = _expand_image_placeholders(ids, int(atid), counts)
                 if found == len(counts) and len(positions) == n_emb:
                     ids, mm = new_ids, (positions, embeds)
-                    # audio-only TMRoPE = sequential 0..seq-1 on all 3 dims (see
-                    # _audio_position_ids); positions grow normally, unlike images.
-                    mrope = _audio_position_ids(len(ids))
-                    print(f"[v1/messages] audio: {len(audios)} clip(s) -> {len(positions)} "
-                          f"audio tokens spliced (counts={counts}); TMRoPE base={mrope[1]}")
+                    if enc_res.get("pos_scheme") == "1d":
+                        mrope = None   # #144 gemma4 audio: plain 1D positions (no TMRoPE)
+                        print(f"[v1/messages] audio: {len(audios)} clip(s) -> {len(positions)} "
+                              f"audio tokens spliced (counts={counts}, pos=1d)")
+                    else:
+                        # audio-only TMRoPE = sequential 0..seq-1 on all 3 dims (see
+                        # _audio_position_ids); positions grow normally, unlike images.
+                        mrope = _audio_position_ids(len(ids))
+                        print(f"[v1/messages] audio: {len(audios)} clip(s) -> {len(positions)} "
+                              f"audio tokens spliced (counts={counts}); TMRoPE base={mrope[1]}")
                 else:
                     print(f"[v1/messages] audio MISMATCH: found {found} placeholder(s) "
                           f"(expected {len(counts)}), {len(positions)} positions vs {n_emb} "

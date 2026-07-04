@@ -972,6 +972,128 @@ def _load_audio_encoder(target_id: str):
     return model, dev
 
 
+# ============= #144 Gemma 4 unified: encoder-free AUDIO (mirror of the #143 vision path) =============
+# Gemma-4's unified audio is torchvision-free and mel-free: each frame of audio_samples_per_token
+# (640) RAW waveform samples becomes one soft token; model.embed_audio (a scale-free RMSNorm -> a
+# single Linear 640->text_hidden) projects them straight into LM space. We frame the waveform
+# ourselves (the HF Gemma4UnifiedAudioFeatureExtractor is a trivial reshape), meta-build the model
+# and materialize ONLY model.embed_audio (1 tensor), then drive get_audio_features.
+_G4AUDIO_CACHE: dict = {}
+
+
+def _read_processor_cfg(target_id: str) -> dict:
+    """The whole processor_config.json dict for a model (or {}). This arch keeps the image + audio
+    processor configs there (no preprocessor_config.json)."""
+    import json
+    for _res in (_LOCAL_DIR_FN, _MODEL_DIR_FN):
+        if _res is None:
+            continue
+        with contextlib.suppress(Exception):
+            d = _res(target_id)
+            pc = os.path.join(d, "processor_config.json") if d else None
+            if pc and os.path.exists(pc):
+                with open(pc, "r", encoding="utf-8") as f:
+                    return json.load(f) or {}
+    return {}
+
+
+def _gemma4_audio_preprocess(audios, target_id: str) -> dict:
+    """[1-D float32 waveforms @16kHz] -> Gemma4 unified audio features, a torchvision-free reimpl of
+    Gemma4UnifiedAudioFeatureExtractor: zero-pad each waveform to a multiple of
+    audio_samples_per_token (640) and reshape to [n_frames, 640] — each frame is one soft token
+    (40ms @16kHz), RAW samples with NO mel/normalization — then batch-pad to the longest with a
+    bool mask. Truncate to audio_seq_length (750, the model's positional limit). Returns
+    {input_features [B,T,640], input_features_mask [B,T] bool, counts [B]}."""
+    import numpy as np
+    import torch
+    pc = _read_processor_cfg(target_id)
+    fe = pc.get("feature_extractor") or {}
+    spt = int(fe.get("audio_samples_per_token", 640) or 640)
+    max_tok = int(pc.get("audio_seq_length", 750) or 750)
+    frames, counts, dropped = [], [], 0
+    for wav in audios:
+        w = np.asarray(wav, dtype=np.float32).reshape(-1)
+        if w.size == 0:
+            w = np.zeros(spt, dtype=np.float32)
+        n_full = (w.size + spt - 1) // spt          # ceil frames = what the reference emits
+        n = min(n_full, max_tok)                     # cap at audio_seq_length (the model's own
+        if n < n_full:                               # documented upper bound) — but NEVER silently
+            dropped += (n_full - n)
+        w = w[:n * spt]
+        if w.size < n * spt:
+            w = np.concatenate([w, np.zeros(n * spt - w.size, dtype=np.float32)])
+        frames.append(torch.from_numpy(w.reshape(n, spt)))
+        counts.append(n)
+    T = max(counts) if counts else 0
+    feats = torch.zeros(len(frames), T, spt, dtype=torch.float32)
+    mask = torch.zeros(len(frames), T, dtype=torch.bool)
+    for i, (f, n) in enumerate(zip(frames, counts)):
+        feats[i, :n] = f
+        mask[i, :n] = True
+    # dropped_seconds so the caller can LOG the truncation (the reference doesn't cap; we do, for
+    # prompt-size safety, but must not drop audio silently).
+    return {"input_features": feats, "input_features_mask": mask, "counts": counts,
+            "dropped_frames": dropped, "dropped_seconds": round(dropped * spt / 16000.0, 1),
+            "max_tokens": max_tok}
+
+
+def _gemma4_audio_token_ids(model):
+    """(audio_token_id, boa_token_id, eoa_token_id) for gemma4 unified — the audio analog of the
+    boi/eoi bracket around the image run. eoa is stored as 'eoa_token_index' in the config."""
+    cfg = getattr(model, "config", None)
+    atid = getattr(cfg, "audio_token_id", None)
+    boa = getattr(cfg, "boa_token_id", None)
+    eoa = getattr(cfg, "eoa_token_id", None)
+    if eoa is None:
+        eoa = getattr(cfg, "eoa_token_index", None)
+    return (int(atid) if atid is not None else None,
+            int(boa) if boa is not None else None,
+            int(eoa) if eoa is not None else None)
+
+
+def _load_gemma4_audio_encoder(target_id: str):
+    """Meta-build the Gemma4 unified model (ZERO memory — text LM stays on meta) and materialize
+    ONLY model.embed_audio (a single embedding_projection.weight; the RMSNorm is scale-free) so
+    get_audio_features runs without the text model. Mirrors _load_vision_encoder's gemma4 path;
+    no checkpoint rename is needed (embed_audio.* keys already match the built module). Cached."""
+    cached = _G4AUDIO_CACHE.get(target_id)
+    if cached is not None:
+        return cached
+    import glob
+    import torch
+    from safetensors import safe_open
+    from transformers import AutoConfig, AutoModelForImageTextToText
+    t0 = time.time()
+    _vlog(f"[audio] gemma4 load START {target_id}")
+    cfg = AutoConfig.from_pretrained(target_id)
+    with torch.device("meta"):
+        model = AutoModelForImageTextToText.from_config(cfg)
+    model.eval()
+    inner = getattr(model, "model", None)
+    ea = getattr(inner, "embed_audio", None) if inner is not None else None
+    if ea is None:
+        raise RuntimeError(f"{type(model).__name__} has no model.embed_audio (not a unified-audio gemma4)")
+    model_dir = _MODEL_DIR_FN(target_id)
+    files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    prefix = "model.embed_audio."
+    sd = {}
+    for fn in files:
+        with safe_open(fn, framework="pt") as fh:
+            for k in fh.keys():
+                if k.startswith(prefix):
+                    sd[k[len(prefix):]] = fh.get_tensor(k)
+    if not sd:
+        raise RuntimeError(f"no '{prefix}*' weights in {model_dir}")
+    ea.load_state_dict(sd, strict=False, assign=True)
+    dev = _pick_audio_device()
+    mat = _materialize_meta_tensors(ea, dev)
+    ea.to(dev)
+    _vlog(f"[audio] gemma4 encoder READY {target_id}: {len(sd)} tensor(s) on {dev} "
+          f"in {time.time() - t0:.1f}s; materialized {len(mat)}")
+    _G4AUDIO_CACHE[target_id] = (model, dev)
+    return model, dev
+
+
 _AUDIOFE_CACHE: dict = {}   # target_id -> WhisperFeatureExtractor
 
 

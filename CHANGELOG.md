@@ -101,6 +101,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   location imprecision observed). Side-fix: gemma-4's `chat_template.jinja` was missing from the model
   dir, so even TEXT prompts had been served through the flat fallback — with it in place the native
   `<|turn>` form renders (and `<turn|>`=106 was already a registered stop).
+- **Gemma 4 unified audio** (#144, speech→text): the audio analog of the encoder-free vision path,
+  equally torchvision-free and mel-free — each frame of `audio_samples_per_token`=640 **raw** waveform
+  samples (40 ms @16 kHz) is one soft token, and `model.embed_audio` (a scale-free RMSNorm → a single
+  `Linear` 640→text-hidden) projects them straight into LM space. The HF feature extractor is a trivial
+  reshape, reimplemented directly (zero-pad each waveform to a multiple of 640, frame, batch-pad with a
+  bool mask); the model is meta-built and only `model.embed_audio` (one tensor) is materialized, then
+  `get_audio_features(input_features, input_features_mask)` runs with no downsampling so its output
+  aligns 1:1 with the mask. Each `<audio_soft_token>` (258881) run is bracketed `boa`/`eoa` and expanded
+  to the real per-clip frame count, spliced with plain 1D positions. Clips beyond `audio_seq_length`
+  (750 tokens ≈ 30 s, the model's documented cap) are truncated with a logged warning (never silently).
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8

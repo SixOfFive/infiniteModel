@@ -1710,6 +1710,7 @@ from multimodal import (_get_tokenizer, _get_processor, _decode_image, _collect_
                         _gemma4_preprocess,
                         _as_feature_tensor, _pick_merged_embeds, _pick_audio_device,
                         _load_audio_encoder, _get_audio_feature_extractor, _omni_audio_token_id,
+                        _gemma4_audio_preprocess, _load_gemma4_audio_encoder, _gemma4_audio_token_ids,
                         _audio_out_lengths, _resolve_speaker, _encode_audio_response,
                         _VISION_LOG,
                         _TOK_CACHE, _PROCESSOR_CACHE, _IMGPROC_CACHE, _AUDIOFE_CACHE,
@@ -1909,16 +1910,76 @@ def _encode_images(target_id: str, images: list) -> dict:
         ENCODING -= 1
 
 
+def _encode_audio_gemma4(target_id: str, audios: list, sampling_rate: int, t0: float) -> dict:
+    """#144 Gemma-4 unified audio (mirror of the #143 encoder-free vision path): frame the waveform
+    into 640-sample soft tokens and project them through model.embed_audio via get_audio_features.
+    Returns per-audio-token embeds to splice at the audio_token (258881) positions, bracketed
+    boa/eoa, with plain 1D positions (pos_scheme '1d' — the serve path then skips TMRoPE)."""
+    import torch
+    model, dev = _load_gemma4_audio_encoder(target_id)
+    inner = getattr(model, "model", model)
+    pre = _gemma4_audio_preprocess(audios, target_id)
+    if pre.get("dropped_frames"):   # #144: cap at audio_seq_length is a safety bound, never silent
+        print(f"[audio] WARN gemma4 audio TRUNCATED: dropped {pre['dropped_frames']} frame(s) "
+              f"(~{pre['dropped_seconds']}s) past the {pre['max_tokens']}-token cap")
+    feats = pre["input_features"].to(dev)
+    mask = pre["input_features_mask"].to(dev)
+    t_load = time.time()
+    cfg = model.config
+    tcfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else getattr(cfg, "text_config", cfg)
+    out_hidden = getattr(tcfg, "hidden_size", None)
+    gaf = getattr(model, "get_audio_features", None) or getattr(inner, "get_audio_features")
+    t_fwd = time.time()
+    with torch.inference_mode():
+        out = gaf(feats, input_features_mask=mask)
+    ft = None
+    for _a in ("audio_features", "audio_embeds", "last_hidden_state", "pooler_output"):
+        _v = getattr(out, _a, None)
+        if isinstance(_v, torch.Tensor):
+            ft = _v
+            break
+    if ft is None:
+        ft = _pick_merged_embeds(out, out_hidden)
+    # get_audio_features has NO downsampling (unified model), so [B,T,H] aligns with the [B,T] mask —
+    # mask-select the valid frames into a flat [sum(valid), H] in row-major (audio, token) order.
+    if ft.dim() == 3:
+        emb = ft[mask]
+    else:
+        emb = ft.reshape(-1, ft.shape[-1])
+    counts = [int(x) for x in mask.sum(-1).tolist()]
+    if out_hidden is None:
+        out_hidden = int(emb.shape[-1])
+    atid, boa, eoa = _gemma4_audio_token_ids(model)
+    info = {"device": str(dev), "arch": "gemma4_unified", "load_s": round(t_load - t0, 1),
+            "forward_s": round(time.time() - t_fwd, 1), "embeds_shape": list(emb.shape)}
+    if sum(counts) != int(emb.shape[0]):
+        print(f"[audio] WARN gemma4 counts sum {sum(counts)} != embeds {emb.shape[0]}")
+    print(f"[audio] encoded {len(audios)} clip(s) on {dev} [gemma4_unified]: "
+          f"load={info['load_s']}s forward={info['forward_s']}s -> {list(emb.shape)} "
+          f"counts={counts} atid={atid} boa/eoa={boa}/{eoa}")
+    return {"audio_embeds": emb, "counts": counts, "audio_token_id": atid,
+            "out_hidden": out_hidden, "info": info,
+            "wrap": ((boa, eoa) if (boa is not None and eoa is not None) else None),
+            "pos_scheme": "1d"}
+
+
 def _encode_audio(target_id: str, audios: list, sampling_rate: int = 16000) -> dict:
-    """Run the feature extractor + Omni audio tower. `audios` is a list of 1-D float32
-    waveforms at `sampling_rate` Hz. Returns {audio_embeds [total_tokens, hidden], counts
-    (per-audio token counts), audio_token_id, out_hidden, info}. audio_embeds are the
-    per-audio-token features to splice at <|AUDIO|> positions (increment 5c)."""
+    """Run the feature extractor + audio tower. `audios` is a list of 1-D float32 waveforms at
+    `sampling_rate` Hz. Returns {audio_embeds [total_tokens, hidden], counts (per-audio token
+    counts), audio_token_id, out_hidden, info}. audio_embeds are the per-audio-token features to
+    splice at the audio-placeholder positions. Routes Gemma-4 unified audio (#144) to its
+    encoder-free path; every other audio model (Qwen2.5-Omni) uses the feature-extractor + tower."""
     import torch
     global ENCODING
     ENCODING += 1   # keep the self-update idle gate closed while we encode
     try:
         t0 = time.time()
+        from transformers import AutoConfig
+        _mtype = ""
+        with contextlib.suppress(Exception):
+            _mtype = getattr(AutoConfig.from_pretrained(target_id), "model_type", "") or ""
+        if _mtype == "gemma4_unified":
+            return _encode_audio_gemma4(target_id, audios, sampling_rate, t0)
         fe = _get_audio_feature_extractor(target_id)
         model, dev = _load_audio_encoder(target_id)
         t_load = time.time()
