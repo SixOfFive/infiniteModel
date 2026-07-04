@@ -402,3 +402,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   history/metrics block was analysed for extraction too but deliberately **left in server.py** — it's
   movable but needs ~16 back-imports (server would re-import almost the whole API) plus the
   `graphs.set_history_sources` identity invariant, i.e. a line-count move with little real decoupling.
+- **Multimodal-adapter dedup (#147):** the encoder-free Gemma-4 vision (#143) and audio (#144) loaders
+  had grown a duplicated "meta-build the model, then materialize only the multimodal submodule(s) from
+  the raw safetensors" loop. That loop — read raw keys per `(submodule, prefix)`, apply per-arch stored-name
+  renames before matching, try both the qualified prefix and the `model.`-stripped candidate (Mistral3),
+  assign-load, materialize meta buffers, move to device — is now the single `_materialize_submodules(...)`
+  helper that both `_load_vision_encoder` (all image arches: Omni / Qwen-VL / Mistral3 / gemma4 / standard)
+  and `_load_gemma4_audio_encoder` call. Behaviour is byte-for-byte the pre-refactor vision loop
+  (re-validated end-to-end on gemma-4 vision, gemma-4 audio, and Mistral3 split-tower vision).

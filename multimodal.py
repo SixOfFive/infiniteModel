@@ -549,49 +549,23 @@ def _vision_cfg_and_token(model):
     return vcfg, itid
 
 
-def _load_vision_encoder(target_id: str):
-    """Meta-load the full multimodal model (ZERO memory — text LM stays on meta) and
-    materialize ONLY the vision tower from the safetensors, so we can run the tower without
-    loading the big text model. Handles standard layout (model.model.visual) AND Qwen2.5-Omni
-    (model.thinker.visual, built via AutoModelForTextToWaveform). Cached per target_id."""
-    cached = _VISION_CACHE.get(target_id)
-    if cached is not None:
-        return cached
-    import torch, glob
-    from transformers import AutoConfig
+def _materialize_submodules(mods, renames, model_dir, dev, tag, mat_store, target_id):
+    """#147: the shared meta->real materialize used by BOTH the vision loader and the gemma4-audio
+    loader (was duplicated). For each (submodule, prefix) in `mods`: read the RAW safetensors keys
+    under that prefix — applying `renames` (per-arch stored-name fixes, e.g. gemma4's
+    vision_embedder.*) to each key BEFORE matching, and trying both the qualified prefix AND the
+    'model.'-stripped candidate (Mistral3 stores vision_tower.* / multi_modal_projector.*
+    un-'model.'-wrapped) — then assign-load, materialize any meta buffers (rotary inv_freq stays on
+    meta after an assign-load) onto `dev`, and move the submodule to `dev`. Records materialize
+    diagnostics in mat_store[target_id]. `tag` = the log prefix ('vision'/'audio'). Returns the
+    total tensor count. Behaviour is byte-for-byte the pre-refactor vision loop."""
+    import glob
     from safetensors import safe_open
-    t0 = time.time()
-    _vlog(f"[vision] load START {target_id}")
-    cfg = AutoConfig.from_pretrained(target_id)
-    is_omni = getattr(cfg, "thinker_config", None) is not None
-    _vlog(f"[vision] config loaded ({'Omni' if is_omni else 'standard'}); meta-building model ...")
-    with torch.device("meta"):
-        if is_omni:
-            from transformers import AutoModelForTextToWaveform
-            model = AutoModelForTextToWaveform.from_config(cfg)
-        else:
-            from transformers import AutoModelForImageTextToText
-            model = AutoModelForImageTextToText.from_config(cfg)
-    model.eval()
-    t_meta = time.time()
-    _vlog(f"[vision] meta-built {type(model).__name__} in {t_meta - t0:.1f}s")
-    mods = _visual_modules(model)
-    model_dir = _MODEL_DIR_FN(target_id)
     files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    dev = _pick_vision_device()
-    _vlog(f"[vision] {len(mods)} vision submodule(s) to materialize "
+    _vlog(f"[{tag}] {len(mods)} submodule(s) to materialize "
           f"({', '.join(p for _, p in mods)}); scanning {len(files)} shard(s); device={dev}")
     total, mat_all = 0, []
-    renames = _vision_ckpt_renames(model)
     for submod, prefix in mods:
-        # The checkpoint may store this submodule under the in-memory qualified prefix
-        # ('model.vision_tower.') OR the raw original prefix without the 'model.' wrapper
-        # ('vision_tower.' — e.g. Devstral/Mistral3, whose checkpoint keys are vision_tower.* /
-        # multi_modal_projector.* / language_model.*). transformers bridges these via
-        # _checkpoint_conversion_mapping at a normal load; we read RAW safetensors keys, so try
-        # both candidates and use whichever the checkpoint actually has. Per-arch stored-name
-        # renames (gemma4's vision_embedder.* — see _vision_ckpt_renames) are applied to each
-        # raw key BEFORE prefix-matching, mirroring transformers' WeightRenaming pass.
         cands = [prefix] + ([prefix[len("model."):]] if prefix.startswith("model.") else [])
         sd, used = {}, None
         for cand in cands:
@@ -611,22 +585,49 @@ def _load_vision_encoder(target_id: str):
             sd = {}
         if not sd:
             raise RuntimeError(f"no weights for any of {cands} in {model_dir}")
-        # Computed non-persistent buffers (rotary inv_freq) stay on meta after the assign-load;
-        # _materialize_meta_tensors gives them real storage on `dev` (arch-correct for 2D rope)
-        # so the .to(dev) below is safe.
         submod.load_state_dict(sd, strict=False, assign=True)
         mat = _materialize_meta_tensors(submod, dev)
         submod.to(dev)
         total += len(sd)
         mat_all += mat
-        _vlog(f"[vision]   '{used}': {len(sd)} tensors assign-loaded + moved to {dev}; "
+        _vlog(f"[{tag}]   '{used}': {len(sd)} tensors assign-loaded + moved to {dev}; "
               f"materialized {len(mat)} meta tensor(s)")
-    _VISION_MAT[target_id] = mat_all
+    mat_store[target_id] = mat_all
     missing = [m for m in mat_all if "MISSING_" in m[2]]   # MISSING_WEIGHT or MISSING_ROTARY
-    _vlog(f"[vision] encoder READY {target_id}: {total} tensors across {len(mods)} "
+    _vlog(f"[{tag}] encoder READY {target_id}: {total} tensors across {len(mods)} "
           f"submodule(s) on {dev}; materialized {len(mat_all)}"
           + (f"; WARNING {len(missing)} missing: {[m[0] for m in missing][:5]}"
              if missing else ""))
+    return total
+
+
+def _load_vision_encoder(target_id: str):
+    """Meta-load the full multimodal model (ZERO memory — text LM stays on meta) and
+    materialize ONLY the vision tower from the safetensors, so we can run the tower without
+    loading the big text model. Handles standard layout (model.model.visual) AND Qwen2.5-Omni
+    (model.thinker.visual, built via AutoModelForTextToWaveform). Cached per target_id."""
+    cached = _VISION_CACHE.get(target_id)
+    if cached is not None:
+        return cached
+    import torch
+    from transformers import AutoConfig
+    t0 = time.time()
+    _vlog(f"[vision] load START {target_id}")
+    cfg = AutoConfig.from_pretrained(target_id)
+    is_omni = getattr(cfg, "thinker_config", None) is not None
+    _vlog(f"[vision] config loaded ({'Omni' if is_omni else 'standard'}); meta-building model ...")
+    with torch.device("meta"):
+        if is_omni:
+            from transformers import AutoModelForTextToWaveform
+            model = AutoModelForTextToWaveform.from_config(cfg)
+        else:
+            from transformers import AutoModelForImageTextToText
+            model = AutoModelForImageTextToText.from_config(cfg)
+    model.eval()
+    _vlog(f"[vision] meta-built {type(model).__name__} in {time.time() - t0:.1f}s")
+    dev = _pick_vision_device()
+    _materialize_submodules(_visual_modules(model), _vision_ckpt_renames(model),
+                            _MODEL_DIR_FN(target_id), dev, "vision", _VISION_MAT, target_id)
     _VISION_CACHE[target_id] = (model, dev)
     return model, dev
 
@@ -1059,9 +1060,7 @@ def _load_gemma4_audio_encoder(target_id: str):
     cached = _G4AUDIO_CACHE.get(target_id)
     if cached is not None:
         return cached
-    import glob
     import torch
-    from safetensors import safe_open
     from transformers import AutoConfig, AutoModelForImageTextToText
     t0 = time.time()
     _vlog(f"[audio] gemma4 load START {target_id}")
@@ -1073,23 +1072,11 @@ def _load_gemma4_audio_encoder(target_id: str):
     ea = getattr(inner, "embed_audio", None) if inner is not None else None
     if ea is None:
         raise RuntimeError(f"{type(model).__name__} has no model.embed_audio (not a unified-audio gemma4)")
-    model_dir = _MODEL_DIR_FN(target_id)
-    files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    prefix = "model.embed_audio."
-    sd = {}
-    for fn in files:
-        with safe_open(fn, framework="pt") as fh:
-            for k in fh.keys():
-                if k.startswith(prefix):
-                    sd[k[len(prefix):]] = fh.get_tensor(k)
-    if not sd:
-        raise RuntimeError(f"no '{prefix}*' weights in {model_dir}")
-    ea.load_state_dict(sd, strict=False, assign=True)
     dev = _pick_audio_device()
-    mat = _materialize_meta_tensors(ea, dev)
-    ea.to(dev)
-    _vlog(f"[audio] gemma4 encoder READY {target_id}: {len(sd)} tensor(s) on {dev} "
-          f"in {time.time() - t0:.1f}s; materialized {len(mat)}")
+    # #147: no checkpoint rename needed (embed_audio.* keys already match the built module).
+    _materialize_submodules([(ea, "model.embed_audio.")], [], _MODEL_DIR_FN(target_id),
+                            dev, "audio", _AUDIO_MAT, target_id)
+    _vlog(f"[audio] gemma4 encoder READY {target_id} in {time.time() - t0:.1f}s")
     _G4AUDIO_CACHE[target_id] = (model, dev)
     return model, dev
 
