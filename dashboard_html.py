@@ -741,6 +741,22 @@ async function openDetail(name){
       +'<div style="margin-top:8px"><button class="btn sm pri" onclick="applyRt(\''+esc(name)+'\')">Apply</button> '
       +'<span class="em" style="font-size:11px">empty = unset · each box\'s dropdown lists common values (free typing works too) · quant / ctx / KV placement still need a reload</span></div>';
   }
+  // #tts-panel: a loaded speech-out model (capability 'tts' — Qwen2.5-Omni) gets an inline
+  // synthesize box: type text, pick a voice, POST /v1/audio/speech, play + download the WAV.
+  // STATIC (outside #dlive) so the per-poll live refresh can't wipe the textarea mid-typing.
+  let tts='';
+  if(m.loaded && (m.capabilities||[]).includes('tts')){
+    const _ist='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    tts='<h3 style="font-size:13px;margin-top:14px">Text-to-speech <span class="em" style="font-weight:normal">· synthesize a WAV from text via the Omni speech pipeline</span></h3>'
+      +'<textarea id="tts-text" rows="3" placeholder="Type text to speak…" style="width:100%;box-sizing:border-box;resize:vertical;'+_ist+'">Hello! This is a test of the InfiniteModel speech engine.</textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)">Voice</label>'
+      +'<select id="tts-voice" style="'+_ist+'"><option>Chelsie</option><option>Ethan</option></select>'
+      +'<button class="btn sm pri" onclick="ttsSpeak(\''+esc(name)+'\')">Speak ▶</button>'
+      +'<span id="tts-status" class="em" style="font-size:11px"></span></div>'
+      +'<audio id="tts-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
+      +'<div><a id="tts-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
+  }
   let acts='';
   if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
@@ -750,7 +766,7 @@ async function openDetail(name){
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+pre
+    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+tts+pre
     +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
@@ -771,6 +787,27 @@ async function applyRt(name){
        toast('runtime settings applied · '+(ks.length?ks.map(k=>k+'='+d[k]).join(' · '):'all unset'));
        tick(); }
   catch(e){ toast(String(e.message||e),1); }
+}
+// #tts-panel: synthesize speech from the detail modal. Raw fetch (NOT api(), which parses JSON) —
+// /v1/audio/speech returns binary audio; read it as a blob, play it, and offer a download. Object
+// URLs are revoked on the next synth so repeated runs don't leak. Errors (503 load/capacity, 400
+// empty input) come back as a JSON body even on this binary endpoint, so decode + surface them.
+async function ttsSpeak(name){
+  const t=$('#tts-text'), st=$('#tts-status'), au=$('#tts-audio'), dl=$('#tts-dl');
+  const text=(t&&t.value||'').trim(), voice=($('#tts-voice')||{}).value||'Chelsie';
+  if(!text){ if(st)st.textContent='enter some text first'; return; }
+  if(st)st.textContent='synthesizing…'; const t0=Date.now();
+  try{
+    const r=await fetch('/v1/audio/speech',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:name,input:text,voice:voice,response_format:'wav'})});
+    if(!r.ok){ let msg='HTTP '+r.status; try{ const j=await r.json(); msg=(j.error&&j.error.message)||j.error||msg; }catch(e){} throw new Error(msg); }
+    const blob=await r.blob();
+    if(au._url)URL.revokeObjectURL(au._url);
+    const url=URL.createObjectURL(blob); au._url=url;
+    au.src=url; au.style.display='block'; au.play().catch(()=>{});
+    dl.href=url; dl.download=name.replace(/[^a-z0-9]+/gi,'_')+'.wav'; dl.style.display='inline';
+    if(st)st.textContent='done · '+Math.round(blob.size/1024)+' KB · '+((Date.now()-t0)/1000).toFixed(1)+'s';
+  }catch(e){ if(st)st.textContent='error: '+(e.message||e); }
 }
 // Context viewer: one scrollable popup showing the IN/OUT flow of recent requests (newest first).
 // History is kept only while the model is resident (cleared on unload).
