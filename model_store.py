@@ -514,10 +514,24 @@ def _spec_from_config(model_dir: str, name: str) -> Optional[ModelSpec]:
     # Generation / LMHead). A causal model like Qwen (Qwen2ForCausalLM) yields False.
     _archs = c.get("architectures") or []
     _mt = str(c.get("model_type") or "").lower()
-    is_embedding = (_mt in {"nomic_bert", "bert", "roberta", "xlm-roberta", "mpnet", "new"}
-                    or (bool(_archs) and all(("ForCausalLM" not in a and "ForConditionalGeneration" not in a
-                                              and "LMHead" not in a) for a in _archs)
-                        and any(a.endswith("Model") for a in _archs)))
+    # A COMPOSITE generative multimodal checkpoint (Qwen2.5-Omni, a VLM, …) is NOT an encoder even
+    # when its TOP-LEVEL architecture is a bare '*Model' name: Qwen2.5-Omni declares
+    # architectures=["Qwen2_5OmniModel"], which otherwise trips the *Model heuristic below and mis-
+    # flags it is_embedding -> the single-node AutoModel embedding load, which transformers CANNOT
+    # build (Qwen2_5OmniConfig has no AutoModel mapping) -> the load hard-fails. Such configs nest a
+    # generative sub-config (thinker/talker/token2wav/text_config) or a modality tower (vision/audio);
+    # a flat encoder (BERT / nomic) nests NONE of these. Excluding composites keeps Omni on the
+    # pipeline Thinker path (worker hand-builds Qwen2_5OmniThinkerTextModel), which /v1/audio/speech
+    # then drives via the controller-side Talker + Token2Wav. (These markers survive the text_config
+    # merge above: it only overwrites text-dim keys, never the sub-config keys themselves.)
+    _composite = any(c.get(k) is not None for k in
+                     ("thinker_config", "talker_config", "token2wav_config",
+                      "text_config", "vision_config", "audio_config"))
+    is_embedding = (not _composite
+                    and (_mt in {"nomic_bert", "bert", "roberta", "xlm-roberta", "mpnet", "new"}
+                         or (bool(_archs) and all(("ForCausalLM" not in a and "ForConditionalGeneration" not in a
+                                                   and "LMHead" not in a) for a in _archs)
+                             and any(a.endswith("Model") for a in _archs))))
     return ModelSpec(name, hidden, layers, heads, kv, head_dim, inter, vocab,
                      tie_embeddings=bool(c.get("tie_word_embeddings", False)),
                      arch=str(c.get("model_type") or "llama"),
