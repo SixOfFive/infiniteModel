@@ -486,14 +486,17 @@ function renderNodes(d){
   $('#ncount').textContent=ns.length+' nodes';
   $('#nodes').innerHTML=ns.map(n=>{
     const gpu=n.has_gpu;
-    const used=gpu?(n.vram_used_gb||0):((n.total_mem_gb||0)-(n.free_mem_gb||0));
-    const tot=gpu?(n.vram_total_gb||0):(n.total_mem_gb||0);
     const util=gpu?('GPU '+Math.round(n.gpu_util||0)+'%'):('CPU '+Math.round(n.cpu_percent||0)+'%');
     const dev=gpu?(n.device_name||'GPU'):((n.cores||'')+'c CPU');
     const off=(!n.alive)?' <span class="err">offline</span>':'';
+    const memRow=(lab,used,tot)=>'<div class="mb"><span class="lab">'+lab+'</span>'+bar(used,tot)
+      +'<span style="font-size:11px;color:var(--muted);white-space:nowrap">'+fmt(used)+' / '+fmt(tot)+'</span></div>';
+    // GPU nodes show both VRAM and RAM; CPU-only nodes show RAM alone.
+    const ramUsed=Math.max(0,(n.total_mem_gb||0)-(n.free_mem_gb||0));
+    let mem=gpu?memRow('VRAM',(n.vram_used_gb||0),(n.vram_total_gb||0)):'';
+    mem+=memRow('RAM',ramUsed,(n.total_mem_gb||0));
     return '<div class="node"><div class="nn">'+esc(n.hostname)+' <small>'+esc(dev)+'</small>'+off+'</div>'
-      +'<div class="mb"><span class="lab">'+(gpu?'VRAM':'RAM')+'</span>'+bar(used,tot)
-      +'<span style="font-size:11px;color:var(--muted);white-space:nowrap">'+fmt(used)+' / '+fmt(tot)+'</span></div>'
+      +mem
       +'<div class="util">'+util+'</div></div>';
   }).join('');
 }
