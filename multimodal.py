@@ -657,21 +657,33 @@ def _get_image_processor(target_id: str):
 
 def _pil_image_processor(target_id: str, orig_exc: Exception):
     """Torchvision-free image processor for a model whose AutoImageProcessor pulls a torchvision-only
-    class. Resolve the concrete class from the model's preprocessor_config `image_processor_type`
-    (dropping the deprecated `Fast` suffix and trying a `Pil` variant), plus a known-good Qwen2-VL
-    fallback; each concrete class auto-falls-back to its PIL backend when torchvision is unavailable."""
+    class. Resolve the concrete class from `image_processor_type` (dropping the deprecated `Fast`
+    suffix and trying a `Pil` variant), plus a known-good Qwen2-VL fallback; each concrete class
+    auto-falls-back to its PIL backend when torchvision is unavailable.
+
+    The config comes from `preprocessor_config.json` (the whole dict IS the image-processor config)
+    OR — for arches that keep it under `processor_config.json`'s `image_processor` section, notably
+    Pixtral/Mistral3 which ships NO preprocessor_config.json — that section. In the latter case
+    from_pretrained can't find the config in the dir, so we build the class via from_dict(section)."""
     import os, json as _json
     import transformers as _T
-    src, itype = None, None
-    try:
-        d = _LOCAL_DIR_FN(target_id) if _LOCAL_DIR_FN is not None else None
+    d = _LOCAL_DIR_FN(target_id) if _LOCAL_DIR_FN is not None else None
+    itype, ipcfg, have_ppc = None, None, False
+    # 1) preprocessor_config.json: the whole dict is the image-processor config (Qwen etc.).
+    with contextlib.suppress(Exception):
         pc = os.path.join(d, "preprocessor_config.json") if d else None
         if pc and os.path.exists(pc):
-            src = d
             with open(pc, "r", encoding="utf-8") as _f:
-                itype = (_json.load(_f) or {}).get("image_processor_type")
-    except Exception:
-        pass
+                cfgd = _json.load(_f) or {}
+            itype, ipcfg, have_ppc = cfgd.get("image_processor_type"), cfgd, True
+    # 2) processor_config.json's `image_processor` section (Pixtral/Mistral3: no preprocessor_config).
+    if itype is None and d:
+        with contextlib.suppress(Exception):
+            prc = os.path.join(d, "processor_config.json")
+            if os.path.exists(prc):
+                with open(prc, "r", encoding="utf-8") as _f:
+                    sec = (_json.load(_f) or {}).get("image_processor") or {}
+                itype, ipcfg = sec.get("image_processor_type"), (sec or None)
     cands = []
     if itype:
         base = itype[:-4] if itype.endswith("Fast") else itype
@@ -686,7 +698,11 @@ def _pil_image_processor(target_id: str, orig_exc: Exception):
         if C is None:
             continue
         try:
-            return C.from_pretrained(src or target_id)
+            if have_ppc:
+                return C.from_pretrained(d)
+            if ipcfg is not None:                 # config from processor_config.json -> build directly
+                return C.from_dict(dict(ipcfg))
+            return C.from_pretrained(target_id)
         except Exception:
             continue
     raise orig_exc
