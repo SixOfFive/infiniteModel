@@ -14,6 +14,16 @@
 fastapi
 uvicorn
 
+# --- Controller (server.py) — Multimodal (vision), CONTROLLER-SIDE only ---
+# Image models (Qwen2.5-VL, Gemma-4 vision unified+tower, Pixtral/Mistral3, Qwen2.5-Omni)
+# decode + preprocess images on the CONTROLLER via Pillow. Without it EVERY vision request
+# ImportErrors ("No module named 'PIL'") — and transformers caches the availability check at
+# import, so install BEFORE starting the controller (or restart it after). torchvision is
+# deliberately NOT required: every image processor here has a PIL-only backend
+# (Qwen2VLImageProcessorPil / Gemma4ImageProcessorPil / PixtralImageProcessorPil), and adding
+# torchvision risks pip pulling a torch that doesn't match the node's pinned build.
+pillow
+
 # --- Worker (client.py) — Milestone 1 ---
 psutil
 
