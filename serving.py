@@ -122,6 +122,22 @@ def _openai_tool_calls(calls: list, with_index: bool = False) -> list:
     return out
 
 
+def _openai_tool_call_delta_chunks(call: dict, index: int, chunk_size: int = 48) -> list:
+    """OpenAI STREAMING shape for ONE tool call, split across SSE chunks the way the real API +
+    SDK do: the FIRST delta.tool_calls entry carries id + type + function.name with EMPTY
+    arguments, then each subsequent entry streams only a fragment of the arguments JSON string
+    (same index, no re-sent id/name). Returns a list of tool_calls-delta payloads (one per chunk).
+    Our parser only yields COMPLETE tools, so the arguments are chunked here for wire-fidelity
+    rather than truly token-incremental; a single-chunk emit was valid but tripped strict clients
+    that expect id/name established before arguments arrive."""
+    args = json.dumps(_tool_args(call))
+    chunks = [[{"index": index, "id": _anth_id("call"), "type": "function",
+                "function": {"name": call.get("name"), "arguments": ""}}]]
+    for i in range(0, max(1, len(args)), chunk_size):   # always >=1 arguments frag (even for "{}")
+        chunks.append([{"index": index, "function": {"arguments": args[i:i + chunk_size]}}])
+    return chunks
+
+
 def _ollama_tool_calls(calls: list) -> list:
     """[{name,arguments}] -> Ollama tool_calls [{function:{name,arguments:<object>}}]."""
     return [{"function": {"name": c.get("name"), "arguments": _tool_args(c)}} for c in calls]
@@ -718,12 +734,13 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                                 "delta": {"content": delta}, "finish_reason": None}]}) + "\n\n"
                             METRICS["api_out"] += len(s); yield s
                         while emitted_tools < len(tools):
-                            tc = _openai_tool_calls([tools[emitted_tools]], with_index=True)
-                            tc[0]["index"] = emitted_tools; emitted_tools += 1
-                            s = "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model, "choices": [{"index": 0,
-                                "delta": {"tool_calls": tc}, "finish_reason": None}]}) + "\n\n"
-                            METRICS["api_out"] += len(s); yield s
+                            # proper incremental deltas: id/name header, then arguments fragments
+                            for tc in _openai_tool_call_delta_chunks(tools[emitted_tools], emitted_tools):
+                                s = "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": model, "choices": [{"index": 0,
+                                    "delta": {"tool_calls": tc}, "finish_reason": None}]}) + "\n\n"
+                                METRICS["api_out"] += len(s); yield s
+                            emitted_tools += 1
                     if reason:
                         finish = reason
             except asyncio.CancelledError:
