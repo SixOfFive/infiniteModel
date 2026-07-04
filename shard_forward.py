@@ -220,6 +220,12 @@ class ShardForwardMixin:
                     m_cpu[:, cs_off:] = torch.triu(
                         torch.full((cl, cl), float("-inf"), dtype=self.dtype), diagonal=1)
                 m_cpu = m_cpu.view(1, 1, cl, tot_off)
+                # #gemma4-sliding: windowed causal mask for sliding_attention layers (per-type path).
+                sm_cpu = None
+                if _per_type:
+                    _sw = getattr(self.cfg, "sliding_window", None)
+                    if _sw:
+                        sm_cpu = self._causal_addmask(cs_off, cl, tot_off, "cpu", self.dtype, _sw)
                 p_cpu = pos_cpu[:, off:off + cl]
                 cp_cpu = cpos_cpu[off:off + cl]
                 cc_cpu = None if _per_type else cos_cpu[:, off:off + cl, :]
@@ -230,7 +236,8 @@ class ShardForwardMixin:
                     a = _a.get(dev)
                     if a is None:
                         pe = None if _per_type else (cc_cpu.to(dev), sc_cpu.to(dev))
-                        a = (m_cpu.to(dev), p_cpu.to(dev), pe, cp_cpu.to(dev))
+                        sm = sm_cpu.to(dev) if sm_cpu is not None else None
+                        a = (m_cpu.to(dev), p_cpu.to(dev), pe, cp_cpu.to(dev), sm)
                         _a[dev] = a
                     return a
 
@@ -240,9 +247,13 @@ class ShardForwardMixin:
                     self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
                     if h_.device != dev:
                         h_ = h_.to(dev)
-                    mask, pos, pos_emb, cache_position = _aux(dev)
+                    mask, pos, pos_emb, cache_position, smask = _aux(dev)
                     if _per_type:
-                        out = layer(h_, attention_mask=mask, position_ids=pos,
+                        # #gemma4-sliding: windowed mask for sliding layers, plain causal for full.
+                        _m = smask if (smask is not None
+                                       and getattr(getattr(layer, "self_attn", None),
+                                                   "sliding_window", None)) else mask
+                        out = layer(h_, attention_mask=_m, position_ids=pos,
                                     past_key_values=self.kv, use_cache=True,
                                     position_embeddings=_posemb_for(dev, _lts[_ls + _li]),
                                     shared_kv_states=_skv, cache_position=cache_position)
@@ -282,7 +293,7 @@ class ShardForwardMixin:
                 # + each decoded token); logits only for the sampled position(s).
                 nh = self.norm(h)
                 sel = nh if all_logits else nh[:, -1:, :]   # verify needs every position
-                logits = self.head(sel).to(self.cpu)
+                logits = self._softcap_logits(self.head(sel)).to(self.cpu)   # #gemma4 final logit softcap
                 if capture_pre_norm:
                     # #91 MTP: return the PRE-final-norm trunk hidden (what the checkpoint's MTP
                     # head consumes via pre_fc_norm_hidden) — distinct from capture_hidden's
@@ -348,13 +359,20 @@ class ShardForwardMixin:
             pos_emb = (cos.to(self.dtype), sin.to(self.dtype))
         cache_position = torch.arange(cache_start, cache_start + q, device=dev)
 
-        def _run(h_, mask_, pos_, pe_, cpos_):   # run this stage's layers over one (sub)sequence
+        def _run(h_, mask_, pos_, pe_, cpos_, smask_=None):   # run this stage's layers over one (sub)sequence
             for _li, layer in enumerate(self.owned_layers):
                 if self._fwd_cancel.is_set():   # #fwd-cancel: yield to a newer forward (orphan cleanup)
                     raise _ForwardSuperseded("forward superseded by a newer request")
                 self._fwd_progress_ts = time.time()   # #fwd-watchdog: per-layer liveness heartbeat
                 if _per_type:
-                    out = layer(h_, attention_mask=mask_, position_ids=pos_,
+                    # #gemma4-sliding: a sliding_attention layer must see a WINDOWED causal mask
+                    # (only the last sliding_window keys), not the plain causal mask the full_attention
+                    # layers get — otherwise its attention leaks past the window and generation diverges
+                    # once the context exceeds sliding_window (validated bit-exact vs the HF reference).
+                    _m = smask_ if (smask_ is not None
+                                    and getattr(getattr(layer, "self_attn", None),
+                                                "sliding_window", None)) else mask_
+                    out = layer(h_, attention_mask=_m, position_ids=pos_,
                                 past_key_values=self.kv, use_cache=True,
                                 position_embeddings=_pe_t[_lts[_ls + _li]],
                                 shared_kv_states=_skv, cache_position=cpos_)
@@ -382,14 +400,23 @@ class ShardForwardMixin:
         do_chunk = (q > 1 and cstep < q and not _per_type and not self._hybrid
                     and not self._omni and not getattr(self, "_mrope3d", False) and position_ids is None)
         if not do_chunk:
-            if q > 1:   # prefill: causal among the new tokens; all prior keys visible
+            if _per_type:
+                # #gemma4-sliding: build BOTH masks; _run hands each layer the one for its type. The
+                # full-causal mask (window=None) reproduces the old prefill-causal / decode-see-all
+                # behavior for full_attention layers; the windowed mask restricts sliding layers.
+                fmask = self._causal_addmask(cache_start, q, total, dev, self.dtype, None)
+                _sw = getattr(self.cfg, "sliding_window", None)
+                smask = (self._causal_addmask(cache_start, q, total, dev, self.dtype, _sw)
+                         if _sw else None)
+                h = _run(h, fmask, pos, pos_emb, cache_position, smask)
+            elif q > 1:   # prefill: causal among the new tokens; all prior keys visible
                 mask = torch.zeros((q, total), dtype=self.dtype, device=dev)
                 mask[:, cache_start:] = torch.triu(
                     torch.full((q, q), float("-inf"), dtype=self.dtype, device=dev), diagonal=1)
                 mask = mask.view(1, 1, q, total)
+                h = _run(h, mask, pos, pos_emb, cache_position)
             else:       # decode: one query sees every key -> no mask needed
-                mask = None
-            h = _run(h, mask, pos, pos_emb, cache_position)
+                h = _run(h, None, pos, pos_emb, cache_position)
         else:
             outs = []
             off = 0
@@ -409,7 +436,7 @@ class ShardForwardMixin:
         if self.has_head:
             nh = self.norm(h)
             sel = nh if all_logits else nh[:, -1:, :]
-            logits = self.head(sel).to(self.cpu)
+            logits = self._softcap_logits(self.head(sel)).to(self.cpu)   # #gemma4 final logit softcap
             if capture_pre_norm:   # #91 MTP: PRE-final-norm trunk hidden (see general path)
                 hsel = h if all_logits else h[:, -1:, :]
                 return logits, hsel.to(self.cpu)
@@ -417,6 +444,35 @@ class ShardForwardMixin:
                 return logits, nh.to(self.cpu)
             return logits
         return h.to(self.cpu)
+
+    def _causal_addmask(self, cache_start: int, q: int, total: int, dev, dtype, window=None):
+        """#gemma4-sliding: additive attention mask [1,1,q,total]. A key at absolute position kpos is
+        visible to a query at absolute position qpos iff 0 <= (qpos - kpos) (< window when given).
+        window=None -> plain causal (full_attention); window=int -> sliding-window causal. This mirrors
+        the HF reference's create_causal_mask / create_sliding_window_causal_mask exactly (validated
+        bit-exact), so the per-type path can hand sliding_attention layers a windowed mask while
+        full_attention layers keep the plain causal one. Cheap: two aranges + a compare."""
+        torch = self.torch
+        qpos = torch.arange(cache_start, cache_start + q, device=dev).view(q, 1)
+        kpos = torch.arange(0, total, device=dev).view(1, total)
+        dist = qpos - kpos
+        allowed = dist >= 0                       # causal (a query never sees a future key)
+        if window:
+            allowed = allowed & (dist < int(window))   # ...and only the last `window` keys
+        m = torch.zeros((q, total), dtype=dtype, device=dev)
+        m = m.masked_fill(~allowed, float("-inf"))
+        return m.view(1, 1, q, total)
+
+    def _softcap_logits(self, logits):
+        """#gemma4: Gemma-4 (like Gemma-2) caps its final logits at ±final_logit_softcapping via
+        logits = cap * tanh(logits / cap) — see Gemma4ForCausalLM.forward. Monotonic, so greedy
+        argmax is unchanged, but it bounds the distribution temperature/top-p sampling sees (without
+        it the head's raw logits sample differently from the reference). No-op for any model whose
+        config lacks the field (every non-Gemma model here)."""
+        cap = getattr(self.cfg, "final_logit_softcapping", None)
+        if cap:
+            logits = self.torch.tanh(logits / cap) * cap
+        return logits
 
     def _prefill_chunk_len(self, q: int) -> int:
         """#prefill-chunk: query-chunk length for a long PREFILL pass. The shard hands HF layers an

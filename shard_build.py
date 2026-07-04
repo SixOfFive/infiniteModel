@@ -955,16 +955,30 @@ class ShardBuildMixin:
         head_dim = int(getattr(cfg, "head_dim", 0) or (hidden // n_heads if n_heads else 0))
         if ctx <= 0 or n_kv <= 0 or head_dim <= 0:
             return
-        per_layer = 2 * int(ctx) * n_kv * head_dim * 2   # k+v, bf16 = 2 bytes/elem
+        per_layer = 2 * int(ctx) * n_kv * head_dim * 2   # k+v, bf16 = 2 bytes/elem (uniform fallback)
         # #7: a hybrid arch's linear-attn (Gated-DeltaNet) layers grow no full-ctx KV — only its
         # full-attention layers do. Reserve per_layer on the KV-holding layers only (all of them
         # for a dense model). _kv_layer_mask is conservative (unknown -> True) so we never
         # under-reserve and risk decode OOM.
         kv_mask = self._kv_layer_mask()
         by_dev: dict = {}
-        for d, holds_kv in zip(self.layer_devices, kv_mask):
-            if holds_kv:
-                by_dev[d] = by_dev.get(d, 0) + per_layer
+        for layer, d, holds_kv in zip(self.owned_layers, self.layer_devices, kv_mask):
+            if not holds_kv:
+                continue
+            # #gemma4-kv: size each layer's KV from ITS OWN attention geometry. head_dim and
+            # num_key_value_groups are set at module construction and are quant-invariant, so this
+            # reads the real per-type dims: Gemma-4 full_attention layers use global_head_dim(512)
+            # with num_global_key_value_heads(1) while sliding layers use head_dim(256)/8 — the
+            # uniform `per_layer` above OVER-reserves the full-attn layers ~4x, which can false-OOM a
+            # tight stage and trigger a needless replan (the distributed-load churn). Falls back to
+            # `per_layer` for any module missing the dims -> bit-identical for uniform-geometry models.
+            pl = per_layer
+            sa = getattr(layer, "self_attn", None)
+            hd_l = int(getattr(sa, "head_dim", 0) or 0) if sa is not None else 0
+            grp_l = int(getattr(sa, "num_key_value_groups", 0) or 0) if sa is not None else 0
+            if hd_l > 0 and grp_l > 0 and n_heads > 0:
+                pl = 2 * int(ctx) * max(1, n_heads // grp_l) * hd_l * 2
+            by_dev[d] = by_dev.get(d, 0) + pl
         # #kv-offload: the KV lives in system RAM regardless of where the layers sit, so probe the
         # WHOLE reservation against CPU RAM (allocate+free there) instead of the layer devices —
         # a GPU that can't hold the KV is exactly the case this mode exists for.

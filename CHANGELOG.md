@@ -111,6 +111,22 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   aligns 1:1 with the mask. Each `<audio_soft_token>` (258881) run is bracketed `boa`/`eoa` and expanded
   to the real per-clip frame count, spliced with plain 1D positions. Clips beyond `audio_seq_length`
   (750 tokens ≈ 30 s, the model's documented cap) are truncated with a logged warning (never silently).
+- **Gemma 4 per-type attention masks** (2026-07-03): the per-type serving path (`layer_types`
+  sliding/full + per-type rotary) was handing EVERY layer a single full-causal mask, so
+  `sliding_attention` layers attended the whole context instead of only the last `sliding_window`
+  (1024) keys — diverging from the reference once a prompt or generation crosses the window
+  (single-node and distributed alike; latent below 1024 tokens). Both forward paths (`_forward_impl`
+  and `_forward_uniform_eager`, prefill + decode) now build a windowed causal mask for sliding layers
+  and the plain causal mask for full layers — validated **bit-exact (0.0)** against the HF
+  `Gemma4TextModel` reference across lengths. Also: the head now applies `final_logit_softcapping`
+  (±30; monotonic so greedy is unchanged, corrects temperature/top-p sampling parity), and the
+  KV-reserve probe sizes each layer from its OWN attention geometry — gemma-4's full-attn layers are
+  `global_head_dim`(512)/`num_global_key_value_heads`(1), not the uniform `head_dim`(256)×8, so the
+  old probe over-reserved them ~4× and could false-OOM a tight stage into a needless replan. Root-cause
+  note: the pipeline SPLIT itself is bit-exact (`num_kv_shared_layers=0`, per-stage rotary indexing by
+  global layer index is correct) — a controlled offline harness proved single-node ≡ 2-stage; the
+  reported "distributed-only garble" was the sliding-mask error (which also hits single-node past the
+  window) compounded by fleet-contention hop-death, not a stage-boundary bug.
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8
