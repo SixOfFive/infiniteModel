@@ -405,13 +405,25 @@ def _materialize_meta_tensors(module, dev: str) -> list:
     import torch
     report = []
     for mod in module.modules():
-        # Pixtral-style 2D positional rotary table (and any rotary module exposing its own rope
-        # init): rebuild inv_freq on `dev` via the MODULE'S OWN function so the arch layout/theta
-        # is exact. Gated on ndim>=2 so Qwen's validated 1D inv_freq path below is untouched.
+        # Pixtral-style 2D positional rotary table: rebuild inv_freq on `dev` via the MODULE'S
+        # OWN function so the arch layout/theta is exact. UNCHANGED (may use the transformers
+        # registry fallback inside _recompute_rotary).
         if any(("inv_freq" in n and b is not None and b.device.type == "meta" and b.ndim >= 2)
                for n, b in mod._buffers.items()):
             if _recompute_rotary(mod, dev):
                 report.append((f"{type(mod).__name__}.inv_freq", [], "rope_init_fn(module 2D)"))
+        # 1D inv_freq whose module exposes its OWN rope init with a NON-standard theta/convention:
+        # gemma4_vision's rotary is 1D [18] but theta=100 with a head_dim//2 spatial split, so the
+        # generic theta=1e4 fallback below would silently corrupt its 2D positions. Only fires when
+        # the module has rope_init_fn OR the compute_default_rope_parameters staticmethod (the
+        # authoritative override); Qwen's dim/theta-only VisionRotaryEmbedding has neither (nor a
+        # .config), so _recompute_rotary bails and it keeps the validated theta=1e4 path untouched.
+        elif any(("inv_freq" in n and b is not None and b.device.type == "meta" and b.ndim == 1)
+                 for n, b in mod._buffers.items()) \
+                and (getattr(mod, "rope_init_fn", None) is not None
+                     or getattr(mod, "compute_default_rope_parameters", None) is not None):
+            if _recompute_rotary(mod, dev):
+                report.append((f"{type(mod).__name__}.inv_freq", [], "rope_init_fn(module 1D)"))
         for name, buf in list(mod._buffers.items()):
             if buf is None or buf.device.type != "meta":
                 continue
