@@ -83,7 +83,7 @@ bash setup.sh        # creates .venv and installs the worker deps (~200 MB torch
 
 ### 5. Point it at your controller
 Edit `config.json` and set `controller_host` to your controller's IP (defaults
-to `192.168.15.103`). Ports rarely need changing.
+to `192.168.15.38`). Ports rarely need changing.
 
 ### 6. Keep the device awake, then start the worker
 In **Termux** (the host shell), keep the CPU from sleeping:

@@ -331,7 +331,7 @@ def _fuse_moe_experts(sd: dict, model) -> dict:
 # pulls from the PUBLIC GitHub repo's raw endpoint — NO auth/token needed — so there are no secrets
 # here or in config.json, and the source is safe to publish.
 _CONFIG_DEFAULTS = {
-    "controller_host": "192.168.15.103",
+    "controller_host": "192.168.15.38",
     "http_port": 21434,
     "control_port": 50100,
     "data_port": 50101,

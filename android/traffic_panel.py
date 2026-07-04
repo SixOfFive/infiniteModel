@@ -35,7 +35,7 @@ import time
 from collections import deque, defaultdict
 from urllib.request import urlopen
 
-CTRL_IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.15.103"
+CTRL_IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.15.38"
 POLL    = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
 URL     = f"http://{CTRL_IP}:21434/status"
 
