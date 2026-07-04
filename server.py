@@ -1782,6 +1782,65 @@ def _encode_images(target_id: str, images: list) -> dict:
                     "grid_list": [], "pos_scheme": "1d",
                     "wrap": ((int(boi), int(eoi))
                              if (boi is not None and eoi is not None) else None)}
+        if mtype == "gemma4":
+            # Gemma 4 TOWER variant (31b-it, 26b-a4b-it): a REAL Gemma4VisionModel ViT
+            # (patch_embedder -> 27-layer encoder -> 3x3 pooler) + the embed_vision
+            # projector. Unlike the 12b 'gemma4_unified' (encoder-free; its processor
+            # PRE-merges the 3x3 pool into 6912-dim patches), the tower does the pooling
+            # INSIDE itself, so it consumes UNMERGED 768-dim (16x16x3) teacher patches +
+            # image_position_ids [B, max_patches, 2] (the tower's learned 2D pos-emb + 2D
+            # RoPE, theta=100). The real Gemma4ImageProcessor emits exactly pixel_values /
+            # image_position_ids / num_soft_tokens_per_image (a torchvision-free PIL variant
+            # exists), so — unlike the unified path — no pure-torch reimplementation is
+            # needed. get_image_features(pixel_values, image_position_ids) runs tower +
+            # projector and returns pooler_output ALREADY padding-stripped
+            # [total_soft_tokens, text_hidden] — LM-ready, splice as-is. Plain 1D LM
+            # positions; 'wrap' brackets each expanded run in boi/eoi.
+            # NOTE: the reference runs LM-side BLOCK-BIDIRECTIONAL attention across each
+            # image span (use_bidirectional_attention='vision'); our pipeline is causal-only
+            # -- shipped causal-first (same choice as the 12b unified path).
+            ip = _get_image_processor(target_id)
+            t_load = time.time()
+            inputs = ip(images=images, return_tensors="pt")
+            pv = inputs["pixel_values"].to(dev)
+            ipos = inputs["image_position_ids"].to(dev)
+            nsoft = inputs.get("num_soft_tokens_per_image")
+            counts = None
+            if nsoft is not None:
+                counts = [int(c) for c in (nsoft.tolist() if hasattr(nsoft, "tolist") else nsoft)]
+            info = {"device": dev, "pixel_values_shape": list(pv.shape),
+                    "load_s": round(t_load - t0, 1)}
+            t_fwd = time.time()
+            with torch.inference_mode():
+                feats = model.get_image_features(pixel_values=pv, image_position_ids=ipos)
+            emb = getattr(feats, "pooler_output", None)
+            if emb is None:
+                emb = _pick_merged_embeds(feats, None)
+            emb = emb.reshape(-1, emb.shape[-1])
+            cfg = model.config
+            itid = getattr(cfg, "image_token_id", None)
+            tcfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") \
+                else getattr(cfg, "text_config", cfg)
+            out_hidden = getattr(tcfg, "hidden_size", None) or int(emb.shape[-1])
+            boi = getattr(cfg, "boi_token_id", None)
+            eoi = getattr(cfg, "eoi_token_id", None)
+            if counts is None and len(images) == 1:   # single image -> all rows are its soft tokens
+                counts = [int(emb.shape[0])]
+            if counts is not None and sum(counts) != emb.shape[0]:
+                print(f"[vision] WARN gemma4-tower counts sum {sum(counts)} != embeds "
+                      f"{emb.shape[0]}")
+            info.update({"arch": "gemma4", "forward_s": round(time.time() - t_fwd, 1),
+                         "raw_return_type": type(feats).__name__,
+                         "embeds_shape": list(emb.shape),
+                         "path": "get_image_features(pixel_values, image_position_ids) [tower]"})
+            print(f"[vision] encoded {len(images)} image(s) on {dev} [gemma4-tower]: "
+                  f"load={info['load_s']}s forward={info['forward_s']}s -> {list(emb.shape)} "
+                  f"counts={counts} itid={itid}")
+            return {"image_embeds": emb, "grid_thw": None, "info": info, "counts": counts,
+                    "image_token_id": itid, "out_hidden": out_hidden, "merge": 1,
+                    "grid_list": [], "pos_scheme": "1d",
+                    "wrap": ((int(boi), int(eoi))
+                             if (boi is not None and eoi is not None) else None)}
         ip = _get_image_processor(target_id)
         t_load = time.time()
         if mtype == "mistral3":

@@ -496,10 +496,13 @@ def _visual_modules(model):
       * Qwen2.5-Omni:        thinker.visual                         ('thinker.visual.')
       * Gemma 4 unified (#143): model.model.embed_vision — encoder-free (embed_vision
                              WITHOUT a vision_tower); ALL vision params live in the
-                             Gemma4UnifiedVisionEmbedder. NOTE the gemma4 TOWER variant
-                             defines BOTH embed_vision and vision_tower — it must NOT
-                             match here (its tower path is a future increment), hence
-                             the vision_tower-is-absent gate.
+                             Gemma4UnifiedVisionEmbedder (the vision_tower-is-absent gate).
+      * Gemma 4 TOWER (31b/26b, model_type 'gemma4'): model.model.vision_tower (a real
+                             Gemma4VisionModel: patch_embedder -> 27-layer encoder -> 3x3
+                             pooler) PLUS model.model.embed_vision (the
+                             Gemma4MultimodalEmbedder projector) — two prefixes, like
+                             Mistral3 but the projector is embed_vision, NOT
+                             multi_modal_projector; keys load as-is (no rename).
       * standard image-text: model.model.visual                    ('model.visual.')
       * Mistral3 / Pixtral / Llava-style: model.model.vision_tower PLUS the SEPARATE
                              model.model.multi_modal_projector      (two prefixes)
@@ -512,6 +515,14 @@ def _visual_modules(model):
     ev = getattr(inner, "embed_vision", None) if inner is not None else None
     if ev is not None and getattr(inner, "vision_tower", None) is None:
         return [(ev, "model.embed_vision.")]
+    if ev is not None and inner is not None and getattr(inner, "vision_tower", None) is not None:
+        # Gemma 4 TOWER variant (31b-it / 26b-a4b-it, model_type 'gemma4'): a real
+        # Gemma4VisionModel (vision_tower) PLUS the Gemma4MultimodalEmbedder projector
+        # (embed_vision) — the Mistral3 tower+projector shape, but the projector is named
+        # embed_vision (not multi_modal_projector) and the keys need NO rename. The 12b
+        # 'gemma4_unified' has embed_vision WITHOUT a tower and is caught just above.
+        return [(inner.vision_tower, "model.vision_tower."),
+                (inner.embed_vision, "model.embed_vision.")]
     if inner is not None and getattr(inner, "vision_tower", None) is not None \
             and getattr(inner, "multi_modal_projector", None) is not None:
         return [(inner.vision_tower, "model.vision_tower."),
