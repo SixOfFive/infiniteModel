@@ -202,13 +202,15 @@ DASHBOARD_HTML = r"""<!doctype html>
   .miniprog > i{display:block;height:100%;background:var(--warn)}
   .grp{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:8px 15px 4px;background:var(--bg)}
   /* nodes */
-  .node{display:flex;align-items:center;gap:12px;padding:9px 15px;border-bottom:1px solid var(--border);font-size:13px}
+  .node{display:grid;grid-template-columns:210px 1fr 1fr 56px;align-items:center;gap:14px;padding:8px 15px;border-bottom:1px solid var(--border);font-size:13px}
   .node:last-child{border-bottom:none}
-  .node .nn{min-width:150px;font-weight:600}
+  .node .nn{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .node .nn small{font-weight:400;color:var(--dim);font-size:11px}
-  .node .mb{flex:1;display:flex;align-items:center;gap:8px;max-width:420px}
-  .node .mb .lab{font-size:11px;color:var(--muted);width:46px}
-  .node .util{font-size:11px;color:var(--dim);width:120px;text-align:right}
+  .node .mb{display:flex;align-items:center;gap:8px;min-width:0}
+  .node .mb .lab{font-size:11px;color:var(--muted);width:34px;flex:none}
+  .node .mb .bar{flex:1}
+  .node .mb .num{font-size:11px;color:var(--muted);white-space:nowrap;flex:none;width:82px;text-align:right}
+  .node .util{font-size:11px;color:var(--dim);text-align:right}
   /* overlay/modal */
   .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-start;justify-content:center;z-index:50}
   .ov.show{display:flex}
@@ -487,16 +489,16 @@ function renderNodes(d){
   $('#nodes').innerHTML=ns.map(n=>{
     const gpu=n.has_gpu;
     const util=gpu?('GPU '+Math.round(n.gpu_util||0)+'%'):('CPU '+Math.round(n.cpu_percent||0)+'%');
-    const dev=gpu?(n.device_name||'GPU'):((n.cores||'')+'c CPU');
+    const dev=(gpu?(n.device_name||'GPU'):((n.cores||'')+'c CPU')).replace(/^NVIDIA GeForce /,'');
     const off=(!n.alive)?' <span class="err">offline</span>':'';
     const memRow=(lab,used,tot)=>'<div class="mb"><span class="lab">'+lab+'</span>'+bar(used,tot)
-      +'<span style="font-size:11px;color:var(--muted);white-space:nowrap">'+fmt(used)+' / '+fmt(tot)+'</span></div>';
-    // GPU nodes show both VRAM and RAM; CPU-only nodes show RAM alone.
+      +'<span class="num">'+fmt(used)+' / '+fmt(tot)+'</span></div>';
+    // Fixed grid columns: name · VRAM · RAM · util. CPU-only nodes leave the VRAM
+    // cell empty so their RAM bar still aligns with the GPU nodes' RAM column.
     const ramUsed=Math.max(0,(n.total_mem_gb||0)-(n.free_mem_gb||0));
-    let mem=gpu?memRow('VRAM',(n.vram_used_gb||0),(n.vram_total_gb||0)):'';
-    mem+=memRow('RAM',ramUsed,(n.total_mem_gb||0));
+    const vram=gpu?memRow('VRAM',(n.vram_used_gb||0),(n.vram_total_gb||0)):'<div class="mb"></div>';
     return '<div class="node"><div class="nn">'+esc(n.hostname)+' <small>'+esc(dev)+'</small>'+off+'</div>'
-      +mem
+      +vram+memRow('RAM',ramUsed,(n.total_mem_gb||0))
       +'<div class="util">'+util+'</div></div>';
   }).join('');
 }
