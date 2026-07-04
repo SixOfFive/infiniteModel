@@ -23,19 +23,43 @@ class ShardBuildMixin:
                    for t in list(module.parameters()) + list(module.buffers())
                    if t.device.type == "cuda")
 
-    def _kv_bytes_per_layer(self, ctx: int) -> int:
-        """Full-ctx KV bytes ONE layer will grow into (k+v, bf16). Mirrors kv_reserve_probe so the
-        GPU placement budget reserves the SAME KV the probe later allocates. 0 if ctx/dims unknown."""
+    def _kv_dims(self, ctx: int):
+        """(num_kv_heads, head_dim) from cfg for full-ctx KV sizing, or (0, 0) if ctx<=0 / unknown."""
         if not ctx or ctx <= 0:
-            return 0
+            return 0, 0
         cfg = self.cfg
         nh = int(getattr(cfg, "num_attention_heads", 0) or 0)
         nkv = int(getattr(cfg, "num_key_value_heads", nh) or nh or 0)
         hidden = int(getattr(cfg, "hidden_size", 0) or 0)
         hd = int(getattr(cfg, "head_dim", 0) or (hidden // nh if nh else 0))
         if nkv <= 0 or hd <= 0:
-            return 0
-        return 2 * int(ctx) * nkv * hd * 2
+            return 0, 0
+        return nkv, hd
+
+    def _kv_bf16_per_layer(self, ctx: int) -> int:
+        """Full-ctx bf16 KV bytes ONE layer grows into (k+v). Also the per-layer TRANSIENT peak under
+        kv_quant — dequant rebuilds one layer's full bf16 K/V at a time. 0 if ctx/dims unknown."""
+        nkv, hd = self._kv_dims(ctx)
+        return 2 * int(ctx) * nkv * hd * 2 if nkv else 0
+
+    def _kv_bytes_per_layer(self, ctx: int) -> int:
+        """Full-ctx KV bytes ONE layer RESTS at: bf16 normally, or the smaller BIT-PACKED TurboQuant
+        footprint when kv_quant is active (self.kv_quant != 'none'). The placement budget reserves this
+        per layer; kv_reserve_probe adds one bf16 transient/device for the sequential dequant peak — the
+        two stay mirrored. kv_quant='none' -> bf16, bit-identical to the pre-#172 reservation. Any error
+        resolving the quant size falls back to bf16 (conservative — never under-reserve -> decode OOM)."""
+        name = (getattr(self, "kv_quant", "none") or "none")
+        if name != "none":
+            try:
+                nkv, hd = self._kv_dims(ctx)
+                if nkv:
+                    import kv_quant
+                    per_tok = kv_quant.kv_quant_bytes_per_token_per_layer(name, nkv, hd)
+                    if per_tok > 0:
+                        return int(ctx) * per_tok
+            except Exception:
+                pass   # bf16 fallback below (conservative)
+        return self._kv_bf16_per_layer(ctx)
 
     def _kv_layer_mask(self) -> list:
         """#7: per-OWNED-layer bool — True = a layer that holds a growing full-ctx KV cache.
@@ -109,10 +133,17 @@ class ShardBuildMixin:
             free = min(int(free), int(gpu_budget_gb * GB))
         GPU_SAFETY = int(0.4 * GB)
         kv_per_layer = self._kv_bytes_per_layer(ctx)
-        # #kv-offload: the KV cache lives in system RAM (OffloadedCache), so NO per-layer KV is
-        # reserved against VRAM — that headroom goes to model layers instead (the feature's point).
+        # #172: under kv_quant, kv_per_layer above is the PACKED resting footprint; the dequant still
+        # rebuilds ONE layer's full bf16 K/V at a time (pipeline runs layers sequentially), so reserve
+        # one bf16 layer of transient headroom on top of the per-layer resting sum. 0 when
+        # kv_quant='none' (kv_per_layer is then already bf16 -> the whole path is bit-identical).
+        kv_transient = (self._kv_bf16_per_layer(ctx)
+                        if (getattr(self, "kv_quant", "none") or "none") != "none" else 0)
+        # #kv-offload: the KV cache lives in system RAM (OffloadedCache), so NO per-layer KV — nor the
+        # dequant transient — is reserved against VRAM; that headroom goes to model layers instead.
         if getattr(self, "kv_offload", False):
             kv_per_layer = 0
+            kv_transient = 0
         # #7: only full-attention layers grow a full-ctx KV; hybrid linear-attn layers don't.
         # kv_lyr[i] = the KV bytes owned layer i actually reserves (kv_per_layer or 0). For a
         # dense model this is kv_per_layer for every layer (unchanged). Mirrors kv_reserve_probe.
@@ -129,7 +160,7 @@ class ShardBuildMixin:
         moe_blocks = ([_find_moe_block(l) for l in self.owned_layers]
                       if moe_off else [(None, None)] * nlyr)
         self.layer_split = [False] * nlyr
-        whole_need = self.loaded_bytes + sum(kv_lyr)
+        whole_need = self.loaded_bytes + sum(kv_lyr) + (kv_transient if any(kv_lyr) else 0)
         whole = ((mode in ("gpu", "cuda") and whole_need <= live_free)
                  or (mode == "auto" and whole_need < free * 0.85))
         if whole:
@@ -140,6 +171,9 @@ class ShardBuildMixin:
         else:  # hybrid: greedily fill a VRAM budget (capped by live-free), spill the rest to CPU
             budget = int(gpu_mem_gb * GB) if gpu_mem_gb > 0 else int(free * 0.85)
             budget = min(budget, live_free)   # live-free cap -> can't oversubscribe a shared card
+            # #172: hold back one bf16 layer for the kv_quant dequant transient before placing layers,
+            # so the greedy fill can't consume the headroom the per-step peak needs (0 when not kv_quant).
+            budget = max(0, budget - kv_transient)
             used = 0
 
             def fits(nbytes: int, kv: int = 0) -> bool:
@@ -248,7 +282,10 @@ class ShardBuildMixin:
                       f"sum={gb/GB:.2f}GB in-use={_al:.2f}GB reserved={_rv:.2f}GB", flush=True)
         # full-ctx KV these GPU-resident layers will grow into — reported so the controller can
         # RESERVE it against coexisting loads (a 2nd model must not eat this model's KV space).
-        self.gpu_kv_bytes = kv_per_layer * sum(1 for d in self.layer_devices if d.type == "cuda")
+        # #172: per-layer resting (packed under kv_quant) + one bf16 dequant transient when any KV
+        # layer is GPU-resident (0 for kv_quant='none' -> bit-identical to the pre-#172 report).
+        _ng_cuda = sum(1 for d in self.layer_devices if d.type == "cuda")
+        self.gpu_kv_bytes = kv_per_layer * _ng_cuda + (kv_transient if _ng_cuda else 0)
         # #moe-offload diagnostic: surface WHY the split did/didn't engage (on=flag+quant gate,
         # blocks=layers where a MoE block was detected, split=layers actually split).
         self._moe_dbg = {"on": bool(moe_off),
@@ -946,7 +983,8 @@ class ShardBuildMixin:
         each device its layers sit on), then free it. If it OOMs, raise KV_RESERVE_OOM so the
         LOAD fails fast and clean — instead of the stage dying mid-decode and dropping its data
         connection. Full-attn KV is sized for EVERY layer (an overestimate for the hybrid
-        linear-attn / Gated-DeltaNet layers -> conservative). Skipped if dims are unknown."""
+        linear-attn / Gated-DeltaNet layers -> conservative). Under kv_quant (#172) it reserves the
+        bit-packed resting footprint + one bf16 dequant transient/device. Skipped if dims unknown."""
         torch = self.torch
         cfg = self.cfg
         n_heads = int(getattr(cfg, "num_attention_heads", 0) or 0)
@@ -956,12 +994,19 @@ class ShardBuildMixin:
         if ctx <= 0 or n_kv <= 0 or head_dim <= 0:
             return
         per_layer = 2 * int(ctx) * n_kv * head_dim * 2   # k+v, bf16 = 2 bytes/elem (uniform fallback)
+        # #172: under kv_quant each layer RESTS at the bit-packed footprint; the dequant transiently
+        # rebuilds ONE layer's full bf16 K/V at a time (sequential pipeline), so the true peak per
+        # device is (sum of packed resting) + one bf16 layer. Track the max bf16 layer per device and
+        # add it once below. kv_quant='none' -> resting == pl (bf16), transient 0 -> bit-identical.
+        _kvq = (getattr(self, "kv_quant", "none") or "none")
+        _kvq_on = _kvq != "none"
         # #7: a hybrid arch's linear-attn (Gated-DeltaNet) layers grow no full-ctx KV — only its
         # full-attention layers do. Reserve per_layer on the KV-holding layers only (all of them
         # for a dense model). _kv_layer_mask is conservative (unknown -> True) so we never
         # under-reserve and risk decode OOM.
         kv_mask = self._kv_layer_mask()
         by_dev: dict = {}
+        max_bf16: dict = {}
         for layer, d, holds_kv in zip(self.owned_layers, self.layer_devices, kv_mask):
             if not holds_kv:
                 continue
@@ -973,12 +1018,27 @@ class ShardBuildMixin:
             # tight stage and trigger a needless replan (the distributed-load churn). Falls back to
             # `per_layer` for any module missing the dims -> bit-identical for uniform-geometry models.
             pl = per_layer
+            nkv_l, hd_use = n_kv, head_dim
             sa = getattr(layer, "self_attn", None)
             hd_l = int(getattr(sa, "head_dim", 0) or 0) if sa is not None else 0
             grp_l = int(getattr(sa, "num_key_value_groups", 0) or 0) if sa is not None else 0
             if hd_l > 0 and grp_l > 0 and n_heads > 0:
-                pl = 2 * int(ctx) * max(1, n_heads // grp_l) * hd_l * 2
-            by_dev[d] = by_dev.get(d, 0) + pl
+                nkv_l, hd_use = max(1, n_heads // grp_l), hd_l
+                pl = 2 * int(ctx) * nkv_l * hd_use * 2
+            resting = pl
+            if _kvq_on:   # packed resting for this layer's geometry; any failure -> bf16 pl (conservative)
+                try:
+                    import kv_quant
+                    _pt = kv_quant.kv_quant_bytes_per_token_per_layer(_kvq, nkv_l, hd_use)
+                    if _pt > 0:
+                        resting = int(ctx) * _pt
+                except Exception:
+                    resting = pl
+            by_dev[d] = by_dev.get(d, 0) + resting
+            max_bf16[d] = max(max_bf16.get(d, 0), pl)
+        if _kvq_on:   # + one bf16 dequant transient per device that holds any KV layer
+            for d in list(by_dev):
+                by_dev[d] += max_bf16.get(d, 0)
         # #kv-offload: the KV lives in system RAM regardless of where the layers sit, so probe the
         # WHOLE reservation against CPU RAM (allocate+free there) instead of the layer devices —
         # a GPU that can't hold the KV is exactly the case this mode exists for.

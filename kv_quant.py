@@ -57,17 +57,45 @@ def preset_bits(name: str):
 
 def kv_quant_bytes_per_token_per_layer(name: str, n_kv_heads: int, head_dim: int) -> int:
     """Stored bytes for ONE token's K+V on ONE layer under preset `name` (for KV-reservation
-    accounting). int8 index storage in the foundation (1 byte/coord) + per-vector fp16 norms;
-    bit-packing to b bits is a follow-up. bf16 baseline is 2*2*nkv*hd. Returns 0 if not TurboQuant."""
+    accounting). BIT-PACKED indices: b bits/coord -> ceil(d*b/8) bytes, plus a per-head fp16 norm.
+    Reflects the DEFAULT (MSE) value path — value_qjl adds a 1-bit residual sign + gamma but is
+    opt-in and untuned, so it isn't budgeted here. bf16 baseline is 2*2*nkv*hd. 0 if not TurboQuant."""
     pb = preset_bits(name)
     if not pb:
         return 0
+    kb, vb = pb
     d = n_kv_heads * head_dim
-    # K: 1 idx byte/coord + 1 fp16 norm/head ; V: 1 idx byte/coord + 1 QJL byte/coord + fp16 norms/head.
-    # (Foundation storage; a bit-packed variant reaches ~b/8 bytes/coord.)
-    k = d * 1 + n_kv_heads * 2
-    v = d * 1 + d * 1 + n_kv_heads * 2 * 2
+    k = math.ceil(d * kb / 8) + n_kv_heads * 2       # packed K idx (kb bits/coord) + fp16 norm/head
+    v = math.ceil(d * vb / 8) + n_kv_heads * 2       # packed V idx (vb bits/coord) + fp16 norm/head
     return k + v
+
+
+def _pack_bits(torch, idx, bits: int):
+    """Pack a uint8 tensor `idx` [...,d] whose values are in [0, 2**bits) into bytes
+    [...,ceil(d*bits/8)] along the last dim: each value emitted MSB-first, the bitstream
+    concatenated and zero-padded up to a byte boundary, then regrouped 8 bits/byte. Exact and
+    vectorized for any bits in 1..8 (b=3 packs across byte boundaries, unlike a nibble hack)."""
+    d = int(idx.shape[-1])
+    lead = tuple(idx.shape[:-1])
+    sh = torch.arange(bits - 1, -1, -1, device=idx.device, dtype=torch.uint8)
+    b = (idx.unsqueeze(-1) >> sh) & 1                          # [...,d,bits] {0,1}
+    b = b.reshape(*lead, d * bits)
+    pad = (-(d * bits)) % 8
+    if pad:
+        b = torch.nn.functional.pad(b, (0, pad))
+    b = b.reshape(*lead, -1, 8).to(torch.int32)               # [...,nbytes,8]
+    w = (1 << torch.arange(7, -1, -1, device=idx.device, dtype=torch.int32))
+    return (b * w).sum(-1).to(torch.uint8)                    # [...,nbytes]
+
+
+def _unpack_bits(torch, packed, bits: int, d: int):
+    """Inverse of _pack_bits: bytes [...,nbytes] -> uint8 idx [...,d] (values in [0, 2**bits))."""
+    lead = tuple(packed.shape[:-1])
+    sh = torch.arange(7, -1, -1, device=packed.device, dtype=torch.uint8)
+    b = (packed.unsqueeze(-1) >> sh) & 1                       # [...,nbytes,8]
+    b = b.reshape(*lead, -1)[..., :d * bits].reshape(*lead, d, bits).to(torch.int32)
+    w = (1 << torch.arange(bits - 1, -1, -1, device=packed.device, dtype=torch.int32))
+    return (b * w).sum(-1).to(torch.uint8)                    # [...,d]
 
 
 class TurboQuantizer:
@@ -159,13 +187,13 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
 
     quantizer_factory(head_dim, device, dtype) -> TurboQuantizer (preset bits bound by the caller).
 
-    MEMORY: each layer persistently holds only the quantized reps (uint8 index/coord + a few fp32
-    norms/head ~= 1 byte/coord vs bf16's 2) — a ~2x RESTING KV reduction at the foundation; bit-
-    packing the indices to b bits reaches ~b/8. update() transiently rebuilds ONE layer's full bf16
-    K/V for the attention (freed when the forward returns); because the pipeline runs layers
-    sequentially, only one layer's bf16 lives at a time, so even the per-step PEAK drops
-    (all-layers-quantized + one-layer-bf16 << all-layers-bf16). The KV RESERVATION still budgets
-    bf16 (conservative) until that peak headroom is measured and tightened — see kv_reserve_probe."""
+    MEMORY: each layer persistently holds only the quantized reps — the indices BIT-PACKED to b
+    bits/coord (ceil(d*b/8) bytes, via _pack_bits) + a few fp16 norms/head, so ~b/8 the bytes of
+    bf16's 2 (turbo3 ~3/16 -> ~4-5x resting reduction incl. norms). update() unpacks the full seq
+    and transiently rebuilds ONE layer's full bf16 K/V for the attention (freed when the forward
+    returns); because the pipeline runs layers sequentially only one layer's bf16 lives at a time,
+    so the per-step PEAK is (all-layers-packed + one-layer-bf16) << all-layers-bf16. The KV
+    reservation is tightened to exactly that peak — see _kv_bytes_per_layer / kv_reserve_probe."""
 
     class _TurboQuantLayer(dynamic_layer_cls):
         """A DynamicLayer that stores K/V QUANTIZED (TurboQuant) and reconstructs full bf16 on
@@ -177,9 +205,10 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
         def __init__(self, config=None):
             super().__init__()
             self._tq = None                              # this layer's TurboQuantizer (built on 1st update)
-            self._ki = self._kn = None                   # key   indices [b,h,S,d] uint8, norms [b,h,S,1]
-            self._vi = self._vn = None                   # value indices/norms
-            self._vq = self._vg = None                   # value QJL sign-bits/gammas (None unless value_qjl)
+            self._d = None                               # head_dim (needed to unpack the bit-packed idx)
+            self._ki = self._kn = None                   # key   idx PACKED [b,h,S,ceil(d*kb/8)] uint8, norms [b,h,S,1]
+            self._vi = self._vn = None                   # value idx PACKED / norms
+            self._vq = self._vg = None                   # value QJL sign-bits (PACKED 1-bit) / gammas (None unless value_qjl)
             self._len = 0                                # cached token count (drives get_seq_length + mask)
 
         def _q(self, k):
@@ -190,12 +219,16 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
         def update(self, key_states, value_states, *args, **kwargs):
             import torch
             q = self._q(key_states)
-            ki, kn = q.quant_keys(key_states)
+            ki, kn = q.quant_keys(key_states)                    # ki [b,h,q,d] uint8, values in [0,2^kb)
             vi, vn, vq, vg = q.quant_values(value_states)
+            ki = _pack_bits(torch, ki, q.kb)                     # -> [b,h,q,ceil(d*kb/8)]
+            vi = _pack_bits(torch, vi, q.vb_mse)
+            vq = _pack_bits(torch, vq.to(torch.uint8), 1) if vq is not None else None
             if self._ki is None:
+                self._d = int(key_states.shape[-1])
                 self._ki, self._kn = ki, kn
                 self._vi, self._vn, self._vq, self._vg = vi, vn, vq, vg
-            else:                                        # append the new step's reps along the seq dim
+            else:                                        # append the new step's PACKED reps along the seq dim
                 self._ki = torch.cat([self._ki, ki], dim=-2)
                 self._kn = torch.cat([self._kn, kn], dim=-2)
                 self._vi = torch.cat([self._vi, vi], dim=-2)
@@ -204,8 +237,12 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
                     self._vq = torch.cat([self._vq, vq], dim=-2)
                     self._vg = torch.cat([self._vg, vg], dim=-2)
             self._len += int(key_states.shape[-2])
-            keys = q.dequant_keys(self._ki, self._kn)            # full bf16, transient (returned only)
-            vals = q.dequant_values(self._vi, self._vn, self._vq, self._vg)
+            d = self._d
+            ki_u = _unpack_bits(torch, self._ki, q.kb, d)        # unpack full seq -> uint8 idx (transient)
+            vi_u = _unpack_bits(torch, self._vi, q.vb_mse, d)
+            vq_u = _unpack_bits(torch, self._vq, 1, d).bool() if self._vq is not None else None
+            keys = q.dequant_keys(ki_u, self._kn)                # full bf16, transient (returned only)
+            vals = q.dequant_values(vi_u, self._vn, vq_u, self._vg)
             return keys, vals
 
         def get_seq_length(self) -> int:
