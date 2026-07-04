@@ -45,11 +45,18 @@ hf_cache/
 
 # --- Logs / runtime artifacts ---
 *.log
-# per-deployment runtime state written by the controller (not source)
+# per-deployment runtime state written by the controller (not source).
+# NEVER track these: they are per-machine, and a `git reset --hard` would clobber a controller's
+# curated model registry (this actually wiped om3nbox's 10 custom models once). custom_models.json /
+# custom_gguf.json = the per-machine pulled-model registries; *_history.json = runtime graph data.
 node_config.json
 engine_config.json
 net_history.json
 deleted_models.json
+custom_models.json
+custom_gguf.json
+ram_history.json
+vram_history.json
 *.json.tmp
 # scratch test/check files
 _dash_check.js
