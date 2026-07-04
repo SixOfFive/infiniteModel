@@ -108,7 +108,13 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   guidance); one quant per repo. Unlocks the large pool of GGUF-only community models.
 - **MoE**: fused + non-fused experts; optional intra-layer offload (attention on GPU, routed experts in
   CPU RAM). Loaded + validated across Mixtral, OLMoE, Qwen3-MoE / Qwen3.6-A3B, MiniMax-M2.
-- **Multimodal**: distributed vision + audio (Qwen2.5-Omni) — image/audio → text, 3D mRoPE positions.
+- **Multimodal**: distributed vision + audio (Qwen2.5-Omni) — image/audio → text, 3D mRoPE positions;
+  speech-out via the controller-side Talker + Token2Wav (`/v1/audio/speech`). Omni's checkpoint declares
+  `architectures=["Qwen2_5OmniModel"]` (a bare `*Model` name), which the conservative encoder heuristic
+  mis-read as an embedding model and routed to a single-node `AutoModel` build transformers can't
+  construct; composite generative checkpoints (thinker/talker/token2wav/text/vision/audio sub-configs)
+  are now excluded from that heuristic, keeping Omni on the pipeline Thinker path (re-validated end-to-end
+  — load, text, and WAV — under transformers 5.12.1).
 - Hybrid architectures (Gated-DeltaNet + mRoPE), multimodal text-config models, and a range of dense
   decoders (Qwen2.5/3, Llama, Mistral/Devstral, DeepSeek).
 
