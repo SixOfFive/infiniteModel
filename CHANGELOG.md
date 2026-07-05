@@ -161,7 +161,9 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   offline parity harness across single/two/edge/all-image layouts × windows {∞,4,1024}, all MATCH).
   Prefill-only (a decoded text token is block −1 → no change), gated on the text config's flag (every
   non-bidir model byte-identical), and chunked prefill is disabled while active so an image never straddles
-  a chunk boundary. Live-fleet confirmation pending (offline-validated).
+  a chunk boundary. **Validated end-to-end on om3nbox** (gemma-4-26b-a4b-it int4, 2026-07-05): red-bg /
+  white-circle image → "there is a white circle. The background color is red" — 256 image tokens spliced,
+  clean stop, zero mask/shard errors.
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8
