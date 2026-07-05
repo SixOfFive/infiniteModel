@@ -77,6 +77,7 @@ class EngineLoadMixin:
             log_activity(f"{friendly}: auto-load on request (not resident) -> mode={a_mode}, "
                          f"quant={aq}, ctx={use_ctx or 'train'}" + (" (CPU-only)" if cpu_only else ""))
             try:
+                await self._precompile_int4(friendly, aq, 1)   # #cache-on-first-load: auto-load parity
                 return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
                                        quant=aq, cpu_only=cpu_only, spread=_spread,
                                        proportional=_prop, gpu_spread=_gpus)
@@ -88,6 +89,38 @@ class EngineLoadMixin:
                                            proportional=_prop, gpu_spread=_gpus)
                 raise
         raise ValueError(f"model '{friendly}' is not loaded — load it first")
+
+    async def _precompile_int4(self, friendly: str, quant: str, tp: int) -> None:
+        """#cache-on-first-load: for an int4 load with NO shard cache yet, BUILD it first (blocks
+        until written) so THIS load — and every future load — serves the small pre-packed int4
+        layers instead of streaming full bf16 and re-quantizing on the fly. No-op when an int4 cache
+        already exists, when quant != int4, or for tp>1 (its dispatch path doesn't read the whole-
+        layer cache). Reuses the /compile_shards SUBPROCESS (deprioritized, GIL-safe — an in-process
+        compile would starve the event loop / drop live generations). Non-fatal: ANY failure falls
+        through to the normal cold load. Shared by the /load route AND the auto-load path
+        (ensure_loaded) so request-triggered loads compile-on-first-load identically to click-loads."""
+        if not (quant == "int4" and tp <= 1):
+            return
+        try:
+            import shards as _sh
+            import urllib.parse as _up
+            _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
+            _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
+            _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
+            if _cdir and not (_cst.get("int4") or {}).get("ok"):
+                log_activity(f"{_ollama_name(friendly)}: no int4 shard cache — building it now so this "
+                             "and every future load serve pre-packed (first load is slower)…")
+                _curl = (f"http://127.0.0.1:{ARGS.http_port}/compile_shards"
+                         f"?model={_up.quote(friendly)}&quant=int4")
+
+                def _build_cache():
+                    import urllib.request as _u
+                    with _u.urlopen(_u.Request(_curl, method="POST"), timeout=10800) as _r:
+                        return _r.read()
+
+                await asyncio.to_thread(_build_cache)
+        except Exception as _ce:
+            log_activity(f"{_ollama_name(friendly)}: pre-load cache build skipped ({_ce!r}) — cold load")
 
     def _reserved_bytes(self, exclude_key: Optional[str] = None) -> tuple[dict, dict]:
         """Sum the in-flight load reservations (RAM, VRAM) per node, EXCLUDING `exclude_key` (a
