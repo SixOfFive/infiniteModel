@@ -139,10 +139,19 @@ so it needs the web framework **and** the model stack:
 # core
 pip install fastapi uvicorn torch transformers safetensors huggingface_hub numpy psutil
 
-# optional — only if you serve multimodal models (vision / audio)
-pip install pillow librosa soundfile
+# optional — CONTROLLER-side only, and only if you serve multimodal models
+pip install pillow          # images (ALL vision models) — required for ANY image input
+pip install soundfile       # audio-in: WAV/FLAC/OGG (also needs the libsndfile system lib)
+pip install librosa         # audio-in: adds mp3 + high-quality resample (heavier — pulls numba)
 ```
 
+- **Multimodal deps are controller-side** — images/audio are decoded + preprocessed on the controller,
+  not the workers — and **`transformers` caches the "is Pillow / torchvision available?" check at
+  import**, so install these *before* starting the controller (or **restart it** after, else vision
+  silently `ImportError`s even once the package is present). Vision needs **no torchvision**: every image
+  processor here has a pure-PIL backend, and installing torchvision risks pip pulling a `torch` that
+  doesn't match your node's pinned build. `soundfile` covers WAV in/out; without any of these, audio-in
+  still handles PCM WAV via the stdlib `wave` fallback and speech-out (TTS) writes WAV the same way.
 - Run the controller on the machine with the most disk + RAM (it holds every model's weights).
 - `torch`: install the build matching that box — the default **CUDA** wheel on an NVIDIA box, or the
   **CPU** wheel otherwise (`pip install torch --index-url https://download.pytorch.org/whl/cpu`). On an

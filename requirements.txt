@@ -14,15 +14,20 @@
 fastapi
 uvicorn
 
-# --- Controller (server.py) — Multimodal (vision), CONTROLLER-SIDE only ---
-# Image models (Qwen2.5-VL, Gemma-4 vision unified+tower, Pixtral/Mistral3, Qwen2.5-Omni)
-# decode + preprocess images on the CONTROLLER via Pillow. Without it EVERY vision request
+# --- Controller (server.py) — Multimodal (vision + audio), CONTROLLER-SIDE only ---
+# Image/audio models (Qwen2.5-VL, Gemma-4 vision unified+tower, Pixtral/Mistral3, Qwen2.5-Omni)
+# decode + preprocess on the CONTROLLER, not the workers. Without pillow EVERY vision request
 # ImportErrors ("No module named 'PIL'") — and transformers caches the availability check at
 # import, so install BEFORE starting the controller (or restart it after). torchvision is
 # deliberately NOT required: every image processor here has a PIL-only backend
 # (Qwen2VLImageProcessorPil / Gemma4ImageProcessorPil / PixtralImageProcessorPil), and adding
 # torchvision risks pip pulling a torch that doesn't match the node's pinned build.
-pillow
+pillow            # images — required for ANY vision model
+# Audio-in decode: soundfile (WAV/FLAC/OGG; needs the libsndfile system lib) then librosa
+# (adds mp3 + resample, heavier — pulls numba which pins numpy). BOTH optional: audio-in falls
+# back to stdlib `wave` for PCM WAV, and TTS/speech-out already writes WAV via stdlib `wave`.
+soundfile         # optional — audio-in for WAV/FLAC/OGG
+# librosa         # optional — audio-in for mp3 + high-quality resample
 
 # --- Worker (client.py) — Milestone 1 ---
 psutil

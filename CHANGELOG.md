@@ -51,6 +51,13 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   to 3D against a meta skeleton it rebuilds from the model config), and posts it back. Bit-identical to
   a single-box compile by construction (the same shared fuse + pack code), proven per-layer by a byte
   comparison, with automatic local fallback on any worker failure.
+- **Compile-on-first-load** — an int4 load with no shard cache yet BUILDS the cache first (via the
+  deprioritized `/compile_shards` subprocess, so the GIL-heavy quantize never starves the event loop /
+  drops live-gen logits), then serves the small pre-packed layers — so the FIRST load *persists* the
+  cache rather than just re-quantizing in memory and re-doing it next time. One shared
+  `engine._precompile_int4` covers BOTH the explicit `/load` (`precompile=1`, default) AND the auto-load
+  path (a serving request to a not-yet-resident model); no-op when a cache exists / quant≠int4 / tp>1,
+  non-fatal (any failure falls through to the cold on-the-fly load).
 
 ## Models
 - **Model aliases shown in the UI**: a registry alias (e.g. `qwen2.5:14b` → `qwen2.5:14b-instruct`,
@@ -101,6 +108,19 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   location imprecision observed). Side-fix: gemma-4's `chat_template.jinja` was missing from the model
   dir, so even TEXT prompts had been served through the flat fallback — with it in place the native
   `<|turn>` form renders (and `<turn|>`=106 was already a registered stop).
+- **Gemma 4 tower vision** (31b-it / 26b-a4b-it, model_type `gemma4`; validated end-to-end int4 on the
+  CUDA fleet + bf16 on the ROCm box, 2026-07-05): unlike the 12b unified path above, the tower variants
+  carry a REAL `Gemma4VisionModel` ViT (`vision_tower`: patch-embed → 27-layer encoder → 3×3 pooler)
+  plus a SEPARATE `embed_vision` projector — the Mistral3 tower+projector shape, but the projector is
+  `embed_vision` (not `multi_modal_projector`) and the checkpoint keys need NO rename. Because the 3×3
+  pooling happens INSIDE the tower (after the encoder), it consumes UNMERGED 768-d (16×16×3) teacher
+  patches — the unified path's pre-merged 6912-d preprocess is NOT reusable — so it drives the real
+  `Gemma4ImageProcessor`, whose pure-PIL variant is torchvision-free (runs on the ROCm box too).
+  `get_image_features(pixel_values, image_position_ids).pooler_output` is padding-stripped and LM-ready,
+  spliced with 1D positions + boi/eoi wrap exactly like the unified path. Rotary subtlety: `gemma4_vision`
+  builds a 1D `inv_freq[18]` at **θ=100** with a `head_dim//2` spatial split (not the θ=1e4 default), so
+  the meta-tensor materializer now rebuilds it via the module's own `compute_default_rope_parameters`
+  when a rotary module exposes one (Qwen's θ=1e4 vision path is byte-identical). Causal-first, as above.
 - **Gemma 4 unified audio** (#144, speech→text): the audio analog of the encoder-free vision path,
   equally torchvision-free and mel-free — each frame of `audio_samples_per_token`=640 **raw** waveform
   samples (40 ms @16 kHz) is one soft token, and `model.embed_audio` (a scale-free RMSNorm → a single
