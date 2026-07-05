@@ -8,6 +8,50 @@ from __future__ import annotations
 
 def register(app):
 
+    @app.post("/refresh_backends")
+    async def refresh_backends() -> JSONResponse:
+        """Re-probe the multimodal backend packages (Pillow / soundfile / torchvision / …) and bust
+        transformers' import-time availability cache IN PROCESS. transformers latches is_vision_available
+        / is_soundfile_available at import, so a `pip install pillow` done AFTER this controller started
+        stays invisible (vision keeps ImportError-ing) until a full restart. Hit this route after
+        installing a backend to make it live WITHOUT restarting im-controller. Returns {name: available}."""
+        avail = await asyncio.to_thread(multimodal.refresh_multimodal_backends, True)
+        return JSONResponse({"ok": True, "backends": avail})
+
+    @app.get("/code_manifest")
+    async def code_manifest(grep: str = "") -> JSONResponse:
+        """Ground-truth of the self-update file set AS IT SITS ON THIS BOX'S DISK — sha1(12)/size/mtime
+        per file, plus the running VERSION/CODE_DATE. The raw.githubusercontent CDN edge lags a push
+        per-controller (a forced /update can pull a STALE file even when the CDN looks fresh from
+        elsewhere), so a deploy must verify the bytes actually landed here rather than trusting the
+        /update 200. This makes that check a single HTTP call instead of SSH+grep. Pass ?grep=<marker>
+        to also report, per file, whether that substring is present on disk (the automated 'grep the
+        marker on the box' step)."""
+        def _run() -> dict:
+            here = os.path.dirname(os.path.abspath(__file__))
+            files = ["server.py"] + list(EXTRA_UPDATE_FILES)
+            out: dict = {}
+            for fn in files:
+                path = os.path.join(here, fn)
+                try:
+                    with open(path, "rb") as fh:
+                        blob = fh.read()
+                except Exception as exc:
+                    out[fn] = {"present": False, "error": f"{type(exc).__name__}: {str(exc)[:80]}"}
+                    continue
+                norm = blob.replace(b"\r\n", b"\n")   # match the self-updater's CRLF-normalized compare
+                rec = {"present": True, "size": len(blob),
+                       "sha1_12": hashlib.sha1(norm).hexdigest()[:12],
+                       "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))}
+                if fn in ("server.py", "client.py"):
+                    rec["version"] = _extract_version(blob)
+                if grep:
+                    rec["grep_hit"] = grep.encode("utf-8", "replace") in norm
+                out[fn] = rec
+            return {"ok": True, "running_version": VERSION, "code_date": CODE_DATE,
+                    "grep": grep or None, "files": out}
+        return JSONResponse(await asyncio.to_thread(_run))
+
     @app.get("/inspect_audio")       # #22 inc 5: introspect an Omni model's AUDIO + Thinker interface
     async def inspect_audio(model: str = "qwen2.5-omni-7b") -> JSONResponse:
         """Meta-load (zero weights) a Qwen2.5-Omni-style checkpoint and report what's needed to

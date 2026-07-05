@@ -378,6 +378,17 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   WITHOUT bouncing the fleet, so a casual push no longer reboots the cluster. The forced dashboard
   "Update + restart" always restarts regardless. (Stale "GitLab" self-update wording corrected to GitHub
   throughout.)
+- **Deploy verification (`GET /code_manifest`):** the raw-CDN edge lags a push *per controller*, so a
+  forced `/update` can pull a stale file on one box while the CDN looks fresh from elsewhere. This route
+  reports the on-disk `sha1(12)`/size/mtime of every self-update file plus the running `VERSION`/`CODE_DATE`
+  (and `?grep=<marker>` reports per-file whether a marker is present on disk) — so a deploy verifies the
+  bytes actually landed with one HTTP call instead of SSH-ing in to grep.
+- **Multimodal backend self-heal:** transformers memoizes its PIL/soundfile/torchvision availability at
+  import, so a dep `pip install`ed *after* the controller started stayed invisible (vision kept
+  ImportError-ing) until a full restart — the trap the `.38` Proxmox rebuild hit (venv had torch, not
+  Pillow). The controller now re-probes and busts that cache at startup, lazily per image/audio request
+  (throttled), and on demand via `POST /refresh_backends` — a freshly-installed backend goes live with no
+  restart.
 
 ## Code organization (context-economy refactor)
 - The controller and worker grew into multi-thousand-line files that were costly to read/edit. They are

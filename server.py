@@ -1712,6 +1712,7 @@ from multimodal import (_get_tokenizer, _get_processor, _decode_image, _collect_
                         _load_audio_encoder, _get_audio_feature_extractor, _omni_audio_token_id,
                         _gemma4_audio_preprocess, _load_gemma4_audio_encoder, _gemma4_audio_token_ids,
                         _audio_out_lengths, _resolve_speaker, _encode_audio_response,
+                        refresh_multimodal_backends,
                         _VISION_LOG,
                         _TOK_CACHE, _PROCESSOR_CACHE, _IMGPROC_CACHE, _AUDIOFE_CACHE,
                         _VISION_CACHE, _VISION_MAT, _AUDIO_CACHE, _AUDIO_MAT,
@@ -1723,6 +1724,12 @@ multimodal.set_model_dir_resolver(_controller_model_dir)
 # present dir WITHOUT downloading/converting (unlike _controller_model_dir), so a metadata-path
 # tokenizer call can't trigger a heavy conversion.
 multimodal.set_local_dir_resolver(_local_model_dir)
+# Re-probe multimodal backends at startup and bust transformers' import-time PIL/torchvision/soundfile
+# availability cache — so a fresh controller (or one restarted AFTER a `pip install pillow/soundfile`)
+# reports the backends correctly. The per-request _ensure_backends() guard covers a dep installed while
+# already running; this covers the just-restarted case without depending on the first request to warm it.
+with contextlib.suppress(Exception):
+    refresh_multimodal_backends()
 
 
 def _encode_images(target_id: str, images: list) -> dict:

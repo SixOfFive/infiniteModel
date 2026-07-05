@@ -36,6 +36,83 @@ _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------------------
+# Multimodal backend availability (Pillow / soundfile / torchvision / …)
+# ---------------------------------------------------------------------------
+# transformers probes these packages ONCE at import and caches the answer as module globals in
+# transformers.utils.import_utils (is_vision_available() / is_torchvision_available() /
+# is_soundfile_available() each read a bool computed at import). If Pillow or an audio lib is
+# pip-installed on a box AFTER the controller process started — exactly what bit the .38 Proxmox
+# rebuild, whose venv had torch but not Pillow — transformers keeps reporting the backend
+# UNAVAILABLE and every image/audio processor raises "requires the PIL library" until the whole
+# controller is restarted. refresh_multimodal_backends() re-probes the real packages and rewrites
+# transformers' cached globals IN PROCESS so a freshly-installed backend takes effect on the very
+# next request, no restart. _ensure_backends() is the cheap per-request guard that calls it while
+# any backend is still unseen (covers a dep installed mid-run) and no-ops once all are present.
+_BACKEND_PKGS = {                    # our-name -> (import spec, transformers cached-global names)
+    "pillow":      ("PIL",         ("_pil_available",)),
+    "torchvision": ("torchvision", ("_torchvision_available",)),
+    "soundfile":   ("soundfile",   ("_soundfile_available",)),
+    "librosa":     ("librosa",     ("_librosa_available",)),
+    "av":          ("av",          ("_av_available",)),
+}
+_BACKENDS_OK: set = set()            # names confirmed importable this run (stop re-probing them)
+_LAST_PROBE = 0.0                    # monotonic ts of the last lazy re-probe (throttle per-request cost)
+_PROBE_EVERY_S = 15.0                # re-probe at most this often while a backend is still unseen
+
+
+def refresh_multimodal_backends(force: bool = False) -> dict:
+    """Re-probe the multimodal backend packages and bust transformers' import-time availability
+    cache for any that are now installed, so a dep installed AFTER startup works without a restart.
+    Idempotent + cheap (skips already-confirmed backends unless force). Returns {name: available}."""
+    import importlib, importlib.util
+    importlib.invalidate_caches()        # so find_spec sees a package pip-installed after startup
+    try:
+        import transformers.utils.import_utils as _tiu
+    except Exception:
+        _tiu = None
+    out: dict = {}
+    for name, (pkg, globs) in _BACKEND_PKGS.items():
+        if name in _BACKENDS_OK and not force:
+            out[name] = True
+            continue
+        present = False
+        with contextlib.suppress(Exception):
+            present = importlib.util.find_spec(pkg) is not None
+        out[name] = present
+        if present:
+            _BACKENDS_OK.add(name)
+            if _tiu is not None:         # overwrite the cached "unavailable" bool transformers latched
+                for g in globs:
+                    if hasattr(_tiu, g) and getattr(_tiu, g, None) is not True:
+                        with contextlib.suppress(Exception):
+                            setattr(_tiu, g, True)
+    if _tiu is not None:                 # some versions memoize the is_*_available() fns with lru_cache
+        for fn in ("is_vision_available", "is_torchvision_available", "is_soundfile_available",
+                   "is_librosa_available", "is_av_available"):
+            f = getattr(_tiu, fn, None)
+            if f is not None and hasattr(f, "cache_clear"):
+                with contextlib.suppress(Exception):
+                    f.cache_clear()
+    return out
+
+
+def _ensure_backends() -> None:
+    """Lazy, cheap guard at each image/audio entry point: while any backend is still unseen, re-probe
+    (picks up a dep installed mid-run). No-op once every backend is confirmed present; throttled to at
+    most once per _PROBE_EVERY_S so a fleet that deliberately never installs torchvision/soundfile/av
+    doesn't pay a probe on every single request forever — it still auto-heals within seconds of an install."""
+    global _LAST_PROBE
+    if len(_BACKENDS_OK) >= len(_BACKEND_PKGS):
+        return
+    now = time.monotonic()
+    if now - _LAST_PROBE < _PROBE_EVERY_S:
+        return
+    _LAST_PROBE = now
+    with contextlib.suppress(Exception):
+        refresh_multimodal_backends()
+
+
+# ---------------------------------------------------------------------------
 # Dependency injection: controller model-dir resolver (no back-import of server)
 # ---------------------------------------------------------------------------
 _MODEL_DIR_FN = None
@@ -179,6 +256,7 @@ def _decode_image(block: dict):
     """An Anthropic/OpenAI image content block -> a PIL RGB image (or None). Handles
     Anthropic {type:image, source:{type:base64|url,...}} and OpenAI {type:image_url,
     image_url:{url}} incl. data: URLs. PIL is required (Pillow); no torchvision."""
+    _ensure_backends()   # pick up a Pillow installed after this controller started (no restart)
     import base64, io, urllib.request
     from PIL import Image
     data = None
@@ -662,6 +740,7 @@ def _get_image_processor(target_id: str):
     """The IMAGE processor only (not the bundled AutoProcessor, which also pulls a VIDEO
     processor that hard-requires torchvision). use_fast=False keeps it on the PIL/numpy slow
     path so we need neither torchvision nor the video processor — Pillow alone."""
+    _ensure_backends()   # bust transformers' cached PIL/torchvision check if a dep landed post-startup
     p = _IMGPROC_CACHE.get(target_id)
     if p is None:
         from transformers import AutoImageProcessor
@@ -1128,6 +1207,7 @@ def _get_audio_feature_extractor(target_id: str):
     Qwen2_5OmniProcessor, which also pulls an image + video processor (video hard-requires
     torchvision, exactly the trap the vision path hit). AutoFeatureExtractor loads only the
     mel/log-spectrogram front-end we need."""
+    _ensure_backends()   # bust transformers' cached soundfile/audio check if a dep landed post-startup
     fe = _AUDIOFE_CACHE.get(target_id)
     if fe is None:
         from transformers import AutoFeatureExtractor
