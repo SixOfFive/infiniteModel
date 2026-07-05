@@ -1754,8 +1754,10 @@ def _encode_images(target_id: str, images: list) -> dict:
             # <|image|> to exactly that many). Plain 1D positions; 'wrap' tells the serve
             # path to bracket each expanded run in boi/eoi (replace_image_token parity).
             # NOTE: the reference runs BIDIRECTIONAL attention across each image block
-            # (use_bidirectional_attention='vision'); our pipeline is causal-only — shipped
-            # causal-first, quality validated empirically.
+            # (use_bidirectional_attention='vision'); the pipeline now HONORS this (039fb24) —
+            # the image-span positions ride the frame header as bidir_spans and every stage's
+            # _causal_addmask ORs a blockwise overlay onto the mask, gated on the text cfg flag
+            # (byte-identical for non-bidir models). Live-validated e2e (26b int4, om3nbox).
             t_load = time.time()
             pre = _gemma4_preprocess(images, target_id)
             pv = pre["pixel_values"].to(dev)
@@ -1804,8 +1806,9 @@ def _encode_images(target_id: str, images: list) -> dict:
             # [total_soft_tokens, text_hidden] — LM-ready, splice as-is. Plain 1D LM
             # positions; 'wrap' brackets each expanded run in boi/eoi.
             # NOTE: the reference runs LM-side BLOCK-BIDIRECTIONAL attention across each
-            # image span (use_bidirectional_attention='vision'); our pipeline is causal-only
-            # -- shipped causal-first (same choice as the 12b unified path).
+            # image span (use_bidirectional_attention='vision'); the pipeline now HONORS this
+            # (039fb24) via bidir_spans threaded to every stage's mask (same path as the 12b
+            # unified), gated on the text cfg flag — byte-identical for non-bidir models.
             ip = _get_image_processor(target_id)
             t_load = time.time()
             inputs = ip(images=images, return_tensors="pt")
