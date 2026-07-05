@@ -271,17 +271,19 @@ class WorkerLoadMixin:
                 continue
             try:
                 data = pickle.loads(payload)
-                # tuple grew over versions: 4 (base) -> 5 (+inject) -> 6 (+position_ids);
-                # tolerate all during a rolling self-update.
-                inject = position_ids = None
-                if len(data) >= 6:
-                    xt, cache_start, reset, all_logits, inject, position_ids = data[:6]
+                # tuple grew over versions: 4 (base) -> 5 (+inject) -> 6 (+position_ids) ->
+                # 7 (+bidir_spans); tolerate all during a rolling self-update.
+                inject = position_ids = bidir_spans = None
+                if len(data) >= 7:
+                    xt, cache_start, reset, all_logits, inject, position_ids, bidir_spans = data[:7]
+                elif len(data) == 6:
+                    xt, cache_start, reset, all_logits, inject, position_ids = data
                 elif len(data) == 5:
                     xt, cache_start, reset, all_logits, inject = data
                 else:
                     xt, cache_start, reset, all_logits = data
                 self.shards[self._tp_model_id].forward(xt, cache_start, reset, all_logits,
-                                                       inject, position_ids)
+                                                       inject, position_ids, bidir_spans=bidir_spans)
             except Exception as exc:
                 print(f"[tp-follow] forward error: {exc!r}")
                 break

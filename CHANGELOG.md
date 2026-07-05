@@ -103,9 +103,9 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   transformers' WeightRenaming table during collection. `get_image_features(pixel_values,
   image_position_ids)` returns padding-stripped LM-ready embeds; each template-rendered `<|image|>` is
   bracketed `boi + n×image + eoi` (processor parity) then expanded to its REAL per-image count and
-  spliced with plain 1D positions. Multi-image attribution exact; works on all three APIs. Known gap:
-  the reference runs bidirectional attention across each image block — we ship causal-first (minor
-  location imprecision observed). Side-fix: gemma-4's `chat_template.jinja` was missing from the model
+  spliced with plain 1D positions. Multi-image attribution exact; works on all three APIs. Image-span
+  bidirectional attention is now honored (see "Gemma 4 bidirectional image-span attention" below; was
+  previously causal-first). Side-fix: gemma-4's `chat_template.jinja` was missing from the model
   dir, so even TEXT prompts had been served through the flat fallback — with it in place the native
   `<|turn>` form renders (and `<turn|>`=106 was already a registered stop).
 - **Gemma 4 tower vision** (31b-it / 26b-a4b-it, model_type `gemma4`; validated end-to-end int4 on the
@@ -120,7 +120,8 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   spliced with 1D positions + boi/eoi wrap exactly like the unified path. Rotary subtlety: `gemma4_vision`
   builds a 1D `inv_freq[18]` at **θ=100** with a `head_dim//2` spatial split (not the θ=1e4 default), so
   the meta-tensor materializer now rebuilds it via the module's own `compute_default_rope_parameters`
-  when a rotary module exposes one (Qwen's θ=1e4 vision path is byte-identical). Causal-first, as above.
+  when a rotary module exposes one (Qwen's θ=1e4 vision path is byte-identical). Image-span bidirectional
+  attention now honored, same as the unified path (see the dedicated entry below).
 - **Gemma 4 unified audio** (#144, speech→text): the audio analog of the encoder-free vision path,
   equally torchvision-free and mel-free — each frame of `audio_samples_per_token`=640 **raw** waveform
   samples (40 ms @16 kHz) is one soft token, and `model.embed_audio` (a scale-free RMSNorm → a single
@@ -147,6 +148,20 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   global layer index is correct) — a controlled offline harness proved single-node ≡ 2-stage; the
   reported "distributed-only garble" was the sliding-mask error (which also hits single-node past the
   window) compounded by fleet-contention hop-death, not a stage-boundary bug.
+- **Gemma 4 bidirectional image-span attention** (2026-07-05): with `use_bidirectional_attention='vision'`
+  (the 12b unified text config's default; the tower checkpoints set it too) the reference lets the soft
+  tokens of each image attend **bidirectionally within their own block** — the pipeline had shipped
+  causal-first, the one remaining vision-quality gap (location precision), flagged twice across prior
+  handoffs. Now honored: the controller derives each image's contiguous soft-token run from the mm splice
+  positions and rides them down the pipeline in the frame header (`bidir_spans`), exactly like
+  `position_ids`, so EVERY stage rebuilds the same mask (TP peers get them via the broadcast tuple).
+  `_causal_addmask` OR's a **blockwise overlay** (two positions attend iff they share one image run) onto
+  BOTH the full and the sliding-window causal masks — bit-identical to HF's
+  `or_masks(base, blockwise_overlay(get_block_sequence_ids_for_mask(mm_token_type_ids)))` (validated by an
+  offline parity harness across single/two/edge/all-image layouts × windows {∞,4,1024}, all MATCH).
+  Prefill-only (a decoded text token is block −1 → no change), gated on the text config's flag (every
+  non-bidir model byte-identical), and chunked prefill is disabled while active so an image never straddles
+  a chunk boundary. Live-fleet confirmation pending (offline-validated).
 - **GGUF ingestion**: a model that ships weights only as a llama.cpp **`.gguf`** is normalized to a
   standard safetensors checkpoint ONCE at add/download time (`transformers` GGUF loader dequantizes →
   bf16 → `save_pretrained`), after which it is an ordinary model — chunk-streamed, int4/int8

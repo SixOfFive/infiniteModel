@@ -7,6 +7,21 @@ across all mixins by MRO. Controller-only leaf module; in EXTRA_UPDATE_FILES.
 from __future__ import annotations
 
 
+def _bidir_spans_from_positions(positions):
+    """#gemma4-bidir: group the image-embed slot positions (row-major, ascending) into contiguous
+    half-open [start,end) runs — one per image block. Mirrors the reference's contiguous vision
+    runs (get_block_sequence_ids_for_mask); the shard OR's a bidirectional overlay within each run.
+    Returns a list of (start,end) tuples, or [] when there are no positions."""
+    spans: list = []
+    for p in positions or []:
+        p = int(p)
+        if spans and p == spans[-1][1]:
+            spans[-1][1] = p + 1
+        else:
+            spans.append([p, p + 1])
+    return [(s, e) for s, e in spans]
+
+
 class EngineGenMixin:
 
     async def embed(self, friendly: str, input_ids, attention_mask) -> list:
@@ -197,6 +212,7 @@ class EngineGenMixin:
         self.pending_friendly[rid] = model.friendly   # #5 routed REPLICA key -> replica-precise recovery
 
         async def _flush(w) -> None:
+            _bspans = None
             if mm is not None and reset:
                 positions, embeds = mm
                 emeta, eraw = _pack_tensor(embeds)
@@ -204,11 +220,17 @@ class EngineGenMixin:
                     "req_id": rid, "model_id": model.target_id, "kind": "mm",
                     "positions": list(positions), **emeta}, eraw)
                 net_account(self._stage0_id(model), to_node=nb)  # controller -> stage0
+                # #gemma4-bidir: image-token runs for block-bidirectional vision attention. Sent on
+                # EVERY vision prefill; the shard gates on use_bidirectional_attention='vision', so a
+                # causal-only vision model (Pixtral/Qwen-VL) simply ignores them. Prefill-only.
+                _bspans = _bidir_spans_from_positions(positions)
             hdr = {"req_id": rid, "model_id": model.target_id, "kind": "ids",
                    "cache_position": cache_position,
                    "reset": reset, "all_logits": all_logits, **meta}
             if position_ids is not None:   # #22 inc 4: 3D mRoPE positions [3][q] (small JSON list)
                 hdr["position_ids"] = position_ids
+            if _bspans:   # #gemma4-bidir: small JSON list of [start,end] image runs
+                hdr["bidir_spans"] = _bspans
             if capture_hidden:   # #P6 speech: ask the head stage for post-norm hidden too
                 hdr["capture_hidden"] = True
             if capture_pre_norm:   # #91 MTP: ask the head stage for the PRE-final-norm trunk hidden

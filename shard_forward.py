@@ -21,7 +21,8 @@ class ShardForwardMixin:
 
     def forward(self, x, cache_start: int = 0, reset: bool = True,
                 all_logits: bool = False, inject=None, position_ids=None,
-                capture_hidden: bool = False, capture_pre_norm: bool = False):
+                capture_hidden: bool = False, capture_pre_norm: bool = False,
+                bidir_spans=None):
         # #fwd-serialize: serialize forwards on this shard so a still-running ORPHANED forward (from a
         # reclaimed/disconnected gen — the worker thread can't be cancelled) can't concurrently mutate
         # the shared self.kv underneath a fresh forward, which desyncs the KV length from the causal
@@ -60,7 +61,8 @@ class ShardForwardMixin:
         self._fwd_started_ts = self._fwd_progress_ts = time.time()
         try:
             return self._forward_impl(x, cache_start, reset, all_logits, inject,
-                                      position_ids, capture_hidden, capture_pre_norm)
+                                      position_ids, capture_hidden, capture_pre_norm,
+                                      bidir_spans)
         finally:
             lock.release()
 
@@ -97,7 +99,8 @@ class ShardForwardMixin:
 
     def _forward_impl(self, x, cache_start: int = 0, reset: bool = True,
                       all_logits: bool = False, inject=None, position_ids=None,
-                      capture_hidden: bool = False, capture_pre_norm: bool = False):
+                      capture_hidden: bool = False, capture_pre_norm: bool = False,
+                      bidir_spans=None):
         """Run this stage's layers with an incremental KV cache (M2e). Always called holding
         self._fwd_lock (see forward()).
         x = token ids (first stage) or hidden states (mid stage), covering the
@@ -166,7 +169,13 @@ class ShardForwardMixin:
         with torch.inference_mode():
             if self.uniform_device is not None:
                 return self._forward_uniform(x, cache_start, all_logits, inject, position_ids,
-                                             capture_hidden, capture_pre_norm)
+                                             capture_hidden, capture_pre_norm, bidir_spans)
+            # #gemma4-bidir: OR image-span bidirectional attention into the PREFILL masks when the
+            # text config asks for it (use_bidirectional_attention='vision') and the controller
+            # sent the image runs. Prefill-only: a decoded token is text (block id -1) -> no effect.
+            _bidir_sp = (bidir_spans if (bidir_spans
+                         and getattr(self.cfg, "use_bidirectional_attention", None) == "vision")
+                         else None)
             h = self.embed(x.to(self.embed_device)) if self.has_embed else x
             if inject is not None and self.has_embed:
                 h = self._splice_mm(h, inject)
@@ -222,17 +231,22 @@ class ShardForwardMixin:
             def _run_layers(h_, off, cl):
                 cs_off = cache_start + off                  # absolute start of this chunk's queries
                 tot_off = cs_off + cl                       # cache length once this chunk's keys land
-                m_cpu = torch.zeros((cl, tot_off), dtype=self.dtype)
-                if cl > 1:   # causal among the chunk's tokens; all prior keys visible
-                    m_cpu[:, cs_off:] = torch.triu(
-                        torch.full((cl, cl), float("-inf"), dtype=self.dtype), diagonal=1)
-                m_cpu = m_cpu.view(1, 1, cl, tot_off)
+                if _bidir_sp and cl > 1:   # #gemma4-bidir: full causal mask + image-span overlay
+                    m_cpu = self._causal_addmask(cs_off, cl, tot_off, "cpu", self.dtype, None, _bidir_sp)
+                else:
+                    m_cpu = torch.zeros((cl, tot_off), dtype=self.dtype)
+                    if cl > 1:   # causal among the chunk's tokens; all prior keys visible
+                        m_cpu[:, cs_off:] = torch.triu(
+                            torch.full((cl, cl), float("-inf"), dtype=self.dtype), diagonal=1)
+                    m_cpu = m_cpu.view(1, 1, cl, tot_off)
                 # #gemma4-sliding: windowed causal mask for sliding_attention layers (per-type path).
+                # #gemma4-bidir: same image-span overlay OR'd onto the sliding mask (HF OR's both).
                 sm_cpu = None
                 if _per_type:
                     _sw = getattr(self.cfg, "sliding_window", None)
                     if _sw:
-                        sm_cpu = self._causal_addmask(cs_off, cl, tot_off, "cpu", self.dtype, _sw)
+                        sm_cpu = self._causal_addmask(cs_off, cl, tot_off, "cpu", self.dtype, _sw,
+                                                      _bidir_sp if cl > 1 else None)
                 p_cpu = pos_cpu[:, off:off + cl]
                 cp_cpu = cpos_cpu[off:off + cl]
                 cc_cpu = None if _per_type else cos_cpu[:, off:off + cl, :]
@@ -281,7 +295,8 @@ class ShardForwardMixin:
 
             cstep = self._prefill_chunk_len(q)
             do_chunk = (q > 1 and cstep < q and not _per_type and not self._hybrid
-                        and not self._omni and not getattr(self, "_mrope3d", False) and position_ids is None)
+                        and not self._omni and not getattr(self, "_mrope3d", False)
+                        and position_ids is None and not _bidir_sp)   # #gemma4-bidir: no cross-chunk image split
             if not do_chunk:
                 h = _run_layers(h, 0, q)
             else:
@@ -314,21 +329,21 @@ class ShardForwardMixin:
 
     def _forward_uniform(self, x, cache_start: int, all_logits: bool, inject=None,
                          position_ids=None, capture_hidden: bool = False,
-                         capture_pre_norm: bool = False):
+                         capture_pre_norm: bool = False, bidir_spans=None):
         """Single-device fast-path router. #cudagraph (opt-in, default OFF): for a graph-eligible
         single-node standard-attention model, a plain single-token decode is served by a captured
         CUDA graph via the COPY-HANDOFF path — prefill (and everything else) stays on the eager
         DynamicCache path below, untouched. _maybe_graph_decode returns None to defer to eager."""
-        if self._graph_enabled() and inject is None and position_ids is None:
+        if self._graph_enabled() and inject is None and position_ids is None and bidir_spans is None:
             r = self._maybe_graph_decode(x, cache_start, all_logits, capture_hidden, capture_pre_norm)
             if r is not None:
                 return r
         return self._forward_uniform_eager(x, cache_start, all_logits, inject, position_ids,
-                                           capture_hidden, capture_pre_norm)
+                                           capture_hidden, capture_pre_norm, bidir_spans)
 
     def _forward_uniform_eager(self, x, cache_start: int, all_logits: bool, inject=None,
                                position_ids=None, capture_hidden: bool = False,
-                               capture_pre_norm: bool = False):
+                               capture_pre_norm: bool = False, bidir_spans=None):
         """The eager single-device path (DynamicCache). Bit-identical to the pre-cudagraph behavior —
         everything (embed, layers, norm/head, rotary) lives on self.uniform_device; single-token
         decode uses no mask (the lone query attends every cached key). Also serves as the cuda-graph
@@ -355,6 +370,10 @@ class ShardForwardMixin:
         # layer picks by global index + gets shared_kv_states={}. Other archs: one shared rotary.
         _per_type = bool(_lts) and hasattr(_rotary, "%s_inv_freq" % _lts[0])
         _ls = int(getattr(self, "layer_start", 0) or 0)
+        # #gemma4-bidir: image runs attend bidirectionally in the PREFILL mask (prefill-only: q>1).
+        _bidir_sp = (bidir_spans if (bidir_spans and q > 1
+                     and getattr(self.cfg, "use_bidirectional_attention", None) == "vision")
+                     else None)
         _pe_t, _skv = {}, {}
         pos_emb = None
         if _per_type:
@@ -405,22 +424,27 @@ class ShardForwardMixin:
         # original single full pass (do_chunk False -> byte-identical to the pre-chunk behavior).
         cstep = self._prefill_chunk_len(q)
         do_chunk = (q > 1 and cstep < q and not _per_type and not self._hybrid
-                    and not self._omni and not getattr(self, "_mrope3d", False) and position_ids is None)
+                    and not self._omni and not getattr(self, "_mrope3d", False)
+                    and position_ids is None and not _bidir_sp)   # #gemma4-bidir: no cross-chunk image split
         if not do_chunk:
             if _per_type:
                 # #gemma4-sliding: build BOTH masks; _run hands each layer the one for its type. The
                 # full-causal mask (window=None) reproduces the old prefill-causal / decode-see-all
                 # behavior for full_attention layers; the windowed mask restricts sliding layers.
-                fmask = self._causal_addmask(cache_start, q, total, dev, self.dtype, None)
+                # #gemma4-bidir: _bidir_sp OR's the image-span overlay onto both (HF OR's both).
+                fmask = self._causal_addmask(cache_start, q, total, dev, self.dtype, None, _bidir_sp)
                 _sw = getattr(self.cfg, "sliding_window", None)
-                smask = (self._causal_addmask(cache_start, q, total, dev, self.dtype, _sw)
+                smask = (self._causal_addmask(cache_start, q, total, dev, self.dtype, _sw, _bidir_sp)
                          if _sw else None)
                 h = _run(h, fmask, pos, pos_emb, cache_position, smask)
             elif q > 1:   # prefill: causal among the new tokens; all prior keys visible
-                mask = torch.zeros((q, total), dtype=self.dtype, device=dev)
-                mask[:, cache_start:] = torch.triu(
-                    torch.full((q, q), float("-inf"), dtype=self.dtype, device=dev), diagonal=1)
-                mask = mask.view(1, 1, q, total)
+                if _bidir_sp:   # #gemma4-bidir: causal + image-span overlay (non-per-type bidir model)
+                    mask = self._causal_addmask(cache_start, q, total, dev, self.dtype, None, _bidir_sp)
+                else:
+                    mask = torch.zeros((q, total), dtype=self.dtype, device=dev)
+                    mask[:, cache_start:] = torch.triu(
+                        torch.full((q, q), float("-inf"), dtype=self.dtype, device=dev), diagonal=1)
+                    mask = mask.view(1, 1, q, total)
                 h = _run(h, mask, pos, pos_emb, cache_position)
             else:       # decode: one query sees every key -> no mask needed
                 h = _run(h, None, pos, pos_emb, cache_position)
@@ -452,13 +476,18 @@ class ShardForwardMixin:
             return logits
         return h.to(self.cpu)
 
-    def _causal_addmask(self, cache_start: int, q: int, total: int, dev, dtype, window=None):
+    def _causal_addmask(self, cache_start: int, q: int, total: int, dev, dtype, window=None,
+                        spans=None):
         """#gemma4-sliding: additive attention mask [1,1,q,total]. A key at absolute position kpos is
         visible to a query at absolute position qpos iff 0 <= (qpos - kpos) (< window when given).
         window=None -> plain causal (full_attention); window=int -> sliding-window causal. This mirrors
         the HF reference's create_causal_mask / create_sliding_window_causal_mask exactly (validated
         bit-exact), so the per-type path can hand sliding_attention layers a windowed mask while
-        full_attention layers keep the plain causal one. Cheap: two aranges + a compare."""
+        full_attention layers keep the plain causal one. Cheap: two aranges + a compare.
+        #gemma4-bidir: `spans` = list of (start,end) absolute half-open image-token runs. When given,
+        OR-in a blockwise overlay so any two positions in the SAME run attend bidirectionally
+        (use_bidirectional_attention='vision') — exactly HF's or_masks(base, blockwise_overlay(
+        block_sequence_ids)). None -> pure causal/sliding (byte-identical to the pre-bidir mask)."""
         torch = self.torch
         qpos = torch.arange(cache_start, cache_start + q, device=dev).view(q, 1)
         kpos = torch.arange(0, total, device=dev).view(1, total)
@@ -466,9 +495,26 @@ class ShardForwardMixin:
         allowed = dist >= 0                       # causal (a query never sees a future key)
         if window:
             allowed = allowed & (dist < int(window))   # ...and only the last `window` keys
+        if spans:
+            # blockwise overlay: unmask iff q and k share the same image run (group >= 0)
+            qsid = self._span_ids(cache_start, q, spans, dev).view(q, 1)
+            ksid = self._span_ids(0, total, spans, dev).view(1, total)
+            allowed = allowed | ((qsid == ksid) & (qsid >= 0))
         m = torch.zeros((q, total), dtype=dtype, device=dev)
         m = m.masked_fill(~allowed, float("-inf"))
         return m.view(1, 1, q, total)
+
+    def _span_ids(self, start: int, n: int, spans, dev):
+        """#gemma4-bidir: per-position block id [n] — the index of the image span containing each
+        absolute position in [start, start+n), or -1 for text. Mirrors the reference's
+        get_block_sequence_ids_for_mask (contiguous vision runs -> 0,1,2,...; text -> -1)."""
+        torch = self.torch
+        pos = torch.arange(start, start + n, device=dev)
+        sid = torch.full((n,), -1, dtype=torch.long, device=dev)
+        for i, (s, e) in enumerate(spans):
+            sid = torch.where((pos >= int(s)) & (pos < int(e)),
+                              torch.full_like(sid, i), sid)
+        return sid
 
     def _softcap_logits(self, logits):
         """#gemma4: Gemma-4 (like Gemma-2) caps its final logits at ±final_logit_softcapping via

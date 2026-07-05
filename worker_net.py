@@ -83,7 +83,8 @@ class WorkerNetMixin:
         return _nb
 
     def _run_stage(self, model_id, x, cache_start, reset, all_logits, inject=None,
-                   position_ids=None, capture_hidden=False, capture_pre_norm=False):
+                   position_ids=None, capture_hidden=False, capture_pre_norm=False,
+                   bidir_spans=None):
         # TP rank 0 drives the group: broadcast this forward's input to the peers (who run
         # their sharded forward in lockstep), then run ours, all-reducing via the mesh hooks.
         if self._tp is not None and self._tp.rank == 0 and model_id == self._tp_model_id:
@@ -94,14 +95,17 @@ class WorkerNetMixin:
             # forward (a busy model keeps its own mesh warm).
             with self._tp_lock:
                 self._tp_last_fwd = time.time()
-                # include inject + position_ids so peers (replicated embeddings + rotary) match
+                # include inject + position_ids + bidir_spans so peers (replicated embeddings +
+                # rotary + per-stage masks) build an identical mask -> matching all-reduce
                 self._tp.broadcast(pickle.dumps(
                     (x.detach().to("cpu"), int(cache_start), bool(reset), bool(all_logits),
-                     inject, position_ids)))
+                     inject, position_ids, bidir_spans)))
                 return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
-                                                     position_ids, capture_hidden, capture_pre_norm)
+                                                     position_ids, capture_hidden, capture_pre_norm,
+                                                     bidir_spans)
         return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
-                                             position_ids, capture_hidden, capture_pre_norm)
+                                             position_ids, capture_hidden, capture_pre_norm,
+                                             bidir_spans)
 
     async def _data_inbound(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
@@ -177,6 +181,10 @@ class WorkerNetMixin:
                     # #22 inc 4: 3D mRoPE positions ride the frame header (small list); every
                     # stage uses them for its rotary, so propagate them to the next stage too.
                     position_ids = hdr.get("position_ids")
+                    # #gemma4-bidir: image-span runs for bidirectional vision attention ride the
+                    # header (small JSON list of [start,end]); every stage rebuilds its own mask,
+                    # so propagate them downstream exactly like position_ids.
+                    bidir_spans = hdr.get("bidir_spans")
                     # #P6 speech: capture thinker hidden states for the talker. The flag rides
                     # the header down the chain so the LAST stage (has_head) returns the
                     # post-norm hidden alongside the logits in a two-tensor result frame.
@@ -191,7 +199,7 @@ class WorkerNetMixin:
                     shard._fwd_next_rid = hdr.get("req_id")
                     out = await asyncio.to_thread(self._run_stage, model_id, x, cache_start,
                                                   reset, all_logits, inject, position_ids,
-                                                  capture_hidden, capture_pre_norm)
+                                                  capture_hidden, capture_pre_norm, bidir_spans)
                     kind = "logits" if shard.has_head else "hidden"
                     if (capture_hidden or capture_pre_norm) and shard.has_head and isinstance(out, tuple):
                         logits_t, hidden_t = out
@@ -203,6 +211,8 @@ class WorkerNetMixin:
                                 "logits_nbytes": len(lraw), "hid_meta": hmeta}
                         if position_ids is not None:
                             ohdr["position_ids"] = position_ids
+                        if bidir_spans is not None:
+                            ohdr["bidir_spans"] = bidir_spans
                         _tx = await self._send_next(model_id, ohdr, lraw + hraw)
                         _net_peer(self.next_peer.get(model_id, "?"), tx=_tx)
                     else:
@@ -212,6 +222,8 @@ class WorkerNetMixin:
                                 "all_logits": all_logits, **meta}
                         if position_ids is not None:
                             ohdr["position_ids"] = position_ids
+                        if bidir_spans is not None:   # #gemma4-bidir: reach every stage's mask
+                            ohdr["bidir_spans"] = bidir_spans
                         # propagate the capture flag to the next stage so it reaches the head stage
                         if capture_hidden and not shard.has_head:
                             ohdr["capture_hidden"] = True
