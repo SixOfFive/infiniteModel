@@ -516,6 +516,7 @@ def register(app):
             if quant == "int4" and precompile and tp <= 1:
                 try:
                     import shards as _sh
+                    import urllib.parse as _up
                     _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
                     _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
                     _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
