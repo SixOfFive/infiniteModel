@@ -83,7 +83,14 @@ class ShardForwardMixin:
             def _qf(head_dim, device, dtype):
                 return _kq.TurboQuantizer(torch, head_dim, key_bits=kb, value_bits=vb,
                                           device=device, dtype=dtype)
-            return _kq.make_turboquant_cache(DynamicCache, DynamicLayer, _qf)
+            # #172 small-model quality: keep the most-recent W tokens in full bf16 (KIVI-style
+            # residual window) so turbo3/turbo4 stay coherent below ~14B. 0 (default) = the
+            # deployed whole-cache-quant behaviour, byte-identical; recommend ~64-128 for small models.
+            try:
+                _rw = max(0, int(os.environ.get("INFINITEMODEL_KV_QUANT_RESIDUAL", "0")))
+            except Exception:
+                _rw = 0
+            return _kq.make_turboquant_cache(DynamicCache, DynamicLayer, _qf, residual_window=_rw)
         except Exception as exc:
             print(f"[kv_quant] '{name}' unavailable ({exc!r}) -> plain bf16 KV", flush=True)
             return DynamicCache()

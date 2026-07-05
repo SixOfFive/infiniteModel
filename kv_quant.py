@@ -176,7 +176,8 @@ class TurboQuantizer:
 
 
 # transformers Cache integration — built lazily so this module imports with torch only.
-def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factory):
+def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factory,
+                          residual_window: int = 0):
     """Return a TurboQuantCache INSTANCE that keeps each layer's K/V QUANTIZED and returns the
     DEQUANTIZED (un-rotated, original-basis) full K/V from update() — so the model's attention runs
     UNCHANGED. Written against the transformers 5.x Cache API (validated on 5.12.1): a DynamicCache
@@ -186,6 +187,15 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
     reconstruct the full bf16 K/V as update()'s return value.
 
     quantizer_factory(head_dim, device, dtype) -> TurboQuantizer (preset bits bound by the caller).
+
+    RESIDUAL WINDOW (small-model quality, KIVI/KVQuant-style): if ``residual_window`` W > 0, the
+    most-recent W tokens' K/V are kept in FULL bf16 (never quantized) and only tokens that age out
+    beyond the window are TurboQuant-quantized. Recent tokens dominate attention and are the most
+    sensitive to quantization noise, so a small full-precision tail restores coherence on models
+    that otherwise collapse under whole-cache quant (turbo3/turbo4 below ~14B). W == 0 (default) is
+    the original whole-cache path, BYTE-IDENTICAL to the deployed #172 behaviour. Cost of W > 0 is a
+    fixed W-token bf16 buffer per layer (negligible: e.g. W=128 on a 14B layer ~0.25 MB), so the KV
+    reservation is only marginally under-counted — safe for any modest W.
 
     MEMORY: each layer persistently holds only the quantized reps — the indices BIT-PACKED to b
     bits/coord (ceil(d*b/8) bytes, via _pack_bits) + a few fp16 norms/head, so ~b/8 the bytes of
@@ -209,6 +219,8 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
             self._ki = self._kn = None                   # key   idx PACKED [b,h,S,ceil(d*kb/8)] uint8, norms [b,h,S,1]
             self._vi = self._vn = None                   # value idx PACKED / norms
             self._vq = self._vg = None                   # value QJL sign-bits (PACKED 1-bit) / gammas (None unless value_qjl)
+            self._W = int(residual_window or 0)          # full-bf16 recent-token window (0 = whole-cache quant)
+            self._rk = self._rv = None                   # bf16 residual buffers: the most-recent <=W tokens, UN-quantized
             self._len = 0                                # cached token count (drives get_seq_length + mask)
 
         def _q(self, k):
@@ -216,19 +228,18 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
                 self._tq = quantizer_factory(k.shape[-1], k.device, k.dtype)
             return self._tq
 
-        def update(self, key_states, value_states, *args, **kwargs):
+        def _append_quant(self, q, ek, ev):
+            """Quantize + bit-pack a chunk of K/V (seq dim -2) and append it to the packed store."""
             import torch
-            q = self._q(key_states)
-            ki, kn = q.quant_keys(key_states)                    # ki [b,h,q,d] uint8, values in [0,2^kb)
-            vi, vn, vq, vg = q.quant_values(value_states)
+            ki, kn = q.quant_keys(ek)                            # ki [b,h,q,d] uint8, values in [0,2^kb)
+            vi, vn, vq, vg = q.quant_values(ev)
             ki = _pack_bits(torch, ki, q.kb)                     # -> [b,h,q,ceil(d*kb/8)]
             vi = _pack_bits(torch, vi, q.vb_mse)
             vq = _pack_bits(torch, vq.to(torch.uint8), 1) if vq is not None else None
             if self._ki is None:
-                self._d = int(key_states.shape[-1])
                 self._ki, self._kn = ki, kn
                 self._vi, self._vn, self._vq, self._vg = vi, vn, vq, vg
-            else:                                        # append the new step's PACKED reps along the seq dim
+            else:                                        # append the PACKED reps along the seq dim
                 self._ki = torch.cat([self._ki, ki], dim=-2)
                 self._kn = torch.cat([self._kn, kn], dim=-2)
                 self._vi = torch.cat([self._vi, vi], dim=-2)
@@ -236,8 +247,12 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
                 if vq is not None:
                     self._vq = torch.cat([self._vq, vq], dim=-2)
                     self._vg = torch.cat([self._vg, vg], dim=-2)
-            self._len += int(key_states.shape[-2])
-            d = self._d
+
+        def _deq_prefix(self, q, d):
+            """Un-pack + dequant the WHOLE quantized store -> (keys, vals) bf16, or (None, None) if empty."""
+            import torch
+            if self._ki is None:
+                return None, None
             ki_u = _unpack_bits(torch, self._ki, q.kb, d)        # unpack full seq -> uint8 idx (transient)
             vi_u = _unpack_bits(torch, self._vi, q.vb_mse, d)
             vq_u = _unpack_bits(torch, self._vq, 1, d).bool() if self._vq is not None else None
@@ -245,28 +260,73 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
             vals = q.dequant_values(vi_u, self._vn, vq_u, self._vg)
             return keys, vals
 
+        def update(self, key_states, value_states, *args, **kwargs):
+            import torch
+            q = self._q(key_states)
+            d = int(key_states.shape[-1])
+            self._d = d
+            if self._W <= 0:
+                # ---- whole-cache quant (original #172 path; byte-identical results) ----
+                self._append_quant(q, key_states, value_states)
+                self._len += int(key_states.shape[-2])
+                return self._deq_prefix(q, d)
+            # ---- residual-window path: hold the most-recent W tokens in FULL bf16 ----
+            if self._rk is None:
+                self._rk, self._rv = key_states, value_states
+            else:                                        # append the new step to the bf16 residual buffer
+                self._rk = torch.cat([self._rk, key_states], dim=-2)
+                self._rv = torch.cat([self._rv, value_states], dim=-2)
+            self._len += int(key_states.shape[-2])
+            r = int(self._rk.shape[-2])
+            if r > self._W:                              # age out the oldest (r-W) tokens into the quantized store
+                e = r - self._W
+                self._append_quant(q, self._rk[..., :e, :], self._rv[..., :e, :])
+                self._rk = self._rk[..., e:, :]
+                self._rv = self._rv[..., e:, :]
+            qk, qv = self._deq_prefix(q, d)              # dequant the aged-out prefix (None until first eviction)
+            if qk is None:
+                return self._rk, self._rv
+            keys = torch.cat([qk, self._rk], dim=-2)     # oldest (quantized) first, recent (bf16) last
+            vals = torch.cat([qv, self._rv], dim=-2)
+            return keys, vals
+
         def get_seq_length(self) -> int:
             return int(self._len)
 
         def crop(self, max_length: int) -> None:
-            # spec-decode rollback: truncate the quantized reps to `max_length` tokens (seq dim = -2).
+            # spec-decode rollback: truncate to `max_length` tokens (seq dim = -2), across BOTH the
+            # quantized prefix and (when W>0) the bf16 residual tail.
             if max_length < 0:
                 max_length = self._len - abs(max_length)
-            if self._ki is None or self._len <= max_length:
+            if self._len <= max_length:
                 return
-            def _sl(t):
-                return t[..., :max_length, :] if t is not None else None
-            self._ki, self._kn = _sl(self._ki), _sl(self._kn)
-            self._vi, self._vn = _sl(self._vi), _sl(self._vn)
-            self._vq, self._vg = _sl(self._vq), _sl(self._vg)
+            def _sl(t, n):
+                return t[..., :n, :] if t is not None else None
+            if self._W <= 0:
+                self._ki, self._kn = _sl(self._ki, max_length), _sl(self._kn, max_length)
+                self._vi, self._vn = _sl(self._vi, max_length), _sl(self._vn, max_length)
+                self._vq, self._vg = _sl(self._vq, max_length), _sl(self._vg, max_length)
+                self._len = int(max_length)
+                return
+            rlen = int(self._rk.shape[-2]) if self._rk is not None else 0
+            qlen = self._len - rlen                      # quantized prefix occupies [0, qlen)
+            if max_length >= qlen:                       # keep all quantized, crop the residual tail
+                keep = max_length - qlen
+                self._rk, self._rv = _sl(self._rk, keep), _sl(self._rv, keep)
+            else:                                        # drop the residual, crop into the quantized prefix
+                self._rk = self._rv = None
+                self._ki, self._kn = _sl(self._ki, max_length), _sl(self._kn, max_length)
+                self._vi, self._vn = _sl(self._vi, max_length), _sl(self._vn, max_length)
+                self._vq, self._vg = _sl(self._vq, max_length), _sl(self._vg, max_length)
             self._len = int(max_length)
 
         def reorder_cache(self, beam_idx) -> None:
-            # beam search isn't used by this engine; reorder the quantized reps if ever invoked.
-            if self._ki is None:
+            # beam search isn't used by this engine; reorder both stores if ever invoked.
+            ref = self._ki if self._ki is not None else self._rk
+            if ref is None:
                 return
-            bi = beam_idx.to(self._ki.device)
-            for nm in ("_ki", "_kn", "_vi", "_vn", "_vq", "_vg"):
+            bi = beam_idx.to(ref.device)
+            for nm in ("_ki", "_kn", "_vi", "_vn", "_vq", "_vg", "_rk", "_rv"):
                 t = getattr(self, nm)
                 if t is not None:
                     setattr(self, nm, t.index_select(0, bi))
