@@ -3785,6 +3785,12 @@ def build_app() -> FastAPI:
         # it shouldn't live in the name. Re-registering an already-cached HF id under a new name
         # is instant (no re-download — the cache is keyed by HF id, not the friendly name).
         hf = (model or "").strip()
+        # HF repo ids are colon-free (dash form, e.g. 'Qwen/Qwen3-4B'). A user may paste the
+        # Ollama 'family:size' form into the org/name field ('qwen/qwen3:4b'), which 404s on the
+        # Hub. Normalize ':' -> '-' in the TARGET id so both forms resolve to the real repo — the
+        # friendly registry KEY derived below already collapses ':' via _friendly_from_hf, but the
+        # download target came straight from this string. (No HF id legitimately contains ':'.)
+        hf = hf.replace(":", "-")
         if "/" not in hf or " " in hf or hf.count("/") > 1:
             return JSONResponse({"ok": False,
                                  "error": "enter a Hugging Face id like org/name"},
