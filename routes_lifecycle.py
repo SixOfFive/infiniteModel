@@ -418,7 +418,7 @@ def register(app):
                    moe_offload: bool = False, force: bool = False,
                    node: str = "", kv_quant: str = "",
                    kv_offload: bool = False, temperature: str = "",
-                   min_p: str = "") -> JSONResponse:
+                   min_p: str = "", precompile: bool = True) -> JSONResponse:
         _req_ip = _client_ip(request)   # #connections: attribute this load to its requester
         # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
@@ -507,6 +507,31 @@ def register(app):
                 except Exception as _moe_exc:
                     log_activity(f"{_ollama_name(friendly)}: MoE check for int8 downgrade failed "
                                  f"({_moe_exc}) — honoring int8 as requested")
+            # #cache-on-first-load: for an int4 load with no shard cache yet, BUILD the cache first
+            # (this blocks until it's written) so THIS load — and every future load — serves the small
+            # pre-packed int4 layers instead of streaming full bf16 and re-quantizing on the fly. No-op
+            # when an int4 cache already exists; precompile=0 opts out; skipped for tp (its dispatch path
+            # doesn't read the whole-layer cache). Reuses the /compile_shards subprocess (deprioritized,
+            # won't starve serving). Non-fatal: any failure falls through to the normal cold load.
+            if quant == "int4" and precompile and tp <= 1:
+                try:
+                    _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
+                    _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
+                    _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
+                    if _cdir and not (_cst.get("int4") or {}).get("ok"):
+                        log_activity(f"{_ollama_name(friendly)}: no int4 shard cache — building it now so "
+                                     "this and every future load serve pre-packed (first load is slower)…")
+                        _curl = (f"http://127.0.0.1:{ARGS.http_port}/compile_shards"
+                                 f"?model={_up.quote(friendly)}&quant=int4")
+
+                        def _build_cache():
+                            import urllib.request as _u
+                            with _u.urlopen(_u.Request(_curl, method="POST"), timeout=10800) as _r:
+                                return _r.read()
+
+                        await asyncio.to_thread(_build_cache)
+                except Exception as _ce:
+                    log_activity(f"{_ollama_name(friendly)}: pre-load cache build skipped ({_ce!r}) — cold load")
             # replicas>1 (#39): load N full copies on disjoint nodes for data-parallel
             # throughput. Mutually exclusive with tp (tp splits one copy; replicas duplicate it).
             if tp <= 1 and replicas > 1:
