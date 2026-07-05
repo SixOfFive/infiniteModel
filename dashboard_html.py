@@ -486,19 +486,33 @@ function int4Badge(m){
 function renderNodes(d){
   const ns=(d.nodes||[]).slice().sort((a,b)=>(b.has_gpu?1:0)-(a.has_gpu?1:0)||a.hostname.localeCompare(b.hostname));
   $('#ncount').textContent=ns.length+' nodes';
+  // #node-split: per node, GREEN = what InfiniteModel itself uses on THAT node — RAM = the worker
+  // process RSS (proc_rss_gb), VRAM = the sum of loaded models' per-stage GPU bytes placed here —
+  // vs BLUE = the rest of the physical usage (OS / other processes), so it stands out from everything
+  // else and mirrors the GPU/RAM pool tiles. Sum iM's per-node VRAM from the loaded models' stages.
+  const imVram={};
+  (d.models||[]).filter(m=>m.loaded).forEach(m=>(m.stages||[]).forEach(s=>{
+    imVram[s.hostname]=(imVram[s.hostname]||0)+(s.gpu_gb||0);
+  }));
   $('#nodes').innerHTML=ns.map(n=>{
     const gpu=n.has_gpu;
     const util=gpu?('GPU '+Math.round(n.gpu_util||0)+'%'):('CPU '+Math.round(n.cpu_percent||0)+'%');
     const dev=(gpu?(n.device_name||'GPU'):((n.cores||'')+'c CPU')).replace(/^NVIDIA GeForce /,'');
     const off=(!n.alive)?' <span class="err">offline</span>':'';
-    const memRow=(lab,used,tot)=>'<div class="mb"><span class="lab">'+lab+'</span>'+bar(used,tot)
-      +'<span class="num">'+fmt(used)+' / '+fmt(tot)+'</span></div>';
+    // GREEN = iM's own usage on this node, BLUE = other/OS usage, then free (poolbar, same as the
+    // pool tiles). `im` is clamped to physical-used so a stale estimate can't overflow the bar.
+    const memRow=(lab,im,used,tot)=>{
+      const g=Math.max(0,Math.min(im,used)),o=Math.max(0,used-g),f=Math.max(0,tot-used);
+      return '<div class="mb"><span class="lab">'+lab+'</span>'
+        +poolbar(g,o,tot,'InfiniteModel '+fmt(g)+' GB (green) · other '+fmt(o)+' GB (blue) · '+fmt(f)+' GB free')
+        +'<span class="num">'+fmt(used)+' / '+fmt(tot)+'</span></div>';
+    };
     // Fixed grid columns: name · VRAM · RAM · util. CPU-only nodes leave the VRAM
     // cell empty so their RAM bar still aligns with the GPU nodes' RAM column.
     const ramUsed=Math.max(0,(n.total_mem_gb||0)-(n.free_mem_gb||0));
-    const vram=gpu?memRow('VRAM',(n.vram_used_gb||0),(n.vram_total_gb||0)):'<div class="mb"></div>';
+    const vram=gpu?memRow('VRAM',(imVram[n.hostname]||0),(n.vram_used_gb||0),(n.vram_total_gb||0)):'<div class="mb"></div>';
     return '<div class="node"><div class="nn">'+esc(n.hostname)+' <small>'+esc(dev)+'</small>'+off+'</div>'
-      +vram+memRow('RAM',ramUsed,(n.total_mem_gb||0))
+      +vram+memRow('RAM',(n.proc_rss_gb||0),ramUsed,(n.total_mem_gb||0))
       +'<div class="util">'+util+'</div></div>';
   }).join('');
 }
