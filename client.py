@@ -2592,14 +2592,25 @@ for _wsm in ("state", "shard_build", "shard_forward", "worker_load", "worker_net
     try:
         __import__(_wsm)
     except Exception:
-        try:
-            with _wsreq.urlopen(repo_raw_url().format(f=_wsm + ".py"), timeout=30) as _wsr:
-                _wsb = _wsr.read()
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), _wsm + ".py"), "wb") as _wsf:
-                _wsf.write(_wsb)
-            __import__(_wsm)
-        except Exception:
-            pass
+        # E2: bounded retry (raw-CDN propagation lag on a freshly-added module), then exit 42.
+        for _wsa in range(3):
+            try:
+                with _wsreq.urlopen(repo_raw_url().format(f=_wsm + ".py"), timeout=30) as _wsr:
+                    _wsb = _wsr.read()
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), _wsm + ".py"), "wb") as _wsf:
+                    _wsf.write(_wsb)
+                __import__(_wsm)
+                break
+            except Exception:
+                time.sleep(5 * (_wsa + 1))
+        else:
+            # Still missing -> exit 42 so the supervisor RELAUNCHES (client.bat loops ONLY on 42;
+            # any other exit drops to `pause` and the Windows worker dies permanently — systemd
+            # workers restart regardless). Each relaunch retries the fetch until the CDN edge
+            # catches up, so a bridge 404 is a bounded crash-loop, not a dead worker.
+            print(f"[update] required module {_wsm}.py unavailable (import+fetch failed) - "
+                  f"exit 42 for supervisor relaunch", flush=True)
+            os._exit(42)
 import state
 import shard_build, shard_forward, worker_load, worker_net
 from shard_build import ShardBuildMixin
