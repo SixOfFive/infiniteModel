@@ -133,6 +133,7 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py",
                                  "control_plane.py",   # code-split Inc 2: worker-facing control plane
                                  # m4c153 code-split: relocated build_app routes
                                  "routes_dashboard.py", "routes_lifecycle.py", "routes_api.py", "routes_diag.py",
+                                 "routes_shards.py",   # code-split Inc 6: shard/pack/weights routes
                                  "serving.py", "status.py",   # m4c154/155 code-split: serving + status-building layers
                                  "serving_anthropic.py",   # code-split Inc 3: Anthropic Messages engine
                                  "downloads.py",   # code-split Inc 5: download/registry lifecycle
@@ -2223,7 +2224,8 @@ from engine_lifecycle import EngineLifecycleMixin
 # Request …) are injected by state.bind() BEFORE build_app() runs (main publishes+binds right after
 # parse_args; build_app is called later), so FastAPI can resolve the route annotations at register time.
 # Controller-only leaf modules; in EXTRA_UPDATE_FILES; pull-once convergence bridge as elsewhere.
-for _crm in ("routes_dashboard", "routes_lifecycle", "routes_api", "routes_diag"):
+for _crm in ("routes_dashboard", "routes_lifecycle", "routes_api", "routes_diag",
+             "routes_shards"):   # code-split Inc 6
     try:
         __import__(_crm)
     except Exception:
@@ -2235,10 +2237,12 @@ import routes_dashboard
 import routes_lifecycle
 import routes_api
 import routes_diag
+import routes_shards
 from routes_dashboard import register as routes_dashboard_register
 from routes_lifecycle import register as routes_lifecycle_register
 from routes_api import register as routes_api_register
 from routes_diag import register as routes_diag_register
+from routes_shards import register as routes_shards_register
 
 # ---- code-split Inc 5: download/registry lifecycle relocated into downloads.py ----
 # _pull_repo_interruptible + _start_download/_do_delete + the download/add_model/delete/forget +
@@ -2986,6 +2990,7 @@ def build_app() -> FastAPI:
     # m4c153 code-split: attach relocated routes (see routes_*.py / state.py)
     routes_dashboard_register(app)
     routes_lifecycle_register(app)
+    routes_shards_register(app)   # code-split Inc 6: shard/pack/weights routes
     routes_api_register(app)
     routes_diag_register(app)
     downloads_register(app)
@@ -3047,7 +3052,7 @@ def main() -> None:
     state.publish(globals())
     state.bind(engine_load, engine_gen, engine_lifecycle, control_plane,
                routes_dashboard, routes_lifecycle, routes_api, routes_diag, serving,
-               serving_anthropic, status, downloads)
+               serving_anthropic, status, downloads, routes_shards)
     print(f"InfiniteModel controller {VERSION}")
     if HF_TOKEN:
         print(f"[hf] auth token loaded (...{HF_TOKEN[-4:]}) — model pulls authenticated")
