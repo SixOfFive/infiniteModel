@@ -724,6 +724,7 @@ def _local_ipv4s() -> set:
     """This controller's own IPv4 addresses (+ loopback) — for co-located-worker detection."""
     ips = {"127.0.0.1"}
     try:
+        import psutil   # not a module-level import here; absent psutil degrades to loopback-only
         for _n, _alist in psutil.net_if_addrs().items():
             for _a in _alist:
                 if _a.family == socket.AF_INET and _a.address:
