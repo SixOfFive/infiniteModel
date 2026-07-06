@@ -28,8 +28,25 @@ def register(app):
         to also report, per file, whether that substring is present on disk (the automated 'grep the
         marker on the box' step)."""
         def _run() -> dict:
+            import re as _re
             here = os.path.dirname(os.path.abspath(__file__))
-            files = ["server.py"] + list(EXTRA_UPDATE_FILES)
+            files = ["server.py"] + list(EXTRA_UPDATE_FILES) + ["client.py"]
+            # WORKER-side files too (E1): client.py keeps its own EXTRA_UPDATE_FILES, which this
+            # controller-side route can't see via the module global above — and importing client.py
+            # to read it would execute the worker's module-level hardware/triton probes. Regex the
+            # list literal out of its source instead. Controller+worker share a checkout on the
+            # fleet boxes, so the on-disk truth for worker files is exactly what a worker deploy
+            # needs verified (worker increments bump no controller VERSION — this is their only
+            # HTTP-visible ground truth).
+            with contextlib.suppress(Exception):
+                with open(os.path.join(here, "client.py"), "r", encoding="utf-8", errors="replace") as fh:
+                    _src = fh.read()
+                _m = _re.search(r"^EXTRA_UPDATE_FILES\s*:\s*list\[str\]\s*=\s*\[(.*?)\]",
+                                _src, _re.DOTALL | _re.MULTILINE)
+                if _m:
+                    for _f in _re.findall(r'"([^"]+)"', _m.group(1)):
+                        if _f not in files:
+                            files.append(_f)
             out: dict = {}
             for fn in files:
                 path = os.path.join(here, fn)
