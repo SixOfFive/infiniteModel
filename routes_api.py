@@ -390,3 +390,41 @@ def register(app):
         inputs = body.get("input", "")
         return await _serve_embed(body.get("model", ""), inputs, mode="openai",
                                   ip=_client_ip(req))
+
+    # ---- Node tier config (code-split Inc 5): relocated from server.py build_app ----
+    # Tier toggles are config, not downloads -- this existing zero-cost home keeps them
+    # discoverable. Bodies BYTE-IDENTICAL; NODE_CONFIG loader is in-place as of Inc 4.
+    @app.post("/nodeconfig")         # dashboard: enable/disable a node's CPU/RAM or GPU/VRAM
+    async def nodeconfig(host: str, ram: Optional[bool] = None,
+                         vram: Optional[bool] = None) -> JSONResponse:
+        # Keyed by hostname so the choice sticks across reconnects; persisted to
+        # node_config.json so it survives a controller restart. A tier change re-plans
+        # ONLY the resident models that actually use a node on this host (surgical —
+        # other models keep running; they'll pick up freed/added capacity on next load).
+        cfg = NODE_CONFIG.setdefault(host, {"ram": True, "vram": True})
+        if ram is not None:
+            cfg["ram"] = ram
+        if vram is not None:
+            cfg["vram"] = vram
+        save_node_config()
+        host_nids = {nid for nid, n in registry._nodes.items() if n.hostname == host}
+        for fr in [fr for fr, m in engine.models.items()
+                   if any(nid in m.stage_node_ids for nid in host_nids)]:
+            engine.invalidate_model(fr, f"tier change on {host}")
+        return JSONResponse({"ok": True, "host": host, "config": cfg})
+
+    @app.post("/nodeconfig_all")     # dashboard: enable/disable a tier on EVERY node at once
+    async def nodeconfig_all(tier: str, enabled: bool) -> JSONResponse:
+        """Bulk version of /nodeconfig: set one tier (ram|vram) for every known host, persist,
+        and re-plan each resident model ONCE (fleet-wide capacity changed). Drives the
+        'all CPU' / 'all GPU' master checkboxes."""
+        if tier not in ("ram", "vram"):
+            return JSONResponse({"ok": False, "error": "tier must be 'ram' or 'vram'"},
+                                status_code=400)
+        hosts = {n.hostname for n in registry.alive_sorted()} | set(NODE_CONFIG.keys())
+        for h in hosts:
+            NODE_CONFIG.setdefault(h, {"ram": True, "vram": True})[tier] = enabled
+        save_node_config()
+        for fr in list(engine.models.keys()):   # capacity changed everywhere -> re-plan all
+            engine.invalidate_model(fr, f"bulk tier change ({tier}={enabled})")
+        return JSONResponse({"ok": True, "tier": tier, "enabled": enabled, "hosts": len(hosts)})
