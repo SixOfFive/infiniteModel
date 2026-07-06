@@ -458,3 +458,21 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   helper that both `_load_vision_encoder` (all image arches: Omni / Qwen-VL / Mistral3 / gemma4 / standard)
   and `_load_gemma4_audio_encoder` call. Behaviour is byte-for-byte the pre-refactor vision loop
   (re-validated end-to-end on gemma-4 vision, gemma-4 audio, and Mistral3 split-tower vision).
+- **Code-split round 2, increments 1-3 + deploy enablers (2026-07-06):** continuing the m4c152-155
+  context-economy refactor with the same contract (byte-identical relocation, `state.bind` globals,
+  convergence bridge, `EXTRA_UPDATE_FILES` sync). New controller-only leaves: **`control_plane.py`**
+  (~500 lines: control-frame IO, `ControlLink`, the resilient TCP listener, `handle_control`,
+  `reaper_loop`, `gen_stall_watchdog` — carries its own stdlib imports because `@dataclass` executes at
+  import, before `state.bind`) and **`serving_anthropic.py`** (~450 lines: the `/v1/messages` Anthropic
+  engine + `_count_tokens_anthropic`, where all recent vision/audio serve-path edits land; shared
+  helpers stay in serving.py, imported leaf-to-leaf). The embed trio (`_serve_embed` + its 3 routes)
+  folded into the existing `routes_api.py`. server.py 4,078 → 3,539; serving.py 1,434 → 1,000.
+  **Deploy enablers:** `/code_manifest` now also reports `client.py` + the WORKER-side
+  `EXTRA_UPDATE_FILES` (regex-extracted from client.py's source — worker deploys bump no controller
+  VERSION, so this is their only HTTP-visible ground truth), and the worker convergence bridge
+  bounded-retries then **exits 42** on failure so a raw-CDN 404 on a freshly-added module is a bounded
+  crash-loop instead of a permanently dead Windows worker (`client.bat` relaunches only on 42). New
+  controller modules deploy **two-phase**: module committed+pushed first, pre-staged on every
+  controller (`git checkout origin/main -- <mod>.py`), then the server.py that imports it — the
+  bridge is fetch-once, and a single commit can race the idle self-updater into a bridge-404
+  restart loop.
