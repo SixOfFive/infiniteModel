@@ -2551,14 +2551,14 @@ class EmbeddingModel:
         # nomic's custom config may reject _attn_implementation="eager"; retry without it.
         try:
             self.model = AutoModel.from_pretrained(
-                model_dir, trust_remote_code=True, torch_dtype=dtype,
+                model_dir, trust_remote_code=True, dtype=dtype,
                 _attn_implementation="eager").eval()
         except ImportError:
             raise   # a MISSING dep (e.g. einops) -> let _build_with_autodeps install + retry the
             #         whole build (don't waste a 2nd no-eager attempt that hits the same ImportError)
         except Exception:
             self.model = AutoModel.from_pretrained(
-                model_dir, trust_remote_code=True, torch_dtype=dtype).eval()
+                model_dir, trust_remote_code=True, dtype=dtype).eval()
         try:
             self.model.to(device)
         except Exception:
