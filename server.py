@@ -356,12 +356,16 @@ NODE_CONFIG: dict[str, dict] = {}
 
 
 def load_node_config() -> None:
-    global NODE_CONFIG
+    # In-place (NEVER rebind; code-split Inc 4): main() runs state.publish() BEFORE this loader,
+    # so a rebind would strand every bound leaf module on the pre-load EMPTY dict (see state.py;
+    # m4c155 DOWNLOAD_STATE precedent). clear()+update() keeps the published identity live.
     try:
         with open(NODE_CONFIG_PATH, encoding="utf-8") as fh:
-            NODE_CONFIG = json.load(fh)
+            _cfg = json.load(fh)
     except Exception:
-        NODE_CONFIG = {}
+        _cfg = {}
+    NODE_CONFIG.clear()
+    NODE_CONFIG.update(_cfg)
 
 
 def save_node_config() -> None:
@@ -387,19 +391,24 @@ GGUF_FILES: dict[str, str] = {}
 
 
 def load_custom_models() -> None:
-    global CUSTOM_MODELS, GGUF_FILES
+    # In-place (NEVER rebind; code-split Inc 4) — same rationale as load_node_config: the
+    # published CUSTOM_MODELS/GGUF_FILES identities must stay live for bound leaf modules.
     try:
         with open(CUSTOM_MODELS_PATH, encoding="utf-8") as fh:
-            CUSTOM_MODELS = json.load(fh)
+            _cm = json.load(fh)
     except Exception:
-        CUSTOM_MODELS = {}
+        _cm = {}
+    CUSTOM_MODELS.clear()
+    CUSTOM_MODELS.update(_cm)
     for friendly, hf in CUSTOM_MODELS.items():
         MODELS.setdefault(friendly, (hf, hf))   # draft = target (no speculative)
     try:
         with open(GGUF_MODELS_PATH, encoding="utf-8") as fh:
-            GGUF_FILES = json.load(fh)
+            _gf = json.load(fh)
     except Exception:
-        GGUF_FILES = {}
+        _gf = {}
+    GGUF_FILES.clear()
+    GGUF_FILES.update(_gf)
 
 
 def save_custom_models() -> None:
@@ -426,12 +435,14 @@ def load_deleted_models() -> None:
     """Load the deleted-model hide-set and drop any matching entries from MODELS. MUST run AFTER
     MODELS is seeded with built-ins AND load_custom_models() has merged customs, so a hidden name
     is filtered no matter which source re-introduced it."""
-    global DELETED_MODELS
+    # In-place (NEVER rebind; code-split Inc 4) — published set identity stays live for bound leaves.
     try:
         with open(DELETED_MODELS_PATH, encoding="utf-8") as fh:
-            DELETED_MODELS = set(json.load(fh))
+            _dm = set(json.load(fh))
     except Exception:
-        DELETED_MODELS = set()
+        _dm = set()
+    DELETED_MODELS.clear()
+    DELETED_MODELS.update(_dm)
     for friendly in DELETED_MODELS:
         MODELS.pop(friendly, None)
 
