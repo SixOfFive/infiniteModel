@@ -134,6 +134,7 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py",
                                  # m4c153 code-split: relocated build_app routes
                                  "routes_dashboard.py", "routes_lifecycle.py", "routes_api.py", "routes_diag.py",
                                  "serving.py", "status.py",   # m4c154/155 code-split: serving + status-building layers
+                                 "serving_anthropic.py",   # code-split Inc 3: Anthropic Messages engine
                                  "config.json"]   # central cluster config — synced like a module
 
 
@@ -2280,7 +2281,7 @@ from routes_api import register as routes_api_register
 from routes_diag import register as routes_diag_register
 
 # ---- m4c154 code-split: request-serving layer relocated into serving.py (see state.py) ----
-# serving.py holds _serve/_serve_anthropic/_count_tokens_anthropic VERBATIM; back-imported here
+# serving.py holds _serve VERBATIM (the Anthropic pair moved on below); back-imported here
 # so the relocated routes_api resolves them via the published namespace, and bound by state.bind
 # so its bodies resolve server globals. Controller-only leaf; in EXTRA_UPDATE_FILES; bridged.
 try:
@@ -2291,7 +2292,20 @@ except Exception:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "serving.py"), "wb") as _svf:
             _svf.write(_svsrc)
     import serving
-from serving import _serve, _serve_anthropic, _count_tokens_anthropic
+from serving import _serve
+
+# ---- code-split Inc 3: the Anthropic Messages engine relocated into serving_anthropic.py ----
+# _serve_anthropic/_count_tokens_anthropic VERBATIM; back-imported here so the relocated
+# routes_api resolves them via the published namespace; bound by state.bind; bridged like serving.
+try:
+    import serving_anthropic
+except Exception:
+    _sasrc = _fetch_repo_file("serving_anthropic.py")
+    if _sasrc:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "serving_anthropic.py"), "wb") as _saf:
+            _saf.write(_sasrc)
+    import serving_anthropic
+from serving_anthropic import _serve_anthropic, _count_tokens_anthropic
 
 # ---- m4c155 code-split: status-building layer relocated into status.py (see state.py) ----
 # build_status/_tag_entry are called by routes_dashboard/routes_api -> back-imported so they stay
@@ -3465,7 +3479,8 @@ def main() -> None:
     # any engine method is exercised (self-test or serving). See state.py.
     state.publish(globals())
     state.bind(engine_load, engine_gen, engine_lifecycle, control_plane,
-               routes_dashboard, routes_lifecycle, routes_api, routes_diag, serving, status)
+               routes_dashboard, routes_lifecycle, routes_api, routes_diag, serving,
+               serving_anthropic, status)
     print(f"InfiniteModel controller {VERSION}")
     if HF_TOKEN:
         print(f"[hf] auth token loaded (...{HF_TOKEN[-4:]}) — model pulls authenticated")
