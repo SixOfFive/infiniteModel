@@ -476,3 +476,20 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   controller (`git checkout origin/main -- <mod>.py`), then the server.py that imports it — the
   bridge is fetch-once, and a single commit can race the idle self-updater into a bridge-404
   restart loop.
+- **Code-split round 2, increments 4-6 (2026-07-06):** the persistence loaders (`load_node_config` /
+  `load_custom_models` / `load_deleted_models`) now mutate their dicts/set **in place** instead of
+  rebinding — `main()` publishes the namespace *before* running them, so a rebind stranded every bound
+  leaf module on the pre-load empty objects (latent staleness; the m4c155 `DOWNLOAD_STATE` fix,
+  generalized). That unblocked **`downloads.py`** (~455 lines: `_pull_repo_interruptible`,
+  `_start_download`/`_do_delete`, and the `/download*`, `/add_model`, `/delete`, `/forget`,
+  `/api/pull`, `/api/delete` routes — the `DOWNLOAD_*`/`ENCODING` *definitions* stay in server.py where
+  the self-update idle lambda live-reads them; the module header documents that invariant) and
+  **`routes_shards.py`** (~900 lines merged out of routes_lifecycle.py: shard-cache/packing control
+  routes + the worker-facing `/weights` `/weights_tp` `/experts` data plane + the parked `/mtp_probe`
+  `/modelcode` debug pair; one module instead of two halves the fleet-sync surface on the route group
+  whose convergence-window failure would break every model load). `/nodeconfig` + `/nodeconfig_all`
+  landed in routes_api.py (tier config, not downloads). routes_lifecycle.py keeps the true lifecycle
+  group (1,341 → 458). Cumulative round-2 effect: **server.py 4,078 → 3,121** · serving.py 1,434 →
+  1,000 · routes_lifecycle.py 1,341 → 458; new leaves: control_plane, serving_anthropic, downloads,
+  routes_shards. Validated per increment on om3nbox (incl. a real int4 load streaming through the
+  relocated `/weights`) and on the production controller (12 nodes re-registered clean).
