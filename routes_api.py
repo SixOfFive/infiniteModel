@@ -300,3 +300,93 @@ def register(app):
                                 status_code=500)
         finally:
             _inflight_release(rec)
+
+    # ---- Embeddings (code-split Inc 1): _serve_embed + the 3 embed routes ----
+    # Bodies BYTE-IDENTICAL to their former server.py build_app originals; globals
+    # (engine, resolve_model_name, _inflight_*, _client_tokens, ...) resolve via state.bind.
+    async def _serve_embed(model: str, inputs, mode: str, ip: str = "?") -> JSONResponse:
+        """Shared embedding serve for /api/embed, /api/embeddings (legacy) and /v1/embeddings.
+        AUTO-LOADS a known-but-not-resident encoder (same policy as the generate paths, gated by
+        the same ENGINE_CONFIG auto_load) — a cold embed request just works, and the #idle-unload
+        knob reaps the encoder back off after the idle window like any other model. Tokenizes on
+        the controller (NO chat template, NO task-prefix), runs one encoder forward on the node,
+        and shapes the response per `mode` ('ollama' | 'legacy' | 'openai')."""
+        try:
+            friendly = resolve_model_name(model)
+        except Exception:
+            return _not_found_json(model, mode)   # unknown model -> 404 (OpenAI envelope|Ollama shape)
+        try:
+            lm = await engine.ensure_loaded(friendly, 0, auto_load=True)
+        except ValueError as exc:   # not loaded AND auto-load off/updating -> 404
+            return JSONResponse({"error": str(exc), "model": model}, status_code=404)
+        except Exception as exc:    # auto-load FAILED (capacity/node) -> retryable 503, not a 500
+            log_activity(f"embed {model}: auto-load failed — {exc!r}")
+            return JSONResponse({"error": f"embedding model load failed: {exc}", "model": model},
+                                status_code=503, headers={"Retry-After": "3"})
+        if not getattr(lm.spec, "is_embedding", False):
+            return JSONResponse(
+                {"error": f"model '{friendly}' is not an embedding model; use /api/chat"},
+                status_code=400)
+        # Normalize inputs to list[str] (accept a string or a list of strings).
+        if isinstance(inputs, str):
+            texts = [inputs]
+        elif isinstance(inputs, list):
+            texts = [str(t) for t in inputs]
+        else:
+            return JSONResponse({"error": "input must be a string or a list of strings"},
+                                status_code=400)
+        if not texts:
+            return JSONResponse({"error": "no input text provided"}, status_code=400)
+        rec = _inflight_admit(ip, friendly, 1)
+        if rec is None:
+            return JSONResponse(
+                {"error": f"queue full for '{friendly}' — retry shortly"}, status_code=503)
+        try:
+            _inflight_start(rec)
+            tok = lm.tokenizer
+            max_len = min(8192, int(getattr(lm.spec, "max_ctx", DEFAULT_CTX) or DEFAULT_CTX))
+            enc = tok(texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+            attn = enc["attention_mask"]
+            vecs = await engine.embed(friendly, enc["input_ids"], attn)
+        except Exception as exc:
+            log_activity(f"embed {model}: FAILED — {exc!r}")
+            print(f"[embed] {model} FAILED: {exc!r}", flush=True)
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}", "model": model},
+                                status_code=500)
+        finally:
+            _inflight_release(rec)
+        display = _ollama_name(friendly)
+        n_tok = int(attn.sum())
+        _client_tokens(ip, tok_in=n_tok, model=display)   # #connections: per-client token totals
+        if mode == "openai":
+            return JSONResponse({
+                "object": "list",
+                "data": [{"object": "embedding", "index": i, "embedding": v}
+                         for i, v in enumerate(vecs)],
+                "model": display,
+                "usage": {"prompt_tokens": n_tok, "total_tokens": n_tok}})
+        if mode == "legacy":   # /api/embeddings -> single vector
+            return JSONResponse({"embedding": vecs[0] if vecs else []})
+        # /api/embed (Ollama)
+        return JSONResponse({"model": display, "embeddings": vecs, "prompt_eval_count": n_tok})
+
+    @app.post("/api/embed")
+    async def api_embed(req: Request) -> JSONResponse:
+        body = await req.json()
+        inputs = body.get("input", body.get("prompt", body.get("text", "")))
+        return await _serve_embed(body.get("model", ""), inputs, mode="ollama",
+                                  ip=_client_ip(req))
+
+    @app.post("/api/embeddings")   # legacy Ollama single-embedding endpoint
+    async def api_embeddings(req: Request) -> JSONResponse:
+        body = await req.json()
+        inputs = body.get("prompt", body.get("input", ""))
+        return await _serve_embed(body.get("model", ""), inputs, mode="legacy",
+                                  ip=_client_ip(req))
+
+    @app.post("/v1/embeddings")    # OpenAI-compatible
+    async def v1_embeddings(req: Request) -> JSONResponse:
+        body = await req.json()
+        inputs = body.get("input", "")
+        return await _serve_embed(body.get("model", ""), inputs, mode="openai",
+                                  ip=_client_ip(req))
