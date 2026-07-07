@@ -66,6 +66,14 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
     mm = None
     mrope = None   # #22 inc 4/5c: (3D position_ids [3][q], base) when media embeds are spliced
     hf_tools = _anthropic_tools_to_hf(body.get("tools"))
+    # #qwen3-thinking: map the Anthropic `thinking` request param onto the chat template's
+    # enable_thinking switch (Qwen3-family). Absent (Claude Code's default) -> False -> the
+    # template PRE-CLOSES the <think> block and the model answers DIRECTLY. Without this a
+    # reasoning model burns its whole token budget on reasoning this path holds back/strips
+    # -> the "loads fine but never produces output" qwen3.6 symptom (hundreds of hidden
+    # reasoning tokens at APU decode speed look like a dead stream). Templates without the
+    # variable simply ignore the extra kwarg, so it is passed unconditionally.
+    _think_on = ((body.get("thinking") or {}).get("type") == "enabled")
 
     def _render_ids(chat):
         """Tokenize a chat with the tools-aware fallback (template throws on tools= for many
@@ -74,9 +82,10 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         try:
             if hf_tools:
                 return _to_id_list(tok.apply_chat_template(chat, tools=hf_tools,
-                                   add_generation_prompt=True, tokenize=True))
+                                   add_generation_prompt=True, tokenize=True,
+                                   enable_thinking=_think_on))
             return _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True,
-                               tokenize=True))
+                               tokenize=True, enable_thinking=_think_on))
         except Exception as exc:
             print(f"[v1/messages] chat-template failed ({type(exc).__name__}: {exc}); "
                   f"re-rendering without native tools" + (" + tool instruction" if hf_tools else ""))
@@ -89,7 +98,7 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                     chat2 = [{"role": "system", "content": instr}] + chat
             try:
                 return _to_id_list(tok.apply_chat_template(chat2, add_generation_prompt=True,
-                                   tokenize=True))
+                                   tokenize=True, enable_thinking=_think_on))
             except Exception:
                 flat = "\n\n".join(f"{m['role']}: {_anth_flatten(m.get('content', ''))}"
                                    for m in chat2)
@@ -295,16 +304,50 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
             raw = ""
             emitted_plain = emitted_tools = next_index = text_index = 0
             text_open = False
+            think_open = False
+            think_index = emitted_think = 0
             finish = "stop"
             try:
                 async for piece, reason in gen_raw():
                     if piece:
                         raw += piece
+                        # #qwen3-thinking: surface reasoning as a first-class Anthropic
+                        # `thinking` content block streamed via thinking_delta — NOT silent
+                        # hold-back pings (a long think phase at APU decode speed otherwise
+                        # looks like a dead stream and agent harnesses give up). The think
+                        # region: everything before </think> when the template opened the
+                        # block in the prompt (starts_in_think) or the model self-opened one.
+                        _ts = (raw[len("<think>"):] if raw.startswith("<think>")
+                               else (raw if starts_in_think else None))
+                        _th = _ts.split("</think>", 1)[0] if _ts is not None else ""
+                        if len(_th) > emitted_think and not text_open:
+                            if not think_open:
+                                think_index = next_index
+                                next_index += 1
+                                yield ev("content_block_start", {
+                                    "type": "content_block_start", "index": think_index,
+                                    "content_block": {"type": "thinking", "thinking": ""}})
+                                think_open = True
+                            yield ev("content_block_delta", {
+                                "type": "content_block_delta", "index": think_index,
+                                "delta": {"type": "thinking_delta",
+                                          "thinking": _th[emitted_think:]}})
+                            emitted_think = len(_th)
                         plain, tools = _segment_tools(raw, starts_in_think)
-                        if len(plain) <= emitted_plain and len(tools) <= emitted_tools:
-                            # tokens flowing but all held back (inside <think> or a
-                            # partial tool call) — ping so the client doesn't time out.
+                        if (len(plain) <= emitted_plain and len(tools) <= emitted_tools
+                                and not think_open):
+                            # tokens flowing but all held back (a partial tool call) —
+                            # ping so the client doesn't time out.
                             yield ev("ping", {"type": "ping"})
+                        if (len(plain) > emitted_plain or len(tools) > emitted_tools) and think_open:
+                            # reasoning finished — close the thinking block (spec-shaped
+                            # empty signature first) before text/tool blocks open.
+                            yield ev("content_block_delta", {
+                                "type": "content_block_delta", "index": think_index,
+                                "delta": {"type": "signature_delta", "signature": ""}})
+                            yield ev("content_block_stop", {
+                                "type": "content_block_stop", "index": think_index})
+                            think_open = False
                         if len(plain) > emitted_plain:
                             if not text_open:
                                 text_index = next_index
@@ -347,6 +390,10 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                     raise
                 with contextlib.suppress(Exception):
                     asyncio.current_task().uncancel()
+                if think_open:
+                    yield ev("content_block_stop", {"type": "content_block_stop",
+                                                    "index": think_index})
+                    think_open = False
                 if text_open:
                     yield ev("content_block_stop", {"type": "content_block_stop",
                                                     "index": text_index})
@@ -358,6 +405,10 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                 # mid-stream failure: close any open block, then signal end. #endpoint-weather:
                 # contention-class -> overloaded_error (retryable) so Claude Code backs off instead
                 # of surfacing a hard api_error on a transient squeeze.
+                if think_open:
+                    yield ev("content_block_stop", {"type": "content_block_stop",
+                                                    "index": think_index})
+                    think_open = False
                 if text_open:
                     yield ev("content_block_stop", {"type": "content_block_stop",
                                                     "index": text_index})
@@ -366,6 +417,14 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                 yield ev("error", {"type": "error", "error": {
                     "type": "overloaded_error" if _retry else "api_error", "message": _msg}})
                 return
+            if think_open:
+                # generation ended still inside the reasoning block (ran out of budget
+                # mid-thought) — close it cleanly so the client renders what it got.
+                yield ev("content_block_delta", {
+                    "type": "content_block_delta", "index": think_index,
+                    "delta": {"type": "signature_delta", "signature": ""}})
+                yield ev("content_block_stop", {"type": "content_block_stop",
+                                                "index": think_index})
             if text_open:
                 yield ev("content_block_stop", {"type": "content_block_stop",
                                                 "index": text_index})
@@ -408,7 +467,22 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                              "error": {"type": "api_error", "message": str(exc)}},
                             status_code=500)
     clean, raw_tools = _extract_tools(full)
+    # #qwen3-thinking: surface reasoning as a first-class `thinking` content block. Think
+    # region = everything before </think> when the template opened the block in the prompt
+    # (starts_in_think) or the model self-opened one. If the model ran out of budget while
+    # STILL thinking (no </think>), _strip_reasoning can't strip the dangling reasoning —
+    # without this guard it leaks verbatim into the text block (the raw "Thinking Process:"
+    # text seen on qwen3.6) — so classify it all as thinking and empty the text.
+    _ts = (full[len("<think>"):] if full.startswith("<think>")
+           else (full if starts_in_think else None))
+    think_txt = ""
+    if _ts is not None:
+        think_txt = _ts.split("</think>", 1)[0].strip()
+        if "</think>" not in _ts:
+            clean = ""
     content = []
+    if think_txt:
+        content.append({"type": "thinking", "thinking": think_txt, "signature": ""})
     if clean:
         content.append({"type": "text", "text": clean})
     for tb in raw_tools:
