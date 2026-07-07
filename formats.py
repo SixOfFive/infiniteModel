@@ -312,9 +312,16 @@ def _anthropic_messages_to_chat(system, messages, keep_images: bool = False,
             if t == "text":
                 text_parts.append(blk.get("text", ""))
             elif t == "tool_use":
+                # arguments as a DICT — the HF chat-template convention. Strict templates
+                # (qwen3.6) iterate it as a mapping and raise "Can only get item pairs from
+                # a mapping" on the old JSON-string form, which failed BOTH the native-tools
+                # render AND the fallback, dropping the prompt to the last-ditch flat render
+                # — which a chat-tuned model answers with an instant EOS (the empty
+                # tool_result-turn symptom). tojson-style templates (qwen2.5) also render a
+                # dict correctly (the string form double-encoded).
                 tool_calls.append({"type": "function", "id": blk.get("id"),
                                    "function": {"name": blk.get("name"),
-                                                "arguments": json.dumps(blk.get("input") or {})}})
+                                                "arguments": blk.get("input") or {}}})
             elif t == "tool_result":
                 tool_results.append(_anth_flatten(blk.get("content")))
             elif t in ("image", "image_url"):
