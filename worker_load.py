@@ -512,3 +512,148 @@ class WorkerLoadMixin:
         self._cleanup_all_weight_tmps()
         _release_ram(trim_working_set=True)   # full teardown -> idle: trim heap back to the OS
         self._maybe_self_restart_if_stuck()   # if the OS still won't reclaim, restart for a clean slate
+
+
+# ---- code-split Inc 8: model-build helpers relocated from client.py (VERBATIM) ----
+# EmbeddingModel + _build_with_autodeps/_missing_pkgs_from_err land beside their only
+# call site (WorkerLoadMixin), and the HF-local weight helpers beside shard_build's use.
+
+def _missing_pkgs_from_err(exc: Exception) -> list[str]:
+    """Best-effort extract pip package name(s) from an ImportError raised while BUILDING a model
+    (esp. trust_remote_code modeling code, e.g. nomic-embed-text needing einops). Handles
+    transformers' "Run `pip install X Y`" and "...not found in your environment: A, B" forms, plus
+    plain "No module named 'X'". Returns ONLY safe package tokens so we never feed pip junk."""
+    import re
+    msg = str(exc)
+    pkgs: list[str] = []
+    m = re.search(r"pip install ([^\n`'\"]+)", msg)
+    if m:
+        pkgs = m.group(1).split()
+    if not pkgs:
+        m = re.search(r"not found in your environment:\s*([^\n.]+)", msg)
+        if m:
+            pkgs = [p.strip() for p in m.group(1).split(",")]
+    if not pkgs:
+        m = re.search(r"No module named ['\"]([A-Za-z0-9_][A-Za-z0-9_.\-]*)", msg)
+        if m:
+            pkgs = [m.group(1).split(".")[0]]
+    return [p for p in pkgs if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*", p or "")]
+
+
+def _build_with_autodeps(build_fn, label: str = ""):
+    """Run build_fn(); if it raises ImportError naming missing pip package(s), install them into
+    THIS worker's env (sys.executable -m pip) and RETRY — so a model whose trust_remote_code needs
+    a package the worker lacks (e.g. einops) self-heals ON LOAD instead of failing the whole load
+    (#84). Bounded: each package is tried once and it gives up after a few rounds, so a genuinely
+    broken import can't loop forever; a pip failure surfaces as a clear ImportError."""
+    import subprocess
+    tried: set = set()
+    while True:
+        try:
+            return build_fn()
+        except ImportError as exc:
+            pkgs = [p for p in _missing_pkgs_from_err(exc) if p not in tried]
+            if not pkgs or len(tried) >= 8:
+                raise
+            tried.update(pkgs)
+            print(f"[deps] {label}: missing {pkgs} — pip-installing into worker env", flush=True)
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *pkgs])
+                import importlib
+                importlib.invalidate_caches()   # make the freshly-installed package importable now
+            except Exception as pe:
+                raise ImportError(f"auto-install of {pkgs} failed ({pe}); install it on this "
+                                  f"worker manually") from exc
+
+
+class EmbeddingModel:
+    """Single-node sentence encoder (BERT-family). One forward -> masked mean-pool -> L2 norm.
+    No KV cache, no pipeline, no lm_head. Stored in Worker.shards like a Shard but only needs
+    loaded_params/loaded_bytes + unloadability — it never enters the decoder data path (it only
+    receives kind:"embed" frames), so it can omit the Shard-only attrs (next_writers/layer
+    ranges/has_head). torch is imported lazily (module-scope torch isn't guaranteed), so encode
+    uses `with torch.inference_mode()` rather than the decorator form."""
+    def __init__(self, model_dir, device, dtype):
+        from transformers import AutoModel
+        # nomic's custom config may reject _attn_implementation="eager"; retry without it.
+        try:
+            self.model = AutoModel.from_pretrained(
+                model_dir, trust_remote_code=True, dtype=dtype,
+                _attn_implementation="eager").eval()
+        except ImportError:
+            raise   # a MISSING dep (e.g. einops) -> let _build_with_autodeps install + retry the
+            #         whole build (don't waste a 2nd no-eager attempt that hits the same ImportError)
+        except Exception:
+            self.model = AutoModel.from_pretrained(
+                model_dir, trust_remote_code=True, dtype=dtype).eval()
+        try:
+            self.model.to(device)
+        except Exception:
+            device = "cpu"
+            self.model.to("cpu")
+        self.device = device
+        self.loaded_params = sum(p.numel() for p in self.model.parameters())
+        self.loaded_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        self.gpu_bytes = self.loaded_bytes if "cuda" in str(device) else 0
+
+    def encode(self, input_ids, attention_mask):
+        import torch
+        with torch.inference_mode():
+            input_ids = input_ids.to(self.device)
+            attention_mask = attention_mask.to(self.device)
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            h = out.last_hidden_state                                   # [B,T,H]
+            m = attention_mask.unsqueeze(-1).to(h.dtype)
+            pooled = (h * m).sum(1) / m.sum(1).clamp(min=1e-9)          # masked mean
+            # L2-normalize, return float32 on CPU -> [B,H]
+            return torch.nn.functional.normalize(pooled, p=2, dim=1).to(torch.float32).cpu()
+
+def _weight_map(model_dir: str) -> dict[str, str]:
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index, encoding="utf-8") as fh:
+            wm = json.load(fh)["weight_map"]
+        return {name: os.path.join(model_dir, fn) for name, fn in wm.items()}
+    single = os.path.join(model_dir, "model.safetensors")
+    if os.path.exists(single):
+        from safetensors import safe_open
+        with safe_open(single, framework="pt") as fh:
+            return {name: single for name in fh.keys()}
+    raise FileNotFoundError(f"no safetensors found in {model_dir}")
+
+
+def _load_tensors(names: list[str], weight_map: dict[str, str]) -> dict:
+    from safetensors import safe_open
+    by_file: dict[str, list[str]] = {}
+    for n in names:
+        by_file.setdefault(weight_map[n], []).append(n)
+    out = {}
+    for fn, ns in by_file.items():
+        with safe_open(fn, framework="pt") as fh:
+            for n in ns:
+                out[n] = fh.get_tensor(n)
+    return out
+
+
+def _assemble_sd(tensors: dict, start: int, end: int, has_embed: bool,
+                 has_head: bool, tied: bool) -> dict:
+    """Map raw tensors to the state-dict keys load_state_dict expects, resolving
+    the tied head to a (cloned) copy of the embedding matrix."""
+    sd: dict = {}
+    if has_embed:
+        sd["model.embed_tokens.weight"] = tensors["model.embed_tokens.weight"]
+    for i in range(start, end):
+        for n in (x for x in tensors if x.startswith(f"model.layers.{i}.")):
+            sd[n] = tensors[n]
+    if has_head:
+        sd["model.norm.weight"] = tensors["model.norm.weight"]
+        if tied:
+            sd["lm_head.weight"] = tensors["model.embed_tokens.weight"].clone()
+        else:
+            sd["lm_head.weight"] = tensors["lm_head.weight"]
+    return sd
+
+
+# ---------------------------------------------------------------------------
+# Worker — owns the current stage's shard + data-plane wiring
+# ---------------------------------------------------------------------------
