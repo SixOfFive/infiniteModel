@@ -502,3 +502,17 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   client.py, the primary file every worker refreshes). `EmbeddingModel` + `_build_with_autodeps` and
   the HF-local weight helpers moved into the EXISTING `worker_load.py` beside their only call sites
   (zero new fleet-sync surface). client.py 3,699 → 2,923.
+- **Code-split round 2, increment 9 — `shard_compile.py` (2026-07-06):** the shard-cache compile/pack
+  family (PACKER_VERSION/`_packer_tag`, `pack_linear_int4/_3d/int8`, `pack_unit_tensors`,
+  `_shard_cache_root`, `_quant_scope`, `_sha256_file`, `compile_shards`, `verify_shard_cache`,
+  `shard_cache_status`, `cache_unit_path`) moved out of shards.py into a **SHARED** leaf (both fleets'
+  `EXTRA_UPDATE_FILES`), leaving shards.py a pure weight-serving/streaming layer (1,321 → 872).
+  Bind-free by requirement — the `/compile_shards` subprocess imports it in a fresh interpreter — with
+  the shared read/dequant/skeleton helpers (and `INT4_GROUP`, a def-time default arg) imported *from*
+  shards. Every consumer repointed, including the three a naive grep misses: engine_load's aliased
+  `import shards as _sh` (whose failure the non-fatal precompile try/except would have swallowed into
+  a silent fleet-wide cache-on-first-load regression), the `/compile_shards` subprocess code-string,
+  and the worker remote-pack handler (shipped atomically with the client VERSION bump). Validated the
+  hard way: cache deleted and recompiled through the new path — **combined sha1 of all 26 units
+  bit-identical to the pre-split cache** — plus a live `/pack_probe` (worker packs via the relocated
+  shared packer: `byte_identical: true`). client.py 2,923 → 2,924 wiring net; fleet on m4c186.
