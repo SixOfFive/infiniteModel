@@ -102,7 +102,7 @@ class EngineLoadMixin:
         if not (quant == "int4" and tp <= 1):
             return
         try:
-            import shards as _sh
+            import shard_compile as _sh   # code-split Inc 9: shard_cache_status moved
             import urllib.parse as _up
             _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
             _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)

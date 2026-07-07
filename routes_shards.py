@@ -69,6 +69,7 @@ def register(app):
         """Offload-pack ONE decoder-layer unit on a worker and prove the result is BIT-IDENTICAL to a
         local compile (the gate before fanning the whole compile out across the fleet). Dense int4/int8."""
         import shards as _sh
+        import shard_compile as _sc   # code-split Inc 9: pack family moved
         import urllib.parse as _up
         import urllib.request as _ur
         from safetensors.torch import load as _stload, save as _stsave
@@ -89,7 +90,7 @@ def register(app):
         link = engine.links.get(nd.node_id)
         if link is None:
             return JSONResponse({"ok": False, "error": f"no control link to {nd.hostname}"}, status_code=503)
-        scope = await asyncio.to_thread(_sh._quant_scope, mdir)   # exact scope (== local compile)
+        scope = await asyncio.to_thread(_sc._quant_scope, mdir)   # exact scope (== local compile)
         lin2d = sorted(scope[0]) if scope else None
         exp3d = sorted(scope[1]) if scope else None
         wm = await asyncio.to_thread(_sh._weight_map, mdir)        # per-expert MoE -> worker must fuse (Inc 3b)
@@ -125,7 +126,7 @@ def register(app):
                    f"&start={int(layer)}&end={int(layer)+1}&embed=0&head=0&skip_experts=0")
             with _ur.urlopen(url, timeout=600) as r:
                 raw = _stload(r.read())
-            out_sd, _mt = _sh.pack_unit_tensors(
+            out_sd, _mt = _sc.pack_unit_tensors(
                 raw, (set(lin2d) if lin2d is not None else None),
                 (set(exp3d) if exp3d is not None else None), _skel, quant, _sh.INT4_GROUP)
             return _stsave(out_sd)
@@ -155,6 +156,7 @@ def register(app):
         Inc 3); the proven local /compile_shards stays the path for MoE / single-box."""
         import hashlib
         import shards as _sh
+        import shard_compile as _sc   # code-split Inc 9: pack family moved
         import urllib.parse as _up
         import urllib.request as _ur
         from safetensors.torch import load as _stload, save as _stsave
@@ -186,7 +188,7 @@ def register(app):
             return JSONResponse({"ok": False, "error": f"{_ollama_name(friendly)} {quant} already compiling"},
                                 status_code=409)
         n_layers = await asyncio.to_thread(_sh._model_num_layers, mdir)
-        out_dir = os.path.join(_sh._shard_cache_root(mdir), quant)
+        out_dir = os.path.join(_sc._shard_cache_root(mdir), quant)
         await asyncio.to_thread(lambda: os.makedirs(out_dir, exist_ok=True))
         caps = [n for n in registry.alive_sorted() if n.can_infer and engine.links.get(n.node_id)]
         engine.compiling[ckey] = {"model": friendly, "display_model": _ollama_name(friendly), "target": tgt,
@@ -195,7 +197,7 @@ def register(app):
                                   f"({len(caps)} worker(s))", "warnings": [], "started": time.time()}
         log_activity(f"distributed {quant} compile for {_ollama_name(friendly)} -> "
                      f"{n_layers} layers across {len(caps)} worker(s)…")
-        scope = await asyncio.to_thread(_sh._quant_scope, mdir)
+        scope = await asyncio.to_thread(_sc._quant_scope, mdir)
         lin2d = sorted(scope[0]) if scope else None
         exp3d = sorted(scope[1]) if scope else None
         _lset = set(lin2d) if lin2d is not None else None
@@ -213,10 +215,10 @@ def register(app):
                    f"&embed={int(embed)}&head={int(head)}&skip_experts=0")
             with _ur.urlopen(url, timeout=1800) as r:
                 raw = _stload(r.read())
-            out_sd, mt = _sh.pack_unit_tensors(raw, _lset, _eset, _skel, quant, _sh.INT4_GROUP)
+            out_sd, mt = _sc.pack_unit_tensors(raw, _lset, _eset, _skel, quant, _sh.INT4_GROUP)
             return _stsave(out_sd), mt
 
-        _ptag = getattr(_sh, "_packer_tag", None)   # tolerate a lagged shards.py on the controller
+        _ptag = getattr(_sc, "_packer_tag", None)   # tolerate a lagged shards.py on the controller
         manifest = {"format": 1, "quant": quant, "group_size": _sh.INT4_GROUP, "num_layers": n_layers,
                     "tied": tied, "files": {}, "tensors": {},
                     "packer_hash": (_ptag(quant, _sh.INT4_GROUP) if _ptag else None),  # Inc 4 drift guard
@@ -343,10 +345,10 @@ def register(app):
         _script = (
             "import sys, json\n"
             "sys.path.insert(0, sys.argv[3])\n"
-            "import shards\n"
+            "import shard_compile\n"
             "def p(d, t):\n"
             "    sys.stdout.write('P %d %d\\n' % (d, t)); sys.stdout.flush()\n"
-            "m = shards.compile_shards(sys.argv[1], sys.argv[2], progress=p)\n"
+            "m = shard_compile.compile_shards(sys.argv[1], sys.argv[2], progress=p)\n"
             "files = m.get('files', {})\n"
             "sys.stdout.write('DONE ' + json.dumps({'files': len(files),\n"
             "    'bytes': sum(int(v.get('bytes', 0)) for v in files.values()),\n"

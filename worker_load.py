@@ -451,6 +451,7 @@ class WorkerLoadMixin:
         the cold load / local compile does. The controller sends the EXACT quant scope (lin2d/exp3d)."""
         import base64
         import shards
+        import shard_compile   # code-split Inc 9: the shared packer moved (INT4_GROUP stays in shards)
         from safetensors.torch import load as st_load, save as st_save
         base = f"http://{self.args.controller}:{msg['controller_http_port']}"
         quant = msg.get("quant", "int4")
@@ -467,7 +468,7 @@ class WorkerLoadMixin:
         def _work() -> tuple[bytes, dict]:
             skel = self._pack_skeleton(base, msg["model_id"]) if fuse else None
             raw = st_load(_http_get(url))                       # {model.* : bf16}, same as compile's raw
-            out_sd, mtensors = shards.pack_unit_tensors(raw, lin2d, exp3d, skel, quant, gs)
+            out_sd, mtensors = shard_compile.pack_unit_tensors(raw, lin2d, exp3d, skel, quant, gs)
             return st_save(out_sd), mtensors
 
         blob, mtensors = await asyncio.to_thread(_work)

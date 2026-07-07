@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c185"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c186"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -2080,7 +2080,7 @@ class _TPAllReduce:
 # not yet these files, so pull each from GitHub raw once if missing (repo_raw_url imported above).
 import urllib.request as _wsreq
 for _wsm in ("state", "shard_build", "shard_forward", "worker_load", "worker_net",
-             "worker_hw", "worker_update"):   # code-split Inc 7 + 8
+             "worker_hw", "worker_update", "shard_compile"):   # code-split Inc 7 + 8 + 9
     try:
         __import__(_wsm)
     except Exception:
@@ -2371,6 +2371,7 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
 # _ver_ordinal, _fetch_repo_file) lives in worker_update.py now (VERBATIM; back-imported).
 # module (wire.py) is listed in BOTH client.py + server.py.
 EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py",
+                                 "shard_compile.py",   # code-split Inc 9: SHARED compile/pack family
                                  "worker_hw.py",   # code-split Inc 7: hw/host helpers
                                  "worker_update.py",   # code-split Inc 8: self-update + watchdogs
                                  # m4c153 code-split: shared-state registry + Shard/Worker mixins

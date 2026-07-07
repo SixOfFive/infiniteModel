@@ -123,6 +123,7 @@ def _fetch_repo_file(fname: str):
 # Extra repo files (besides the primary entry point) to keep in sync on self-update. Extracted
 # modules go here; a client+server SHARED module (wire.py) is listed in BOTH server.py + client.py.
 EXTRA_UPDATE_FILES: list[str] = ["wire.py", "dashboard_html.py", "placement.py", "shards.py",
+                                 "shard_compile.py",   # code-split Inc 9: SHARED compile/pack family
                                  "formats.py", "multimodal.py", "graphs.py", "model_store.py",
                                  "mtp_core.py",   # #91 MTP head forward (controller-only import)
                                  "gguf_convert.py",  # GGUF->safetensors converter (subprocess)
@@ -1477,8 +1478,18 @@ from shards import (_weight_map, _text_prefix, _head_key, _plan_weight_stream,
                     _plan_experts_chunk, _plan_experts_chunk_fused,
                     _build_weight_tp_blob, _fp8_dequant_part_bytes,
                     _nvfp4_dequant_part_bytes,
-                    compile_shards, verify_shard_cache, shard_cache_status,
-                    cache_unit_path, validate_arch_supported)   # noqa: E402,F401
+                    validate_arch_supported)   # noqa: E402,F401
+# code-split Inc 9: the compile/pack family lives in shard_compile.py (SHARED module, both
+# fleets' EXTRA_UPDATE_FILES; bind-free so the /compile_shards subprocess can import it bare).
+try:
+    import shard_compile as _shard_compile   # noqa: F401
+except Exception:
+    _sc_src = _fetch_repo_file("shard_compile.py")
+    if _sc_src:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "shard_compile.py"), "wb") as _sc_f:
+            _sc_f.write(_sc_src)
+from shard_compile import (compile_shards, verify_shard_cache, shard_cache_status,
+                           cache_unit_path)   # noqa: E402,F401
 
 
 # #shard-cache Inc 2 (serve-from-cache): a compiled int4 cache is served byte-for-byte as PRE-PACKED
