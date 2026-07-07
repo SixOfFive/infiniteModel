@@ -14,6 +14,36 @@ from __future__ import annotations
 from serving import (_coerce_knobs, _pixtral_break_end, _stream_fail, _transient_gen_exc, _wrap_image_runs)   # noqa: F401
 
 
+async def _with_keepalive(agen, idle_s: float = 10.0):
+    """Wrap a (piece, reason) token generator so a silent stretch yields a (None, None)
+    keepalive tick instead of dead air. #prefill-keepalive: a Claude-Code-sized system
+    prompt (10-20k tokens) prefills for 30-120s on an APU-class box, during which the
+    SSE stream otherwise emits NOTHING after message_start — harness inactivity timeouts
+    abort the healthy stream and re-send, re-prefilling forever ("no output" + a retry
+    storm). The pending __anext__ future survives across ticks (asyncio.wait, no
+    wait_for-style cancel), so generation is never disturbed."""
+    it = agen.__aiter__()
+    nt = None
+    try:
+        while True:
+            if nt is None:
+                nt = asyncio.ensure_future(it.__anext__())
+            done, _ = await asyncio.wait({nt}, timeout=idle_s)
+            if not done:
+                yield None, None
+                continue
+            try:
+                item = nt.result()
+            except StopAsyncIteration:
+                return
+            finally:
+                nt = None
+            yield item
+    finally:
+        if nt is not None:
+            nt.cancel()
+
+
 async def _serve_anthropic(body: dict, ip: str = "?"):
     """POST /v1/messages — the Anthropic Messages API, so Claude Code (and any
     Anthropic SDK client) can drive the distributed fleet. Translates the Anthropic
@@ -89,6 +119,10 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         except Exception as exc:
             print(f"[v1/messages] chat-template failed ({type(exc).__name__}: {exc}); "
                   f"re-rendering without native tools" + (" + tool instruction" if hf_tools else ""))
+            # render-debug: enough shape info to reproduce a strict-template failure offline
+            with contextlib.suppress(Exception):
+                print(f"[v1/messages] render-debug: roles={[m.get('role') for m in chat]} "
+                      f"tools={len(hf_tools or [])} think={_think_on}")
             chat2 = chat
             if hf_tools:
                 instr = _tool_instruction(hf_tools)
@@ -308,7 +342,11 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
             think_index = emitted_think = 0
             finish = "stop"
             try:
-                async for piece, reason in gen_raw():
+                async for piece, reason in _with_keepalive(gen_raw()):
+                    if piece is None and reason is None:
+                        # #prefill-keepalive tick: >10s with no token (prefill / slow decode)
+                        yield ev("ping", {"type": "ping"})
+                        continue
                     if piece:
                         raw += piece
                         # #qwen3-thinking: surface reasoning as a first-class Anthropic

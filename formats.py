@@ -297,6 +297,19 @@ def _anthropic_messages_to_chat(system, messages, keep_images: bool = False,
     for m in (messages or []):
         role = m.get("role", "user")
         content = m.get("content")
+        if role == "system":
+            # Off-spec but seen in the wild: a system-role entry INSIDE messages[] (the
+            # Anthropic API only defines the top-level `system` param). Strict templates
+            # (qwen3.6: "System message must be at the beginning.") reject any system
+            # message past index 0, so MERGE it into the leading system message instead
+            # of passing it through (lenient templates tolerated the pass-through).
+            _st = _anth_flatten(content).strip()
+            if _st:
+                if chat and chat[0].get("role") == "system":
+                    chat[0]["content"] = chat[0]["content"] + "\n\n" + _st
+                else:
+                    chat.insert(0, {"role": "system", "content": _st})
+            continue
         if isinstance(content, str):
             chat.append({"role": role, "content": content})
             continue
@@ -324,6 +337,11 @@ def _anthropic_messages_to_chat(system, messages, keep_images: bool = False,
                                                 "arguments": blk.get("input") or {}}})
             elif t == "tool_result":
                 tool_results.append(_anth_flatten(blk.get("content")))
+            elif t in ("thinking", "redacted_thinking"):
+                # assistant reasoning echoed back in the conversation history (clients replay
+                # the thinking blocks the serve path now returns) — never re-render reasoning
+                # into the prompt; the template's own <think> handling owns that channel.
+                continue
             elif t in ("image", "image_url"):
                 if keep_images:
                     n_images += 1
