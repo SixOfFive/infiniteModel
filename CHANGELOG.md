@@ -493,3 +493,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   1,000 · routes_lifecycle.py 1,341 → 458; new leaves: control_plane, serving_anthropic, downloads,
   routes_shards. Validated per increment on om3nbox (incl. a real int4 load streaming through the
   relocated `/weights`) and on the production controller (12 nodes re-registered clean).
+- **Code-split round 2, increments 7-8 — the worker side (2026-07-06):** first client.py splits under
+  the same contract, deployed via VERSION-gated rolling worker self-update (fleet converged in ~3 min,
+  zero dropped workers — the exit-42 bridge enabler held). **`worker_hw.py`** (~450 lines: memory/GC,
+  capability probes, the read-only route detectors, RAM-module detection, `build_registration`, startup
+  cleanup — `_ROUTE_SRC`/`_local_addr` stay in client.py, the live rebind pair). **`worker_update.py`**
+  (~265 lines: the self-update machinery + fwd-watchdog + console panel; `EXTRA_UPDATE_FILES` stays in
+  client.py, the primary file every worker refreshes). `EmbeddingModel` + `_build_with_autodeps` and
+  the HF-local weight helpers moved into the EXISTING `worker_load.py` beside their only call sites
+  (zero new fleet-sync surface). client.py 3,699 → 2,923.
