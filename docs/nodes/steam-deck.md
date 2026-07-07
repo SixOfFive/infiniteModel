@@ -80,38 +80,39 @@ off the iGPU.
 
 ### Persistence
 
-On SteamOS, use a **`systemctl --user`** unit (the [../ROCM.md](../ROCM.md) persistence
-method — no `sudo`, survives in `$HOME`). Enable linger once so the user service starts at
-boot without an interactive login:
-
-```bash
-loginctl enable-linger "$USER"
-```
-
-Example `~/.config/systemd/user/im-worker.service` (verify paths/IP for your box):
+**As deployed (verified on the box 2026-07-07):** the worker runs as a **system** unit,
+`/etc/systemd/system/infinitemodel-worker.service` (enabled, `WantedBy=multi-user.target`),
+with the venv at `~/infinitemodel/.venv` — **not** `~/imenv`, and **not** a
+`systemctl --user` unit:
 
 ```ini
 [Unit]
-Description=InfiniteModel CPU worker (steamdeck)
+Description=InfiniteModel worker -> controller <old-controller-ip>
 After=network-online.target
+Wants=network-online.target
 
 [Service]
-WorkingDirectory=%h/infinitemodel
-ExecStart=%h/imenv/bin/python client.py --controller <controller-ip> --device cpu
+Type=simple
+User=deck
+Environment=HOME=/home/deck
+WorkingDirectory=/home/deck/infinitemodel
+ExecStart=/home/deck/infinitemodel/.venv/bin/python /home/deck/infinitemodel/client.py --controller <controller-ip> --control-port 50100 --name steamdeck --ram 4x-LPDDR5-5500 --no-clean
 Restart=always
+RestartSec=5
+OOMScoreAdjust=800
+Nice=5
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 ```
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now im-worker.service
-```
+(The unit Description may still name a previous controller IP; the load-bearing
+`--controller <controller-ip>` in ExecStart is what counts.) Restart with
+`sudo systemctl restart infinitemodel-worker.service`.
 
-> SteamOS ships systemd, so `systemctl --user` is the right persistence mechanism here —
-> not `start_worker.bat` (Windows) or `shell:startup` (Windows). If SteamOS Game Mode
-> resets the unit state across updates, re-`enable` after a SteamOS update (verify).
+> A system unit under `/etc` survives SteamOS updates in practice (the `/etc` overlay is
+> writable and persistent), but the original `systemctl --user` + `loginctl enable-linger`
+> approach is the no-`sudo` alternative if this box is ever rebuilt.
 
 ## 4. Optimal settings
 
