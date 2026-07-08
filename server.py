@@ -354,6 +354,10 @@ REQUEUE_GRACE_S = 12.0  # #stage0-stale-reconnect: when a head's return data-con
                         # long before dooming the requests it was serving — a head that just FRESHENED
                         # its return socket (drop+reconnect at prefill) re-delivers their logits on the
                         # new conn within its stage compute; only a genuinely dead head stays pending.
+                        # #70b-long-prefill: this is now the SLICE of a progress-extended loop — grace
+                        # keeps renewing while the owning model reports advancing per-layer forward
+                        # progress (see engine_lifecycle._grace_doom), so a multi-minute big-model
+                        # prefill is never doomed mid-flight by a flat timer.
 STAGE0_STALE_S = 5.0    # #stage0-stale-reconnect: if the controller hasn't pushed a frame to a model's
                         # stage 0 for this long, its stage0_writer may have gone silently half-open while
                         # idle -> rebuild it FRESH before the next generation's prefill (a connect is ~ms;

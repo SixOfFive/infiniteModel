@@ -79,7 +79,34 @@ class EngineLifecycleMixin:
                 writer.close()
             if at_close:
                 async def _grace_doom(rids):
-                    await asyncio.sleep(REQUEUE_GRACE_S)
+                    # #70b-long-prefill: the freshened return conn only re-delivers AFTER the
+                    # in-flight forward completes — on a big model that is a multi-minute prefill
+                    # (one 2048-token chunk through 70B int4 on an APU outlasts any flat grace),
+                    # so a flat sleep doomed every long prefill right after the head's reconnect.
+                    # Instead, after each grace slice keep granting grace while the model that
+                    # owns a still-pending req reports ADVANCING per-layer forward progress
+                    # (fwd_progress_ts — heartbeat-fed, credited only while the rid is pending —
+                    # plus last_send_ts for the first-stamp gap; the same liveness basis as
+                    # _send's adaptive prefill wait). A genuinely dead head goes progress-quiet
+                    # and still fails in grace+quiet; the hard ceiling backstops a stuck feed.
+                    _quiet_s = 120.0   # matches _send's _PROG_QUIET_S (same signal, same tolerance)
+                    _hard_s = max(3600.0, GEN_TIMEOUT_S)
+                    _t0 = time.time()
+                    while True:
+                        await asyncio.sleep(REQUEUE_GRACE_S)
+                        live = [rid for rid in rids
+                                if rid in self.pending and not self.pending[rid].done()]
+                        if not live:
+                            return   # everything re-delivered (or already failed elsewhere)
+                        if (time.time() - _t0) >= _hard_s:
+                            break
+                        mids = {self.pending_model.get(rid) for rid in live}
+                        _fp = max((max(getattr(mm, "fwd_progress_ts", 0.0) or 0.0,
+                                       getattr(mm, "last_send_ts", 0.0) or 0.0)
+                                   for mm in self.models.values() if mm.target_id in mids),
+                                  default=0.0)
+                        if (time.time() - _fp) > _quiet_s:
+                            break
                     for rid in rids:
                         fut = self.pending.get(rid)
                         if fut is not None and not fut.done():
