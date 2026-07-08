@@ -4,11 +4,12 @@ _start_download, _do_delete, _resolve_or_404, /download, /download/pause|stop|re
 /add_model, /delete, /forget, /api/pull, /api/delete.
 
 WHERE THE STATE LIVES (do not "fix" this): every DOWNLOAD_* global (DOWNLOADING,
-DOWNLOAD_PROGRESS/_ERROR/_CONTROL/_STATE/_EPOCH, DOWNLOAD_STATE_PATH) and ENCODING are
-DEFINED in server.py and only MUTATED IN PLACE here -- the self-updater's idle lambda in
-server.py reads DOWNLOADING/ENCODING as live server globals, so moving those definitions
-(or rebinding them anywhere) would silently decouple the self-update idle gate: the exact
-ENCODING hazard documented in state.py. load/save_download_state also stay in server.py
+DOWNLOAD_PROGRESS/_ERROR/_CONTROL/_STATE/_EPOCH, DOWNLOAD_STATE_PATH) is DEFINED in
+server.py and only MUTATED IN PLACE here -- the self-updater's idle lambda in server.py
+reads DOWNLOADING as a live server global, so moving those definitions (or rebinding them
+anywhere) would silently decouple the self-update idle gate: the ENCODING hazard documented
+in state.py (ENCODING itself moved to media_encode.py WITH its mutators in Inc 11; the
+lambda reads media_encode.ENCODING live). load/save_download_state also stay in server.py
 beside their data. The persistence loaders are in-place as of Inc 4, so this module's bound
 snapshot of CUSTOM_MODELS/GGUF_FILES/DELETED_MODELS/MODELS stays live across a reload.
 Bodies BYTE-IDENTICAL; module globals injected by state.bind() -- see state.py.

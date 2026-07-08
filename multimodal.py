@@ -17,13 +17,13 @@ This is a controller-only leaf module: it must NEVER ``import server``. It is li
 EXTRA_UPDATE_FILES so the multi-file self-update keeps it in sync across the fleet, and server.py
 imports its symbols back via a convergence-bridge import.
 
-NOTE (what STAYED in server.py and why): the public encode entry points ``_encode_images`` /
-``_encode_audio`` / ``_load_speech_components`` and the whole speech-out group (``_SPEECH_CACHE`` /
-``_SPEECH_MAT`` / ``_ensure_spk_dict`` / ``_materialize_from_prefix``) were NOT moved — they mutate
-the ``ENCODING`` idle-gate counter (read by the self-updater's idle lambda in server.py; a moved
-``global ENCODING`` would bind to THIS module and silently decouple the gate) and/or use server-only
-globals (MODELS_DIR / _safe_name / HF_TOKEN / shutil). They call the helpers below, which resolve
-through server.py's convergence-bridge import — so leaving them behind is correct and cycle-free.
+NOTE (Inc 11 update): the public encode entry points ``_encode_images`` / ``_encode_audio`` /
+``_load_speech_components``, the whole speech-out group, and ``Engine.generate_speech`` now live in
+**media_encode.py** — TOGETHER with the ``ENCODING`` idle-gate counter (canonical home there; all
+four ``global ENCODING`` mutators moved with it, and server.py's self-updater idle lambda reads
+``media_encode.ENCODING`` as a live module attribute — the hazard the original stay-behind avoided
+is resolved by moving definition + mutators as one unit). They call the helpers below through the
+state.bind-injected namespace; this module remains strictly downstream (no callback).
 """
 from __future__ import annotations
 

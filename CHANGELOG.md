@@ -572,3 +572,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   the live values). worker_quant.py joins `EXTRA_UPDATE_FILES` + the convergence-bridge tuple;
   bit-identity doc contracts in shard_compile.py/shards.py/bench_moe_w4a16.py repointed.
   client.py 3,032 → 1,346.
+- **Code-split round 2, increment 11 — `media_encode.py` + EngineSpeechMixin, server.py's flagship
+  (2026-07-08):** the media/speech encode family relocated verbatim into a new bound controller leaf:
+  `_encode_images`, `_encode_audio_gemma4`, `_encode_audio`, the #P6 speech-out group (`_SPEECH_CACHE`/
+  `_SPEECH_MAT`/`_ensure_spk_dict`/`_materialize_from_prefix`/`SPEECH_DEVICE`/`_load_speech_components`),
+  and `Engine.generate_speech` as **EngineSpeechMixin** (Engine now composes four mixins; only `__init__`
+  remains on the shell). **`ENCODING`'s canonical home moved with them** — this supersedes the "stays in
+  server.py" rationale recorded at m4c152/Inc 5: all FOUR `global ENCODING` mutators live in
+  media_encode.py, the self-updater's idle lambda reads `media_encode.ENCODING` as a live module
+  attribute, and ENCODING is never back-imported or published (an int snapshot would freeze the idle
+  gate open — the original "ENCODING hazard", now closed by moving definition + mutators as one unit;
+  state.py's SAFETY NOTE documents both valid patterns). Relocated bodies byte-identical (verified
+  against git HEAD); the hazard comments in state.py/multimodal.py/model_store.py/downloads.py
+  repointed. server.py 3,152 → 2,551.

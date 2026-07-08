@@ -29,11 +29,14 @@ SAFETY NOTE (the "ENCODING hazard")
 -----------------------------------
 A snapshot shares object *references*, so in-place mutation (``ENGINE_CONFIG[...] = x``,
 ``engine.models[...] = m``) is visible everywhere. What it does NOT track is a *rebind*
-(``global X; X = new_obj``). The only controller globals that get rebound at runtime are
-ENCODING / the DOWNLOAD_STATE group / NODE_CONFIG / CUSTOM_MODELS / GGUF_FILES — and the
-code that rebinds OR reads them stays in server.py by design, so no relocated body ever
-observes a stale snapshot. If you later relocate code that rebinds a shared global, make
-that global canonical HERE (``state.X``) and reference it as ``state.X`` everywhere.
+(``global X; X = new_obj``). Two valid patterns keep rebound globals coherent:
+(1) STAY-BEHIND: the DOWNLOAD_STATE group's rebinder + reader both stay in server.py.
+(2) CANONICAL-HOME-MOVES (Inc 11): ``ENCODING`` moved to media_encode.py TOGETHER with all
+four of its ``global ENCODING`` mutators; the one outside reader (server.py's self-update
+idle lambda) reads ``media_encode.ENCODING`` as a live module attribute, and the name is
+never back-imported or published (an int snapshot would freeze and decouple the gate).
+If you later relocate code that rebinds a shared global, use pattern (2), make the global
+canonical HERE (``state.X``), or keep rebinder+reader together — never split them.
 
 DEPLOY
 ------

@@ -26,8 +26,9 @@ NOTE (what STAYED in server.py and why):
     interruptible pull ``_pull_repo_interruptible`` — were NOT moved. They are mutated IN-PLACE
     *and rebound* (``global DOWNLOAD_STATE``) by server.py's FastAPI download routes and read by
     the self-updater's idle lambda (``not DOWNLOADING``). A moved ``global`` rebind would bind to
-    THIS module and silently decouple from server's name (exactly the ``ENCODING`` hazard from the
-    multimodal split), so they stay in server.py.
+    THIS module and silently decouple from server's name (the historical ``ENCODING`` hazard from
+    the multimodal split — since Inc 11 ENCODING itself lives in media_encode.py WITH its mutators,
+    the other valid pattern), so the DOWNLOAD-STATE group stays in server.py.
   * ``resolve_spec`` / ``resolve_model_name`` / ``_ollama_name`` / ``_split_family_size`` stay in
     server.py: they use the MODELS registry / MODEL_ALIASES (server globals). They call the moved
     ``_spec_from_config`` / ``_local_model_dir`` / ``_normalize_model_request`` / ``_friendly_from_hf``
