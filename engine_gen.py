@@ -618,47 +618,81 @@ class EngineGenMixin:
             return
         eos = model.eos_ids
         K = k if (k and k > 0) else SPEC_K
+        # #spec-fold: ONE target sweep per round. The old shape paid TWO full weight sweeps
+        # per round (the K-token verify PLUS a single-token _send to re-establish the target
+        # logits after the bonus/correction token) — on a bandwidth-bound 70B that is ~570 ms
+        # of sweeps per round, and spec measured SLOWER than plain greedy (3.63 vs 2.57 tok/s,
+        # om3nbox). Folded: the bonus token is carried as `pending` (emitted but not yet in the
+        # target KV) and rides at the FRONT of the next round's verify sequence, so its logits
+        # come from the same traversal that verifies the drafts. Bit-exact vs plain greedy:
+        # every emitted token is still the target's argmax over the full prefix.
         a0 = (await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True))[0, -1]
-        cur = len(prompt_ids)
+        cur = len(prompt_ids)              # target KV holds exactly tokens[0:cur]
         d_logits = await asyncio.to_thread(self._draft_prefill, model, prompt_ids)
         produced = 0
+        rounds = drafted = matched = 0
+
+        def _stats() -> None:
+            if rounds:
+                print(f"[spec] {model.friendly}: {produced} tok in {rounds} rounds "
+                      f"(K={K}, accept {matched}/{drafted} = {matched / max(1, drafted):.0%}, "
+                      f"{produced / rounds:.2f} tok/round)")
+
+        # the prefill's own greedy token comes free — emit it and carry it as pending
+        pending = int(a0.argmax())
+        produced += 1
+        if pending in eos:
+            yield None, "stop"
+            return
+        yield pending, None
+        if produced >= max_new:
+            yield None, "length"
+            return
+        d_logits = await asyncio.to_thread(self._draft_step, model, pending, cur)
         while produced < max_new:
             if model.friendly not in self.models or model.stage0_writer is None:
                 raise RuntimeError("pipeline went down mid-generation")
-            # 1. draft K tokens greedily on the controller
+            # 1. draft K tokens greedily on the controller, chained after `pending`
             drafts = []
             dl = d_logits
-            for k in range(K):
+            for i in range(K):
                 dt = int(dl.argmax())
                 drafts.append(dt)
-                dl = await asyncio.to_thread(self._draft_step, model, dt, cur + k)
-            # 2. verify all K on the target in ONE pipeline traversal
-            V = await self._send(model, torch.tensor([drafts], dtype=torch.long), cur, False,
-                                 all_logits=True)
-            # 3. target's greedy tokens for positions cur..cur+K
-            tg = [int(a0.argmax())] + [int(V[0, k].argmax()) for k in range(K)]
-            # 4. accept the matched prefix, then one target token (correction/bonus)
+                dl = await asyncio.to_thread(self._draft_step, model, dt, cur + 1 + i)
+            # 2. ONE pipeline traversal verifies pending + all K drafts
+            V = await self._send(model, torch.tensor([[pending] + drafts], dtype=torch.long),
+                                 cur, False, all_logits=True)
+            # 3. target's greedy tokens for positions cur+1 .. cur+K+1
+            tg = [int(V[0, i].argmax()) for i in range(K + 1)]
+            # 4. accept the matched draft prefix + one target token (correction/bonus)
             m = 0
             while m < K and tg[m] == drafts[m]:
                 m += 1
             accepted = tg[:m + 1]
-            # 5. roll target KV back to drop rejected draft positions
-            await self._crop(model, cur + m)
+            rounds += 1
+            drafted += K
+            matched += m
+            # 5. roll target KV back: keep pending + the m accepted drafts, drop the rest
+            await self._crop(model, cur + 1 + m)
             # 6. emit
             for t in accepted:
                 produced += 1
                 if t in eos:
+                    _stats()
                     yield None, "stop"
                     return
                 yield t, None
                 if produced >= max_new:
+                    _stats()
+                    yield None, "length"
                     return
-            # 7. re-establish a0 (+ draft) by feeding the last accepted token
-            last = accepted[-1]
-            a0 = (await self._send(model, torch.tensor([[last]], dtype=torch.long), cur + m, False))[0, -1]
-            await asyncio.to_thread(self._draft_crop, model, cur + m)
-            d_logits = await asyncio.to_thread(self._draft_step, model, last, cur + m)
-            cur += m + 1
+            # 7. the bonus token becomes the next round's pending (target logits for it come
+            # from the NEXT verify — no extra sweep); advance the draft to chain after it
+            pending = accepted[-1]
+            cur += 1 + m
+            await asyncio.to_thread(self._draft_crop, model, cur)
+            d_logits = await asyncio.to_thread(self._draft_step, model, pending, cur)
+        _stats()
         yield None, "length"
 
     # -- MTP (nextn) self-speculation (#91) — the checkpoint's own draft head -------------------
