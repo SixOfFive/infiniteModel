@@ -290,6 +290,17 @@ MODELS: dict[str, tuple[str, str]] = {
         "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
         "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
     ),
+    # Llama-3.3-70B-Instruct (dense), via the unsloth mirror (the official meta-llama repo is
+    # GATED and the fleet's HF account isn't on its authorized list). Draft = Llama-3.2-1B
+    # (SAME 128256-token Llama-3 vocab/tokenizer) -> the load auto-attaches it controller-side
+    # and greedy requests with options.speculative=true get draft-K/verify-once decode — the
+    # one lever that beats the bandwidth ceiling on a 37.8 GB/token dense sweep (#spec).
+    # Promoted to a built-in PAIR because custom /add_model entries register draft==target
+    # (spec off); the built-in is seeded before custom_models.json merges, so it wins.
+    "llama-3.3-70b": (
+        "unsloth/Llama-3.3-70B-Instruct",
+        "unsloth/Llama-3.2-1B-Instruct",
+    ),
     # MoE (Mixtral 8x7B): ~47B params resident (~94 GB bf16) but only ~13B active per
     # token -> ideal for the RAM-rich fleet. Per-layer expert bytes are MEASURED from
     # the safetensors headers at load (the dense formula can't see the 8 experts).
