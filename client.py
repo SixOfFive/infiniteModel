@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c187"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c188"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -932,8 +932,14 @@ def _w4a16_moe_op_locked():
                 triton.Config({"BN": 128, "SPLITK": 8}, num_warps=4, num_stages=3),
                 triton.Config({"BN": 64, "SPLITK": 4}, num_warps=2, num_stages=3),
                 triton.Config({"BN": 64, "SPLITK": 8}, num_warps=4, num_stages=2),
+                # #dram-dealias: what the de-aliased (row-padded) gemma-26b gate_up wants on
+                # gfx1151 (+8% over BN=128 there; never picked where it loses)
+                triton.Config({"BN": 256, "SPLITK": 4}, num_warps=8, num_stages=2),
             ],
-            key=["B", "N", "K"],
+            # sqn (within-expert row stride) is in the key so the load-time pad-vs-unpadded
+            # bench (Packed4Tensor3D.prepare_fused) tunes each variant separately instead of
+            # inheriting whichever ran first — and the winning tensor keeps its own best config.
+            key=["B", "N", "K", "sqn"],
             reset_to_zero=["y_ptr"],
         )
         @triton.jit
@@ -1194,7 +1200,7 @@ def _packed4_3d_cls():
                 if self._expert_triton:
                     return _w4a16_expert_cls()(self.qweight[e], self.scale[e], self.zero[e],
                                                self.group_size, self.in_features)
-                qw = self.qweight[e]                         # [out, in_pad//2]
+                qw = self.qweight[e]                         # [out, in_pad//2] (row-strided ok)
                 out = qw.shape[0]
                 lo = (qw & 0x0F).to(torch.int16)
                 hi = (qw >> 4).to(torch.int16)
@@ -1205,6 +1211,82 @@ def _packed4_3d_cls():
                 qf = q.reshape(out, ng, G).to(dt)
                 w = (qf - self.zero[e].to(dt).unsqueeze(2)) * self.scale[e].to(dt).unsqueeze(2)
                 return w.reshape(out, ng * G)[:, :self.in_features].contiguous()
+
+            _pad_choice = {}   # (E, N, rs) -> bool, shared across layers (one bench per shape)
+
+            def _dealias_ms(self, op, q, iters=25):
+                # time the FUSED expert GEMV on `q` at decode shape (B=top_k-ish), a FRESH random
+                # expert subset per call so consecutive calls miss the 32MB MALL the way real
+                # decode does (every layer's experts are cold every token; a fixed subset would
+                # measure cache, not DRAM).
+                import time as _time
+                E = q.shape[0]
+                B = min(8, E)
+                x = torch.randn(B, self.in_features, device=q.device, dtype=torch.bfloat16) * 0.1
+                eids = [torch.randperm(E, device=q.device)[:B].to(torch.int32)
+                        for _ in range(iters + 3)]
+                for i in range(3):                       # warmup + autotune (keyed on sqn too)
+                    op(x, eids[i], q, self.scale, self.zero, self.group_size, self.in_features)
+                torch.cuda.synchronize()
+                t0 = _time.perf_counter()
+                for i in range(iters):
+                    op(x, eids[3 + i], q, self.scale, self.zero, self.group_size, self.in_features)
+                torch.cuda.synchronize()
+                return (_time.perf_counter() - t0) / iters * 1e3
+
+            def prepare_fused(self):
+                # #dram-dealias (MoE): the fused expert GEMV walks rows along N with a
+                # WITHIN-EXPERT row stride of rs = K_pad/2 bytes, and a layer's expert stack
+                # (134-280 MB) is far past the 32MB MALL, so decode reads are DRAM-cold —
+                # the same regime where the DENSE GEMV collapsed on even-64B row strides (see
+                # QuantLinear4.prepare_fused). But the MoE response is NOT the dense rule:
+                # measured on gfx1151, gemma-4-26b's gate_up (rs=1408B) collapses to 64 GB/s
+                # and row-padding to an odd 64B multiple restores 188 GB/s (2.9x), while
+                # qwen3.6-35b's pow-2 shapes (rs=1024B/256B) run ~96 GB/s unpadded and padding
+                # HALVES them (bench_moe_dealias.py, 2026-07-07). So the choice is MEASURED per
+                # expert-stack shape at load: time the production op unpadded vs padded
+                # ([E, N, rs+64] buffer kept as the [:, :, :rs] view) and keep the winner
+                # (padded only on a >=15% win; decision cached per (E,N,rs) so 40 layers pay 1
+                # bench). All consumers (fused _mk kernel, per-expert 2D op, eager dequant)
+                # read via .stride()/indexing — the strided view needs no kernel change; the
+                # fused kernel's expert base is e*stride(0), which the view carries. Runtime-
+                # only: _shards/ caches stay bit-identical (pad at load, never at pack time).
+                # Called by the _finalize_placement sweep AFTER final device placement,
+                # ROCm-only like the dense pad. Idempotent.
+                if getattr(self, "_dealiased", False):
+                    return
+                self._dealiased = True
+                qw = self.qweight
+                if qw is None or qw.dim() != 3 or not (qw.device.type == "cuda"
+                                                       and getattr(torch.version, "hip", None)):
+                    return
+                E, N, rs = qw.shape
+                if rs % 128 != 0 or qw.stride(2) != 1 or qw.stride(1) != rs:
+                    return               # rows already an odd multiple of 64B (or already padded)
+                op = _w4a16_moe_op()
+                if op is None:
+                    return
+                choice = Packed4Tensor3D._pad_choice.get((E, N, rs))
+                try:
+                    if choice is None:
+                        buf = torch.zeros((E, N, rs + 64), dtype=torch.uint8, device=qw.device)
+                        buf[:, :, :rs].copy_(qw)
+                        t_un = self._dealias_ms(op, qw)
+                        t_pad = self._dealias_ms(op, buf[:, :, :rs])
+                        choice = t_pad < t_un * 0.87
+                        Packed4Tensor3D._pad_choice[(E, N, rs)] = choice
+                        _builtins.print(f"[int4] moe row de-alias [E={E},N={N},rs={rs}]: "
+                                        f"unpadded={t_un:.3f}ms padded={t_pad:.3f}ms -> "
+                                        f"{'PAD' if choice else 'keep unpadded'}", flush=True)
+                        if choice:
+                            self.qweight = buf[:, :, :rs]
+                        return
+                    if choice:
+                        buf = torch.zeros((E, N, rs + 64), dtype=torch.uint8, device=qw.device)
+                        buf[:, :, :rs].copy_(qw)
+                        self.qweight = buf[:, :, :rs]
+                except Exception as exc:     # never let a bench hiccup break placement
+                    _builtins.print(f"[int4] moe row de-alias skipped ({exc!r})", flush=True)
 
         _PACKED4_3D = Packed4Tensor3D
     return _PACKED4_3D
@@ -2338,8 +2420,10 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
                 _accelerate_cpu_linears(_m)
         # Fused int4 (#71): every weight now has its FINAL device, so build the tinygemm fused-int4
         # kernel per QuantLinear4 (2D linears: attn, router, shared experts, dense). ~3.6x faster
-        # int4 decode (no per-token re-dequant). Self-checked + naive fallback inside prepare_fused;
-        # MoE 3D experts (Packed4Tensor3D) have no prepare_fused -> stay on the naive path. Idempotent.
+        # int4 decode (no per-token re-dequant). Self-checked + naive fallback inside prepare_fused.
+        # Packed4Tensor3D's prepare_fused is picked up by this same sweep: it doesn't build a fused
+        # op (the MoE kernel binds at forward time) but re-allocates expert rows on an odd 64B
+        # multiple (#dram-dealias, ROCm) — must also run AFTER final device placement. Idempotent.
         if _FUSED_INT4:
             _nf = 0
             for _m in (([self.embed] if self.has_embed else [])

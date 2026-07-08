@@ -67,8 +67,9 @@ if _HAVE_TRITON:
             triton.Config({"BN": 128, "SPLITK": 8}, num_warps=4, num_stages=3),
             triton.Config({"BN": 64, "SPLITK": 4}, num_warps=2, num_stages=3),
             triton.Config({"BN": 64, "SPLITK": 8}, num_warps=4, num_stages=2),
+            triton.Config({"BN": 256, "SPLITK": 4}, num_warps=8, num_stages=2),   # #dram-dealias
         ],
-        key=["B", "N", "K"],
+        key=["B", "N", "K", "sqn"],   # sqn: see client.py — pad-vs-unpadded variants tune apart
         reset_to_zero=["y_ptr"],   # atomic-acc kernel: zero y before each autotune trial + launch
     )
     @triton.jit
