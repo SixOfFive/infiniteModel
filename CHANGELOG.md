@@ -528,3 +528,21 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   FASTER too); (2) the GEMV autotune space adds the `BN=64 / num_warps=16` family the de-aliased
   70B shapes want (28672x8192 gate/up: 1.94ms -> 0.67ms). Matrix-bench ceilings: 70B 0.75 -> 4.50
   tok/s, 32B 6.66 -> 10.81 tok/s.
+- **gfx1151 fused-MoE expert-row de-aliasing — MEASURED per shape (#dram-dealias MoE, m4c188,
+  2026-07-07):** the fused grouped MoE GEMV has the same exposure as the dense one — within-expert
+  rows sit K_pad/2 bytes apart in the contiguous `[E, N, rs]` `Packed4Tensor3D`, and a layer's
+  expert stack (134-280 MB) is far past the 32MB MALL, so decode reads are DRAM-cold. But the
+  isolated-shape bench (bench_moe_dealias, the dense fix's methodology with a fresh random expert
+  subset per call) showed the response is NOT the dense static rule: gemma-4-26b's gate_up
+  (rs=1408B, even*64) collapses to 63.7 GB/s and row-padding restores 187.5 GB/s (2.9x; per-token
+  expert kernels 9.62 -> 4.45 ms), yet qwen3.6-35b's power-of-two shapes (rs=1024B/256B) run ~96
+  GB/s unpadded and padding HALVES them — an even-multiple pad control shows the same, so it's not
+  the odd/even story dense followed. Fix accordingly: `Packed4Tensor3D.prepare_fused` (same
+  post-placement sweep as the dense pad, ROCm-only) TIMES the production op unpadded vs row-padded
+  (`[E,N,rs+64]` buffer kept as the `[:,:,:rs]` view) on DRAM-cold subsets and keeps the winner
+  (>=15% to pad; decision cached per (E,N,rs) so 30 layers pay one bench; kernels read via
+  `.stride()` so the strided view needs no kernel change). `sqn` joins the MoE autotune key so the
+  two variants tune apart (side effect: MoE decode autotune now happens at load, not first decode),
+  and the de-aliased gemma gate_up's preferred `BN=256/SPLITK=4/w8` config joins the space (+8%).
+  Shard caches stay bit-identical — pad at load, never at pack time. gpt-oss is naturally odd-row
+  (rs=1472B) and skips untouched.
