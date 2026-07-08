@@ -4,7 +4,7 @@ WHY: at batch-1 decode the eager MoE forward loops the top_k routed experts in P
 separate `F.linear(x, gate_up_proj[e])` (+ down) per expert — each a tiny kernel launch plus
 tensor-subclass dispatch. On the bandwidth-limited Strix Halo iGPU that per-expert launch/Python
 overhead, not the GEMV math, dominates the MoE layer's decode cost. This harness validates and
-benchmarks the FUSED path that client.py installs on a Qwen3-MoE-style experts module: ONE Triton
+benchmarks the FUSED path that worker_quant.py installs on a Qwen3-MoE-style experts module: ONE Triton
 launch over all B = tokens*top_k applications (program (b, n) gathers expert eid[b]'s int4 tile),
 replacing the Python loop.
 
@@ -28,7 +28,7 @@ except Exception as _e:                     # pragma: no cover
 G = 128
 
 
-# --- packing (matches client.py _quantize_linear4 / _pack4_expert) ---------------------------
+# --- packing (matches worker_quant.py _quantize_linear4 / _pack4_expert) ---------------------------
 def pack_expert(W, group=G):
     """W [out, in] bf16 -> (qweight uint8 [out, in_pad//2], scale/zero bf16 [out, ng]), in_features."""
     out, in_f = W.shape
@@ -56,9 +56,9 @@ def dequant_expert(qw, scale, zero, in_f, group=G):
     return w.reshape(out, ng * group)[:, :in_f].contiguous()
 
 
-# --- fused kernel (copy of client.py _w4a16_moe_op _mk, incl. its autotune set) -------------
+# --- fused kernel (copy of worker_quant.py _w4a16_moe_op _mk, incl. its autotune set) -------------
 if _HAVE_TRITON:
-    # split-K MoE GEMV — byte-for-byte mirror of client.py _w4a16_moe_op _mk (incl. its autotune set)
+    # split-K MoE GEMV — byte-for-byte mirror of worker_quant.py _w4a16_moe_op _mk (incl. its autotune set)
     @triton.autotune(
         configs=[
             triton.Config({"BN": 128, "SPLITK": 1}, num_warps=4, num_stages=2),   # == prior default
@@ -69,7 +69,7 @@ if _HAVE_TRITON:
             triton.Config({"BN": 64, "SPLITK": 8}, num_warps=4, num_stages=2),
             triton.Config({"BN": 256, "SPLITK": 4}, num_warps=8, num_stages=2),   # #dram-dealias
         ],
-        key=["B", "N", "K", "sqn"],   # sqn: see client.py — pad-vs-unpadded variants tune apart
+        key=["B", "N", "K", "sqn"],   # sqn: see worker_quant.py — pad-vs-unpadded variants tune apart
         reset_to_zero=["y_ptr"],   # atomic-acc kernel: zero y before each autotune trial + launch
     )
     @triton.jit

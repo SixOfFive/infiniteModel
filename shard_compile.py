@@ -35,7 +35,7 @@ def _packer_tag(quant: str, group_size: int) -> str:
 def pack_linear_int4(W, group_size: int = INT4_GROUP):
     """Group-wise asymmetric int4 pack of one Linear weight — the SHARED packer for the shard cache.
     Returns (qweight uint8 [out, in_pad//2], scale, zero, in_features). MUST stay BIT-IDENTICAL to
-    client.py `_quantize_linear4` (same min/max/scale/zero/round/clamp/nibble-order) so a cached
+    worker_quant.py `_quantize_linear4` (same min/max/scale/zero/round/clamp/nibble-order) so a cached
     shard loads exactly as a freshly-quantized one. W is a 2D bf16/fp16 tensor [out, in_features]."""
     import torch
     import torch.nn.functional as F
@@ -77,7 +77,7 @@ def pack_linear_int4_3d(W3, group_size: int = INT4_GROUP):
 def pack_linear_int8(W):
     """Per-output-channel symmetric int8 pack of one Linear weight — the SHARED int8 packer for the
     shard cache. Returns (qweight int8 [out, in], scale [out, 1]). MUST stay BIT-IDENTICAL to
-    client.py `_quantize_linear` (same |W|.amax/127 scale, round, clamp(-127,127)) so a cached int8
+    worker_quant.py `_quantize_linear` (same |W|.amax/127 scale, round, clamp(-127,127)) so a cached int8
     shard loads exactly as a freshly-quantized one. W is a 2D bf16/fp16 tensor [out, in]."""
     import torch
     scale = (W.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)

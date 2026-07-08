@@ -552,3 +552,23 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   keep-unpadded (gemma's live tensors never collapsed; e2e ~20.5 tok/s unchanged). fused-MoE
   self-checks all `-> ACTIVE` (rel ~0.006), gemma `/api/chat` coherent, qwen output text identical
   to baseline at temp 0.
+- **Code-split round 2, increment 10 — `worker_quant.py`, client.py's flagship (m4c189, 2026-07-08):**
+  the whole quant/kernel family (~1,660 lines) relocated out of client.py into a SELF-CONTAINED worker
+  leaf (shard_compile precedent — deliberately NOT in `state.bind`): the guarded module-level triton/tl
+  import + the #triton-race Autotuner patch, the CPU fp32-GEMM family (flags + `tune_cpu_threads` +
+  `_accelerate_cpu_linears`), the int8/int4 cores (QuantLinear/QuantLinear4 incl. `prepare_fused` and
+  both #dram-dealias paths), the w4a16 triton kernels (dense + fused-MoE + expert tensor-subclass),
+  the packers (`Packed4Tensor3D`, `_pack4_expert`/`_pack4_3d`), fused-MoE + gpt-oss installs, the MoE
+  offload bridge, per-expert/streamed builds, meta-expert detectors, and `_assign_meta_from_sd`. All
+  relocated bodies byte-identical (verified against git HEAD). worker_quant.py is now the CANONICAL
+  home of the runtime-rebound flag family (`_CPU_FP32_GEMM`/`_CPU_FP32_MIN_ROWS`/`_CPU_BF16_GEMM_OK`/
+  `_FUSED_INT4`): client.py back-imports only the functions/classes (never the flags) before
+  `state.publish` so shard_build's bind-injected bare names keep resolving, and the two flagged
+  NOT-byte-identical edits make every flag access a live module attribute — `main()`'s `--no-cpu-fp32`
+  sets `worker_quant._CPU_FP32_GEMM = False` (was `global`), and `Shard._finalize_placement` reads
+  `worker_quant._CPU_FP32_GEMM` / `._FUSED_INT4` (a from-import copy would freeze the pre-main values
+  and silently ignore the CLI flag / the aarch64 FEAT_BF16 crash-guard rebind). Zero leftover
+  flag/triton/tl definitions remain in client.py (they would re-enter the publish snapshot and stomp
+  the live values). worker_quant.py joins `EXTRA_UPDATE_FILES` + the convergence-bridge tuple;
+  bit-identity doc contracts in shard_compile.py/shards.py/bench_moe_w4a16.py repointed.
+  client.py 3,032 → 1,346.

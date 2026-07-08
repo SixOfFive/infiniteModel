@@ -23,8 +23,9 @@ from wire import _tp_hetsplit, _fuse_moe_experts   # noqa: F401  (het-TP geometr
 # _fuse_moe_experts is the SAME function the worker cold load uses, so a per-expert MoE cache is
 # fused into the model's 3D layout IDENTICALLY -> bit-identical to a cold load by construction.)
 
-# Shared int4 group size — MUST match client.py _INT4_GROUP so a controller-compiled shard cache is
-# byte-identical to what the worker quantizes at load time (#shard-cache).
+# Shared int4 group size — MUST match worker_quant.py _INT4_GROUP (code-split Inc 10; was client.py)
+# so a controller-compiled shard cache is byte-identical to what the worker quantizes at load
+# time (#shard-cache).
 INT4_GROUP = 128
 
 # code-split Inc 9: the pack family (PACKER_VERSION/_packer_tag/pack_linear_*/pack_unit_tensors)
