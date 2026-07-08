@@ -293,8 +293,24 @@ class EngineGenMixin:
         import torch
         from transformers import AutoModelForCausalLM
         _controller_model_dir(draft_id)
-        model.draft_model = AutoModelForCausalLM.from_pretrained(
+        _dm = AutoModelForCausalLM.from_pretrained(
             draft_id, dtype=torch.bfloat16, attn_implementation="eager").eval()
+        # #spec-draft-gpu: a CPU draft step reads the draft's full weights from DDR — on an
+        # APU-class box that costs 150-350 ms/step, MORE than the target's ~285 ms verify
+        # sweep, so CPU drafting loses outright (measured: llama-70b 3.50 plain -> 2.49
+        # spec tok/s on om3nbox). On the GPU the same step is ~15-30 ms and spec pays off.
+        # Use the GPU only when its REAL free VRAM fits the draft plus a 4 GB margin — the
+        # controller's allocation is invisible to the worker-side placement budget, so a
+        # thin margin could squeeze a resident model's KV growth. CPU remains the fallback.
+        with contextlib.suppress(Exception):
+            if torch.cuda.is_available():
+                _free_b, _tot_b = torch.cuda.mem_get_info()
+                _need = sum(p.numel() * p.element_size() for p in _dm.parameters())
+                if _free_b > _need + 4 * (1024 ** 3):
+                    _dm = _dm.to("cuda")
+                    print(f"[load] spec draft on GPU ({_need / 1024**3:.1f} GB model, "
+                          f"{_free_b / 1024**3:.1f} GB free before)")
+        model.draft_model = _dm
         model.draft_id = draft_id
         model.draft_kv = None
 
@@ -306,18 +322,20 @@ class EngineGenMixin:
     def _draft_prefill(self, model: LoadedModel, prompt_ids):
         import torch
         from transformers import DynamicCache
+        _dev = model.draft_model.device   # cpu or cuda (#spec-draft-gpu)
         model.draft_kv = DynamicCache()
         with torch.inference_mode():
-            out = model.draft_model(input_ids=torch.tensor([prompt_ids]),
+            out = model.draft_model(input_ids=torch.tensor([prompt_ids], device=_dev),
                                     past_key_values=model.draft_kv, use_cache=True)
         return out.logits[0, -1]
 
     def _draft_step(self, model: LoadedModel, token: int, position: int):
         import torch
+        _dev = model.draft_model.device
         with torch.inference_mode():
-            out = model.draft_model(input_ids=torch.tensor([[token]]),
+            out = model.draft_model(input_ids=torch.tensor([[token]], device=_dev),
                                     past_key_values=model.draft_kv, use_cache=True,
-                                    cache_position=torch.tensor([position]))
+                                    cache_position=torch.tensor([position], device=_dev))
         return out.logits[0, -1]
 
     def _draft_crop(self, model: LoadedModel, length: int) -> None:
