@@ -545,4 +545,10 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   two variants tune apart (side effect: MoE decode autotune now happens at load, not first decode),
   and the de-aliased gemma gate_up's preferred `BN=256/SPLITK=4/w8` config joins the space (+8%).
   Shard caches stay bit-identical — pad at load, never at pack time. gpt-oss is naturally odd-row
-  (rs=1472B) and skips untouched.
+  (rs=1472B) and skips untouched. LIVE-VALIDATED on om3nbox — and the live tensors INVERTED the
+  synthetic verdicts, proving the measured design necessary: the collapse is ALLOCATION-dependent
+  (physical-page bits in the channel hash), not a shape rule. Live decisions: qwen3.6-35b gate_up
+  PAD (0.088 -> 0.052 ms, 1.7x; e2e 15.75 -> 16.34 tok/s clean A/B), its down + both gemma shapes
+  keep-unpadded (gemma's live tensors never collapsed; e2e ~20.5 tok/s unchanged). fused-MoE
+  self-checks all `-> ACTIVE` (rel ~0.006), gemma `/api/chat` coherent, qwen output text identical
+  to baseline at temp 0.

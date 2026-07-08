@@ -1239,13 +1239,16 @@ def _packed4_3d_cls():
                 # WITHIN-EXPERT row stride of rs = K_pad/2 bytes, and a layer's expert stack
                 # (134-280 MB) is far past the 32MB MALL, so decode reads are DRAM-cold —
                 # the same regime where the DENSE GEMV collapsed on even-64B row strides (see
-                # QuantLinear4.prepare_fused). But the MoE response is NOT the dense rule:
-                # measured on gfx1151, gemma-4-26b's gate_up (rs=1408B) collapses to 64 GB/s
-                # and row-padding to an odd 64B multiple restores 188 GB/s (2.9x), while
-                # qwen3.6-35b's pow-2 shapes (rs=1024B/256B) run ~96 GB/s unpadded and padding
-                # HALVES them (bench_moe_dealias.py, 2026-07-07). So the choice is MEASURED per
-                # expert-stack shape at load: time the production op unpadded vs padded
-                # ([E, N, rs+64] buffer kept as the [:, :, :rs] view) and keep the winner
+                # QuantLinear4.prepare_fused). But unlike dense, the MoE collapse is
+                # ALLOCATION-dependent, not a stride rule: the same (E,N,rs) can collapse in
+                # one allocation and run full-speed in another (gfx1151 2026-07-07 — synthetic
+                # bench_moe_dealias: gemma-26b gate_up 64->188 GB/s from padding while qwen's
+                # pow-2 shapes got HALVED by it; live cache-installed tensors: the OPPOSITE —
+                # qwen gate_up 0.088->0.052ms from padding, gemma fine unpadded). Presumably
+                # the DRAM channel hash includes physical-page bits, so no static rule works.
+                # Hence the choice is MEASURED on the actual tensor at load: time the
+                # production op unpadded vs padded ([E, N, rs+64] buffer kept as the
+                # [:, :, :rs] view) on DRAM-cold random expert subsets and keep the winner
                 # (padded only on a >=15% win; decision cached per (E,N,rs) so 40 layers pay 1
                 # bench). All consumers (fused _mk kernel, per-expert 2D op, eager dequant)
                 # read via .stride()/indexing — the strided view needs no kernel change; the
