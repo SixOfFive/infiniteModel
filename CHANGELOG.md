@@ -516,3 +516,15 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   hard way: cache deleted and recompiled through the new path — **combined sha1 of all 26 units
   bit-identical to the pre-split cache** — plus a live `/pack_probe` (worker packs via the relocated
   shared packer: `byte_identical: true`). client.py 2,923 → 2,924 wiring net; fleet on m4c186.
+- **gfx1151 int4 GEMV DRAM de-aliasing + 70B-shape autotune coverage (#dram-dealias, 2026-07-07):**
+  `llama-3.3:70b` int4 decoded at 0.61 tok/s on Strix Halo while dense-32B hit 5.28 — a 4x per-BYTE
+  gap, fully reproduced in an isolated kernel bench (per-shape times predicted 0.73 vs observed 0.61).
+  Root cause: the split-K w4a16 GEMV walks `qweight` along N with a row stride of K/2 bytes; at the
+  70B dims (K=8192 -> a 4096B power-of-two stride) every row maps to the same DRAM channels/banks,
+  and any matrix too big for the 32MB MALL collapses to 17-67 GB/s (the 33MB q/o just overflows it;
+  the 4MB k/v stays cached and fast — why only big-K dense models ever showed this). Two-part fix,
+  no kernel change: (1) `prepare_fused` re-allocates the packed rows on an ODD multiple of 64B
+  (kernels already read via `qweight.stride(0)`; +64B/row ≈ 1%, and the aligned 32B shapes got
+  FASTER too); (2) the GEMV autotune space adds the `BN=64 / num_warps=16` family the de-aliased
+  70B shapes want (28672x8192 gate/up: 1.94ms -> 0.67ms). Matrix-bench ceilings: 70B 0.75 -> 4.50
+  tok/s, 32B 6.66 -> 10.81 tok/s.

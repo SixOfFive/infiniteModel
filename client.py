@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c186"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c187"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -603,6 +603,21 @@ def _quant4_linear_cls():
                         G = self.group_size
                         ng = self.scale.shape[1]
                         in_pad = ng * G
+                        # #dram-dealias: the GEMV walks qweight along N with a row stride of K/2
+                        # bytes. When that stride is an EVEN multiple of 64B (worst case a power of
+                        # two — llama-70b's K=8192 -> 4096B) every row lands on the same DRAM
+                        # channels/banks, and any weight too big for the 32MB MALL collapses to
+                        # ~17-67 GB/s (llama-3.3-70b decoded 0.61 tok/s). Re-allocating rows on an
+                        # ODD multiple of 64B restores 130-210 GB/s (bench_w4a16 matrix, gfx1151).
+                        # The kernels read via qweight.stride(0), so a padded VIEW needs no other
+                        # change; cost is 64B/row (~1% for the mats this matters to) and never hurts
+                        # the aligned case (32b shapes got faster too).
+                        qw = self.qweight
+                        if qw.shape[1] % 128 == 0:
+                            buf = torch.zeros((qw.shape[0], qw.shape[1] + 64),
+                                              dtype=torch.uint8, device=dev)
+                            buf[:, :qw.shape[1]].copy_(qw)
+                            self.qweight = buf[:, :qw.shape[1]]
                         sz = (self.scale, self.zero)
                         xt = torch.randn(8, self.in_features, device=dev, dtype=torch.bfloat16)
                         xk = xt if in_pad == self.in_features else F.pad(xt, (0, in_pad - self.in_features))
@@ -771,13 +786,19 @@ def _w4a16_triton_op_locked():
         # num_warps is the dominant knob for a BW-bound GEMV (more warps = more in-flight loads to
         # hide memory latency); RDNA/iGPU often wants more than sm_89, so sweep {4,8} x SPLITK and
         # let autotune pick per (N,K)/arch. SPLITK=4/w4 == the prior default, so never worse.
+        # #dram-dealias: the BN=64 / num_warps=16 configs are what the 70B dims (N 8192-28672,
+        # K 8192/28672) want once the row stride is de-aliased (see prepare_fused) — measured
+        # 0.67ms vs 1.94ms on the 28672x8192 gate/up with the old space (gfx1151 matrix bench).
         # reset_to_zero: this kernel atomic-adds into y_ptr, so autotune's timing reruns would
         # accumulate into the same buffer and corrupt the first call for each (N,K) — zero it per
         # launch. (Was missing before; first-token-per-shape corruption was masked by the load-time
         # self-check absorbing it.)
         @triton.autotune(
             configs=[triton.Config({"BN": 128, "SPLITK": s}, num_warps=w)
-                     for s in (4, 8, 16) for w in (4, 8)],
+                     for s in (4, 8, 16) for w in (4, 8)]
+                    + [triton.Config({"BN": bn, "SPLITK": s}, num_warps=w)
+                       for (bn, s, w) in ((64, 4, 8), (64, 4, 16), (64, 8, 16), (64, 16, 16),
+                                          (64, 32, 16), (128, 4, 16), (128, 8, 16))],
             key=["N", "K"],
             reset_to_zero=["y_ptr"],
         )
