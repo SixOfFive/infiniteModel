@@ -80,7 +80,7 @@ here, not load-bearing as it was on RDNA (where no vendor int4 GEMM exists at al
 |---|---|
 | `INFINITEMODEL_CUDA_FUSED_MOE=1` | **Linux + NVIDIA Ampere (sm_80+) opt-in:** use the fused Triton MoE-expert kernel instead of bf16 remat. No effect on ROCm (already on); on pre-Ampere NVIDIA the bf16 kernel won't compile and the self-check falls back to the default. |
 | `INFINITEMODEL_NO_FUSED_MOE=1` | Kill switch: force the bf16-remat (default) expert path everywhere, incl. ROCm. Use to A/B the fused kernel on/off. |
-| `INFINITEMODEL_CUDA_GRAPH=<ctx>` | **⚠ EXPERIMENTAL — do not activate yet.** Opt-in CUDA-graph decode (single-node, standard-attention, CUDA). The capture mechanism is proven (exact-match offline) but the in-worker integration is **not yet validated/safe**: (1) it must match transformers 5.12.1's Qwen3 cache/rotary contract (attention calls `cache.update(k,v,layer_idx)` *without* `cache_position`, and `apply_rotary_pos_emb` is a hub kernel with a specific layout), and (2) the current first-decode self-check compares StaticCache-vs-StaticCache, so a StaticCache-semantics bug would not be caught — the self-check must compare against the proven **DynamicCache** path. Leave unset until the corrected copy-handoff design lands. Code is default-OFF (inert without this var). |
+| `INFINITEMODEL_CUDA_GRAPH=<ctx>` | Opt-in CUDA-graph decode (single-node, standard-attention, uniform-CUDA models; `<ctx>` sizes the StaticCache mirror — set it to the serving ctx). Copy-handoff design: prefill/verify stay on the proven eager DynamicCache path; the first decode captures `model.forward` over a StaticCache mirror, the second **replays at a new position** and self-checks against the eager DynamicCache decode — activates only on a match (`[cudagraph] decode ACTIVE`), else latches off permanently and serving stays eager (byte-identical). Default-OFF (inert without this var). **HIP/ROCm gfx1151: tested 2026-07-08 (TheRock torch 2.12.0a0+rocm7.13, HIP 7.13.60980, llama-3.3-70b int4) — capture and replay execute without error, but the replayed logits are ~71–74% off (`rel=0.740`/`0.714`, two independent loads); the self-check DISABLES it every time. Leave unset on ROCm until a TheRock/HIP build replays faithfully; NVIDIA is the intended target.** |
 | `INFINITEMODEL_PREFILL_CHUNK=<tokens>` | **Default 2048 (ON).** Processes a long-prompt **prefill** in query-chunks of this many tokens so SDPA never materializes the full `[1, H, q, total]` attention-score tensor. An explicit additive mask disables SDPA's flash backend; on a device without the mem-efficient backend (**ROCm gfx1151**, the CPU math path) SDPA otherwise falls to the math backend and allocates the whole `O(H·q²)` matrix → OOM on long prompts (the 43 GiB single-alloc seen on the Strix Halo). Chunking caps peak score memory to `O(H·C·q)`. Math-identical to the unchunked pass (validated); **standard-attention models only** (per-type/hybrid/omni keep the full pass); decode is unaffected. Set `0` to disable (single full pass); lower it (512–1024) for very long contexts on memory-tight boxes. |
 
 Set them in the worker's environment (e.g. a systemd `--user` unit `Environment=` line, or the shell
@@ -170,11 +170,18 @@ Decode here is **memory-bandwidth-bound** (~80% GPU-busy), so tok/s tracks effec
 RDNA needs *all* of these — no vendor int4 GEMM exists on it at all.
 
 **Big dense models (llama-3.3-70b class, hidden 8192):** these dims hit the #4b DRAM-aliasing
-pathology (measured 0.61 tok/s before the fix, 1.73 after, same box). The remaining gap to the
-~4.5 tok/s pure-kernel ceiling is **eager-mode overhead**, measured by simulating one token's full
-launch schedule: the 560 GEMV launches (zeros + kernel + bf16-convert each) cost ~362 ms/token
-against ~222 ms of pure kernel time, and HF eager attention/norms/serve add ~215 ms more. Killing
-that needs graph-captured decode (`INFINITEMODEL_CUDA_GRAPH`, untested on HIP), not kernel work.
+pathology (measured 0.61 tok/s before the fix, same box). With the fix, a **clean** box measures
+**3.5 tok/s / 284 ms-token steady-state** (2026-07-08: 3.48–3.52 over three 128-tok runs across two
+fresh loads, exclusive box) — ~78% of the ~4.5 tok/s pure-kernel ceiling, i.e. real eager overhead
+is only ~60 ms/token. Two earlier numbers are hereby corrected: the **1.73 tok/s** first recorded
+for the fix was depressed ~2× by contaminated first-token autotune picks under concurrent fleet
+traffic (the caveat noted at the time — always bench after a fresh worker restart with the box
+exclusive), and the ~362 ms/token launch-schedule sim does **not** reproduce on a clean box.
+The graph-decode lever was tested and is **broken on this HIP stack** (2026-07-08, TheRock torch
+2.12.0a0+rocm7.13.0a20260411 / HIP 7.13.60980): `INFINITEMODEL_CUDA_GRAPH=8192` captures and
+replays without error, but replayed logits come back ~71–74% off (rel=0.740/0.714, two independent
+loads) — the first-decode self-check catches it (`[cudagraph] replay self-check vs DynamicCache
+rel=0.714 -> DISABLED (eager)`) and serving stays eager and coherent. Retest on a newer TheRock/HIP.
 
 ### NVIDIA — the MoE opt-in (dense is already tinygemm-fast)
 
@@ -211,8 +218,14 @@ These kernels are good but not the ceiling. Ranked by likely payoff:
    opt-in** (`INFINITEMODEL_CUDA_GRAPH=<ctx>`, default off — see Environment switches). Single-node
    standard-attention only; a persistent StaticCache + captured per-token graph + first-decode self-check
    vs eager (permanent fallback on mismatch). To activate on a worker: add the env var to its launch
-   (e.g. `start_worker.bat`), restart, load an eligible model, and confirm `[cudagraph] decode capture
-   ACTIVE` in the log.
+   (e.g. `start_worker.bat`), restart, load an eligible model, and confirm `[cudagraph] decode ACTIVE`
+   in the log. **HIP/ROCm status (tested 2026-07-08, gfx1151 / TheRock torch 2.12.0a0+rocm7.13, HIP
+   7.13.60980, llama-3.3-70b int4):** `torch.cuda.CUDAGraph` capture and replay execute without raising,
+   but the replay computes wrong logits — self-check rel≈0.71–0.74 across two independent loads → auto
+   `DISABLED (eager)` both times. The fallback is safe (coherent serving, no crash), but there is **no
+   win available on ROCm** until a TheRock/HIP build replays faithfully; NVIDIA remains the proven
+   target. Note the eager overhead this lever buys back is also smaller than first simmed: a clean
+   llama-70b box decodes at 284 ms/token vs the ~222 ms kernel floor (~1.28× headroom, not 2.6×).
 2. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
    kernel is gated behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. Attention is a real slice of decode
    on the hybrid (Gated-DeltaNet + SDPA) models.
