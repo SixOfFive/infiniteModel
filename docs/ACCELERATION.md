@@ -150,6 +150,7 @@ platform. This table is the whole story — what each one does, where it runs, a
 | 2 | **Fused dense int4 GEMM** (torch tinygemm `_weight_int4pack_mm`) | dequantizes *inside* the GEMM — no bf16 rematerialize | NVIDIA, CPU, CDNA2+ | int4 7B **3.25 → 21.13 tok/s**; int4 now beats bf16 |
 | 3 | **Triton w4a16 dense** | hand-rolled substitute where tinygemm is absent | AMD RDNA only | **5–20×** over naive (14× @4096², 20× @5120²) |
 | 4 | **Split-K dense GEMV** (M=1 decode) | splits K across more programs to saturate the bus at batch-1 | AMD RDNA only | **3.5–3.9×** on the dense GEMV |
+| 4b | **DRAM channel de-aliasing** (#dram-dealias, padded qweight rows) | when the packed row stride (K/2 bytes) is an even multiple of 64B — worst case a power of two, e.g. K=8192 → 4096B — every row maps to the same DRAM channels/banks and any matrix too big for the 32MB MALL collapses (17–67 GB/s); `prepare_fused` re-allocates rows on an **odd** multiple of 64B (+64B/row, no kernel change) and the GEMV autotune space gains the `BN=64/warps=16` family these shapes want | AMD RDNA only | worst GEMV (28672×8192) **17 → 175 GB/s**; **llama-3.3-70b e2e 0.61 → 1.73 tok/s (2.8×)**; the 32B/5120-dim shapes got faster too (never worse) |
 | 5 | **Fused grouped MoE GEMV** (`_w4a16_moe_op`) | all `top_k` experts' int4 GEMVs in ONE launch (kills the per-expert Python loop) | ROCm (auto), NVIDIA (opt-in) | **~3.7×** on the expert GEMM (per-platform below) |
 | 6 | **MoE autotune** `(BN, warps, stages)` | best tile per `(B,N,K)` per GPU | ROCm, NVIDIA | up to **1.18×** (shape-dependent) |
 | 7 | **Serve-from-cache pre-packed int4** | streams pre-quantized layers; skips load-time re-quant | all | faster *loads* (not decode) |
@@ -167,6 +168,13 @@ platform. This table is the whole story — what each one does, where it runs, a
 
 Decode here is **memory-bandwidth-bound** (~80% GPU-busy), so tok/s tracks effective GB/s, not FLOPs.
 RDNA needs *all* of these — no vendor int4 GEMM exists on it at all.
+
+**Big dense models (llama-3.3-70b class, hidden 8192):** these dims hit the #4b DRAM-aliasing
+pathology (measured 0.61 tok/s before the fix, 1.73 after, same box). The remaining gap to the
+~4.5 tok/s pure-kernel ceiling is **eager-mode overhead**, measured by simulating one token's full
+launch schedule: the 560 GEMV launches (zeros + kernel + bf16-convert each) cost ~362 ms/token
+against ~222 ms of pure kernel time, and HF eager attention/norms/serve add ~215 ms more. Killing
+that needs graph-captured decode (`INFINITEMODEL_CUDA_GRAPH`, untested on HIP), not kernel work.
 
 ### NVIDIA — the MoE opt-in (dense is already tinygemm-fast)
 
