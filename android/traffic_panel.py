@@ -54,6 +54,7 @@ hin  = defaultdict(lambda: deque(maxlen=HIST))     # download (in) rate samples 
 hout = defaultdict(lambda: deque(maxlen=HIST))     # upload  (out) rate samples per row
 _last_log = [0.0]
 _prev_cpu = [None]                                 # (total, idle) /proc/stat jiffies, for a delta CPU%
+_cpu_hist = deque(maxlen=HIST)                      # this tablet's CPU% samples (for the cpu sparkline)
 
 
 def human(bps):
@@ -73,9 +74,9 @@ def human_bytes(b):
 
 
 def tablet_cpu():
-    """A CPU-load string for THIS tablet. Primary: /proc/stat busy% (delta between polls). Android
-    denies app-UID processes /proc/stat + /proc/loadavg, so fall back to a cpufreq clock proxy
-    (mean scaling_cur_freq/cpuinfo_max_freq, marked 'clk'). Returns e.g. '42%', '38% clk', '…', 'n/a'."""
+    """(pct, label) for THIS tablet's CPU. `pct` is a float 0-100 (or None), `label` the display
+    string. Primary: /proc/stat busy% (delta between polls). Android denies app-UID processes
+    /proc/stat + /proc/loadavg, so fall back to a cpufreq clock proxy (mean cur/max freq, 'clk')."""
     try:
         with open("/proc/stat") as f:
             v = [int(x) for x in f.readline().split()[1:]]
@@ -85,8 +86,9 @@ def tablet_cpu():
         _prev_cpu[0] = (total, idle)
         if prev is not None and total > prev[0]:
             dt, di = total - prev[0], idle - prev[1]
-            return f"{max(0.0, min(100.0, 100.0 * (dt - di) / dt)):.0f}%"
-        return "…"                                     # /proc/stat readable, warming up
+            p = max(0.0, min(100.0, 100.0 * (dt - di) / dt))
+            return p, f"{p:.0f}%"
+        return None, "…"                               # /proc/stat readable, warming up
     except Exception:
         pass
     try:                                               # fallback: cpufreq clock-load proxy
@@ -101,10 +103,23 @@ def tablet_cpu():
             except Exception:
                 pass
         if rs:
-            return f"{100.0 * sum(rs) / len(rs):.0f}% clk"
+            p = 100.0 * sum(rs) / len(rs)
+            return p, f"{p:.0f}% clk"
     except Exception:
         pass
-    return "n/a"
+    return None, "n/a"
+
+
+def pct_spark(values, width, ceiling=100.0):
+    """Sparkline of the last `width` percent-values scaled 0..ceiling (0 -> blank, ceiling -> full).
+    Unlike spark(), no byte noise-floor — meant for a 0-100 CPU graph."""
+    s = list(values)[-width:]
+    if not s:
+        return " " * width
+    mx = ceiling or (max(s) or 1)
+    cells = "".join(SPARK[min(len(SPARK) - 1, int(min(max(v, 0.0), mx) / mx * (len(SPARK) - 1)))]
+                    for v in s)
+    return cells.rjust(width)
 
 
 def tablet_mem():
@@ -424,14 +439,23 @@ def render():
                    f"{DIM}↓green=download ↑red=upload (scaled to MAX) · "
                    f"FROM→node→NEXT: 'home'=controller (drop-off → home){RST}")
         # This tablet's own load (the panel process runs here, so /proc is the tablet's).
-        cpu_s, memv, ld = tablet_cpu(), tablet_mem(), tablet_load()
+        cpu_pct, cpu_s = tablet_cpu()
+        if cpu_pct is not None:
+            _cpu_hist.append(cpu_pct)
+        memv, ld = tablet_mem(), tablet_load()
         if memv and memv[1]:
             used, tot = memv
             mem_s = f"{used / 1048576:.1f}/{tot / 1048576:.1f}GB {100 * used / tot:.0f}%"
         else:
             mem_s = "—"
-        ld_s = f"   load {ld:.2f}" if ld is not None else ""
-        out.append(f"  {BOLD}TABLET{RST}  cpu {cpu_s}    mem {mem_s}{ld_s}")
+        ld_s = f"  load {ld:.2f}" if ld is not None else ""
+        # cpu sparkline over the SAME window as the network graphs, right beside the current %
+        # (green <60%, yellow <85%, red above). Width capped so the line never wraps.
+        head, tail = f"  TABLET  cpu {cpu_s}  ", f"   mem {mem_s}{ld_s}"
+        gw = min(sw, max(0, cols - len(head) - len(tail)))
+        cgraph = pct_spark(_cpu_hist, gw, 100.0) if gw >= 6 else ""
+        ccol = GRN if (cpu_pct or 0) < 60 else ("\033[33m" if (cpu_pct or 0) < 85 else RED)
+        out.append(f"  {BOLD}TABLET{RST}  cpu {cpu_s}  {ccol}{cgraph}{RST}{tail}")
         # Loaded models on the fleet — names only, comma-separated (placement is in the chart).
         mnames = []
         for mdl in (st.get("cluster", {}).get("loaded_models") or []):
