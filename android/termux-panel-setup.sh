@@ -1,12 +1,13 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# InfiniteModel tablet: live bandwidth panel layout for Termux. Idempotent.
-# Run once inside Termux:   bash /data/local/tmp/termux-panel-setup.sh
+# InfiniteModel tablet: live bandwidth panel (FOREGROUND) + fleet worker (BACKGROUND). Idempotent.
+# Run inside Termux:   bash /data/local/tmp/termux-panel-setup.sh
 # Expects traffic_panel.py staged at /data/local/tmp/traffic_panel.py.
 #
-# DEFAULT = bandwidth panel only (a shell on top, the live FLEET BANDWIDTH panel on the
-# bottom). The fleet WORKER is NOT auto-started: on this Wi-Fi aarch64 tablet the worker's
-# control connection churns reconnects (every ~2s -> re-register spam on the controller),
-# so it's opt-in via the `worker` command, run in the foreground (Ctrl-C to stop).
+# On each Termux launch this starts the fleet WORKER detached in the background (tmux 'wrk') and
+# shows the live FLEET BANDWIDTH panel in the foreground (tmux 'im'). Note: on this Wi-Fi aarch64
+# tablet the worker can churn reconnects / thrash RAM — the panel's TABLET line shows cpu+mem so
+# you can watch the load. Commands: `panel` rebuilds the display; `startworker` / `stopworker`
+# control the background worker; `worker` attaches to its log.
 set -e
 echo "[IM] installing deps (tmux, python, procps)..."
 pkg install -y tmux python procps >/dev/null 2>&1 || true
@@ -31,47 +32,43 @@ if [ -f "$BRC" ] && grep -q 'IM-AUTOSTART' "$BRC"; then
 fi
 
 cat >> "$BRC" <<'EOF'
-# IM-AUTOSTART BEGIN -- InfiniteModel live bandwidth panel (shell on top, panel on bottom).
-_im_kill() {
-  tmux kill-server 2>/dev/null
-  pkill -9 -f 'client.py'                 2>/dev/null
-  pkill -9 -f 'start-client.sh'           2>/dev/null
-  pkill -9 -f 'proot-distro login debian' 2>/dev/null
-  pkill -9 -f 'installed-rootfs/debian'   2>/dev/null
-}
-_im_panel() {
-  ln -sf python3.13 /data/data/com.termux/files/usr/bin/python3.12 2>/dev/null
-  # FULL-SCREEN bandwidth panel (dedicated display). For a shell, open a new Termux session.
-  tmux new-session -d -s im "while true; do /data/data/com.termux/files/usr/bin/python3 /data/data/com.termux/files/home/.im/traffic_panel.py; sleep 2; done"
-  tmux set-option -t im status off 2>/dev/null    # clean full-screen (hide the status bar)
-}
-# `panel` = (re)build the shell+bandwidth layout cleanly.
-panel() {
-  if [ -n "$TMUX" ]; then echo '[IM] already in the layout -- Ctrl-b d to detach first'; return 1; fi
-  _im_kill; sleep 1; _im_panel; tmux attach -t im
-}
-# `worker` = OPT-IN, one foreground attempt of the fleet worker. It is NOT looped, but note
-# the client itself may churn reconnects on this tablet's Wi-Fi link -- Ctrl-C to stop it.
-worker() {
-  ln -sf python3.13 /data/data/com.termux/files/usr/bin/python3.12 2>/dev/null
-  echo '[IM] one-shot fleet worker (foreground). Ctrl-C to stop. (May reconnect-churn on Wi-Fi.)'
+# IM-AUTOSTART BEGIN -- InfiniteModel: bandwidth panel (foreground) + fleet worker (background).
+_im_shim() { ln -sf python3.13 /data/data/com.termux/files/usr/bin/python3.12 2>/dev/null; }
+# Fleet WORKER, detached in the background (tmux 'wrk'). Idempotent (won't double-start).
+_im_worker() {
+  _im_shim
   termux-wake-lock >/dev/null 2>&1 || true
-  proot-distro login debian -- bash -lc 'cd /root/android && bash start-client.sh --name tablet'
-  echo '[IM] worker stopped.'
+  tmux has-session -t wrk 2>/dev/null || \
+    tmux new-session -d -s wrk "proot-distro login debian -- bash -lc 'cd /root/android && bash start-client.sh --name tablet'"
 }
-# New Termux session: run my pushed hook (if any), else attach/build the panel layout. No worker.
+# Bandwidth PANEL, detached (tmux 'im'), full-screen. Idempotent.
+_im_panel() {
+  _im_shim
+  if ! tmux has-session -t im 2>/dev/null; then
+    tmux new-session -d -s im "while true; do /data/data/com.termux/files/usr/bin/python3 /data/data/com.termux/files/home/.im/traffic_panel.py; sleep 2; done"
+    tmux set-option -t im status off 2>/dev/null
+  fi
+}
+# `panel` = rebuild + show the bandwidth display (leaves the background worker running).
+panel()       { if [ -n "$TMUX" ]; then echo '[IM] detach first: Ctrl-b d'; return 1; fi; tmux kill-session -t im 2>/dev/null; sleep 1; _im_panel; tmux attach -t im; }
+# `worker` = attach to the background worker's log (Ctrl-b d to detach).
+worker()      { if tmux has-session -t wrk 2>/dev/null; then tmux attach -t wrk; else echo '[IM] no background worker -- run: startworker'; fi; }
+startworker() { _im_worker; echo '[IM] background worker running (tmux wrk).'; }
+stopworker()  { tmux kill-session -t wrk 2>/dev/null; pkill -9 -f client.py 2>/dev/null; pkill -9 -f start-client.sh 2>/dev/null; pkill -9 -f proot 2>/dev/null; echo '[IM] background worker stopped.'; }
+# New Termux session: start the worker in the BACKGROUND, then show the panel in the FOREGROUND.
 if [ -z "$TMUX" ] && [ -z "$IM_STARTED" ]; then
   export IM_STARTED=1
   if [ -f /data/local/tmp/im_boot.sh ]; then
     bash /data/local/tmp/im_boot.sh
-  elif tmux has-session -t im 2>/dev/null; then
-    tmux attach -t im
   else
-    _im_kill; sleep 1; _im_panel; tmux attach -t im
+    _im_worker
+    _im_panel
+    tmux attach -t im
   fi
 fi
 # IM-AUTOSTART END
 EOF
 
-echo "[IM] panel layout installed in ~/.bashrc"
-echo "[IM] DONE. Open Termux -> shell on top, live bandwidth on bottom. ('panel' rebuilds it; 'worker' = opt-in fleet worker.)"
+echo "[IM] installed in ~/.bashrc: worker (background) + panel (foreground)."
+echo "[IM] DONE. Open Termux -> the worker starts in the background, the live panel in the foreground."
+echo "[IM]   panel=rebuild display · worker=attach worker log · startworker/stopworker=control"
