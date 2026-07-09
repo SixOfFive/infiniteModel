@@ -299,14 +299,19 @@ class EngineGenMixin:
         # APU-class box that costs 150-350 ms/step, MORE than the target's ~285 ms verify
         # sweep, so CPU drafting loses outright (measured: llama-70b 3.50 plain -> 2.49
         # spec tok/s on om3nbox). On the GPU the same step is ~15-30 ms and spec pays off.
-        # Use the GPU only when its REAL free VRAM fits the draft plus a 4 GB margin — the
-        # controller's allocation is invisible to the worker-side placement budget, so a
+        # Use the GPU only when its REAL free VRAM fits the draft plus a margin (default 4 GB)
+        # — the controller's allocation is invisible to the worker-side placement budget, so a
         # thin margin could squeeze a resident model's KV growth. CPU remains the fallback.
+        # #draft-gpu: the margin is tunable per load (/load?draft_margin_gb=) because on a small
+        # card (16 GB 4070TiS) the fixed 4 GB made a GPU draft unreachable even with the plan-time
+        # reserve; an explicit draft_gpu load accepts a thinner cushion knowingly.
         with contextlib.suppress(Exception):
             if torch.cuda.is_available():
                 _free_b, _tot_b = torch.cuda.mem_get_info()
                 _need = sum(p.numel() * p.element_size() for p in _dm.parameters())
-                if _free_b > _need + 4 * (1024 ** 3):
+                _margin_b = int(max(0.0, float(getattr(model, "draft_margin_gb", 4.0) or 4.0))
+                                * (1024 ** 3))
+                if _free_b > _need + _margin_b:
                     _dm = _dm.to("cuda")
                     print(f"[load] spec draft on GPU ({_need / 1024**3:.1f} GB model, "
                           f"{_free_b / 1024**3:.1f} GB free before)")

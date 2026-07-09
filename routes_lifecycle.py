@@ -18,7 +18,8 @@ def register(app):
                    moe_offload: bool = False, force: bool = False,
                    node: str = "", kv_quant: str = "",
                    kv_offload: bool = False, temperature: str = "",
-                   min_p: str = "", precompile: bool = True) -> JSONResponse:
+                   min_p: str = "", precompile: bool = True,
+                   draft_gpu: bool = False, draft_margin_gb: str = "") -> JSONResponse:
         _req_ip = _client_ip(request)   # #connections: attribute this load to its requester
         # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
@@ -81,6 +82,23 @@ def register(app):
             if not (0.0 <= default_min_p <= 1.0):
                 return JSONResponse({"ok": False,
                                      "error": "min_p out of range (0.0 - 1.0)"}, status_code=400)
+        # #draft-gpu: opt-in — reserve the spec draft's bf16 size + margin on the CONTROLLER's
+        # GPU at plan time (registry-pair models only), so the draft attaches on cuda instead of
+        # CPU (a CPU draft step can cost more than the sweep it saves — see MODEL_TEST_STATUS
+        # llama-3.3:70b). draft_margin_gb tunes _load_draft's VRAM cushion (default 4.0; a small
+        # shared card may need 1.5-2.0). Single-pipeline loads only (replicas/tp share one draft).
+        _draft_margin = 4.0
+        if str(draft_margin_gb).strip():
+            try:
+                _draft_margin = float(draft_margin_gb)
+            except ValueError:
+                return JSONResponse({"ok": False,
+                                     "error": f"bad draft_margin_gb '{draft_margin_gb}' (float)"},
+                                    status_code=400)
+            if not (0.0 <= _draft_margin <= 16.0):
+                return JSONResponse({"ok": False,
+                                     "error": "draft_margin_gb out of range (0.0 - 16.0)"},
+                                    status_code=400)
         cons, pv = LOAD_MODES.get(mode, LOAD_MODES["auto"])
         if mode == "auto" and not consolidate:   # back-compat with the old checkbox
             cons, pv = False, True
@@ -137,7 +155,8 @@ def register(app):
                                    moe_offload=moe_offload, force=force, pin_host=node,
                                    kv_quant=kv_quant, kv_offload=kv_offload,
                                    default_temp=default_temp, default_min_p=default_min_p,
-                                   requested_by=_req_ip)
+                                   requested_by=_req_ip,
+                                   draft_gpu=draft_gpu, draft_margin_gb=_draft_margin)
             _modelbl = ("pin:%s/%s" % (node, "cpu" if cpu_only else "gpu")) if node else \
                        (((("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp)) if tp > 1 else mode))
             return JSONResponse({"ok": True, "model": lm.friendly, "ctx": lm.ctx,

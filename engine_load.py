@@ -147,7 +147,9 @@ class EngineLoadMixin:
                    kv_quant: str = "", kv_offload: bool = False,
                    default_temp: Optional[float] = None,
                    default_min_p: Optional[float] = None,
-                   requested_by: str = "") -> LoadedModel:
+                   requested_by: str = "",
+                   draft_gpu: bool = False,
+                   draft_margin_gb: float = 4.0) -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -169,7 +171,9 @@ class EngineLoadMixin:
                                          pin_host=pin_host, kv_quant=kv_quant,
                                          kv_offload=kv_offload, default_temp=default_temp,
                                          default_min_p=default_min_p,
-                                         requested_by=requested_by, _own=_own)
+                                         requested_by=requested_by,
+                                         draft_gpu=draft_gpu, draft_margin_gb=draft_margin_gb,
+                                         _own=_own)
         finally:
             if _own["v"]:
                 self._reservations.pop(rk, None)
@@ -190,6 +194,8 @@ class EngineLoadMixin:
                    default_temp: Optional[float] = None,
                    default_min_p: Optional[float] = None,
                    requested_by: str = "",
+                   draft_gpu: bool = False,
+                   draft_margin_gb: float = 4.0,
                    _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
@@ -439,6 +445,27 @@ class EngineLoadMixin:
             if self.models:
                 await self._await_free_refresh()   # current free RAM before budgeting vs residents
 
+            # #draft-gpu: resolve the spec draft's REAL size EARLY (downloads it if missing — small)
+            # so planning can reserve controller-GPU room for it. Opt-in per load (draft_gpu=1):
+            # greedy GPU-first placement otherwise fills the controller's card with target layers
+            # and the draft ALWAYS falls to CPU, where a draft step can cost more than the sweep it
+            # saves (beast bench: plain 1.33 vs spec 0.99 tok/s — MODEL_TEST_STATUS llama-3.3:70b).
+            # The reserve costs target-GPU layers, so default loads keep the old greedy behavior.
+            draft_reserve_gb = 0.0
+            if draft_gpu:
+                _dg_id = MODELS.get(friendly, (target_id, target_id))[1]
+                if _dg_id and _dg_id != target_id:
+                    try:
+                        _dg_dir = await asyncio.to_thread(_controller_model_dir, _dg_id)
+                        _dg_b = sum(os.path.getsize(os.path.join(_dg_dir, f))
+                                    for f in os.listdir(_dg_dir) if f.endswith(".safetensors"))
+                        if _dg_b > 0:
+                            draft_reserve_gb = _dg_b / GB + max(0.0, draft_margin_gb)
+                            log_activity(f"{_ollama_name(friendly)}: reserving {draft_reserve_gb:.1f} GB "
+                                         f"of controller GPU for the spec draft ({_dg_id}) — #draft-gpu")
+                    except Exception as _dg_exc:
+                        log_activity(f"{_ollama_name(friendly)}: draft-gpu reserve failed ({_dg_exc!r}) "
+                                     f"— planning without it")
             # Plan over CAPABLE nodes, each sized by memory LEFT after resident models (so a 2nd
             # model can share a node's spare RAM/VRAM). If a node fails the load (missing deps)
             # mark it incapable and replan; if it won't fit even sharing, evict LRU and retry.
@@ -504,6 +531,11 @@ class EngineLoadMixin:
                     # brink (decode activations + allocator fragmentation OOM it otherwise, dropping
                     # the stage mid-generation). RAM already keeps RAM_SAFETY_GB; VRAM had none.
                     free_vram = max(0.0, free_vram - PLAN_VRAM_FLOOR_GB)
+                    # #draft-gpu: keep the spec draft's slice of the CONTROLLER-co-located GPU out
+                    # of this plan (the draft loads into the controller process on this same card
+                    # AFTER placement; without the reserve, greedy GPU-first fills it first).
+                    if draft_reserve_gb > 0.0 and n.data_host in _LOCAL_IPS:
+                        free_vram = max(0.0, free_vram - draft_reserve_gb)
                     # Reserve the build transient from RAM (the worker streams+builds each layer in
                     # CPU RAM before quant/placement, even for GPU-bound layers). Linux uses a tmpfs
                     # mmap (~1.3x one layer); Windows/no-shm loads in-RAM (~2.3x). A node that can't
@@ -693,6 +725,10 @@ class EngineLoadMixin:
                         _gpu_budget_gb = max(0.0, min(
                             nd.free_vram_after_resident_gb(committed.get(st.node_id, 0)),
                             _live_free_gb) - PLAN_VRAM_FLOOR_GB)
+                    # #draft-gpu: mirror the planner's reserve on the co-located node or the worker
+                    # re-expands into the VRAM the draft is about to claim.
+                    if draft_reserve_gb > 0.0 and nd.data_host in _LOCAL_IPS:
+                        _gpu_budget_gb = max(0.0, _gpu_budget_gb - draft_reserve_gb)
                     fut = loop.create_future()
                     link.pending_loads[target_id] = fut   # #1: key by model so a co-node load can't pop us
                     futs[st.node_id] = fut
@@ -919,6 +955,7 @@ class EngineLoadMixin:
             draft_id = MODELS.get(friendly, (target_id, target_id))[1]
             if draft_id and draft_id != target_id:
                 try:
+                    lm.draft_margin_gb = draft_margin_gb   # #draft-gpu: _load_draft's VRAM cushion
                     await asyncio.to_thread(self._load_draft, lm, draft_id)
                     print(f"[load] draft {draft_id} on controller -> speculative decode K={SPEC_K}")
                 except Exception as exc:
