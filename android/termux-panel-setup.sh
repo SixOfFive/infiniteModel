@@ -69,6 +69,27 @@ fi
 # IM-AUTOSTART END
 EOF
 
+# Termux:Boot -- start the worker + panel ON DEVICE BOOT (headless). Requires the Termux:Boot
+# add-on installed. The worker then serves from boot without opening the app; the panel runs in
+# the background and becomes visible the moment you open Termux (Android can't foreground an app's
+# UI on boot). Replaces the old start-infinitemodel.sh boot script.
+mkdir -p "$HOME/.termux/boot"
+rm -f "$HOME/.termux/boot/start-infinitemodel.sh" "$HOME/.termux/boot/start-infinitemodel.sh.disabled"
+cat > "$HOME/.termux/boot/im-autostart.sh" <<'BOOT'
+#!/data/data/com.termux/files/usr/bin/bash
+ln -sf python3.13 /data/data/com.termux/files/usr/bin/python3.12 2>/dev/null
+termux-wake-lock >/dev/null 2>&1 || true
+sleep 25   # let Wi-Fi associate before the worker dials the controller
+tmux has-session -t wrk 2>/dev/null || \
+  tmux new-session -d -s wrk "proot-distro login debian -- bash -lc 'cd /root/android && bash start-client.sh --name tablet'"
+if ! tmux has-session -t im 2>/dev/null; then
+  tmux new-session -d -s im "while true; do /data/data/com.termux/files/usr/bin/python3 /data/data/com.termux/files/home/.im/traffic_panel.py; sleep 2; done"
+  tmux set-option -t im status off 2>/dev/null
+fi
+BOOT
+chmod +x "$HOME/.termux/boot/im-autostart.sh"
+
 echo "[IM] installed in ~/.bashrc: worker (background) + panel (foreground)."
+echo "[IM] installed Termux:Boot script -> worker + panel start on device boot (panel shows on app open)."
 echo "[IM] DONE. Open Termux -> the worker starts in the background, the live panel in the foreground."
 echo "[IM]   panel=rebuild display · worker=attach worker log · startworker/stopworker=control"
