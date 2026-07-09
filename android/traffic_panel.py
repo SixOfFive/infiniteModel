@@ -132,6 +132,31 @@ def tablet_load():
         return None
 
 
+_cver_cache = [None]                               # cached VERSION read from the guest's client.py
+
+
+def _local_cver():
+    """VERSION of the worker's client.py deployed in the proot guest on THIS tablet (cached), or ''.
+    A fallback for the title when the worker isn't registered (so /status has no version for us)."""
+    if _cver_cache[0] is not None:
+        return _cver_cache[0]
+    import glob
+    import re
+    v = ""
+    for p in glob.glob("/data/data/com.termux/files/usr/var/lib/proot-distro/"
+                       "containers/*/rootfs/root/android/client.py"):
+        try:
+            with open(p) as f:
+                m = re.search(r'^VERSION\s*=\s*"([^"]+)"', f.read(4000), re.M)
+            if m:
+                v = m.group(1)
+                break
+        except Exception:
+            pass
+    _cver_cache[0] = v
+    return v
+
+
 def spark(window, width, ceiling):
     """Sparkline of the last `width` samples, scaled to `ceiling` (the window's own max) so the
     tallest displayed bar is full. Idle rows (below the noise floor) render flat."""
@@ -337,8 +362,15 @@ def render():
     except Exception as e:
         st, err = None, str(e)
 
-    title = (f" FLEET BANDWIDTH  round trip: home → node → home   (MAX·XFER = last {win_s}s shown)"
-             f"   poll {POLL:.0f}s   {now}")
+    cver = ""
+    if st:                                             # the tablet's own client version, from /status
+        for n in st.get("nodes", []):
+            if "tablet" in (n.get("hostname") or "").lower():
+                cver = n.get("client_version") or ""
+                break
+    cver = cver or _local_cver() or "?"                # fallback: read the guest client.py VERSION
+    title = (f" FLEET BANDWIDTH  round trip: home → node → home   client {cver}"
+             f"   (MAX·XFER=last {win_s}s)   poll {POLL:.0f}s   {now}")
     out.append(f"\033[1;36m{title[:cols].ljust(cols)}\033[0m")
 
     if err:
