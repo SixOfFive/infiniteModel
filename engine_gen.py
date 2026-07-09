@@ -320,9 +320,22 @@ class EngineGenMixin:
         model.draft_kv = None
 
     def _unload_draft(self, model: LoadedModel) -> None:
+        # #draft-gpu: a draft placed on cuda (draft_gpu load) keeps its ~GB of weights in the torch
+        # caching allocator after the Python object is dropped — only empty_cache() hands it back
+        # (exactly the MTP-head leak _free_mtp_cuda documents: a leaked controller-GPU tensor fouls
+        # the box's GPU so the NEXT model spills to CPU — observed as qwen2.5:14b landing 75% on CPU
+        # after a 70B GPU-draft unload). A CPU draft frees via _release_ram (callers already do that),
+        # so only pay the gc+empty_cache when the draft was actually GPU-resident.
+        _on_cuda = False
+        with contextlib.suppress(Exception):
+            _dm = model.draft_model
+            _on_cuda = (_dm is not None
+                        and next(_dm.parameters()).device.type == "cuda")
         model.draft_model = None
         model.draft_kv = None
         model.draft_id = None
+        if _on_cuda:
+            _free_mtp_cuda()   # gc.collect() + torch.cuda.empty_cache() (server.py; generic reclaim)
 
     def _draft_prefill(self, model: LoadedModel, prompt_ids):
         import torch
