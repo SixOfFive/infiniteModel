@@ -26,7 +26,9 @@ echo "=== [3/4] deploy worker + in-guest setup (venv + deps; LONG, torch ~200MB)
 proot-distro login debian --bind "$HERE":/mnt/im -- bash -c '
   set -e
   mkdir -p /root/android
-  cp /mnt/im/client.py /mnt/im/wire.py /mnt/im/config.json \
+  # client.py is code-split across sibling modules (worker_*, shard_*, kv_quant, state, wire, ...),
+  # so copy ALL the vendored .py files, not just client.py.
+  cp /mnt/im/*.py /mnt/im/config.json \
      /mnt/im/requirements-android.txt \
      /mnt/im/setup.sh /mnt/im/start-client.sh /root/android/
   echo "deployed to guest /root/android:"; ls -la /root/android
