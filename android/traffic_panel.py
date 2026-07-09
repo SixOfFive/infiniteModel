@@ -53,6 +53,7 @@ GRN, RED, DIM, MAG, BOLD, RST = (
 hin  = defaultdict(lambda: deque(maxlen=HIST))     # download (in) rate samples per row
 hout = defaultdict(lambda: deque(maxlen=HIST))     # upload  (out) rate samples per row
 _last_log = [0.0]
+_prev_cpu = [None]                                 # (total, idle) /proc/stat jiffies, for a delta CPU%
 
 
 def human(bps):
@@ -69,6 +70,66 @@ def human_bytes(b):
         if b >= div:
             return f"{b / div:5.1f}{unit}B"
     return f"{b:5.0f} B"
+
+
+def tablet_cpu():
+    """A CPU-load string for THIS tablet. Primary: /proc/stat busy% (delta between polls). Android
+    denies app-UID processes /proc/stat + /proc/loadavg, so fall back to a cpufreq clock proxy
+    (mean scaling_cur_freq/cpuinfo_max_freq, marked 'clk'). Returns e.g. '42%', '38% clk', '…', 'n/a'."""
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        idle = v[3] + (v[4] if len(v) > 4 else 0)      # idle + iowait
+        total = sum(v)
+        prev = _prev_cpu[0]
+        _prev_cpu[0] = (total, idle)
+        if prev is not None and total > prev[0]:
+            dt, di = total - prev[0], idle - prev[1]
+            return f"{max(0.0, min(100.0, 100.0 * (dt - di) / dt)):.0f}%"
+        return "…"                                     # /proc/stat readable, warming up
+    except Exception:
+        pass
+    try:                                               # fallback: cpufreq clock-load proxy
+        import glob
+        rs = []
+        for cf in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"):
+            try:
+                c = int(open(cf).read())
+                mx = int(open(cf.replace("scaling_cur_freq", "cpuinfo_max_freq")).read())
+                if mx:
+                    rs.append(c / mx)
+            except Exception:
+                pass
+        if rs:
+            return f"{100.0 * sum(rs) / len(rs):.0f}% clk"
+    except Exception:
+        pass
+    return "n/a"
+
+
+def tablet_mem():
+    """THIS tablet's (used_kB, total_kB) from /proc/meminfo, or None."""
+    try:
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                p = line.split()
+                if p:
+                    mem[p[0].rstrip(":")] = int(p[1])
+        total = mem.get("MemTotal", 0)
+        avail = mem.get("MemAvailable", mem.get("MemFree", 0))
+        return total - avail, total
+    except Exception:
+        return None
+
+
+def tablet_load():
+    """THIS tablet's 1-minute load average, or None."""
+    try:
+        with open("/proc/loadavg") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return None
 
 
 def spark(window, width, ceiling):
@@ -307,7 +368,7 @@ def render():
 
         out.append(DIM + fmt_prefix(("NODE", "DOWN", "UP", "FROM→…→NEXT", "RESIDENT", "MAX", "XFER"))
                    + "  ↓ download / ↑ upload" + RST)
-        budget = max(1, (lines - 7) // 2)              # 2 rows per node; reserve header/ctrl/total/legend
+        budget = max(1, (lines - 9) // 2)              # 2 rows/node; reserve header/ctrl/total/legend/tablet/models
         shown = node_names[:budget]
         for name in shown:
             i, o = cur[name]
@@ -330,6 +391,26 @@ def render():
         out.append(f"  {GRN}██{RST} download  {RED}██{RST} upload   "
                    f"{DIM}↓green=download ↑red=upload (scaled to MAX) · "
                    f"FROM→node→NEXT: 'home'=controller (drop-off → home){RST}")
+        # This tablet's own load (the panel process runs here, so /proc is the tablet's).
+        cpu_s, memv, ld = tablet_cpu(), tablet_mem(), tablet_load()
+        if memv and memv[1]:
+            used, tot = memv
+            mem_s = f"{used / 1048576:.1f}/{tot / 1048576:.1f}GB {100 * used / tot:.0f}%"
+        else:
+            mem_s = "—"
+        ld_s = f"   load {ld:.2f}" if ld is not None else ""
+        out.append(f"  {BOLD}TABLET{RST}  cpu {cpu_s}    mem {mem_s}{ld_s}")
+        # Loaded models on the fleet — names only, comma-separated (placement is in the chart).
+        mnames = []
+        for mdl in (st.get("cluster", {}).get("loaded_models") or []):
+            nmn = (mdl.get("friendly") or mdl.get("display_name") or mdl.get("target") or "").strip()
+            if nmn and nmn not in mnames:
+                mnames.append(nmn)
+        mtxt = ", ".join(mnames) if mnames else "(none loaded)"
+        avail = max(12, cols - 10)
+        if len(mtxt) > avail:
+            mtxt = mtxt[:avail - 1] + "…"
+        out.append(f"  {BOLD}MODELS{RST} {mtxt}")
         log_csv(time.time(), [(nm, *cur[nm]) for nm in node_names] + [("controller", ci, co)])
 
     sys.stdout.write("\033[H")
