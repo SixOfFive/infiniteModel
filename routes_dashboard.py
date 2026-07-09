@@ -286,7 +286,11 @@ def register(app):
                          gen_stall_decode_s: Optional[float] = None,
                          idle_unload_m: Optional[float] = None,
                          persist: Optional[str] = None,
-                         unpersist: Optional[str] = None) -> JSONResponse:
+                         unpersist: Optional[str] = None,
+                         no_unload: Optional[str] = None,
+                         no_unload_off: Optional[str] = None,
+                         juggler: Optional[bool] = None,
+                         autostart_delay_s: Optional[float] = None) -> JSONResponse:
         if persist is not None:                          # #77: keep this model across restarts
             with contextlib.suppress(ValueError):
                 fr = resolve_model_name(persist)
@@ -303,6 +307,24 @@ def register(app):
                 if _pm.pop(fr, None) is not None:
                     ENGINE_CONFIG["persist_models"] = _pm
                     log_activity(f"persist: {fr} removed (no longer auto-reloaded on startup)")
+        if no_unload is not None:                        # #no-unload: absolute do-not-auto-unload veto
+            with contextlib.suppress(ValueError):
+                fr = resolve_model_name(no_unload)
+                _nu = dict(ENGINE_CONFIG.get("no_unload_models") or {})
+                _nu[fr] = True
+                ENGINE_CONFIG["no_unload_models"] = _nu
+                log_activity(f"no-unload: {fr} pinned — never auto-unloaded (idle/LRU/juggler all skip it)")
+        if no_unload_off is not None:
+            with contextlib.suppress(ValueError):
+                fr = resolve_model_name(no_unload_off)
+                _nu = dict(ENGINE_CONFIG.get("no_unload_models") or {})
+                if _nu.pop(fr, None) is not None:
+                    ENGINE_CONFIG["no_unload_models"] = _nu
+                    log_activity(f"no-unload: {fr} removed (auto-unload re-enabled)")
+        if juggler is not None:                          # #juggler: promote hybrid->VRAM after an auto-unload
+            ENGINE_CONFIG["juggler"] = bool(juggler)
+        if autostart_delay_s is not None:                # #autostart-delay: client-connect grace before persist reload
+            ENGINE_CONFIG["autostart_delay_s"] = max(0.0, float(autostart_delay_s))
         if max_loaded is not None:
             ENGINE_CONFIG["max_loaded"] = max(1, int(max_loaded))
         if auto_unload is not None:

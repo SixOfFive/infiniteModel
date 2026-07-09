@@ -361,6 +361,17 @@ class EngineGenMixin:
             with contextlib.suppress(Exception):
                 model.draft_kv.crop(length)
 
+    async def _await_promote_gate(self, base: str) -> None:
+        """#juggler barrier: block until any in-progress VRAM-promotion of `base` has finished, so a
+        request transparently rides the re-place and then resolves the FRESH replica. No-op (one dict
+        lookup) when nothing is being juggled — the common case. The loop re-checks because a promotion
+        can (rarely) start again while an earlier waiter is being woken."""
+        for _ in range(10000):
+            ev = self._promote_gates.get(base)
+            if ev is None:
+                return
+            await ev.wait()
+
     async def generate(self, friendly: str, prompt_ids: list[int], max_new: int,
                        temperature: float, top_p: float, speculative: bool = False,
                        rec=None, mm=None, mrope=None, spec_k: int = 0,
@@ -374,6 +385,12 @@ class EngineGenMixin:
         repeat_last_n / presence_penalty / frequency_penalty / seed) for the PLAIN decode path;
         the speculative paths are greedy-only by construction and ignore it (penalties would
         break draft/target logit agreement)."""
+        # #juggler barrier: if this model is being promoted to VRAM (drained + re-placed), hold the
+        # request HERE — before it resolves a replica or takes a queue slot — until the swap finishes,
+        # then fall through and pick the fresh copy. The client's connection just pauses (no reconnect).
+        # No await between the gate returning and `model.queued += 1` below, so this is race-tight with
+        # the promoter's drain (a request that clears the gate is counted before the reload starts).
+        await self._await_promote_gate(friendly)
         model = self._pick_replica(friendly)   # data-parallel: least-loaded replica (#39)
         if model is None or model.stage0_writer is None:
             raise RuntimeError("no model loaded")

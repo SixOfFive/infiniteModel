@@ -628,6 +628,15 @@ async function doLoad(name){
   catch(e){ toast(name+' load failed: '+String(e.message||e),1); }
   tick();
 }
+// #persist / #no-unload: toggle a per-model lifecycle pin. persist -> autoload-on-restart;
+// no_unload -> the absolute do-not-auto-unload veto. Unchecking sends the OFF variant.
+async function setPin(name,kind,on){
+  const p=kind==='persist'?(on?'persist':'unpersist'):(on?'no_unload':'no_unload_off');
+  try{ await api('/config?'+p+'='+encodeURIComponent(name),{method:'POST'});
+       toast((kind==='persist'?'autoload-on-restart ':'do-not-auto-unload ')+(on?'on':'off')+' · '+name); }
+  catch(e){ toast(String(e.message||e),1); }
+  tick();
+}
 async function unload(name){ closeOv(); try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function cancelLoad(name){ try{ await api('/cancel_load?model='+encodeURIComponent(name),{method:'POST'}); toast('cancelled load'); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function dl(name,action){ try{ await api('/download'+(action==='start'?'':'/'+action)+'?model='+encodeURIComponent(name),{method:'POST'}); toast(action+' '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
@@ -791,6 +800,16 @@ async function openDetail(name){
       +'<audio id="tts-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
       +'<div><a id="tts-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
   }
+  // #persist / #no-unload: per-model lifecycle pins (work for loaded AND not-loaded models — the
+  // controller reports current state via LAST.controller.{persist_models,no_unload_models}).
+  const _pc=(LAST&&LAST.controller)||{}, _pk=m.internal_name||m.friendly||name;
+  const _isP=!!m.persist||(_pc.persist_models||[]).includes(_pk);
+  const _isNU=!!m.no_unload||(_pc.no_unload_models||[]).includes(_pk);
+  const pers='<h3 style="font-size:13px;margin-top:14px">Persistence</h3>'
+    +'<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0;color:var(--text);cursor:pointer" title="Auto-reload this model when the controller restarts or redeploys — it re-streams to the workers after the fleet settles. Independent of the unload pin below.">'
+    +'<input type="checkbox" style="width:auto"'+(_isP?' checked':'')+' onchange="setPin(\''+esc(name)+'\',\'persist\',this.checked)"> Autoload on restart</label>'
+    +'<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0;color:var(--text);cursor:pointer" title="NEVER auto-unload this model — overrides every automatic unload path: idle-unload, LRU eviction to free room for a new load (that new load FAILS instead of evicting this one), and the juggler. This is the flag that wins.">'
+    +'<input type="checkbox" style="width:auto"'+(_isNU?' checked':'')+' onchange="setPin(\''+esc(name)+'\',\'no_unload\',this.checked)"> Do not auto-unload</label>';
   let acts='';
   if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
@@ -800,7 +819,7 @@ async function openDetail(name){
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+tts+pre
+    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+tts+pre+pers
     +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
@@ -924,9 +943,11 @@ CONFIG_HTML = r"""<!doctype html>
     <div class="fld"><label>Prefill stall-watchdog (s, 0=off)</label><input id="gen_stall_s" type="number" min="0"></div>
     <div class="fld"><label>Decode stall-watchdog (s, 0=off)</label><input id="gen_stall_decode_s" type="number" min="0"></div>
     <div class="fld"><label title="Unload any model that has served no requests for this many minutes. 0 or -1 = keep every model loaded forever (the default; -1 is the Ollama-style spelling and saves as -1). Pinned (📌) models and models with an active or queued request are never idle-unloaded.">Idle unload (min, 0/-1 = keep forever)</label><input id="idle_unload_m" type="number" min="-1" step="any" list="dl-idleu"><datalist id="dl-idleu"><option value="-1"></option><option value="0"></option><option value="5"></option><option value="15"></option><option value="60"></option><option value="240"></option><option value="1440"></option></datalist></div>
+    <div class="fld"><label title="On controller startup, wait at least this many seconds — AFTER the worker fleet has settled — before auto-reloading persisted (autoload-on-restart) models, so API clients have time to (re)connect before the box gets busy streaming weights. 0 = no extra wait.">Autostart delay (s, client-connect grace)</label><input id="autostart_delay_s" type="number" min="0" step="any"></div>
     <div class="fld tog"><input type="checkbox" id="auto_unload"><label for="auto_unload">LRU auto-unload</label></div>
     <div class="fld tog"><input type="checkbox" id="auto_load"><label for="auto_load">Auto-load on request</label></div>
     <div class="fld tog"><input type="checkbox" id="vram_weights_first"><label for="vram_weights_first">Budget weights vs physical-free VRAM</label></div>
+    <div class="fld tog"><input type="checkbox" id="juggler"><label for="juggler" title="When a model is automatically unloaded (idle-unload) and frees VRAM, promote the HOTTEST resident model that is running split across GPU+RAM so it fits entirely in VRAM. It engages a barrier (new requests wait), drains that model's in-flight generation, re-places it VRAM-only, then resumes — the client connection just pauses briefly, no reconnect. Lets models auto-load hybrid under memory pressure and migrate to full-GPU speed as the busy one out-competes quieter models for VRAM.">Juggler (promote hybrid→VRAM on free)</label></div>
   </div>
   <div style="margin-top:14px"><button class="btn pri" onclick="save()">Save settings</button><span id="cfg-msg"></span></div>
 </div>
@@ -958,8 +979,8 @@ CONFIG_HTML = r"""<!doctype html>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
-const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s','idle_unload_m'];
-const TOGS=['auto_unload','auto_load','vram_weights_first'];
+const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s','idle_unload_m','autostart_delay_s'];
+const TOGS=['auto_unload','auto_load','vram_weights_first','juggler'];
 // #cfg-dirty: fields the user touched since the last successful save. The 5s /status poll
 // used to overwrite EVERY field wholesale, silently reverting an in-progress edit before
 // the user could click Save. A dirty field is never overwritten by the poll; Save clears

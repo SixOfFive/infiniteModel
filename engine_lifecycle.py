@@ -250,10 +250,15 @@ class EngineLifecycleMixin:
 
     def _lru_evictable(self) -> Optional[str]:
         """LRU resident model with NO active/queued requests (safe to auto-unload), or None
-        if every resident model is busy serving. Never picks an actively-serving model."""
+        if every resident model is busy serving. Never picks an actively-serving model, the
+        model currently being loaded (_no_evict_base), or a #no-unload-pinned model — the
+        absolute do-not-auto-unload veto: such a model is never evicted, so a new load that
+        can't otherwise fit FAILS rather than displacing it (that's the flag 'winning')."""
+        no_unload = set(ENGINE_CONFIG.get("no_unload_models") or {})
         idle = [(fr, m) for fr, m in self.models.items()
                 if m.active == 0 and m.queued == 0
-                and (m.base or m.friendly) != self._no_evict_base]
+                and (m.base or m.friendly) != self._no_evict_base
+                and (m.base or m.friendly) not in no_unload]
         if not idle:
             return None
         return min(idle, key=lambda kv: kv[1].last_used)[0]

@@ -1486,6 +1486,104 @@ class EngineLoadMixin:
         finally:
             self.reconfiguring = None
 
+    def _model_cpu_frac(self, m) -> float:
+        """Fraction of a resident model's WEIGHTS currently on CPU (0.0 = fully on GPU), from the
+        worker-reported per-stage gpu_bytes — mirrors status.py's cpu_frac so the juggler judges by
+        the SAME 'is this hybrid?' signal the dashboard shows."""
+        try:
+            vram = sum(s.gpu_bytes for s in m.plan.stages)
+            total = (sum(getattr(s, "loaded_bytes", 0) or 0 for s in m.plan.stages)
+                     or m.spec.total_weight_bytes)
+            return max(0.0, (total - vram) / total) if total else 0.0
+        except Exception:
+            return 0.0
+
+    async def _juggle_would_fit_vram(self, m) -> bool:
+        """Dry-run the VRAM-first planner for `m` against the LIVE free VRAM PLUS this model's own
+        on-GPU bytes (which a reload reclaims), and return True only when every weight lands on GPU.
+        Cheap go/no-go so the juggler never does a disruptive re-place that would stay hybrid."""
+        try:
+            spec = m.spec   # the model's OWN measured, quant-sized spec (what it was placed with)
+            own = {}   # per-node VRAM this model holds now -> reclaimed on reload, so add it back
+            for s in m.plan.stages:
+                own[s.node_id] = own.get(s.node_id, 0) + (getattr(s, "gpu_bytes", 0) or 0)
+            mems = []
+            for n in registry.alive_sorted():
+                fv = max(0.0, n.eff_vram_gb - PLAN_VRAM_FLOOR_GB) + own.get(n.node_id, 0) / GB
+                ram = n.eff_ram_gb - (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
+                mems.append(NodeMem(n.node_id, n.hostname,
+                                    int((max(0.0, ram) + fv) * GB), int(fv * GB)))
+            p = plan_pipeline(spec, mems, m.ctx, consolidate=True, prefer_vram=True)
+            if not p.ok:
+                return False
+            assess = _assess_placement(spec, m.ctx, mems, p.stages, cpu_only=False)
+            return (assess.get("cpu_weight_gb", 0.0) or 0.0) < 0.05
+        except Exception as exc:
+            log_activity(f"juggler: fit-check error ({exc!r})")
+            return False
+
+    async def _maybe_juggle(self, reason: str = "auto-unload") -> None:
+        """#juggler: after an AUTOMATIC unload freed VRAM, promote the HOTTEST resident model that is
+        running split GPU+RAM (hybrid) to VRAM-only — IF the freed VRAM now lets its weights fit
+        entirely on GPU. HITLESS: engage a per-model barrier so new requests wait, DRAIN the in-flight
+        generation, re-place VRAM-first via reconfigure (atomic + rollback), then release the barrier.
+        The client's open connection simply pauses across the swap — no reconnect. Opt-in
+        (ENGINE_CONFIG['juggler']); one model per call; serialized by _juggle_lock."""
+        if not ENGINE_CONFIG.get("juggler", False) or self._juggle_lock.locked():
+            return
+        async with self._juggle_lock:
+            # 1) hottest hybrid candidate (freshest use wins, so a 'constantly in use' model beats
+            #    quieter hybrids). Skip embeddings (tiny/CPU) and anything already ~all-GPU.
+            cand, best_hot = None, -1.0
+            for fr, m in list(self.models.items()):
+                if getattr(m.spec, "is_embedding", False):
+                    continue
+                if self._model_cpu_frac(m) <= 0.02:
+                    continue
+                hot = max(m.last_used or 0.0, getattr(m, "last_token_ts", 0.0) or 0.0)
+                if hot > best_hot:
+                    best_hot, cand = hot, (fr, m)
+            if cand is None:
+                return
+            fr, m = cand
+            base = m.base or fr
+            # 2) only commit to the disruptive re-place if it will actually land fully on GPU now.
+            if not await self._juggle_would_fit_vram(m):
+                log_activity(f"juggler: {fr} is {self._model_cpu_frac(m)*100:.0f}% on CPU but still "
+                             f"won't fit VRAM-only after {reason} — leaving it")
+                return
+            if fr not in self.models:                       # unloaded during the fit-check await
+                return
+            # 3) HITLESS swap: barrier -> drain -> reconfigure VRAM-first -> release.
+            gate = asyncio.Event()                          # CLEAR (present) = barrier engaged
+            self._promote_gates[base] = gate
+            try:
+                drain_s = float(ENGINE_CONFIG.get("juggle_drain_s", 120.0))
+                deadline = time.time() + drain_s
+                while time.time() < deadline:               # let the current gen(s) finish
+                    if not [r for r in self.replicas_of(base)
+                            if (r.active or 0) > 0 or (r.queued or 0) > 0]:
+                        break
+                    await asyncio.sleep(0.25)
+                else:
+                    log_activity(f"juggler: {fr} still busy after {drain_s:g}s — deferring promotion")
+                    return
+                log_activity(f"juggler: promoting {fr} to VRAM-only "
+                             f"({self._model_cpu_frac(m)*100:.0f}% was on CPU) after {reason} — "
+                             f"hitless re-place")
+                await self.reconfigure(fr, tp=getattr(m, "tp_size", 1), ctx=m.ctx,
+                                       quant=(m.quant or "none"), consolidate=True,
+                                       prefer_vram=True, cpu_only=False)
+                newm = self.models.get(fr)
+                nf = self._model_cpu_frac(newm) if newm else 1.0
+                log_activity(f"juggler: {fr} re-placed — now {nf*100:.0f}% on CPU "
+                             + ("(fully on GPU)" if nf <= 0.02 else "(still hybrid — fleet shifted)"))
+            except Exception as exc:
+                log_activity(f"juggler: promote {fr} FAILED ({exc!r})")
+            finally:
+                gate.set()                                  # wake every barrier waiter
+                self._promote_gates.pop(base, None)
+
     async def _await_free_refresh(self, timeout: float = 12.0) -> None:
         """After unloading, wait for workers to gc and report FRESH free RAM (via the next
         heartbeat) so the planner budgets against true free memory, not RAM the old model

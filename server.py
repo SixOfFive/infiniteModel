@@ -902,6 +902,28 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # fleet settles, so GPU models land on the GPU, not CPU). Opt-in (default empty);
                        # set via /config?persist=<model> / the dashboard 📌 toggle.
                        "persist_models": {},
+                       # #no-unload: per-model ABSOLUTE do-not-auto-unload veto (reg_key -> true).
+                       # A model in this set is NEVER auto-unloaded — not by idle_unload_m, not by
+                       # LRU eviction to make room for a new load (a load that can't otherwise fit
+                       # FAILS instead), and it is never disturbed by the juggler. It is the flag
+                       # that WINS over every other automatic-unload path. Independent of
+                       # persist_models (that survives a restart but stays evictable under pressure).
+                       # Opt-in (default empty); set via /config?no_unload=<model> / the dashboard
+                       # per-model checkbox.
+                       "no_unload_models": {},
+                       # #juggler: when a model is AUTOMATICALLY unloaded (idle-unload or LRU
+                       # eviction) and that frees VRAM, promote the HOTTEST resident model that is
+                       # running split GPU+RAM (hybrid) to VRAM-only IF the freed VRAM now lets its
+                       # weights fit entirely on GPU. One promotion per event, and only while that
+                       # model is momentarily idle (a reload would drop an in-flight request -> 5xx).
+                       # Lets models auto-load hybrid under pressure yet migrate to full-GPU speed as
+                       # the hot one out-competes the others for VRAM. Opt-in (default off).
+                       "juggler": False,
+                       # #autostart-delay: minimum wall-clock seconds _persist_reload waits on
+                       # startup before it begins reloading persisted models — ON TOP of waiting for
+                       # the worker fleet to settle — so API clients have time to (re)connect before
+                       # the controller gets busy streaming weights. 0 = no extra wait. Default 60.
+                       "autostart_delay_s": 60.0,
                        # #idle-unload: unload a model after this many minutes with NO requests.
                        # 0 (default) = loaded forever. Independent of auto_unload (that knob is
                        # about evicting to make ROOM for a new load; this one reclaims memory on a
@@ -1873,6 +1895,13 @@ class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin, EngineSpeech
         # #88 in-flight reconfigure (managed reload to/from TP): {"model","from","to"} or None.
         # Surfaced on /status so the card shows "reconfiguring -> TP×N" instead of vanishing.
         self.reconfiguring: Optional[dict] = None
+        # #juggler: hitless VRAM-promotion barrier. base -> asyncio.Event that is CLEAR while that
+        # model is being re-placed (drained + reloaded VRAM-first) and absent otherwise. A new gen
+        # request waits on a present-but-clear gate BEFORE it resolves a replica, so it transparently
+        # rides the swap (the client's open connection just pauses — no reconnect) and lands on the
+        # promoted copy. _juggle_lock serializes the promoter so at most one model juggles at a time.
+        self._promote_gates: dict[str, asyncio.Event] = {}
+        self._juggle_lock = asyncio.Lock()
         # PARALLEL-LOAD reservation ledger: reg_key -> {node_id: {"ram": bytes, "vram": bytes}}.
         # A load reserves its planned per-node footprint under the engine lock, then RELEASES the
         # lock for the (slow) weight-streaming gather so a second load can plan + stream IN PARALLEL.
@@ -2260,6 +2289,7 @@ def build_app() -> FastAPI:
                     continue
                 now = time.time()
                 pinned = set(ENGINE_CONFIG.get("persist_models") or {})
+                pinned |= set(ENGINE_CONFIG.get("no_unload_models") or {})   # #no-unload: absolute veto
                 # GROUP-wise judgment (review #idle-unload): engine.unload(base) CASCADES to every
                 # data-parallel replica (base + base#N), and the serving path stamps last_used on
                 # the BASE at arrival while the routed REPLICA carries active/last_token_ts — so
@@ -2287,6 +2317,10 @@ def build_app() -> FastAPI:
                     log_activity(f"idle-unload {fr}: no requests for > {_im:g} min (idle_unload_m)")
                     with contextlib.suppress(Exception):
                         await engine.unload(fr)
+                # #juggler: an idle-unload just freed VRAM — try promoting the hottest hybrid model
+                # to VRAM-only (background: it drains + re-places, must not block the reaper loop).
+                if stale and ENGINE_CONFIG.get("juggler", False):
+                    asyncio.create_task(engine._maybe_juggle("idle-unload"))
         idle_unloader = asyncio.create_task(_idle_unload_loop())
         async def _persist_reload():
             # #77: re-load the PERSISTED models on startup so a resident model survives a controller
@@ -2296,6 +2330,7 @@ def build_app() -> FastAPI:
             persist = dict(ENGINE_CONFIG.get("persist_models") or {})
             if not persist:
                 return
+            _t0 = time.time()                         # #autostart-delay: client-connect grace clock
             for _ in range(40):                       # up to ~60s for the fleet to come back up
                 if any(n.can_infer for n in registry.alive_sorted()):
                     break
@@ -2321,6 +2356,15 @@ def build_app() -> FastAPI:
                 await asyncio.sleep(1.5)
             log_activity(f"persist: fleet settled (gpu_pool={prev:.1f} GB) — reloading "
                          f"{len(persist)} persisted model(s)")
+            # #autostart-delay: give API clients time to (re)connect before we get busy streaming
+            # weights — hold until at least autostart_delay_s of wall-clock has elapsed since startup
+            # (ON TOP of the fleet-settle wait above). 0 disables the extra wait.
+            _delay = float(ENGINE_CONFIG.get("autostart_delay_s", 60.0) or 0.0)
+            _remain = _delay - (time.time() - _t0)
+            if _remain > 0:
+                log_activity(f"persist: autostart-delay — waiting {_remain:.0f}s more for "
+                             f"clients to connect before reloading")
+                await asyncio.sleep(_remain)
             for name, p in persist.items():
                 if name in engine.models:
                     continue

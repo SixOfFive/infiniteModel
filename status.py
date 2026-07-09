@@ -169,6 +169,12 @@ def build_status() -> dict:
             "quant": lm.quant,     # the quant this model was loaded with (none/int8)
             "kv_quant": getattr(lm, "kv_quant", "none"),     # #172 TurboQuant KV preset (none/turbo2/3/4)
             "kv_offload": bool(getattr(lm, "kv_offload", False)),  # #kv-offload: KV cache in system RAM
+            # #persist (autoload-on-restart) / #no-unload (absolute do-not-auto-unload veto): pin state
+            # for this model, driving the detail-modal checkboxes. Keyed by friendly OR base (replicas).
+            "persist": bool((getattr(lm, "friendly", None) in (ENGINE_CONFIG.get("persist_models") or {}))
+                            or (getattr(lm, "base", None) in (ENGINE_CONFIG.get("persist_models") or {}))),
+            "no_unload": bool((getattr(lm, "friendly", None) in (ENGINE_CONFIG.get("no_unload_models") or {}))
+                              or (getattr(lm, "base", None) in (ENGINE_CONFIG.get("no_unload_models") or {}))),
             # #load-temp: per-model default temperature (None = unset -> requests default to 0.0)
             "def_temperature": getattr(lm, "default_temperature", None),
             # #min-p: per-model default min-p sampling floor (None = unset -> off)
@@ -334,7 +340,8 @@ def build_status() -> dict:
                      "is_embedding", "replica_idx",
                      "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",
                      "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
-                     "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe")
+                     "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe",
+                     "persist", "no_unload")
     for _e in model_cards:
         if _e.get("loaded"):
             _ld = _lm_by_key.get(_e.get("internal_name")) or _lm_by_key.get(_e.get("name"))
@@ -365,6 +372,12 @@ def build_status() -> dict:
             "queue_depth": ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH),
             # #idle-unload: minutes with no requests before a model is unloaded (0 = keep forever)
             "idle_unload_m": ENGINE_CONFIG.get("idle_unload_m", 0.0),
+            "juggler": ENGINE_CONFIG.get("juggler", False),                       # #juggler
+            "autostart_delay_s": ENGINE_CONFIG.get("autostart_delay_s", 60.0),   # #autostart-delay
+            # #persist / #no-unload: friendly keys pinned for autoload-on-restart and never-auto-unload
+            # (the detail modal reflects these for models that aren't currently loaded, too).
+            "persist_models": sorted(ENGINE_CONFIG.get("persist_models") or {}),
+            "no_unload_models": sorted(ENGINE_CONFIG.get("no_unload_models") or {}),
         },
         "pool": {"nodes": len(nodes), "total_gb": round(pool_total, 2),
                  "used_gb": round(pool_used, 2), "free_gb": round(pool_free, 2),  # LIVE physical
