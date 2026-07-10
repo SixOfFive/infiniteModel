@@ -358,6 +358,31 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     log_activity(f"hop_error: {_ollama_name(_fr or msg.get('model_id') or '?')} "
                                  f"stage {_st} next-hop {_nh} died ({node.hostname}) — failed req "
                                  f"{_rid} fast (slot reclaimed)")
+            elif mtype == "stage_error":
+                # #stage-error-ctrl: a worker stage's COMPUTE exception (model forward raised),
+                # mirrored over the control link because the data-plane error frame can be eaten by
+                # a stale/dead downstream hop (the 2026-07-09 qwen2.5-vl silent-wedge class: the
+                # controller learned nothing and blind-waited out the ~240s gen-stall watchdog on
+                # EVERY retry). Fail the rid's pending future NOW with the worker's real error so the
+                # API client gets a fast, causal 500. Same idempotence/anti-double-count contract as
+                # hop_error above: pop + not-done check; never touch model.active; stamp
+                # last_token_ts so the watchdog doesn't double-act on the just-failed gen.
+                _rid = msg.get("req_id")
+                _fr = engine.pending_friendly.get(_rid)
+                _f = engine.pending.pop(_rid, None)
+                engine.pending_model.pop(_rid, None)
+                engine.pending_friendly.pop(_rid, None)
+                if _f is not None and not _f.done():
+                    _err = str(msg.get("error") or "stage compute error")
+                    with contextlib.suppress(Exception):
+                        _f.set_exception(RuntimeError(
+                            f"stage {msg.get('stage')} on {node.hostname} failed: {_err}"))
+                    _m = engine.models.get(_fr) if _fr else None
+                    if _m is not None:
+                        _m.last_token_ts = time.time()
+                    log_activity(f"stage_error: {_ollama_name(_fr or msg.get('model_id') or '?')} "
+                                 f"stage {msg.get('stage')} on {node.hostname} — {_err[:200]} — "
+                                 f"failed req {_rid} fast")
             elif mtype in ("ready", "error"):
                 _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":
@@ -501,3 +526,42 @@ async def gen_stall_watchdog() -> None:
             log_activity(f"gen-stall watchdog: {_ollama_name(key)} wedged — no token for {idle}s "
                          f"({'decode' if _decoding else 'prefill'}, thresh {int(_eff)}s) "
                          f"(active {old_active}, cancelled {cancelled} req) — reclaimed slot + reset pipeline lock")
+            # #wedge-quarantine: repeated reclaims of the SAME model inside a short window mean the
+            # replica is SYSTEMATICALLY broken (poisoned worker state / stale pipeline — the
+            # 2026-07-09 beast wedge-storm: qwen2.5-vl re-wedged on every client retry, 37 times in
+            # 5.5h, and the accumulated pathological load fed a kernel panic). A fresh re-place (new
+            # shards + new data conns, via reconfigure's rollback-safe managed reload) is the
+            # demonstrated cure — do it automatically after wedge_reload_n wedges in 15 min instead
+            # of reclaim-retry-rewedge forever. 0 disables. Skips embeddings; serialized against the
+            # juggler's own re-places via _juggle_lock (skip -> the next wedge tries again).
+            try:
+                _thr = int(ENGINE_CONFIG.get("wedge_reload_n", 3) or 0)
+            except (TypeError, ValueError):
+                _thr = 3
+            _wr = getattr(engine, "_wedge_recent", None)
+            if _wr is None:
+                _wr = engine._wedge_recent = {}
+            _cnt, _ts = _wr.get(key, (0, 0.0))
+            _cnt = _cnt + 1 if (now - _ts) < 900.0 else 1
+            _wr[key] = (_cnt, now)
+            if (_thr > 0 and _cnt >= _thr and not engine._juggle_lock.locked()
+                    and not getattr(getattr(m, "spec", None), "is_embedding", False)):
+                _wr[key] = (0, now)
+                log_activity(f"wedge-quarantine: {_ollama_name(key)} wedged {_cnt} times in "
+                             f"{int((now - _ts) / 60) if _ts else 0}+ min — forcing a fresh "
+                             f"re-place (self-heal)")
+
+                async def _selfheal(fr=key, _tp=getattr(m, "tp_size", 1), _ctx=m.ctx,
+                                    _q=(m.quant or "none")):
+                    async with engine._juggle_lock:   # one managed re-place at a time, fleet-wide
+                        try:
+                            if fr not in engine.models:
+                                return   # already gone (unloaded/re-placed elsewhere meanwhile)
+                            await engine.reconfigure(fr, tp=_tp, ctx=_ctx, quant=_q,
+                                                     consolidate=True, prefer_vram=True,
+                                                     cpu_only=False)
+                            log_activity(f"wedge-quarantine: {_ollama_name(fr)} re-placed OK")
+                        except Exception as _exc:
+                            log_activity(f"wedge-quarantine: re-place of {_ollama_name(fr)} "
+                                         f"failed ({_exc!r}) — will retry after the next wedge")
+                asyncio.create_task(_selfheal())

@@ -227,6 +227,13 @@ class EngineGenMixin:
             hdr = {"req_id": rid, "model_id": model.target_id, "kind": "ids",
                    "cache_position": cache_position,
                    "reset": reset, "all_logits": all_logits, **meta}
+            # #mm-pairing: DECLARE the companion mm frame on the ids header. Stage 0 claims the
+            # staged embeds only when declared (and fails LOUD if declared-but-missing, instead of
+            # silently running the vision prefill unspliced); undeclared frames never claim, so a
+            # leaked companion from a reclaimed gen + a controller-restart req_id collision can't
+            # splice stale image embeds into an unrelated prompt.
+            if mm is not None and reset:
+                hdr["mm"] = True
             if position_ids is not None:   # #22 inc 4: 3D mRoPE positions [3][q] (small JSON list)
                 hdr["position_ids"] = position_ids
             if _bspans:   # #gemma4-bidir: small JSON list of [start,end] image runs

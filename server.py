@@ -932,6 +932,12 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # the worker fleet to settle — so API clients have time to (re)connect before
                        # the controller gets busy streaming weights. 0 = no extra wait. Default 60.
                        "autostart_delay_s": 60.0,
+                       # #wedge-quarantine: after this many gen-stall-watchdog reclaims of the SAME
+                       # model within 15 min, force a fresh re-place of it (reconfigure: new shards +
+                       # new data conns, rollback-safe) instead of letting client retries re-wedge it
+                       # forever — the 2026-07-09 beast wedge-storm (37 VL prefill wedges in 5.5h fed
+                       # a kernel panic) self-heals after ~3 wedges. 0 disables the self-heal.
+                       "wedge_reload_n": 3,
                        # #idle-unload: unload a model after this many minutes with NO requests.
                        # 0 (default) = loaded forever. Independent of auto_unload (that knob is
                        # about evicting to make ROOM for a new load; this one reclaims memory on a
