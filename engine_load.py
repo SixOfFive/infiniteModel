@@ -1202,6 +1202,7 @@ class EngineLoadMixin:
             await self._await_free_refresh()
         node = edge = None
         _ctrl_host = socket.gethostname()
+        _refreshed = False
         while True:
             # co-located = same box as the controller: hostname match (the robust signal —
             # a standalone worker may register its LAN IP, e.g. om3nbox's 192.168.x) or a
@@ -1223,6 +1224,13 @@ class EngineLoadMixin:
                 break
             victim = self._lru_evictable() if bool(ENGINE_CONFIG.get("auto_unload", True)) else None
             if victim is None:
+                # right after a restart/unload the heartbeat can still show the OLD vram_used —
+                # wait one stats refresh and re-check ONCE before declaring no room (bit us live:
+                # a load fired seconds after /update saw pre-unload numbers + nothing evictable)
+                if not _refreshed:
+                    _refreshed = True
+                    await self._await_free_refresh()
+                    continue
                 _need = _est_gb(1 if quant != "none" else 0) + _MARGIN_GB
                 raise RuntimeError(
                     f"no controller-co-located GPU has ~{_need:.1f} GB free VRAM for the image "
