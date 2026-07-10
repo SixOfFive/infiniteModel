@@ -1852,6 +1852,13 @@ class EngineLoadMixin:
             for fr, m in list(self.models.items()):
                 if getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False):
                     continue
+                # #t2i-serve: an image model's CPU share IS its text encoder — a DESIGNED
+                # placement (encode-once per request; the TE never fits beside the DiT on a
+                # 16 GB card), not a hybrid to promote. The juggler re-placing it unloads a
+                # healthy pipeline (observed live: 'promoting qwen-image (56% was on CPU)'
+                # 25s after its first load). Skip like embeddings.
+                if getattr(m, "is_t2i", False):
+                    continue
                 if self._model_cpu_frac(m) <= 0.02:
                     continue
                 # #no-stall: only promote a model that is momentarily IDLE. Engaging the barrier on a
