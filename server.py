@@ -919,8 +919,9 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # frees VRAM, AND a periodic ~60s sweep (juggle_sweep_s) so it also acts when
                        # VRAM frees for any OTHER reason (a manual unload, a shrinking KV, an earlier
                        # promotion). Picks the hottest hybrid that would now fit ENTIRELY on GPU (skips
-                       # embeddings and anything that can't fit) and does a HITLESS swap: a per-model
-                       # barrier holds new requests, the in-flight generation drains, then reconfigure
+                       # embeddings and anything that can't fit) and, only when that model is momentarily
+                       # IDLE (a busy one is skipped, not stalled — a later sweep catches it at a gap),
+                       # does a HITLESS swap: a per-model barrier holds new requests while reconfigure
                        # re-places it VRAM-first — so the client's open connection just pauses across
                        # the re-place (no reconnect). One promotion per pass, serialized. Lets models
                        # auto-load hybrid under pressure yet migrate to full-GPU speed as the hot one

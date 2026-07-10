@@ -385,11 +385,12 @@ class EngineGenMixin:
         repeat_last_n / presence_penalty / frequency_penalty / seed) for the PLAIN decode path;
         the speculative paths are greedy-only by construction and ignore it (penalties would
         break draft/target logit agreement)."""
-        # #juggler barrier: if this model is being promoted to VRAM (drained + re-placed), hold the
-        # request HERE — before it resolves a replica or takes a queue slot — until the swap finishes,
-        # then fall through and pick the fresh copy. The client's connection just pauses (no reconnect).
+        # #juggler barrier: if this model is being promoted to VRAM (re-placed), hold the request
+        # HERE — before it resolves a replica or takes a queue slot — until the swap finishes, then
+        # fall through and pick the fresh copy. The client's connection just pauses (no reconnect).
         # No await between the gate returning and `model.queued += 1` below, so this is race-tight with
-        # the promoter's drain (a request that clears the gate is counted before the reload starts).
+        # the promoter's idle re-check: a request that clears the gate is counted (active/queued)
+        # before the reload starts, so the promoter sees it and SKIPS rather than reloading under it.
         await self._await_promote_gate(friendly)
         model = self._pick_replica(friendly)   # data-parallel: least-loaded replica (#39)
         if model is None or model.stage0_writer is None:

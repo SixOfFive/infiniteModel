@@ -393,10 +393,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   full-GPU model once room frees: on a ~60 s sweep (and right after an idle-unload frees VRAM) it picks
   the hottest resident hybrid *that a VRAM-first planner dry-run says now fully fits on GPU* — skipping
   embeddings and any hybrid too big to fit, so a bigger hot one never blocks a smaller promotable one —
-  then does a **hitless** swap: a per-model barrier (checked at the top of `generate()` before the request takes
-  a queue slot, so it's race-tight with the drain) holds new requests, the in-flight generation
-  drains, `reconfigure` re-places it VRAM-first (atomic, with rollback), and the barrier releases — so
-  the client's open connection just pauses across the re-place, no reconnect. The juggler is exempt
+  then — only if that model is momentarily IDLE (a busy/backlogged one is skipped, not stalled: engaging
+  the barrier and draining it could hold a slow model's clients for minutes; a later sweep catches it at
+  a gap) — does a **hitless** swap: a per-model barrier (checked at the top of `generate()` before the
+  request takes a queue slot, so it's race-tight) holds new requests while `reconfigure` re-places it
+  VRAM-first (atomic, with rollback), then releases — so the client's open connection just pauses across
+  the ~10-20 s re-place, no reconnect. The juggler is exempt
   from the do-not-auto-unload veto BY DESIGN: it may promote a pinned hybrid too, because a promotion
   is a reload-into-a-better-placement, not a removal — and it restores the model if a rare
   double-failure ever evicts it, so the pin's "always resident" contract still holds. **Autostart

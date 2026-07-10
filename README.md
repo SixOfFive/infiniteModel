@@ -65,11 +65,12 @@ dashboard.
   **Do not auto-unload** is an absolute veto (never reclaimed by idle-unload *or* by LRU eviction — a
   new load that can't otherwise fit fails instead). **Juggler** (settings page, opt-in): on a ~60 s
   sweep — and right after an idle-unload frees VRAM — the hottest model still running split across
-  GPU+RAM *that would now fit entirely on GPU* is *promoted* to VRAM-only by a **hitless**
-  drain-and-reload: new requests briefly pause on their still-open connection (no reconnect) while its
-  in-flight generation finishes and it re-places VRAM-first. Embeddings and models too big for GPU are
-  skipped; a do-not-auto-unload model is promoted too, since the reload is a better placement, never a
-  removal (and it's never left unloaded).
+  GPU+RAM *that would now fit entirely on GPU* — and is momentarily idle — is *promoted* to VRAM-only
+  by a **hitless** re-place: new requests briefly pause on their still-open connection (no reconnect)
+  while it re-places VRAM-first, then resume on the faster copy. A busy model is skipped (a later sweep
+  catches it at a gap) rather than stalled; embeddings and models too big for GPU are skipped; a
+  do-not-auto-unload model is promoted too, since the reload is a better placement, never a removal
+  (and it's never left unloaded).
   **Autostart delay** (`autostart_delay_s`, default 60 s) holds the startup reload of persisted
   models that long so clients reconnect first. **Honest overload behavior:** under GPU contention the endpoint degrades into
   *retryable* backpressure, not failures — slow-but-advancing prefills are never reclaimed as wedged

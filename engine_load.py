@@ -1532,9 +1532,11 @@ class EngineLoadMixin:
         that still won't fit must NOT block a smaller one that would, and a model that can never fit
         (too big for the fleet's GPUs) is simply skipped. Embeddings / encoder models are IGNORED —
         they run on CPU by design and aren't served through the generate() barrier, so they can't be
-        promoted to GPU. HITLESS: engage a per-model barrier so new requests wait, DRAIN the in-flight
-        generation, re-place VRAM-first via reconfigure (atomic + rollback), then release the barrier —
-        the client's open connection just pauses across the swap, no reconnect. One promotion per call;
+        promoted to GPU. HITLESS: only a momentarily-IDLE model is promoted (a busy/backlogged one is
+        skipped — engaging the barrier and draining it would stall its clients; a later sweep catches it
+        at a gap) — engage a per-model barrier so new requests wait during the ~10-20s re-place,
+        reconfigure VRAM-first (atomic + rollback), then release the barrier — the client's open
+        connection just pauses across the swap, no reconnect. One promotion per call;
         serialized by _juggle_lock. #no-unload / persist PINNED models are eligible on purpose (a
         promotion is a reload-in-a-BETTER-way, not a removal — the finally restores a pinned target if a
         rare reconfigure+rollback double-failure ever evicts it, so "never auto-unloaded" still holds)."""
@@ -1552,6 +1554,12 @@ class EngineLoadMixin:
                 if getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False):
                     continue
                 if self._model_cpu_frac(m) <= 0.02:
+                    continue
+                # #no-stall: only promote a model that is momentarily IDLE. Engaging the barrier on a
+                # busy/backlogged model and waiting to drain it would STALL its new requests (a slow
+                # CPU-bound model with a queue never drains) — far worse than leaving it hybrid. A
+                # frequently-used model is caught at a gap by a later ~60s sweep instead.
+                if (m.active or 0) > 0 or (m.queued or 0) > 0:
                     continue
                 # #anti-churn: a prior promotion left this model STILL hybrid (fit-check was optimistic /
                 # fleet couldn't hold it all on GPU) — skip re-promoting it until the fleet has
@@ -1573,20 +1581,15 @@ class EngineLoadMixin:
                     break
             if fr is None or fr not in self.models:
                 return
-            # 3) HITLESS swap: barrier -> drain -> reconfigure VRAM-first -> release.
+            # 3) HITLESS swap: engage the barrier (holds NEW requests for the ~10-20s re-place ONLY,
+            #    never a long drain) -> reconfigure VRAM-first -> release. The candidate was idle when
+            #    selected; a request can only have slipped in during the fit-check awaits, so re-check
+            #    under the now-engaged barrier and skip (don't stall it) if the model just went busy.
             gate = asyncio.Event()                          # CLEAR (present) = barrier engaged
             self._promote_gates[base] = gate
             try:
-                drain_s = float(ENGINE_CONFIG.get("juggle_drain_s", 120.0))
-                deadline = time.time() + drain_s
-                while time.time() < deadline:               # let the current gen(s) finish
-                    if not [r for r in self.replicas_of(base)
-                            if (r.active or 0) > 0 or (r.queued or 0) > 0]:
-                        break
-                    await asyncio.sleep(0.25)
-                else:
-                    log_activity(f"juggler: {fr} still busy after {drain_s:g}s — deferring promotion")
-                    return
+                if any((r.active or 0) > 0 or (r.queued or 0) > 0 for r in self.replicas_of(base)):
+                    return                                   # became busy — try again next sweep at a gap
                 log_activity(f"juggler: promoting {fr} to VRAM-only "
                              f"({self._model_cpu_frac(m)*100:.0f}% was on CPU) [{reason}] — "
                              f"hitless re-place")
