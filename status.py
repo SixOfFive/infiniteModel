@@ -475,6 +475,7 @@ def _model_caps(tgt: str, spec=None) -> list:
     if tgt in _CAPS_CACHE:
         return _CAPS_CACHE[tgt]
     caps: list = []
+    d = None
     try:
         # Read MODALITIES from config first (so a multimodal model whose spec is mis-flagged
         # is_embedding — e.g. Qwen2.5-Omni — still shows image/stt/tts), then fall back to the
@@ -482,6 +483,11 @@ def _model_caps(tgt: str, spec=None) -> list:
         import os
         import json as _json
         d = _local_model_dir(tgt)
+        # #t2i: a diffusers image-generation checkpoint (model_index.json) is its own kind —
+        # the dashboard badges it and hides the (unsupported) LLM Load action.
+        if d and _is_diffusers_dir(d):
+            _CAPS_CACHE[tgt] = ["t2i"]
+            return ["t2i"]
         cfgd = None
         if d:
             p = os.path.join(d, "config.json")
@@ -515,7 +521,10 @@ def _model_caps(tgt: str, spec=None) -> list:
             caps.append("tools")
     except Exception:
         pass
-    _CAPS_CACHE[tgt] = caps
+    if d:
+        # Only cache once the model dir exists — caching [] for a not-yet-downloaded model
+        # would freeze its badges empty until a controller restart (#t2i).
+        _CAPS_CACHE[tgt] = caps
     return caps
 
 
@@ -546,6 +555,12 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
             m = measure_model_weights(d)
             if m and m.get("total"):
                 size_bytes = int(m["total"])
+            if size_bytes is None:
+                # diffusers layout (#t2i): weights live in component subfolders the flat
+                # measurer can't see — fall back to the recursive on-disk safetensors sum
+                t = _tree_weight_bytes(d)
+                if t:
+                    size_bytes = t
     # Display the Ollama 'family:size' name ('qwen3:4b'); the dashboard sends it back as the
     # op key and resolve_model_name() maps it to this dash-form key. internal_name is the raw
     # registry key, so existing tooling that keys off the dash form keeps working.

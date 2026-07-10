@@ -314,6 +314,16 @@ class EngineLoadMixin:
             from transformers import AutoTokenizer
             spec = resolve_spec(friendly)
             if spec is None:
+                # #t2i: a registered DIFFUSERS checkpoint (image generation — model_index.json,
+                # no top-level config.json) can never build an LLM spec. Refuse with the real
+                # reason instead of a misleading "unknown model" (which reads like a typo).
+                _tgt = MODELS[friendly][0] if friendly in MODELS else friendly
+                _d = _local_model_dir(_tgt)
+                if _d and _is_diffusers_dir(_d):
+                    raise ValueError(
+                        f"'{friendly}' is an image-generation (diffusers) checkpoint — "
+                        "it cannot be loaded as a text-generation model; the image "
+                        "pipeline is not implemented yet (weights are staged for it)")
                 raise ValueError(f"unknown model '{friendly}'")
             target_id = MODELS[friendly][0] if friendly in MODELS else friendly
             # ENCODER / sentence-embedding model: a whole-model single-node load (no pipeline/TP/KV

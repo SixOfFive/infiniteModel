@@ -78,7 +78,9 @@ def register(app):
         # image/video/stt/tts/embedding/tools) so /api/show, /status badges, and the dashboard agree.
         import status as _status
         _mcaps = _status._model_caps(target, spec)
-        if "embedding" in _mcaps:
+        if "t2i" in _mcaps:
+            caps = ["t2i"]                   # diffusers image-gen checkpoint — not a chat model (#t2i)
+        elif "embedding" in _mcaps:
             caps = ["embedding"]
         else:
             caps = ["completion", "chat"]

@@ -184,9 +184,60 @@ def _safe_name(model_id: str) -> str:
     return model_id.replace("/", "--")
 
 
-def _dir_has_model(d: str) -> bool:
-    """True if dir holds a complete model: config.json + every shard in the index."""
+def _is_diffusers_dir(d: str) -> bool:
+    """A diffusers multi-component checkpoint (model_index.json at the root): an image/video
+    pipeline repo (e.g. Qwen-Image = transformer/ + text_encoder/ + vae/ + …), NOT a flat
+    transformers LM. Weights live in component SUBFOLDERS, so every flat-layout assumption
+    (root config.json, root safetensors) is wrong for these. (#t2i)"""
+    return os.path.exists(os.path.join(d, "model_index.json"))
+
+
+def _diffusers_complete(d: str) -> bool:
+    """Completeness for a diffusers-layout dir (#t2i): every weight-bearing component subdir
+    (marked by its config.json) holds at least one .safetensors; sharded components
+    ('-0000X-of-0000N') have all N shards AND their index; every safetensors index that
+    exists has all referenced files present. Conservative: any doubt -> incomplete, so a
+    partial pull is never migrated/reported ready (mirrors the flat check's contract)."""
     try:
+        found_weights = False
+        for sub in sorted(os.listdir(d)):
+            sd = os.path.join(d, sub)
+            if not os.path.isdir(sd) or not os.path.exists(os.path.join(sd, "config.json")):
+                continue                       # tokenizer/ (tokenizer_config) & scheduler/ carry no weights
+            entries = os.listdir(sd)
+            shards = [f for f in entries if f.endswith(".safetensors")]
+            if not shards:
+                return False                   # component config pulled but weights not yet
+            found_weights = True
+            sharded = [f for f in shards if re.search(r"-of-\d+", f)]
+            # group by prefix so a dir holding several sharded weight SETS (e.g. an extra fp16
+            # variant) counts each set against its own -of-N, not a pooled total
+            groups: dict = {}
+            for f in sharded:
+                groups.setdefault(re.sub(r"-\d+-of-\d+", "", f), []).append(f)
+            for fl in groups.values():
+                m = re.search(r"-of-(\d+)", fl[0])
+                if m and len(fl) != int(m.group(1)):
+                    return False               # e.g. 3 of 9 transformer shards on disk so far
+            idx = [f for f in entries if f.endswith(".safetensors.index.json")]
+            if sharded and not idx:
+                return False                   # shards present but index (ships last) not yet
+            for f in idx:
+                with open(os.path.join(sd, f), encoding="utf-8") as fh:
+                    wm = json.load(fh).get("weight_map") or {}
+                if not all(os.path.exists(os.path.join(sd, p)) for p in set(wm.values())):
+                    return False
+        return found_weights
+    except Exception:
+        return False
+
+
+def _dir_has_model(d: str) -> bool:
+    """True if dir holds a complete model: config.json + every shard in the index
+    (flat transformers layout), or a complete diffusers component tree (#t2i)."""
+    try:
+        if _is_diffusers_dir(d):
+            return _diffusers_complete(d)
         return (os.path.exists(os.path.join(d, "config.json"))
                 and all(os.path.exists(p) for p in set(_weight_map(d).values())))
     except Exception:
@@ -200,6 +251,8 @@ def _ensure_template_files(model_id: str, local: str) -> None:
     without it AutoTokenizer loads NO template and rendering falls back to a flat prompt that breaks
     vision (the model never sees the native [INST][IMG]...[/INST]). Best-effort + silent: a model
     that has no such file in its repo (or an offline box) is simply left as-is."""
+    if _is_diffusers_dir(local):
+        return                       # image pipelines have no chat template (#t2i)
     aux = ["chat_template.jinja"]
     missing = [f for f in aux if not os.path.exists(os.path.join(local, f))]
     if not missing:
@@ -229,7 +282,9 @@ def _controller_model_dir(model_id: str) -> str:
     if _gf:
         return convert_gguf_to_model_dir(model_id, _gf, model_id)
     from huggingface_hub import snapshot_download
-    patterns = ["*.safetensors", "*.json", "*.jinja"]   # *.jinja: chat_template.jinja (Mistral3 etc.)
+    # *.jinja: chat_template.jinja (Mistral3 etc.); *.txt/*.model: tokenizer files (merges.txt,
+    # sentencepiece) that diffusers repos keep under tokenizer/ (#t2i); *.py: trust_remote_code.
+    patterns = ["*.safetensors", "*.json", "*.jinja", "*.txt", "*.model", "*.py"]
     src = None
     try:
         cached = snapshot_download(model_id, allow_patterns=patterns, local_files_only=True)
@@ -249,19 +304,25 @@ def _controller_model_dir(model_id: str) -> str:
     # an instant rename — no 2x read+write (brutal on a USB/spinning disk), and no half-written
     # shard if interrupted. Across drives shutil.move falls back to copy+delete. The cache
     # snapshot holds symlinks -> blobs, so resolve realpath and move the blob; the now-dangling
-    # snapshot is cleaned by the purge below.
-    for fn in os.listdir(src):
-        if not fn.endswith((".safetensors", ".json")):
-            continue
-        dst = os.path.join(local, fn)
-        real = os.path.realpath(os.path.join(src, fn))
-        if os.path.exists(dst):
-            if not os.path.exists(real):
-                continue                       # blob already moved here on a prior run
-            with contextlib.suppress(OSError):
-                os.remove(dst)                 # replace a partial prior copy with the real blob
-        if os.path.exists(real):
-            shutil.move(real, dst)             # same-drive: instant rename; cross-drive: copy+del
+    # snapshot is cleaned by the purge below. RECURSIVE (#t2i): diffusers repos keep their
+    # weights in component subfolders (transformer/, text_encoder/, vae/, tokenizer/) — the
+    # relative tree is preserved under models/<name>/ so the pipeline layout survives.
+    _mig_ext = (".safetensors", ".json", ".jinja", ".txt", ".model", ".py")
+    for root, _dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        for fn in files:
+            if not fn.endswith(_mig_ext):
+                continue
+            dst = os.path.join(local, fn) if rel == "." else os.path.join(local, rel, fn)
+            real = os.path.realpath(os.path.join(root, fn))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.exists(dst):
+                if not os.path.exists(real):
+                    continue                   # blob already moved here on a prior run
+                with contextlib.suppress(OSError):
+                    os.remove(dst)             # replace a partial prior copy with the real blob
+            if os.path.exists(real):
+                shutil.move(real, dst)         # same-drive: instant rename; cross-drive: copy+del
     # Migration done: models/ is now the source of truth, so the HF-cache copy is a pure
     # duplicate (~2x the model on disk). Drop it once the copy is verified complete.
     if _dir_has_model(local):
@@ -420,7 +481,9 @@ def _local_model_dir(target_id: str):
     else:
         try:
             from huggingface_hub import snapshot_download
-            d = snapshot_download(target_id, allow_patterns=["*.safetensors", "*.json", "*.jinja"],
+            d = snapshot_download(target_id,
+                                  allow_patterns=["*.safetensors", "*.json", "*.jinja",
+                                                  "*.txt", "*.model", "*.py"],
                                   local_files_only=True)
             if _dir_has_model(d):
                 result = d
@@ -442,6 +505,19 @@ def _display_weight_bytes(target_id: str, spec: ModelSpec) -> int:
         if m and m.get("total"):
             return int(m["total"])
     return spec.total_weight_bytes
+
+
+def _tree_weight_bytes(d: str) -> int:
+    """Recursive on-disk sum of every *.safetensors under a model dir. The size fallback for
+    layouts measure_model_weights can't parse — diffusers repos (#t2i) keep weights in
+    component subfolders, so the flat top-level glob sees nothing."""
+    total = 0
+    for root, _dirs, files in os.walk(d):
+        for f in files:
+            if f.endswith(".safetensors"):
+                with contextlib.suppress(OSError):
+                    total += os.path.getsize(os.path.join(root, f))
+    return total
 
 
 def _friendly_from_hf(hf_id: str) -> str:
@@ -554,8 +630,11 @@ def _hf_total_bytes(repo_id: str) -> int:
     try:
         from huggingface_hub import HfApi
         info = HfApi(token=_HF_TOKEN_FN()).model_info(repo_id, files_metadata=True)
+        # extension set MUST mirror _pull_repo_interruptible's wanted list, or the progress
+        # %/ETA denominator drifts from what is actually pulled
         return sum(int(s.size or 0) for s in (info.siblings or [])
-                   if s.rfilename.endswith((".safetensors", ".json")))
+                   if s.rfilename.endswith((".safetensors", ".json", ".jinja",
+                                            ".txt", ".model", ".py")))
     except Exception:
         return 0
 
@@ -600,7 +679,9 @@ def model_ready(target_id: str, ttl: float = 3.0) -> bool:
     if not ready:
         try:
             from huggingface_hub import snapshot_download
-            d = snapshot_download(target_id, allow_patterns=["*.safetensors", "*.json", "*.jinja"],
+            d = snapshot_download(target_id,
+                                  allow_patterns=["*.safetensors", "*.json", "*.jinja",
+                                                  "*.txt", "*.model", "*.py"],
                                   local_files_only=True)
             ready = _dir_has_model(d)
         except Exception:

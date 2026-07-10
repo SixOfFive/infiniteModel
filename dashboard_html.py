@@ -402,7 +402,11 @@ function renderModels(d,cl){
   $('#models').innerHTML=html;
 }
 function modelRow(m,s){
-  const arch=archChip(m), al=(m.aliases||[]).map(a=>'<span class="chip al">'+esc(a)+'</span>').join('');
+  // #t2i: diffusers image-generation checkpoint — download/registry work like any model,
+  // but there is no LLM Load for it (the serving pipeline is a separate, pending feature).
+  const t2i=(m.capabilities||[]).includes('t2i');
+  const arch=archChip(m)+(t2i?'<span class="chip" title="Text-to-image (diffusers) checkpoint — downloadable and managed like any model; the image-generation serving pipeline is coming.">🖼 t2i</span>':'');
+  const al=(m.aliases||[]).map(a=>'<span class="chip al">'+esc(a)+'</span>').join('');
   let meta='', acts='';
   if(s.k==='loaded'){
     const parts=[];
@@ -438,7 +442,9 @@ function modelRow(m,s){
   } else if(s.k==='downloading'){
     meta='downloading weights…'; acts='<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'stop\')">Stop</button>';
   } else if(s.k==='registered'){
-    meta=fitMeta(m); acts='<button class="btn sm pri" onclick="openLoad(\''+esc(m.name)+'\')">Load ▾</button>';
+    meta=fitMeta(m);
+    acts=t2i?'<button class="btn sm ghost" disabled title="Weights are on disk and ready; the image-generation serving pipeline is not implemented yet, so there is nothing to load them into.">pipeline pending</button>'
+            :'<button class="btn sm pri" onclick="openLoad(\''+esc(m.name)+'\')">Load ▾</button>';
   } else { // notdl
     meta='<span class="err">not downloaded</span> · '+gb(m.size_gb); acts='<button class="btn sm" onclick="dl(\''+esc(m.name)+'\',\'start\')">Download</button>';
   }
@@ -473,7 +479,7 @@ function int4Badge(m){
   const cz=m.cached||{};
   // embedding encoders load whole-model float32 (_load_embedding_locked) and NEVER read the
   // shard cache — a compile would fail (decoder-shaped packer) and the payoff is false. No badge.
-  if(!m.ready||(cz.int4&&cz.int4.ok)||(m.capabilities||[]).includes('embedding'))return '';
+  if(!m.ready||(cz.int4&&cz.int4.ok)||(m.capabilities||[]).includes('embedding')||(m.capabilities||[]).includes('t2i'))return '';
   const dk=(((LAST||{}).disk||{}).models||[]).find(x=>x.name===m.name||x.internal_name===m.internal_name)||{};
   const est=(dk.quant_gb||{}).int4, free=((LAST||{}).disk||{}).controller_free_gb;
   const tip='Compile the int4 shard cache for '+m.name

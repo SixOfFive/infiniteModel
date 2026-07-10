@@ -47,12 +47,18 @@ def _pull_repo_interruptible(friendly: str, repo_id: str):
                 from huggingface_hub import snapshot_download
                 print(f"[model] {friendly}: repo listing failed -> non-interruptible "
                       f"snapshot_download fallback (pause/stop won't apply this run)")
-                snapshot_download(repo_id, allow_patterns=["*.safetensors", "*.json", "*.py"], token=tok)
+                snapshot_download(repo_id, allow_patterns=["*.safetensors", "*.json", "*.py",
+                                                           "*.jinja", "*.txt", "*.model"], token=tok)
                 return "done"
     # include *.py: trust_remote_code models (auto_map) ship their modeling/configuration code as
     # .py — without them a worker builds the native class for the model_type (wrong arch -> meta
     # tensors, e.g. MiniMax-M2 'minimax' -> lightning Text-01). #78.
-    wanted = [f for f in files if f.endswith((".safetensors", ".json", ".py"))]
+    # include *.jinja/*.txt/*.model: chat templates + tokenizer sidecars (merges.txt,
+    # sentencepiece .model) — diffusers repos (#t2i) ship the tokenizer under tokenizer/ with
+    # these, and Mistral3-style LLMs ship chat_template.jinja. Extension set mirrors
+    # _hf_total_bytes so the progress denominator matches what is pulled.
+    wanted = [f for f in files if f.endswith((".safetensors", ".json", ".py",
+                                              ".jinja", ".txt", ".model"))]
     for f in wanted:
         ctrl = DOWNLOAD_CONTROL.get(friendly)        # checked BETWEEN files (cheap dict read)
         if ctrl in ("pause", "stop"):

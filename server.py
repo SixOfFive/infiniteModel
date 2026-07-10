@@ -1425,7 +1425,8 @@ from model_store import (MODELS_DIR, _safe_name, _dir_has_model, _controller_mod
                          _spec_from_config, _hf_total_bytes, _hf_cache_bytes, model_ready,
                          _READY_CACHE, _invalidate_ready_cache, _purge_hf_cache,
                          gc_redundant_cache, delete_model_cache,
-                         convert_gguf_to_model_dir)   # noqa: E402,F401
+                         convert_gguf_to_model_dir,
+                         _is_diffusers_dir, _tree_weight_bytes)   # noqa: E402,F401
 model_store.set_hf_token_provider(lambda: HF_TOKEN)
 # GGUF source lookup: a target (HF repo) in GGUF_FILES is normalized to safetensors at acquisition
 # instead of pulled as safetensors. Set after GGUF_FILES is populated by load_custom_models() too,
