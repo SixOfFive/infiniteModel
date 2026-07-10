@@ -1544,11 +1544,21 @@ class EngineLoadMixin:
             # 1) rank the PROMOTABLE hybrids by hotness (freshest use first, so a 'constantly in use'
             #    model wins). Skip embeddings/encoders (CPU-by-design, not served through the barrier)
             #    and anything already ~all-GPU (nothing to promote).
+            _fleet_free = sum(max(0.0, n.eff_vram_gb - PLAN_VRAM_FLOOR_GB)
+                              for n in registry.alive_sorted()
+                              if getattr(n, "can_infer", False) and n.eff_vram_gb > 0)
             cands = []
             for fr, m in list(self.models.items()):
                 if getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False):
                     continue
                 if self._model_cpu_frac(m) <= 0.02:
+                    continue
+                # #anti-churn: a prior promotion left this model STILL hybrid (fit-check was optimistic /
+                # fleet couldn't hold it all on GPU) — skip re-promoting it until the fleet has
+                # meaningfully MORE free VRAM than it did then, else we'd re-place it to the same spot
+                # every sweep. Cleared on a fully-GPU promotion (below) or when room grows past it.
+                _stuck = self._juggle_stuck.get(m.base or fr)
+                if _stuck is not None and _fleet_free <= _stuck + 0.5:
                     continue
                 hot = max(m.last_used or 0.0, getattr(m, "last_token_ts", 0.0) or 0.0)
                 cands.append((hot, fr, m))
@@ -1585,8 +1595,18 @@ class EngineLoadMixin:
                                        prefer_vram=True, cpu_only=False)
                 newm = self.models.get(fr)
                 nf = self._model_cpu_frac(newm) if newm else 1.0
-                log_activity(f"juggler: {fr} re-placed — now {nf*100:.0f}% on CPU "
-                             + ("(fully on GPU)" if nf <= 0.02 else "(still hybrid — fleet shifted)"))
+                if nf <= 0.02:
+                    self._juggle_stuck.pop(base, None)      # success — clear any anti-churn record
+                    log_activity(f"juggler: {fr} re-placed — now fully on GPU")
+                else:
+                    # #anti-churn: the re-place couldn't reach full-GPU (the fit-check was optimistic /
+                    # the fleet can't hold it all on VRAM right now). Record the room level so the sweep
+                    # won't re-place it to the same spot every ~60s — it retries only once the fleet
+                    # frees meaningfully MORE VRAM than this.
+                    self._juggle_stuck[base] = _fleet_free
+                    log_activity(f"juggler: {fr} re-placed to {(1.0 - nf) * 100:.0f}% on GPU "
+                                 f"({nf * 100:.0f}% still on CPU) — best fit for now; won't retry "
+                                 f"until the fleet frees more VRAM")
             except Exception as exc:
                 log_activity(f"juggler: promote {fr} FAILED ({exc!r})")
             finally:

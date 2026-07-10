@@ -1909,6 +1909,12 @@ class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin, EngineSpeech
         # promoted copy. _juggle_lock serializes the promoter so at most one model juggles at a time.
         self._promote_gates: dict[str, asyncio.Event] = {}
         self._juggle_lock = asyncio.Lock()
+        # #juggler anti-churn: base -> fleet free-VRAM (GB) measured at a promotion that landed the
+        # model STILL hybrid (the fit-check was optimistic — the re-place couldn't reach full-GPU).
+        # The sweep then skips re-promoting that model until the fleet has meaningfully MORE room than
+        # it did then (else it would re-place it to the same spot every ~60s). Cleared on a fully-GPU
+        # promotion or when room grows past the recorded level.
+        self._juggle_stuck: dict[str, float] = {}
         # PARALLEL-LOAD reservation ledger: reg_key -> {node_id: {"ram": bytes, "vram": bytes}}.
         # A load reserves its planned per-node footprint under the engine lock, then RELEASES the
         # lock for the (slow) weight-streaming gather so a second load can plan + stream IN PARALLEL.
