@@ -214,8 +214,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   /* overlay/modal */
   .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-start;justify-content:center;z-index:50}
   .ov.show{display:flex}
+  /* #modal-scroll: while a popup is open the PAGE must not scroll — lock body (also covers
+     touch/keyboard), and contain wheel chaining when the modal's own scroll hits an end. */
+  body:has(.ov.show){overflow:hidden}
   .modal{background:var(--surface);border:1px solid var(--border2);border-radius:12px;max-width:640px;width:92%;
-         margin:60px 0;padding:20px 22px;max-height:80vh;overflow:auto}
+         margin:60px 0;padding:20px 22px;max-height:80vh;overflow:auto;overscroll-behavior:contain}
   .modal h3{margin:0 0 4px;font-size:17px}
   .modal .x{float:right;cursor:pointer;color:var(--muted);font-size:20px;line-height:1}
   .modal label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
@@ -519,6 +522,10 @@ function renderNodes(d){
 
 // ---------- actions ----------
 function closeOv(){ $('#ov').classList.remove('show'); DETAIL_OPEN=null; }
+// #modal-scroll: wheel over the dark backdrop (outside the popup box) used to scroll the PAGE
+// behind the popup. Forward it to the modal instead so the wheel scrolls the popup wherever
+// the mouse sits. deltaMode 1 = line-based deltas (Firefox) — scale to ~pixels.
+$('#ov').addEventListener('wheel',e=>{ if(e.target===e.currentTarget){ $('#modal').scrollTop+=e.deltaY*(e.deltaMode===1?16:1); e.preventDefault(); } },{passive:false});
 function openAdd(){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Add a model</h3>'
    +'<div style="font-size:12px;color:var(--muted);margin-top:4px">Register any Hugging Face id. It downloads in the background.</div>'
