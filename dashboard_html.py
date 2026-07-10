@@ -410,7 +410,16 @@ function modelRow(m,s){
   const arch=archChip(m)+(t2i?'<span class="chip" title="Text-to-image (diffusers) checkpoint — downloadable and managed like any model; the image-generation serving pipeline is coming.">🖼 t2i</span>':'');
   const al=(m.aliases||[]).map(a=>'<span class="chip al">'+esc(a)+'</span>').join('');
   let meta='', acts='';
-  if(s.k==='loaded'){
+  if(s.k==='loaded'&&m.t2i){
+    // #t2i-serve: image model card — no ctx/tok_s; live per-step render progress instead.
+    const parts=[];
+    if(m.quant)parts.push(esc(m.quant));
+    if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
+    if(m.active>0)parts.push('<span style="color:var(--good)">● rendering'
+      +(m.t2i_step?(' step '+m.t2i_step+'/'+(m.t2i_total||'?')):'')+'</span>');
+    meta=parts.join(' · ');
+    acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
+  } else if(s.k==='loaded'){
     const parts=[];
     if(m.quant)parts.push(esc(m.quant));
     if(m.kv_quant&&m.kv_quant!=='none')parts.push('<span class="em" title="TurboQuant KV-cache quantization ('+esc(m.kv_quant)+'): keys/values stored at ~3–4 bits instead of bf16 (data-free rotation + Lloyd-Max, un-rotated on read so attention is unchanged) → ~2× smaller KV cache, so longer context and more co-resident models on the same VRAM. turbo4 ≈ near-lossless, turbo3 more aggressive; best on large models.">KV:'+esc(m.kv_quant)+'</span>');
@@ -463,7 +472,7 @@ function modelRow(m,s){
         +'<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'clear\')" title="Discard the partially downloaded files">Clear</button>';
   } else if(s.k==='registered'){
     meta=fitMeta(m);
-    acts=t2i?'<button class="btn sm ghost" disabled title="Weights are on disk and ready; the image-generation serving pipeline is not implemented yet, so there is nothing to load them into.">pipeline pending</button>'
+    acts=t2i?'<button class="btn sm pri" title="Load the image pipeline onto a controller-co-located GPU: DiT mixed-edge int4 (first+last blocks bf16 — the gate-tested near-bf16 recipe), text encoder on CPU, tiled VAE. Takes a few minutes (quantize + move)." onclick="loadT2i(\''+esc(m.name)+'\')">Load 🖼</button>'
             :'<button class="btn sm pri" onclick="openLoad(\''+esc(m.name)+'\')">Load ▾</button>';
   } else { // notdl
     meta='<span class="err">not downloaded</span> · '+gb(m.size_gb); acts='<button class="btn sm" onclick="dl(\''+esc(m.name)+'\',\'start\')">Download</button>';
@@ -836,6 +845,24 @@ async function openDetail(name){
       +'<audio id="tts-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
       +'<div><a id="tts-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
   }
+  // #t2i-serve: image-generation box — prompt + knobs, POST /v1/images/generations, show the
+  // PNG inline + download. STATIC (outside #dlive) so the poll can't wipe the prompt mid-typing.
+  let t2ig='';
+  if(m.loaded && (m.capabilities||[]).includes('t2i')){
+    const _ig='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    t2ig='<h3 style="font-size:13px;margin-top:14px">Generate image <span class="em" style="font-weight:normal">· flow-matching render on the model\'s GPU worker</span></h3>'
+      +'<textarea id="t2i-prompt" rows="3" placeholder="Describe the image…" style="width:100%;box-sizing:border-box;resize:vertical;'+_ig+'"></textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)">Size</label>'
+      +'<select id="t2i-size" style="'+_ig+'"><option>1024x1024</option><option>1328x1328</option><option>1664x928</option><option>928x1664</option><option>768x768</option></select>'
+      +'<label style="font-size:12px;color:var(--muted)" title="Denoising steps: 20 is the tested quality/speed default; fewer = faster, softer">Steps</label>'
+      +'<input id="t2i-steps" type="number" value="20" min="1" max="100" style="width:64px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Blank = random. Same seed + same prompt + same settings = same image">Seed</label>'
+      +'<input id="t2i-seed" type="number" placeholder="rnd" style="width:90px;'+_ig+'">'
+      +'<button class="btn sm pri" id="t2i-go" onclick="t2iGen(\''+esc(name)+'\')">Generate ▶</button>'
+      +'<span id="t2i-status" class="em" style="font-size:11px"></span></div>'
+      +'<div id="t2i-out" style="margin-top:8px"></div>';
+  }
   // #persist / #no-unload: per-model lifecycle pins (work for loaded AND not-loaded models — the
   // controller reports current state via LAST.controller.{persist_models,no_unload_models}).
   const _pc=(LAST&&LAST.controller)||{}, _pk=m.internal_name||m.friendly||name;
@@ -847,15 +874,20 @@ async function openDetail(name){
     +'<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0;color:var(--text);cursor:pointer" title="NEVER auto-unload this model — overrides every automatic REMOVAL: idle-unload and LRU eviction to free room for a new load (that new load FAILS instead of evicting this one). The juggler may still RELOAD it to promote it to a faster VRAM-only placement — a promotion, not a removal, so it is never left unloaded. This is the flag that wins.">'
     +'<input type="checkbox" style="width:auto"'+(_isNU?' checked':'')+' onchange="setPin(\''+esc(name)+'\',\'no_unload\',this.checked)"> Do not auto-unload</label>';
   let acts='';
-  if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
+  const _isT2i=(m.capabilities||[]).includes('t2i');
+  if(m.loaded&&_isT2i) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button>';
+  else if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
     +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
     +'<button class="btn sm ghost" onclick="reconf(\''+esc(name)+'\')">Reconfigure…</button>';
+  else if(_isT2i) acts='<button class="btn sm pri" onclick="closeOv();loadT2i(\''+esc(name)+'\')">Load 🖼</button> '
+    +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
+    +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+tts+pre+pers
+    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+t2ig+tts+pre+pers
     +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
@@ -876,6 +908,46 @@ async function applyRt(name){
        toast('runtime settings applied · '+(ks.length?ks.map(k=>k+'='+d[k]).join(' · '):'all unset'));
        tick(); }
   catch(e){ toast(String(e.message||e),1); }
+}
+// #t2i-serve: load an image model (no dialog — the load path picks the gate-tested recipe
+// itself). /load blocks for the whole multi-minute build, so fire it WITHOUT awaiting: the
+// loading card appears via the status poll, exactly like the LLM load dialog's pattern.
+function loadT2i(name){
+  toast('loading image pipeline for '+name+' — a few minutes (quantize + move)…');
+  api('/load?model='+encodeURIComponent(name)+'&quant=int4',{method:'POST'})
+    .then(()=>{toast(name+' ready — open its card to generate');tick();})
+    .catch(e=>toast(String(e.message||e),1));
+  tick();
+}
+// #t2i-serve: render from the detail modal. Long await (a render is minutes) with a live
+// elapsed timer; while it runs the card's status poll shows the worker's step i/n too.
+async function t2iGen(name){
+  const p=($('#t2i-prompt').value||'').trim(); if(!p){toast('type a prompt',1);return;}
+  const sz=($('#t2i-size').value||'1024x1024');
+  const steps=parseInt($('#t2i-steps').value||'20')||20;
+  const seed=($('#t2i-seed').value||'').trim();
+  const btn=$('#t2i-go'), st=$('#t2i-status'), out=$('#t2i-out');
+  btn.disabled=true; const t0=Date.now();
+  const tick_=setInterval(()=>{ if(st){ const m=(LAST.models||[]).find(x=>x.name===name)||{};
+    st.textContent='rendering… '+Math.round((Date.now()-t0)/1000)+'s'
+      +(m.t2i_step?(' · step '+m.t2i_step+'/'+(m.t2i_total||'?')):''); } },1000);
+  try{
+    const body={model:name,prompt:p,size:sz,steps:steps};
+    if(seed!=='')body.seed=parseInt(seed);
+    const r=await fetch('/v1/images/generations',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok) throw new Error((j.error&&j.error.message)||('HTTP '+r.status));
+    const b64=j.data&&j.data[0]&&j.data[0].b64_json; if(!b64) throw new Error('empty response');
+    const src='data:image/png;base64,'+b64;
+    out.innerHTML='<img src="'+src+'" style="max-width:100%;border-radius:10px;border:1px solid var(--border)">'
+      +'<div><a href="'+src+'" download="'+esc(name)+'_'+Date.now()+'.png" '
+      +'style="font-size:11px;color:var(--accent)">⬇ download png</a>'
+      +'<span class="em" style="font-size:11px;margin-left:8px">'
+      +Math.round((Date.now()-t0)/1000)+'s · '+esc(sz)+' · '+steps+' steps</span></div>';
+    st.textContent='';
+  }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
+  finally{ clearInterval(tick_); btn.disabled=false; }
 }
 // #tts-panel: synthesize speech from the detail modal. Raw fetch (NOT api(), which parses JSON) —
 // /v1/audio/speech returns binary audio; read it as a blob, play it, and offer a download. Object

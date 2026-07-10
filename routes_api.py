@@ -57,6 +57,76 @@ def register(app):
         return JSONResponse({"id": _ollama_name(friendly), "object": "model",
                              "created": int(START_TIME), "owned_by": "infinitemodel"})
 
+    @app.post("/v1/images/generations")   # OpenAI Images API (#t2i-serve, task #37)
+    async def v1_images_generations(req: Request) -> JSONResponse:
+        """Text-to-image via the OpenAI images shape: {model?, prompt, size?, n?,
+        response_format?} + extensions {negative_prompt, steps|num_inference_steps,
+        cfg|true_cfg_scale|guidance_scale, seed}. Returns b64_json data entries (v1: no
+        URL hosting). `model` may be omitted when exactly one image model is loaded.
+        Auto-loads a registered-but-cold image model like the chat endpoints do."""
+        import base64
+        try:
+            body = await req.json()
+        except Exception:
+            return JSONResponse({"error": {"message": "invalid JSON body",
+                                           "type": "invalid_request_error"}}, status_code=400)
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            return JSONResponse({"error": {"message": "'prompt' is required",
+                                           "type": "invalid_request_error"}}, status_code=400)
+        name = str(body.get("model") or "").strip()
+        if not name:
+            _t2i = [k for k, m in engine.models.items() if getattr(m, "is_t2i", False)]
+            if len(_t2i) == 1:
+                name = _t2i[0]
+            else:
+                return JSONResponse({"error": {"message":
+                    "pass 'model' — " + ("no image model is loaded"
+                                         if not _t2i else f"multiple loaded: {_t2i}"),
+                    "type": "invalid_request_error"}}, status_code=400)
+        try:
+            friendly = resolve_model_name(name)
+        except ValueError as exc:
+            return JSONResponse({"error": {"message": str(exc), "type": "invalid_request_error"}},
+                                status_code=404)
+        try:
+            w, h = (int(x) for x in str(body.get("size") or "1024x1024").lower().split("x"))
+        except Exception:
+            return JSONResponse({"error": {"message": "size must look like '1024x1024'",
+                                           "type": "invalid_request_error"}}, status_code=400)
+        steps = max(1, min(100, int(body.get("num_inference_steps")
+                                    or body.get("steps") or 20)))
+        cfg = float(body.get("true_cfg_scale") or body.get("guidance_scale")
+                    or body.get("cfg") or 4.0)
+        neg = str(body.get("negative_prompt") or " ")
+        seed = body.get("seed")
+        n = max(1, min(4, int(body.get("n") or 1)))
+        if friendly not in engine.models:
+            try:
+                await engine.ensure_loaded(friendly, 0)
+            except Exception as exc:
+                return JSONResponse({"error": {"message": f"image model load failed: {exc}",
+                                               "type": "server_error"}}, status_code=503)
+        data, meta = [], {}
+        try:
+            for i in range(n):
+                s_i = (int(seed) + i) if seed not in (None, "") else None
+                png, meta = await engine.t2i_generate(
+                    friendly, prompt, negative_prompt=neg, width=w, height=h,
+                    steps=steps, cfg=cfg, seed=s_i)
+                data.append({"b64_json": base64.b64encode(png).decode()})
+        except ValueError as exc:
+            return JSONResponse({"error": {"message": str(exc), "type": "invalid_request_error"}},
+                                status_code=400)
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": {"message": "image generation timed out",
+                                           "type": "server_error"}}, status_code=504)
+        except Exception as exc:
+            return JSONResponse({"error": {"message": f"image generation failed: {exc}",
+                                           "type": "server_error"}}, status_code=500)
+        return JSONResponse({"created": int(time.time()), "data": data,
+                             "infinitemodel": {"model": friendly, **meta}})
+
     @app.post("/api/show")
     async def api_show(req: Request) -> JSONResponse:
         body = await req.json()

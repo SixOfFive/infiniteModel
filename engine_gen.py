@@ -392,6 +392,12 @@ class EngineGenMixin:
         repeat_last_n / presence_penalty / frequency_penalty / seed) for the PLAIN decode path;
         the speculative paths are greedy-only by construction and ignore it (penalties would
         break draft/target logit agreement)."""
+        # #t2i-serve: an image model has no token path — refuse text generation with a
+        # pointer to the right endpoint instead of a cryptic downstream crash.
+        _lm0 = self.models.get(friendly)
+        if _lm0 is not None and getattr(_lm0, "is_t2i", False):
+            raise ValueError(f"'{friendly}' is an image-generation model — "
+                             "use POST /v1/images/generations")
         # #juggler barrier: if this model is being promoted to VRAM (re-placed), hold the request
         # HERE — before it resolves a replica or takes a queue slot — until the swap finishes, then
         # fall through and pick the fresh copy. The client's connection just pauses (no reconnect).

@@ -575,6 +575,11 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
         lm = engine.models[name]
         entry["active"] = lm.active              # currently generating (0/1)
         entry["queued"] = lm.queued             # requests waiting on this model's lock
+        if getattr(lm, "is_t2i", False):         # #t2i-serve: image model — live render progress
+            entry["t2i"] = True
+            _pr = getattr(engine, "_t2i_progress", {}).get(getattr(lm, "t2i_req", None))
+            if _pr:
+                entry["t2i_step"], entry["t2i_total"] = _pr[0], _pr[1]
     if status in ("downloading", "pausing", "stopping", "paused", "stopped"):
         pr = DOWNLOAD_PROGRESS.get(name) or {}     # frozen at the halt point for paused/stopped
         dl, tot = pr.get("downloaded", 0), pr.get("total", 0)

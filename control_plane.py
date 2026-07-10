@@ -388,6 +388,22 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                              f"stage {msg.get('stage')} on {node.hostname} — {_err[:200]} — "
                              + (f"failed req {_rid} fast" if _live
                                 else f"(req {_rid} not pending — already resolved/reclaimed)"))
+            elif mtype == "t2i_step":
+                # #t2i-serve: per-step render progress. Stored on the engine for /status (the
+                # dashboard's live "step i/n" on the model card); also stamps the progress time
+                # so a wedged render is distinguishable from a slow one (t2i_generate's timeout).
+                _tp = getattr(engine, "_t2i_progress", None)
+                if _tp is None:
+                    _tp = engine._t2i_progress = {}
+                _tp[msg.get("req_id")] = (int(msg.get("step", 0)), int(msg.get("total", 0)),
+                                          time.time())
+            elif mtype in ("t2i_done", "t2i_err"):
+                # #t2i-serve: final render result — resolve the waiting t2i_generate future.
+                _pend = getattr(engine, "_t2i_pending", None) or {}
+                _fut = _pend.pop(msg.get("req_id"), None)
+                if _fut is not None and not _fut.done():
+                    _fut.set_result(msg)
+                getattr(engine, "_t2i_progress", {}).pop(msg.get("req_id"), None)
             elif mtype in ("ready", "error"):
                 _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":

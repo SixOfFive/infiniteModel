@@ -147,6 +147,8 @@ class EngineLoadMixin:
             import urllib.parse as _up
             _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
             _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
+            if _cdir and _is_diffusers_dir(_cdir):
+                return   # #t2i-serve: image checkpoints have no LLM shard cache to compile
             _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
             if _cdir and not (_cst.get(quant) or {}).get("ok"):
                 log_activity(f"{_ollama_name(friendly)}: no {quant} shard cache — building it now so this "
@@ -318,16 +320,14 @@ class EngineLoadMixin:
             from transformers import AutoTokenizer
             spec = resolve_spec(friendly)
             if spec is None:
-                # #t2i: a registered DIFFUSERS checkpoint (image generation — model_index.json,
-                # no top-level config.json) can never build an LLM spec. Refuse with the real
-                # reason instead of a misleading "unknown model" (which reads like a typo).
+                # #t2i-serve: a registered DIFFUSERS checkpoint (image generation —
+                # model_index.json, no top-level config.json) never builds an LLM spec;
+                # it loads via the single-node image path instead (task #37).
                 _tgt = MODELS[friendly][0] if friendly in MODELS else friendly
                 _d = _local_model_dir(_tgt)
                 if _d and _is_diffusers_dir(_d):
-                    raise ValueError(
-                        f"'{friendly}' is an image-generation (diffusers) checkpoint — "
-                        "it cannot be loaded as a text-generation model; the image "
-                        "pipeline is not implemented yet (weights are staged for it)")
+                    return await self._load_t2i_locked(friendly, _tgt, reg_key or friendly,
+                                                       quant, replica_idx=replica_idx)
                 raise ValueError(f"unknown model '{friendly}'")
             target_id = MODELS[friendly][0] if friendly in MODELS else friendly
             # ENCODER / sentence-embedding model: a whole-model single-node load (no pipeline/TP/KV
@@ -1150,6 +1150,204 @@ class EngineLoadMixin:
         log_activity(f"{reg_key} READY (embedding, {node.hostname}) "
                      f"[{len(self.models)} model(s) resident]")
         return lm
+
+    async def _load_t2i_locked(self, friendly: str, target_id: str, reg_key: str,
+                               quant: str = "int4", replica_idx: int = 0) -> LoadedModel:
+        """#t2i-serve (task #37): load a DIFFUSERS image-generation checkpoint (Qwen-Image
+        class) WHOLE onto ONE controller-CO-LOCATED GPU worker — the diffusion sibling of
+        _load_embedding_locked. v1 constraints, by design: the worker must share this box's
+        filesystem (it reads the model dir directly and hands back PNG paths — the only GPUs
+        that can host the 20B DiT in this fleet are on controller boxes anyway), and the DiT
+        serves with the GATE-TESTED mixed-edge recipe: middle blocks RTN int4 g128, the first
+        + last `edge` blocks bf16 (edge 2 ~= bf16 quality at ~13.5 GB; edge 1 is the tighter
+        fallback a 16 GB card may need). Text encoder runs on the worker's CPU (encode-once).
+        MUST be called with self.lock held (reached only from load())."""
+        model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+        # int8/int2 have no meaning for the DiT path — coerce to the tested tier, loudly.
+        if quant in ("int8", "int2"):
+            log_activity(f"{_ollama_name(friendly)}: {quant} is not a t2i tier — using int4 (mixed-edge)")
+            quant = "int4"
+        # Real dims from the shipped transformer config (generic across Edit variants etc.).
+        _tc = {}
+        with contextlib.suppress(Exception):
+            with open(os.path.join(model_dir, "transformer", "config.json"), encoding="utf-8") as _fh:
+                _tc = json.load(_fh)
+        _layers = int(_tc.get("num_layers") or 60)
+        _heads = int(_tc.get("num_attention_heads") or 24)
+        _hd = int(_tc.get("attention_head_dim") or 128)
+        dit_b = await asyncio.to_thread(_tree_weight_bytes, os.path.join(model_dir, "transformer"))
+        all_b = await asyncio.to_thread(_tree_weight_bytes, model_dir)
+        spec = ModelSpec(name=friendly, hidden_size=_heads * _hd, num_layers=_layers,
+                         num_heads=_heads, num_kv_heads=_heads, head_dim=_hd,
+                         intermediate_size=int(_tc.get("joint_attention_dim") or 3584),
+                         vocab_size=0, tie_embeddings=True, max_ctx=0, arch="t2i",
+                         meas_layer_w=max(1, dit_b // max(1, _layers)),
+                         meas_embed=0, meas_head=0, meas_norm=0,
+                         meas_params=max(1, all_b // 2))
+
+        def _est_gb(edge: int) -> float:
+            # measured on the gate test: pure int4 DiT ~0.284x bf16; each protected edge
+            # block adds back its bf16-minus-int4 delta; +0.5 GB VAE/embedders; the
+            # activation/decode margin is added by the caller.
+            if quant == "none":
+                return dit_b / GB + 0.6
+            blk = dit_b / max(1, _layers)
+            return (0.284 * dit_b + 2 * edge * blk * 0.716) / GB + 0.5
+
+        _MARGIN_GB = 2.2   # step activations (~1.8 GB @1024^2 with CFG) + allocator headroom
+        want_edge = 2 if quant != "none" else 0
+        await self.ensure_data_listener()
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (t2i)")
+            await self._await_free_refresh()
+        node = edge = None
+        while True:
+            # co-located = the worker advertises a loopback data endpoint (this box).
+            cand = [n for n in registry.alive_sorted()
+                    if n.can_infer and n.vram_total_gb > 0
+                    and (str(n.data_host).startswith(("127.", "::1"))
+                         or str(n.data_host) in _LOCAL_IPS)]
+            for n in sorted(cand, key=lambda x: x.vram_total_gb - x.vram_used_gb, reverse=True):
+                free = n.vram_total_gb - n.vram_used_gb
+                for e in ([want_edge, 1] if quant != "none" else [0]):
+                    if free >= _est_gb(e) + _MARGIN_GB:
+                        node, edge = n, e
+                        break
+                if node is not None:
+                    break
+            if node is not None:
+                break
+            victim = self._lru_evictable() if bool(ENGINE_CONFIG.get("auto_unload", True)) else None
+            if victim is None:
+                _need = _est_gb(1 if quant != "none" else 0) + _MARGIN_GB
+                raise RuntimeError(
+                    f"no controller-co-located GPU has ~{_need:.1f} GB free VRAM for the image "
+                    f"model ({'no co-located GPU workers connected' if not cand else 'and nothing evictable'})"
+                    " — v1 serves t2i only on a GPU sharing the controller's box")
+            await self._unload_model_locked(victim, "evict idle LRU: image model needs VRAM")
+            await self._await_free_refresh()
+        if edge != want_edge and quant != "none":
+            log_activity(f"{_ollama_name(friendly)}: tight VRAM on {node.hostname} — edge {edge} "
+                         f"(first+last {edge} blocks bf16) instead of {want_edge}")
+        self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
+                        "target": target_id, "total": 1, "ready": 0,
+                        "stages_total": 1, "stages_ready": 0,
+                        "basis": f"t2i: single-node ({node.hostname}, "
+                                 f"{quant if quant == 'none' else f'int4 edge{edge}'})",
+                        "warnings": [], "node_ids": [node.node_id],
+                        "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
+                        "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
+        link = self.links.get(node.node_id)
+        if link is None:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"no control link to {node.node_id}")
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        link.pending_loads[target_id] = fut
+        await link.send({
+            "type": "load", "kind": "t2i", "model_id": target_id,
+            "model_dir": model_dir, "quant": quant, "t2i_edge": edge,
+            "controller_http_port": ARGS.http_port,
+            "next_host": None, "next_port": ARGS.data_port,
+            "device": node.load_device(),
+        })
+        try:
+            r = await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
+        except Exception as exc:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"t2i load on {node.hostname} failed: {exc!r}")
+        if isinstance(r, dict) and r.get("type") == "error":
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"t2i load on {node.hostname} failed: {r.get('error')}")
+        gpu_b = int(r.get("gpu_bytes", 0)) if isinstance(r, dict) else 0
+        tot_b = int(r.get("loaded_bytes", 0)) if isinstance(r, dict) else 0
+        stage = StageAssign(node_id=node.node_id, hostname=node.hostname,
+                            layer_start=0, layer_end=spec.num_layers,
+                            has_embed=True, has_head=True,
+                            est_bytes=tot_b or spec.total_weight_bytes,
+                            usable_bytes=int(node.usable_total_gb * GB), gpu_bytes=gpu_b,
+                            loaded_bytes=tot_b)
+        plan = PlanResult(ok=True, model=spec.name, ctx_len=0,
+                          num_layers=spec.num_layers,
+                          pool_usable_gb=node.usable_total_gb,
+                          required_gb=(tot_b or spec.total_weight_bytes) / GB, stages=[stage])
+        node.shard_gpu_bytes = gpu_b
+        _dial = (_dial_host(node.data_host), node.data_port)
+        stage0_writer = await self._connect_retry(*_dial)
+        now = time.time()
+        lm = LoadedModel(reg_key, target_id, spec, 0, plan,
+                         [node.node_id], None, set(), now,
+                         quant=("none" if quant == "none" else f"int4-e{edge}"),
+                         stage0_writer=stage0_writer, last_used=now,
+                         stage0_dial=_dial, last_send_ts=now)
+        lm.base, lm.replica_idx = friendly, replica_idx
+        lm.plan_basis = "t2i: single-node"
+        lm.is_t2i = True
+        self.models[reg_key] = lm
+        self.loadings.pop(reg_key, None)
+        registry.dirty = False
+        print(f"[load] {reg_key} t2i on {node.hostname} "
+              f"({tot_b / GB:.1f} GB total, {gpu_b / GB:.1f} GB GPU)")
+        log_activity(f"{reg_key} READY (t2i, {node.hostname}, "
+                     f"{'bf16' if quant == 'none' else f'int4 edge{edge}'}) "
+                     f"[{len(self.models)} model(s) resident]")
+        return lm
+
+    async def t2i_generate(self, friendly: str, prompt: str, negative_prompt: str = " ",
+                           width: int = 1024, height: int = 1024, steps: int = 20,
+                           cfg: float = 4.0, seed=None) -> tuple[bytes, dict]:
+        """#t2i-serve: render one image on the model's worker. Serializes per model on
+        LoadedModel.lock (same discipline as text gens); the request travels the control
+        link, per-step progress arrives as t2i_step (see control_plane + /status), and the
+        finished PNG comes back as a LOCAL path (co-located worker) read + deleted here."""
+        lm = self.models.get(friendly)
+        if lm is None:
+            raise ValueError(f"model '{friendly}' is not loaded — load it first")
+        if not getattr(lm, "is_t2i", False):
+            raise ValueError(f"'{friendly}' is not an image-generation model")
+        async with lm.lock:
+            lm.last_used = time.time()
+            link = self.links.get(lm.stage_node_ids[0])
+            if link is None:
+                raise RuntimeError("the image model's worker is disconnected — reload the model")
+            rid = self._t2i_rid = getattr(self, "_t2i_rid", 0) + 1
+            pend = getattr(self, "_t2i_pending", None)
+            if pend is None:
+                pend = self._t2i_pending = {}
+            fut = asyncio.get_event_loop().create_future()
+            pend[rid] = fut
+            lm.active = 1
+            lm.t2i_req = rid            # status: lets the card find this render's progress
+            try:
+                await link.send({"type": "t2i_gen", "model_id": lm.target_id, "req_id": rid,
+                                 "prompt": str(prompt), "negative_prompt": str(negative_prompt or " "),
+                                 "width": int(width), "height": int(height),
+                                 "steps": int(steps), "cfg": float(cfg), "seed": seed})
+                # slowest observed ~42 s/step (gfx1151 sharing the GPU) — generous flat margin
+                r = await asyncio.wait_for(fut, timeout=300 + int(steps) * 120)
+            finally:
+                lm.active = 0
+                lm.t2i_req = None
+                pend.pop(rid, None)
+                getattr(self, "_t2i_progress", {}).pop(rid, None)
+            if not isinstance(r, dict) or r.get("type") == "t2i_err":
+                raise RuntimeError(f"image generation failed: "
+                                   f"{(r or {}).get('error', 'no result')}")
+            path = r.get("path") or ""
+
+            def _read() -> bytes:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                return data
+
+            data = await asyncio.to_thread(_read)
+            lm.last_used = time.time()
+            log_activity(f"{_ollama_name(friendly)}: image {width}x{height} steps={steps} "
+                         f"in {r.get('seconds', '?')}s ({len(data) / 1e6:.1f} MB)")
+            return data, {"seconds": r.get("seconds"), "steps": int(steps),
+                          "width": int(width), "height": int(height), "seed": seed}
 
     async def replicate(self, friendly: str, ctx: int, count: int,
                         consolidate: bool = True, prefer_vram: bool = True,
