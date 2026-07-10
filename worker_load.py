@@ -204,6 +204,45 @@ class WorkerLoadMixin:
                 return {"loaded_params": em.loaded_params,
                         "loaded_bytes": em.loaded_bytes,
                         "gpu_bytes": getattr(em, "gpu_bytes", 0)}
+            # T2I load (#t2i-serve): a diffusers image-generation pipeline (Qwen-Image class)
+            # builds WHOLE on THIS node — no pipeline stages, no KV. v1 constraint: the worker
+            # must be CO-LOCATED with the controller (shared filesystem) — the controller sends
+            # its LOCAL model dir and this branch reads it directly (no weight streaming), and
+            # generated PNGs are handed back as local paths. worker_t2i is imported lazily with
+            # a fetch-if-missing bridge so pre-#t2i workers converge without a restart loop.
+            if a.get("kind") == "t2i":
+                mdir = a.get("model_dir") or ""
+                if not os.path.isdir(mdir):
+                    raise RuntimeError(
+                        f"t2i model dir not visible on this worker: {mdir!r} — v1 serves "
+                        "image models only on a GPU worker co-located with the controller")
+                try:
+                    import worker_t2i
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_t2i.py")
+                    if not _src:
+                        raise RuntimeError("worker_t2i.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_t2i.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_t2i
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_t2i.T2IPipeline, mdir, device,
+                        str(a.get("quant") or "int4"), int(a.get("t2i_edge", 2)))
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes}
             self._building += 1   # mark BUSY across the build so reclaim/self-update can't kill it
             try:
                 shard = await asyncio.to_thread(self._build_shard, base, model_id, a)
@@ -440,6 +479,47 @@ class WorkerLoadMixin:
         m = shards.build_skeleton_from_config(cfg)
         self._pack_skel[model_id] = m
         return m
+
+    async def handle_t2i_gen(self, msg: dict, reply) -> None:
+        """#t2i-serve: run ONE image generation on this worker's resident T2IPipeline and mirror
+        the result over the control link. Dispatched as a TASK by command_loop (a render takes
+        minutes — awaiting it inline would block unload/ping handling), so replies are keyed by
+        req_id. Per-step progress mirrors as `t2i_step` (scheduled threadsafe from the render
+        thread); the finished PNG's LOCAL path returns in `t2i_done` (controller is co-located,
+        v1). _building marks the worker busy so self-update/reclaim won't kill a live render."""
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "t2i":
+            await reply({"type": "t2i_err", "req_id": rid, "model_id": mid,
+                         "error": "t2i model not resident on this worker"})
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_step(i: int, n: int) -> None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(
+                    reply({"type": "t2i_step", "req_id": rid, "model_id": mid,
+                           "step": i, "total": n}), loop)
+
+        try:
+            self._building += 1
+            try:
+                path, secs = await asyncio.to_thread(
+                    eng.generate, str(msg.get("prompt") or ""),
+                    str(msg.get("negative_prompt") or " "),
+                    int(msg.get("width", 1024)), int(msg.get("height", 1024)),
+                    int(msg.get("steps", 20)), float(msg.get("cfg", 4.0)),
+                    msg.get("seed"), _on_step)
+            finally:
+                self._building -= 1
+            await reply({"type": "t2i_done", "req_id": rid, "model_id": mid,
+                         "path": path, "seconds": round(secs, 1)})
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "t2i_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[t2i] generate FAILED: {exc!r}", flush=True)
 
     async def handle_pack(self, msg: dict) -> dict:
         """#distributed-packing Inc 1b/3b: pack ONE shard-cache unit FOR the controller (offloads the
