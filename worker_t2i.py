@@ -117,8 +117,15 @@ class T2IPipeline:
         except Exception:
             pass
 
-        self.pipe = QwenImagePipeline(scheduler=scheduler, vae=vae, text_encoder=text_encoder,
-                                      tokenizer=tokenizer, transformer=transformer)
+        # TWO pipeline views over shared components (the gate-harness topology, proven):
+        # a single pipeline holding the CPU text encoder makes diffusers' _execution_device
+        # resolve to CPU — latents/timesteps then prepare on CPU and the cuda DiT crashes with
+        # 'mat1 is on cpu'. The ENCODER view (TE+tokenizer, no transformer) encodes on CPU;
+        # the RENDER view (transformer+VAE, no TE) resolves cuda and runs the denoise loop.
+        self.enc = QwenImagePipeline(scheduler=scheduler, vae=None, text_encoder=text_encoder,
+                                     tokenizer=tokenizer, transformer=None)
+        self.pipe = QwenImagePipeline(scheduler=scheduler, vae=vae, text_encoder=None,
+                                      tokenizer=None, transformer=transformer)
 
         def _module_bytes(mod) -> int:
             return sum(p.numel() * p.element_size() for p in mod.parameters()) + \
@@ -154,12 +161,13 @@ class T2IPipeline:
             g = torch.Generator("cpu").manual_seed(int(seed))
 
             with torch.no_grad():
-                # Encode on CPU (the TE lives there); masks may legitimately come back None
-                # (this diffusers build drops an all-ones mask).
-                pe, pm = pipe.encode_prompt(prompt=prompt, device="cpu")[:2]
+                # Encode on CPU via the ENCODER view (the TE lives there); masks may
+                # legitimately come back None (this diffusers build drops an all-ones mask).
+                pe, pm = self.enc.encode_prompt(prompt=prompt, device="cpu")[:2]
                 ne = nm = None
                 if cfg > 1.0:
-                    ne, nm = pipe.encode_prompt(prompt=(negative_prompt or " "), device="cpu")[:2]
+                    ne, nm = self.enc.encode_prompt(prompt=(negative_prompt or " "),
+                                                    device="cpu")[:2]
                 _m = lambda x: x.to(dev) if x is not None else None
 
                 def _cb(_p, i, _t, kw):
