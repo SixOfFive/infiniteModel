@@ -123,6 +123,8 @@ def _fetch_repo_file(fname: str):
 # Extra repo files (besides the primary entry point) to keep in sync on self-update. Extracted
 # modules go here; a client+server SHARED module (wire.py) is listed in BOTH server.py + client.py.
 EXTRA_UPDATE_FILES: list[str] = ["worker_t2i.py",   # #t2i-serve: worker diffusion engine
+                                 "gptq_pack.py",       # #38: calibrated int2 compile (controller-only)
+                                 "calib_corpus.txt",   # #38: its bundled calibration text
                                  "wire.py", "dashboard_html.py", "placement.py", "shards.py",
                                  "shard_compile.py",   # code-split Inc 9: SHARED compile/pack family
                                  "formats.py", "multimodal.py", "graphs.py", "model_store.py",

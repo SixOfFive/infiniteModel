@@ -73,8 +73,11 @@ def register(app):
         import urllib.parse as _up
         import urllib.request as _ur
         from safetensors.torch import load as _stload, save as _stsave
-        if quant not in ("int4", "int8", "int2"):
-            return JSONResponse({"ok": False, "error": "int4|int8|int2 only"}, status_code=400)
+        if quant not in ("int4", "int8"):
+            # #38: int2 is GPTQ-calibrated — layer L needs layer L-1's QUANTIZED outputs, so
+            # per-unit remote packing can't reproduce it. int2 compiles locally (/compile_shards).
+            return JSONResponse({"ok": False, "error": "int4|int8 only (int2 is calibrated + "
+                                 "sequential — use /compile_shards)"}, status_code=400)
         try:
             friendly = resolve_model_name(model)
         except ValueError as exc:
@@ -160,8 +163,10 @@ def register(app):
         import urllib.parse as _up
         import urllib.request as _ur
         from safetensors.torch import load as _stload, save as _stsave
-        if quant not in ("int4", "int8", "int2"):
-            return JSONResponse({"ok": False, "error": "int4|int8|int2 only"}, status_code=400)
+        if quant not in ("int4", "int8"):
+            # #38: int2 is GPTQ-calibrated (sequential layer dependency) — not distributable.
+            return JSONResponse({"ok": False, "error": "int4|int8 only (int2 is calibrated + "
+                                 "sequential — use /compile_shards)"}, status_code=400)
         try:
             friendly = resolve_model_name(model)
         except ValueError as exc:

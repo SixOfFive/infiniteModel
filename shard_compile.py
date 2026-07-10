@@ -26,9 +26,16 @@ from wire import (_fuse_moe_experts)   # noqa: F401
 # the pack MATH changes (not for comments/refactors). A manifest WITHOUT packer_hash is legacy and is
 # grandfathered (accepted) so existing caches keep working.
 PACKER_VERSION = 1
+# int2 has its OWN version line (#38): v2 = the GPTQ-calibrated packer (gptq_pack.py). Every v1
+# int2 cache is plain-RTN token salad — the tag bump makes verify_shard_cache fail it with
+# "packer_hash mismatch — recompile", which is exactly the auto-invalidation we want, WITHOUT
+# touching the int4/int8 v1 caches (their pack math is unchanged).
+INT2_PACKER_VERSION = 2
 
 
 def _packer_tag(quant: str, group_size: int) -> str:
+    if quant == "int2":
+        return f"v{INT2_PACKER_VERSION}-g{group_size}-int2-gptq"
     return f"v{PACKER_VERSION}-g{group_size}-{quant}"
 
 
@@ -265,6 +272,12 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     if quant not in ("int4", "int8", "int2"):
         raise ValueError(f"shard cache supports quant int4|int8|int2 (got {quant!r})")
     group_size = _default_group(quant, group_size)   # int2 caches pack at INT2_GROUP (64)
+    if quant == "int2":
+        # #38: int2 is the GPTQ-CALIBRATED tier — plain RTN at 2 bits is token salad on every
+        # model tried, so the RTN unit loop below never runs for it. Lazy import (gptq_pack
+        # imports this module back at its top; function-scope breaks the cycle).
+        import gptq_pack
+        return gptq_pack.compile_int2_gptq(model_dir, group_size, progress)
     wm = _weight_map(model_dir)
     fp8_block = _fp8_block_size(model_dir)   # None unless this is an fp8 checkpoint (then dequant->bf16)
     nvfp4_group = _nvfp4_group_size(model_dir)   # None unless compressed-tensors nvfp4 (then dequant->bf16)
