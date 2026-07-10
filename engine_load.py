@@ -1201,11 +1201,15 @@ class EngineLoadMixin:
             await self._unload_model_locked(reg_key, "reload (t2i)")
             await self._await_free_refresh()
         node = edge = None
+        _ctrl_host = socket.gethostname()
         while True:
-            # co-located = the worker advertises a loopback data endpoint (this box).
+            # co-located = same box as the controller: hostname match (the robust signal —
+            # a standalone worker may register its LAN IP, e.g. om3nbox's 192.168.x) or a
+            # loopback/this-box data endpoint.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and n.vram_total_gb > 0
-                    and (str(n.data_host).startswith(("127.", "::1"))
+                    and (n.hostname == _ctrl_host
+                         or str(n.data_host).startswith(("127.", "::1"))
                          or str(n.data_host) in _LOCAL_IPS)]
             for n in sorted(cand, key=lambda x: x.vram_total_gb - x.vram_used_gb, reverse=True):
                 free = n.vram_total_gb - n.vram_used_gb
