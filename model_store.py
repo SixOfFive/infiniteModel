@@ -199,6 +199,18 @@ def _diffusers_complete(d: str) -> bool:
     exists has all referenced files present. Conservative: any doubt -> incomplete, so a
     partial pull is never migrated/reported ready (mirrors the flat check's contract)."""
     try:
+        # EVERY component declared in model_index.json must have its subdir on disk — the
+        # per-subdir checks below only validate dirs that EXIST, so without this a pull whose
+        # first component landed completely (text_encoder arrives before transformer/ in the
+        # sorted file list) read as "complete" at ~30% downloaded. Entries are name ->
+        # [library, class]; nulls (optional components) and _meta keys are skipped.
+        with open(os.path.join(d, "model_index.json"), encoding="utf-8") as fh:
+            mi = json.load(fh)
+        for comp, v in mi.items():
+            if comp.startswith("_") or not (isinstance(v, (list, tuple)) and any(v)):
+                continue
+            if not os.path.isdir(os.path.join(d, comp)):
+                return False                   # declared component not even started
         found_weights = False
         for sub in sorted(os.listdir(d)):
             sd = os.path.join(d, sub)
