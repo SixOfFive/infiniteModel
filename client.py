@@ -1027,6 +1027,9 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                         if msg.get("kind") == "embedding":   # no layer range — whole encoder on one node
                             print(f"[load] embedding {msg.get('model_id')} "
                                   f"({info['loaded_bytes']/GB:.2f} GB)")
+                        elif msg.get("kind") == "t2i":       # no layer range — whole pipeline on this node
+                            print(f"[load] t2i {msg.get('model_id')} "
+                                  f"({info['loaded_bytes']/GB:.2f} GB)")
                         else:
                             print(f"[load] stage {msg.get('stage')} "
                                   f"layers {msg['layer_start']}-{msg['layer_end']} "

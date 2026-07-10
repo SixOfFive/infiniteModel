@@ -153,6 +153,21 @@ def _fwd_watchdog_loop(worker) -> None:
                     continue                       # forward hasn't reached the layer loop yet
                 stalled = now - prog
                 if stalled > EXIT_S:
+                    # #t2i-contention: a live image render saturates the GPU (and the CPU via the
+                    # text encoder) for MINUTES — a co-resident text forward stalling then is
+                    # resource contention, not a poisoned forward, and exit(42) would murder the
+                    # healthy multi-minute render (observed: qwen3-30b stalled 332s beside a
+                    # Qwen-Image render at step 9/20 and the relaunch killed both). Defer the
+                    # nuclear option while any render is active; if the stall persists once the
+                    # render ends, a later scan still exits. Cooperative cancel above stays live.
+                    if any(getattr(s, "kind", "") == "t2i"
+                           and getattr(s, "_gen_lock", None) is not None
+                           and s._gen_lock.locked()
+                           for s in list(getattr(worker, "shards", {}).values())):
+                        print(f"[fwd-watchdog] {mid}: stalled {stalled:.0f}s but a t2i render is "
+                              f"active on this node — contention, deferring relaunch until the "
+                              f"render ends", flush=True)
+                        continue
                     print(f"[fwd-watchdog] {mid}: forward stalled {stalled:.0f}s with no layer progress "
                           f"— cooperative cancel ineffective; exiting(42) for supervisor relaunch",
                           flush=True)
