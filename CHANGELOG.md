@@ -18,6 +18,21 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   for Qwen3.6 was built and the forward validated (~84-88% accept), but shelved: the hybrid
   Gated-DeltaNet trunk can't roll back its recurrent state on reject (not bit-exact) and a 2-token
   verify costs ~2x on the compute-bound GPU pipeline (no wall-clock win). Code kept, gated off.
+- **#loopback-nexthop — LAN-visible next-hop wiring (2026-07-10).** A worker co-located with the
+  controller advertises a **loopback** data endpoint (fastest for the controller's own stage-0
+  dials) — but handed verbatim to a **remote** stage as its next pipeline hop (or TP mesh root),
+  `127.0.0.1:<data_port>` made that remote stage dial **itself**: every stage output looped
+  straight back into its own input (stage 0 then ate its own bf16 hidden state as "token ids"),
+  and even the data-plane error frames cycled forever on the self-hop — the engine of a silent
+  wedge storm that only struck placements with a mid-chain hop *into* the controller's box (rare:
+  the planner usually seats that node first, so it masqueraded as intermittent "worker state
+  poisoning" for a day). Fixed at wiring time (`Engine._lan_visible_host`, applied to pipeline
+  `next_host` + TP `tp_root_host`): a loopback next-hop for a remote receiver is translated to the
+  controller's address as that receiver already reaches it (its control-link sockname; fallback:
+  first LAN IP); a receiver on the controller's own box keeps the loopback (correct and fastest).
+  Caught within minutes by the silent-wedge hardening below (the dtype door-guard named the
+  looped frame; the control-link stage_error delivered it) — the two fixes together close both
+  the cause and the blindness.
 
 ## Memory, quantization & the shard cache
 - **int4** (group-wise asymmetric, fused tinygemm GEMM) and **int8** (per-channel) load-time quant;

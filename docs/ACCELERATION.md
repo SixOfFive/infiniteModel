@@ -20,6 +20,13 @@ There are two hot matmul classes per layer:
 | **AMD ROCm · RDNA** (e.g. Strix Halo gfx1151) | **Triton w4a16 + split-K** GEMV | **fused Triton w4a16** | automatic (only fast path here) |
 | **CPU** | tinygemm-cpu (`_weight_int4pack_mm_for_cpu`) | bf16 rematerialize per expert | automatic (default) |
 
+**int2 (dense only):** there is no torch tinygemm for 2-bit, so a Triton **w2a16** batch +
+split-K-GEMV pair (same structure and autotune space as the w4a16 family) is the fused path on
+**both** CUDA and ROCm — self-checked vs the naive dequant at placement, automatic naive fallback,
+`IM_FUSED_INT2=0` kill-switch; no-triton workers (e.g. Windows) fall back to naive automatically.
+(Note: the int2 *tier* is currently infrastructure-complete but its plain-RTN packer collapses
+model quality — see the CHANGELOG entry; the kernels are exact and ready for a calibrated packer.)
+
 ### Why the split
 
 - **Dense:** on NVIDIA and CPU, torch ships a tuned fused int4 GEMM (`_weight_int4pack_mm`) — this is

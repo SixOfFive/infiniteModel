@@ -60,42 +60,26 @@ dashboard.
   `response_format` — best-effort instruction + fence-stripping), OpenAI text-part list content,
   Ollama-native per-message `images:[b64]` and `/api/generate` top-level `images`.
 - **Multi-model & ops.** N models resident at once, node-sharing, concurrency + queueing,
-  auto-load/unload, a live dashboard (placement preview, per-load progress, fleet memory/throughput,
-  bandwidth), curl-able fleet logs, and idle-gated self-update. **Idle unload** (settings page /
-  `/config?idle_unload_m=`): unload any model that served no requests for N minutes — default 0 =
-  every model stays loaded forever (`-1`, the Ollama-style spelling, is accepted and saves as -1
-  with the same meaning); models with an active or queued request — and either **per-model lifecycle
-  pin** — are never idle-unloaded. Those pins live on the model-detail modal: **Autoload on restart**
-  re-streams a model to its workers on controller startup so it survives a restart/redeploy, and
-  **Do not auto-unload** is an absolute veto (never reclaimed by idle-unload *or* by LRU eviction — a
-  new load that can't otherwise fit fails instead). **Juggler** (settings page, opt-in): on a ~60 s
-  sweep — and right after an idle-unload frees VRAM — the hottest model still running split across
-  GPU+RAM *that would now fit entirely on GPU* — and is momentarily idle — is *promoted* to VRAM-only
-  by a **hitless** re-place: new requests briefly pause on their still-open connection (no reconnect)
-  while it re-places VRAM-first, then resume on the faster copy. A busy model is skipped (a later sweep
-  catches it at a gap) rather than stalled; embeddings and models too big for GPU are skipped; a
-  do-not-auto-unload model is promoted too, since the reload is a better placement, never a removal
-  (and it's never left unloaded).
-  **Autostart delay** (`autostart_delay_s`, default 60 s) holds the startup reload of persisted
-  models that long so clients reconnect first. **Honest overload behavior:** under GPU contention the endpoint degrades into
-  *retryable* backpressure, not failures — slow-but-advancing prefills are never reclaimed as wedged
-  (workers report per-layer forward progress over their heartbeat), the prefill wait extends while
-  progress advances, and contention-class failures return `503 + Retry-After` (Ollama/OpenAI) or
-  `529 overloaded_error` (Anthropic) instead of bare 500s or dropped sockets. Per-load knobs: KV-cache placement
-  (**GPU or system RAM** — offloading frees the VRAM KV reserve for model layers, for long context
-  on small cards) and **per-model default temperature + min-p** (used when a request doesn't send
-  its own). **Min-p sampling** is supported per-request too (Ollama `options.min_p`, top-level
-  `min_p` on the OpenAI/Anthropic endpoints): tokens below `min_p` × the top token's probability
-  are dropped — a confidence-adaptive floor that pairs well with high temperature.
-- **The full sampling-knob family, per-request and runtime-tunable.** `top_p`, `top_k`,
-  `repeat_penalty` (+ `repeat_last_n` window), `presence_penalty`, `frequency_penalty` and
-  `seed` (reproducible sampling) work per-request on all three APIs (Ollama `options.*`;
-  top-level on OpenAI/Anthropic, `repetition_penalty` accepted as an alias). Every knob — plus
-  a default `num_predict` for requests that send no length cap — is also a **runtime-mutable
-  per-model default**: `POST /model_config?model=...&top_k=40&repeat_penalty=1.1...` applies
-  instantly to a loaded model (empty string clears; explicit request values always win), and the
-  dashboard's model-detail **Runtime settings** panel edits all of them with suggested-value
-  dropdowns.
+  auto-load/unload with **idle unload**, per-model lifecycle pins (**autoload on restart**,
+  **do-not-auto-unload** veto), and the opt-in **juggler** — a ~60 s sweep that *hitlessly*
+  promotes the hottest GPU+RAM-split model to VRAM-only once room frees (new requests just pause
+  on their open connection during the re-place; busy models are skipped, never stalled). A live
+  dashboard (placement preview, per-load progress, fleet memory/throughput, bandwidth,
+  per-client connections), curl-able fleet logs (`/logs?node=…`), and idle-gated self-update.
+  **Full guide → [docs/OPERATIONS.md](docs/OPERATIONS.md).**
+- **Self-healing under load and failure.** Honest overload behavior: contention degrades into
+  *retryable* backpressure (`503 + Retry-After` / Anthropic `529`), and slow-but-advancing
+  prefills are never reclaimed as wedged (workers heartbeat per-layer forward progress). Worker
+  compute errors surface **instantly** on the controller over the control link (a causal 500,
+  never a silent multi-minute stall); a gen-stall watchdog reclaims truly wedged generations; and
+  a **wedge quarantine** auto-re-places any model that wedges repeatedly (fresh shards + fresh
+  connections). Details + the full config reference → [docs/OPERATIONS.md](docs/OPERATIONS.md).
+- **The full sampling-knob family, per-request and runtime-tunable.** `temperature`, `top_p`,
+  `top_k`, `min_p`, `repeat_penalty` (+ window), `presence`/`frequency_penalty`, `seed`,
+  `num_predict` — per-request on all three APIs and runtime-mutable as per-model defaults
+  (`POST /model_config`, or the model-detail **Runtime settings** panel). Per-load knobs include
+  KV-cache placement (GPU or system RAM) and per-model default temperature/min-p — see
+  [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## How it works
 
