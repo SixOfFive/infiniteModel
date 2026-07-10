@@ -99,6 +99,22 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   non-fatal (any failure falls through to the cold on-the-fly load).
 
 ## Models
+- **Diffusers-layout repos are first-class downloads (#t2i, 2026-07-10).** A multi-component
+  image-generation checkpoint (`model_index.json` + `transformer/`/`text_encoder/`/`vae/`/`tokenizer/`
+  subfolders — Qwen-Image class) now flows through the normal `/add_model` → background pull →
+  dashboard progress card → migrate-to-`models/` lifecycle like any flat LLM repo. Completeness is
+  diffusers-aware (`_diffusers_complete`: every component subdir with a `config.json` must hold
+  weights, sharded sets verified per-prefix against their `-of-N` count *and* their index's
+  `weight_map`; conservative — partial pulls never migrate or report ready); the cache→`models/`
+  migration walks recursively preserving the component tree (it was top-level-only — subfolders were
+  silently dropped) and now also carries `.py`/`.jinja`/`.txt`/`.model` sidecars; the pull and
+  progress-total extension sets were widened in lockstep so tokenizer files (`merges.txt`,
+  sentencepiece) arrive and the % denominator matches reality. Status badges the model **🖼 t2i**
+  (and no longer freezes an empty badge set computed before a model finished downloading), sizes it
+  by recursive safetensors sum, `/api/show` reports `capabilities: ["t2i"]`, the dashboard shows
+  "pipeline pending" instead of a Load button, and `engine.load` refuses with the real reason
+  instead of "unknown model". The **serving pipeline for these checkpoints is a separate, pending
+  feature** — this milestone makes acquisition/registry/UI treat them properly.
 - **Model aliases shown in the UI**: a registry alias (e.g. `qwen2.5:14b` → `qwen2.5:14b-instruct`,
   via `MODEL_ALIASES`) is now surfaced as an "alias: …" line under the model's primary name — in the
   models list, each loaded-model card, and the model detail modal — so it's obvious which alternate
