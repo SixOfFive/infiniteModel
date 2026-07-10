@@ -59,8 +59,19 @@ dashboard.
   bandwidth), curl-able fleet logs, and idle-gated self-update. **Idle unload** (settings page /
   `/config?idle_unload_m=`): unload any model that served no requests for N minutes — default 0 =
   every model stays loaded forever (`-1`, the Ollama-style spelling, is accepted and saves as -1
-  with the same meaning); pinned (📌) models and models with an active or queued request are never
-  idle-unloaded. **Honest overload behavior:** under GPU contention the endpoint degrades into
+  with the same meaning); models with an active or queued request — and either **per-model lifecycle
+  pin** — are never idle-unloaded. Those pins live on the model-detail modal: **Autoload on restart**
+  re-streams a model to its workers on controller startup so it survives a restart/redeploy, and
+  **Do not auto-unload** is an absolute veto (never reclaimed by idle-unload *or* by LRU eviction — a
+  new load that can't otherwise fit fails instead). **Juggler** (settings page, opt-in): on a ~60 s
+  sweep — and right after an idle-unload frees VRAM — the hottest model still running split across
+  GPU+RAM *that would now fit entirely on GPU* is *promoted* to VRAM-only by a **hitless**
+  drain-and-reload: new requests briefly pause on their still-open connection (no reconnect) while its
+  in-flight generation finishes and it re-places VRAM-first. Embeddings and models too big for GPU are
+  skipped; a do-not-auto-unload model is promoted too, since the reload is a better placement, never a
+  removal (and it's never left unloaded).
+  **Autostart delay** (`autostart_delay_s`, default 60 s) holds the startup reload of persisted
+  models that long so clients reconnect first. **Honest overload behavior:** under GPU contention the endpoint degrades into
   *retryable* backpressure, not failures — slow-but-advancing prefills are never reclaimed as wedged
   (workers report per-layer forward progress over their heartbeat), the prefill wait extends while
   progress advances, and contention-class failures return `503 + Retry-After` (Ollama/OpenAI) or

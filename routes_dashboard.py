@@ -313,7 +313,8 @@ def register(app):
                 _nu = dict(ENGINE_CONFIG.get("no_unload_models") or {})
                 _nu[fr] = True
                 ENGINE_CONFIG["no_unload_models"] = _nu
-                log_activity(f"no-unload: {fr} pinned — never auto-unloaded (idle/LRU/juggler all skip it)")
+                log_activity(f"no-unload: {fr} pinned — never auto-unloaded by idle-unload or LRU "
+                             f"(the juggler may still reload it to a better placement, never removing it)")
         if no_unload_off is not None:
             with contextlib.suppress(ValueError):
                 fr = resolve_model_name(no_unload_off)

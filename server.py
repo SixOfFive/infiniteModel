@@ -903,21 +903,28 @@ ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        # set via /config?persist=<model> / the dashboard 📌 toggle.
                        "persist_models": {},
                        # #no-unload: per-model ABSOLUTE do-not-auto-unload veto (reg_key -> true).
-                       # A model in this set is NEVER auto-unloaded — not by idle_unload_m, not by
+                       # A model in this set is NEVER auto-unloaded — not by idle_unload_m, and not by
                        # LRU eviction to make room for a new load (a load that can't otherwise fit
-                       # FAILS instead), and it is never disturbed by the juggler. It is the flag
-                       # that WINS over every other automatic-unload path. Independent of
-                       # persist_models (that survives a restart but stays evictable under pressure).
+                       # FAILS instead). It WINS over every automatic-REMOVAL path. The juggler is the
+                       # ONE deliberate exception: it may still RELOAD a pinned model to PROMOTE it to a
+                       # faster VRAM-only placement — a reload-in-a-better-way, NOT a removal (and it
+                       # restores the model if a rare double-failure evicts it, so "never auto-unloaded"
+                       # still holds). Independent of persist_models (survives a restart but stays
+                       # evictable under pressure).
                        # Opt-in (default empty); set via /config?no_unload=<model> / the dashboard
                        # per-model checkbox.
                        "no_unload_models": {},
-                       # #juggler: when a model is AUTOMATICALLY unloaded (idle-unload or LRU
-                       # eviction) and that frees VRAM, promote the HOTTEST resident model that is
-                       # running split GPU+RAM (hybrid) to VRAM-only IF the freed VRAM now lets its
-                       # weights fit entirely on GPU. One promotion per event, and only while that
-                       # model is momentarily idle (a reload would drop an in-flight request -> 5xx).
-                       # Lets models auto-load hybrid under pressure yet migrate to full-GPU speed as
-                       # the hot one out-competes the others for VRAM. Opt-in (default off).
+                       # #juggler: promote a resident model running split GPU+RAM (hybrid) to VRAM-only
+                       # once the fleet has room. Fires on TWO triggers — right after an idle-unload
+                       # frees VRAM, AND a periodic ~60s sweep (juggle_sweep_s) so it also acts when
+                       # VRAM frees for any OTHER reason (a manual unload, a shrinking KV, an earlier
+                       # promotion). Picks the hottest hybrid that would now fit ENTIRELY on GPU (skips
+                       # embeddings and anything that can't fit) and does a HITLESS swap: a per-model
+                       # barrier holds new requests, the in-flight generation drains, then reconfigure
+                       # re-places it VRAM-first — so the client's open connection just pauses across
+                       # the re-place (no reconnect). One promotion per pass, serialized. Lets models
+                       # auto-load hybrid under pressure yet migrate to full-GPU speed as the hot one
+                       # out-competes the others for VRAM. Opt-in (default off).
                        "juggler": False,
                        # #autostart-delay: minimum wall-clock seconds _persist_reload waits on
                        # startup before it begins reloading persisted models — ON TOP of waiting for
@@ -2322,6 +2329,19 @@ def build_app() -> FastAPI:
                 if stale and ENGINE_CONFIG.get("juggler", False):
                     asyncio.create_task(engine._maybe_juggle("idle-unload"))
         idle_unloader = asyncio.create_task(_idle_unload_loop())
+        async def _juggler_sweep_loop():
+            # #juggler periodic sweep: independent of idle-unload, check every ~60s whether a hybrid
+            # (GPU+RAM) model can now be promoted to VRAM-only — so a promotion fires when VRAM frees
+            # for ANY reason (a manual unload, a shrinking KV, an earlier promotion completing), not
+            # only right after an idle-unload. No-op when juggler is off; _maybe_juggle self-guards,
+            # serializes on _juggle_lock (so it can't collide with an idle-unload-triggered run), and
+            # stays quiet when nothing is promotable. juggle_sweep_s tunes the cadence (default 60s).
+            while True:
+                await asyncio.sleep(max(10.0, float(ENGINE_CONFIG.get("juggle_sweep_s", 60.0) or 60.0)))
+                if ENGINE_CONFIG.get("juggler", False):
+                    with contextlib.suppress(Exception):
+                        await engine._maybe_juggle("periodic sweep")
+        juggler_sweeper = asyncio.create_task(_juggler_sweep_loop())
         async def _persist_reload():
             # #77: re-load the PERSISTED models on startup so a resident model survives a controller
             # restart/crash/deploy without a manual reload (workers drop their shards on link loss, so
@@ -2406,7 +2426,7 @@ def build_app() -> FastAPI:
             # (each parked in readline()), so we drop those connections first and
             # time-box the wait — this is what makes Ctrl-C actually quit.
             print("\n[*] shutting down controller…")
-            for t in (serve, reaper, sampler, updater, idle_unloader, persist_reloader):
+            for t in (serve, reaper, sampler, updater, idle_unloader, juggler_sweeper, persist_reloader):
                 t.cancel()
             ctrl.close()
             with contextlib.suppress(Exception):

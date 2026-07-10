@@ -1523,36 +1523,45 @@ class EngineLoadMixin:
             return False
 
     async def _maybe_juggle(self, reason: str = "auto-unload") -> None:
-        """#juggler: after an AUTOMATIC unload freed VRAM, promote the HOTTEST resident model that is
-        running split GPU+RAM (hybrid) to VRAM-only — IF the freed VRAM now lets its weights fit
-        entirely on GPU. HITLESS: engage a per-model barrier so new requests wait, DRAIN the in-flight
-        generation, re-place VRAM-first via reconfigure (atomic + rollback), then release the barrier.
-        The client's open connection simply pauses across the swap — no reconnect. Opt-in
-        (ENGINE_CONFIG['juggler']); one model per call; serialized by _juggle_lock."""
+        """#juggler: promote a resident model that is running split GPU+RAM (hybrid) to VRAM-only once
+        the fleet has room. TWO triggers (both opt-in via ENGINE_CONFIG['juggler']): the idle-unload
+        hook (right after a reclaim frees VRAM) AND a periodic ~60s sweep (_juggler_sweep_loop) — so a
+        promotion also happens when VRAM frees for ANY reason (a manual unload, a shrinking KV, an
+        earlier promotion), not just on idle-unload. Walks the promotable hybrids HOTTEST-first and
+        promotes the hottest one whose weights would now fit ENTIRELY on GPU: a bigger, hotter hybrid
+        that still won't fit must NOT block a smaller one that would, and a model that can never fit
+        (too big for the fleet's GPUs) is simply skipped. Embeddings / encoder models are IGNORED —
+        they run on CPU by design and aren't served through the generate() barrier, so they can't be
+        promoted to GPU. HITLESS: engage a per-model barrier so new requests wait, DRAIN the in-flight
+        generation, re-place VRAM-first via reconfigure (atomic + rollback), then release the barrier —
+        the client's open connection just pauses across the swap, no reconnect. One promotion per call;
+        serialized by _juggle_lock. #no-unload / persist PINNED models are eligible on purpose (a
+        promotion is a reload-in-a-BETTER-way, not a removal — the finally restores a pinned target if a
+        rare reconfigure+rollback double-failure ever evicts it, so "never auto-unloaded" still holds)."""
         if not ENGINE_CONFIG.get("juggler", False) or self._juggle_lock.locked():
             return
         async with self._juggle_lock:
-            # 1) hottest hybrid candidate (freshest use wins, so a 'constantly in use' model beats
-            #    quieter hybrids). Skip embeddings (tiny/CPU) and anything already ~all-GPU.
-            cand, best_hot = None, -1.0
+            # 1) rank the PROMOTABLE hybrids by hotness (freshest use first, so a 'constantly in use'
+            #    model wins). Skip embeddings/encoders (CPU-by-design, not served through the barrier)
+            #    and anything already ~all-GPU (nothing to promote).
+            cands = []
             for fr, m in list(self.models.items()):
-                if getattr(m.spec, "is_embedding", False):
+                if getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False):
                     continue
                 if self._model_cpu_frac(m) <= 0.02:
                     continue
                 hot = max(m.last_used or 0.0, getattr(m, "last_token_ts", 0.0) or 0.0)
-                if hot > best_hot:
-                    best_hot, cand = hot, (fr, m)
-            if cand is None:
-                return
-            fr, m = cand
-            base = m.base or fr
-            # 2) only commit to the disruptive re-place if it will actually land fully on GPU now.
-            if not await self._juggle_would_fit_vram(m):
-                log_activity(f"juggler: {fr} is {self._model_cpu_frac(m)*100:.0f}% on CPU but still "
-                             f"won't fit VRAM-only after {reason} — leaving it")
-                return
-            if fr not in self.models:                       # unloaded during the fit-check await
+                cands.append((hot, fr, m))
+            cands.sort(key=lambda t: t[0], reverse=True)    # hottest first
+            # 2) promote the HOTTEST candidate that would now land FULLY on GPU. Skip (don't block on)
+            #    any hotter one that still won't fit VRAM-only. Quiet no-op when nothing fits — this
+            #    runs every ~60s, so it must NOT log on the common "nothing to do" case.
+            fr = m = base = None
+            for _hot, _fr, _m in cands:
+                if await self._juggle_would_fit_vram(_m):
+                    fr, m, base = _fr, _m, (_m.base or _fr)
+                    break
+            if fr is None or fr not in self.models:
                 return
             # 3) HITLESS swap: barrier -> drain -> reconfigure VRAM-first -> release.
             gate = asyncio.Event()                          # CLEAR (present) = barrier engaged
@@ -1569,7 +1578,7 @@ class EngineLoadMixin:
                     log_activity(f"juggler: {fr} still busy after {drain_s:g}s — deferring promotion")
                     return
                 log_activity(f"juggler: promoting {fr} to VRAM-only "
-                             f"({self._model_cpu_frac(m)*100:.0f}% was on CPU) after {reason} — "
+                             f"({self._model_cpu_frac(m)*100:.0f}% was on CPU) [{reason}] — "
                              f"hitless re-place")
                 await self.reconfigure(fr, tp=getattr(m, "tp_size", 1), ctx=m.ctx,
                                        quant=(m.quant or "none"), consolidate=True,
@@ -1581,8 +1590,24 @@ class EngineLoadMixin:
             except Exception as exc:
                 log_activity(f"juggler: promote {fr} FAILED ({exc!r})")
             finally:
-                gate.set()                                  # wake every barrier waiter
-                self._promote_gates.pop(base, None)
+                # #no-unload safety: a promotion is a reload-in-a-BETTER-way, NEVER a removal — so a
+                # pinned (do-not-auto-unload / persist) target must be resident again BEFORE the barrier
+                # releases, even in the rare case reconfigure AND its rollback both failed. The gate
+                # release is in an INNER finally so it ALWAYS runs — even if the restore await is
+                # cancelled at shutdown (CancelledError is a BaseException that suppress(Exception)
+                # would not catch), the barrier must never be left engaged with waiters parked on it.
+                try:
+                    _pinned = (base in (ENGINE_CONFIG.get("no_unload_models") or {})
+                               or fr in (ENGINE_CONFIG.get("no_unload_models") or {})
+                               or base in (ENGINE_CONFIG.get("persist_models") or {})
+                               or fr in (ENGINE_CONFIG.get("persist_models") or {}))
+                    if _pinned and fr not in self.models:
+                        log_activity(f"juggler: {fr} is pinned but not resident after promotion — restoring")
+                        with contextlib.suppress(Exception):
+                            await self.load(fr, m.ctx, quant=(m.quant or "none"))
+                finally:
+                    gate.set()                              # wake every barrier waiter (ALWAYS)
+                    self._promote_gates.pop(base, None)
 
     async def _await_free_refresh(self, timeout: float = 12.0) -> None:
         """After unloading, wait for workers to gc and report FRESH free RAM (via the next

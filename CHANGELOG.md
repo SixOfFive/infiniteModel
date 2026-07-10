@@ -252,7 +252,7 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   across data-parallel replicas (unload(base) cascades, and the base carries last_used while the
   routed replica carries active/last_token_ts — judging one key alone could reap a group whose
   sibling is mid-decode); models with an active or queued request, a held per-model lock
-  (embeddings), or a 📌 pin (persist_models) are never idle-unloaded, and the speech thinker
+  (embeddings), or either lifecycle pin (persist_models / no_unload_models) are never idle-unloaded, and the speech thinker
   stamps per-step progress so long TTS runs aren't reaped. Replaces the old hidden coupling
   where the LRU auto-unload checkbox also enabled a hardcoded 60-min idle unload. Ollama
   `/api/ps` `expires_at` is now honest: last activity + the idle window when the knob is on.
@@ -382,6 +382,27 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 - **Idle-unload accepts `-1` as "keep forever":** the Ollama-style sentinel round-trips (saves and
   displays as -1) instead of silently resetting to 0; -1 and 0 mean the same thing — the reaper is
   off and `/api/ps` reports effectively-never expiry.
+- **Lifecycle pins + the juggler (hitless VRAM promotion).** Two independent per-model pins on the
+  model-detail modal plus one global control. **Autoload on restart** (`persist_models`, previously
+  API-only, now a checkbox) re-streams a model to its workers on controller startup so a resident
+  model survives a restart/redeploy. **Do not auto-unload** (`no_unload_models`, `/config?no_unload=`)
+  is an absolute veto: the model is never reclaimed by idle-unload *or* by LRU eviction — a new load
+  that can't otherwise fit FAILS rather than displacing it (distinct from persist, which survives a
+  restart but stays evictable under memory pressure). **Juggler** (`/config?juggler=`, off by default)
+  turns a model that auto-loaded HYBRID (weights split GPU+RAM under memory pressure) back into a
+  full-GPU model once room frees: on a ~60 s sweep (and right after an idle-unload frees VRAM) it picks
+  the hottest resident hybrid *that a VRAM-first planner dry-run says now fully fits on GPU* — skipping
+  embeddings and any hybrid too big to fit, so a bigger hot one never blocks a smaller promotable one —
+  then does a **hitless** swap: a per-model barrier (checked at the top of `generate()` before the request takes
+  a queue slot, so it's race-tight with the drain) holds new requests, the in-flight generation
+  drains, `reconfigure` re-places it VRAM-first (atomic, with rollback), and the barrier releases — so
+  the client's open connection just pauses across the re-place, no reconnect. The juggler is exempt
+  from the do-not-auto-unload veto BY DESIGN: it may promote a pinned hybrid too, because a promotion
+  is a reload-into-a-better-placement, not a removal — and it restores the model if a rare
+  double-failure ever evicts it, so the pin's "always resident" contract still holds. **Autostart
+  delay** (`autostart_delay_s`, default 60 s) makes the startup reload of persisted models wait at
+  least that long — on top of the fleet-settle wait — so API clients reconnect before the controller
+  gets busy streaming weights.
 
 ## Public release
 - Central `config.json` (all hosts/ports + the self-update source; no addresses baked into code);
