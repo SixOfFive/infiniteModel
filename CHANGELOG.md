@@ -440,6 +440,27 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   `{"error":…}` object (no longer a clean `finish_reason:"stop"` that presented a truncated answer
   as complete — the worst of the pre-fix cases), Anthropic an `overloaded_error` event — rather than
   a silently truncated stream; a genuine client disconnect or user cancel still drops the connection.
+- **#at-capacity + #autoload-herd — a cold model at a full cap answers honestly, and concurrent
+  auto-loads share one load (2026-07-10).** With `auto_load` on but `max_loaded` reached and
+  `auto_unload` OFF, every request for a cold model failed at the resident-cap check — and serving
+  mapped that to `503 + Retry-After: 3`, a promise no retry could ever keep (a probe measured an
+  honest client retrying 25× over 90 s, forever-looping). Capacity failures are now a typed
+  `CapacityError` whose `terminal` flag distinguishes the two shapes at all three raise sites
+  (resident cap, no-room, won't-fit-even-at-minimum-ctx): *retryable* = eviction is possible but
+  blocked right now (residents busy serving) → unchanged `503 + Retry-After: 3`; *terminal* =
+  no automatic recovery exists (auto-unload off, or every resident `no_unload`-pinned) → `503`
+  with `code`/`state` **`at_capacity`** and **no Retry-After**, on every surface (OpenAI, Ollama,
+  Anthropic, embeddings). The auto-load's one-shot bf16 fallback is skipped on a CapacityError
+  (bf16 is strictly bigger — it can only fail the same way). Two adjacent fixes in the same pass:
+  the **Anthropic path returned `404 not_found_error` for any load failure** (a capacity problem
+  looked like a nonexistent model to Claude Code) — now typed 503s per terminality, embedding-
+  misuse a 400; and **concurrent requests for the same cold model now await ONE shared load task**
+  (`#autoload-herd`) — previously each duplicate queued behind the engine lock and, on acquiring
+  it, found the model resident and *reloaded* it (serial unload+reload churn that could kill the
+  first request's generation; measured fixed: 3 concurrent cold requests → exactly one load, all
+  three served). `/api/ps` alias-echo rows (a loaded model re-listed under its alias names) now
+  carry `alias_of: <canonical>` so clients counting real instances can filter them — the admission
+  cap never counted echoes.
 - **Idle-unload accepts `-1` as "keep forever":** the Ollama-style sentinel round-trips (saves and
   displays as -1) instead of silently resetting to 0; -1 and 0 mean the same thing — the reaper is
   off and `/api/ps` reports effectively-never expiry.
