@@ -773,6 +773,17 @@ class EngineLoadMixin:
                     except Exception as _ce:
                         log_activity(f"{friendly}: shard-cache check failed ({_ce!r}) -> bf16 stream")
                         _cache_quant = ""
+                    # #38: int2 WITHOUT a valid calibrated cache must FAIL LOUD, never fall back.
+                    # The bf16-stream fallback (correct for int4 — cold quant == cache by
+                    # construction) would silently serve load-time RTN int2 = token salad. int2
+                    # stays explicit-compile by policy (never auto-built on first load), so the
+                    # operator gets the exact next step instead of a garbage model.
+                    if quant == "int2" and not _cache_quant:
+                        raise RuntimeError(
+                            "int2 needs a valid CALIBRATED shard cache (packer v2 gptq) — this "
+                            "model's int2 cache is missing, stale (v1 RTN), or corrupt. Build it "
+                            "via the dashboard's 'Compile int2' or POST /compile_shards?model="
+                            f"{_ollama_name(friendly)}&quant=int2, then load again")
                 futs: dict[str, asyncio.Future] = {}
                 loop = asyncio.get_event_loop()
                 for i, st in enumerate(stages):
