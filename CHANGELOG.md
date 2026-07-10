@@ -188,6 +188,28 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 ## Multi-model & ops
 - N models resident at once, per-node sharing, concurrency + queueing, auto-load/unload, same-model
   replication + data-parallel routing.
+- **Silent-wedge hardening (the beast kernel-panic postmortem, 2026-07-10).** A poisoned 30h-old
+  worker process turned every distributed vision prefill into a silent 240s gen-stall reclaim —
+  37 wedges in 5.5h, each client retry re-wedging, and the accumulated pathological load fed a
+  host kernel panic (netconsole-captured NULL-deref; no GPU Xid — nvidia/UVM software state, not
+  hardware). The worker's stage exception ("F.embedding got CUDABFloat16" — the mm companion frame
+  consumed as forward input) never reached the controller: the data-plane error frame rides the
+  one-way stage chain a stale hop can eat. Four fixes so one sick worker can never again become an
+  hours-long wedge storm: (1) **#stage-error-ctrl** — every stage COMPUTE exception is also
+  mirrored over the heartbeat-kept control link; the controller fails the request's future
+  immediately (fast causal 500 instead of a blind stall) and logs every arrival, matched or not;
+  (2) **#mm-pairing** — the prefill ids frame declares its multimodal companion (`hdr["mm"]`):
+  declared-but-missing fails loud (never run a vision prefill unspliced), undeclared never claims
+  (a leaked companion + controller-restart req_id collision can't splice stale image embeds into an
+  unrelated prompt), and staged companions expire after 10 min; (3) **#stage0-dtype-guard** — a
+  first-stage prefill frame carrying floating-point data is classified at the door as a mispaired
+  mm/ids or misrouted hidden frame; (4) **#wedge-quarantine** — `wedge_reload_n` (default 3,
+  `/config`-tunable, 0=off) gen-stall reclaims of the same model within 15 min trigger an automatic
+  fresh re-place (reconfigure: new shards + new data conns, rollback-safe, serialized with the
+  juggler) — the demonstrated cure for poisoned pipeline state. Ops note: worker files apply on
+  fetch but worker PROCESSES only pick them up on restart — deploys that change worker code need
+  `POST /restart?workers=1` after the `/update` (a periodic fleet-wide worker restart is also the
+  cheap hygiene against long-lived-process state poisoning).
 - Robust loads: survive a worker drop mid-load (replan on survivors), free partial shards on failure,
   scaled timeouts, gentler restarts; auto-recover resident models when a worker reconnects.
 - **Stale-KV self-heal + crash-proof attention:** a worker stage's causal mask is sized for
