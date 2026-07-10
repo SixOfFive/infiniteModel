@@ -49,6 +49,10 @@ dashboard.
   progress on the model's row.
 - **MoE & multimodal.** Mixture-of-Experts (incl. attention-on-GPU / experts-in-CPU-RAM offload), and
   distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3): image/audio → text.
+- **Text-to-image.** Diffusers-layout checkpoints (Qwen-Image) serve `POST /v1/images/generations`
+  on a controller-co-located GPU worker — DiT in mixed-edge int4 (first/last blocks bf16 ≈ bf16
+  quality), text encoder on CPU, tiled VAE — with live per-step progress and a dashboard Generate
+  panel.
 - **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
   object args), OpenAI `/v1/chat/completions` (`tool_calls` + `finish_reason:"tool_calls"`), and
   Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming, including the full

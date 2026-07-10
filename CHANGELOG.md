@@ -99,6 +99,26 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   non-fatal (any failure falls through to the cold on-the-fly load).
 
 ## Models
+- **Text-to-image serving v1 (#t2i-serve, 2026-07-11): the fleet renders images.** A downloaded
+  diffusers checkpoint (Qwen-Image, 20B MMDiT) now loads like any model and serves
+  `POST /v1/images/generations` (OpenAI images shape + `negative_prompt` / `steps` / `cfg` / `seed`,
+  `b64_json` out, auto-load) plus a Generate panel in the model's dashboard modal with a live
+  "rendering step i/n" on its card. v1 places the whole pipeline on ONE GPU worker **co-located
+  with the controller** (hostname match; shared filesystem — the model dir is read in place and the
+  PNG handed back as a local path): the DiT is quantized at load with the fleet's own RTN int4 g128
+  packer in the gate-tested **mixed-edge** recipe (first + last `edge` transformer blocks kept bf16
+  ≈ bf16 quality at ~13.5 GB weights; `edge` 2→1 fallback on tight VRAM), the Qwen2.5-VL-7B text
+  encoder runs on worker **CPU** bf16 (encode-once per request), and the VAE decodes tiled on GPU
+  with an exact CPU fallback on OOM. Requests ride the existing control link (`t2i_gen` →
+  per-step `t2i_step` progress → `t2i_done`); placement respects live-free VRAM with LRU eviction;
+  text-gen on a t2i model refuses with the images-endpoint hint; the juggler skips t2i models (the
+  CPU text encoder is designed placement, not a hybrid to "promote"). Needs `diffusers` in the
+  worker venv. Integration fixes that made it real: **split encoder/render pipeline views** (one
+  view holding the CPU TE poisons diffusers' `_execution_device` → 'mat1 is on cpu'), tier-string →
+  torch device normalization, a one-refresh retry on stale post-update heartbeats, and the
+  **fwd-watchdog defers its exit(42) relaunch while a render is active** — a co-resident text
+  forward stalling under a render's GPU+CPU saturation is contention, not a poisoned forward
+  (observed: the relaunch killed a healthy render at step 9/20).
 - **Diffusers-layout repos are first-class downloads (#t2i, 2026-07-10).** A multi-component
   image-generation checkpoint (`model_index.json` + `transformer/`/`text_encoder/`/`vae/`/`tokenizer/`
   subfolders — Qwen-Image class) now flows through the normal `/add_model` → background pull →
