@@ -38,8 +38,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   packer/kernel), mirroring the int8-on-MoE rule; MoE cache compiles reject non-int4 as before.
   Planner/status size the tier at 0.2× layer weights (`for_quant`), `/status` quant_gb/quant_fits
   carry an int2 entry, and the dashboard's Load + auto-load-default selects offer it. The shipped
-  **auto-load default remains int4** — int2 is an explicit operator choice: a capacity tier with
-  VISIBLE quality loss (use it to fit a model that otherwise can't load at all, not to speed one up).
+  **auto-load default remains int4** — int2 is an explicit operator choice.
+  **Measured quality verdict (2026-07-10, qwen2.5 0.5B + 7B, greedy):** plain round-to-nearest at
+  2 bits **collapses the model** (token salad) — and stays collapsed at group 32/16, with per-group
+  MSE-optimal clip search, and under mixed-tier salvage (down/o_proj + edge layers at int4 —
+  grammatical but meaningless at best). This matches the literature: RTN-2bit is broken at any
+  scale; 2-bit needs a **GPTQ-class calibrated packer** to be usable. The infrastructure shipped
+  here is deliberately packer-agnostic — a calibrated packer emits the SAME qweight/scale/zero
+  format through the same kernels, cache layout and serve path (a packer-only follow-up;
+  `packer_hash` in the cache manifest auto-invalidates stale int2 caches when it lands). Until
+  then int2 is machinery-complete but NOT usable for real serving.
 - **Hybrid models reserve KV only on their attention layers:** a Gated-DeltaNet hybrid (qwen3-next /
   qwen3.6) grows a full-context KV only on its `full_attention` layers (the linear-attn layers keep a
   small fixed recurrent state). KV reservation — both the GPU placement budget and the pre-alloc probe,

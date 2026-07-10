@@ -32,7 +32,9 @@ dashboard.
   mixed meshes) and opt-in speculative decoding.
 - **Quantization.** int4 (group-wise, fused tinygemm GEMM), int8 (per-channel), and **int2**
   (group-wise ~2.5-bit, group 64 — a *capacity* tier for dense models that won't fit at int4;
-  expect visible quality loss; MoE auto-downgrades to int4) at load time;
+  MoE auto-downgrades to int4. ⚠ the current round-to-nearest packer **collapses model quality
+  at 2 bits** — the tier is complete infrastructure awaiting a GPTQ-class calibrated packer,
+  which slots into the same format/kernels/cache) at load time;
   serves fp8 and nvfp4 checkpoints by dequantizing on the fly. Decode-kernel acceleration is
   **platform-tiered** — torch tinygemm int4 on NVIDIA/CPU, a Triton w4a16 + split-K kernel on **AMD
   GPUs (ROCm/RDNA)**, a Triton **w2a16** kernel for int2 on both GPU stacks, and an **opt-in fused
