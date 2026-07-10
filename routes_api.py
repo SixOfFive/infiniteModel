@@ -187,8 +187,11 @@ def register(app):
             models.append(entry)
             # ALIAS echo: also list the loaded model under any alias name (e.g. 'qwen2.5:14b' when
             # 'qwen2.5-14b-instruct' is loaded) so a client configured with the alias sees it running.
+            # `alias_of` marks the echo rows as the SAME instance (not extra residents) — clients
+            # counting real loaded instances filter on it; the admission cap never counted them.
             for _a in _alias_by_canon.get(lm.friendly, []):
                 ae = dict(entry); ae["name"] = ae["model"] = _ollama_name(_a)
+                ae["alias_of"] = _ollama_name(lm.friendly)
                 models.append(ae)
         return {"models": models, "pool": pool}
 
@@ -321,8 +324,13 @@ def register(app):
             return JSONResponse({"error": str(exc), "model": model}, status_code=404)
         except Exception as exc:    # auto-load FAILED (capacity/node) -> retryable 503, not a 500
             log_activity(f"embed {model}: auto-load failed — {exc!r}")
-            return JSONResponse({"error": f"embedding model load failed: {exc}", "model": model},
-                                status_code=503, headers={"Retry-After": "3"})
+            # #at-capacity: terminal capacity (auto-unload off / all pinned) -> no Retry-After
+            _term = isinstance(exc, CapacityError) and getattr(exc, "terminal", False)
+            _out = {"error": f"embedding model load failed: {exc}", "model": model}
+            if _term:
+                _out["state"] = "at_capacity"
+            return JSONResponse(_out, status_code=503,
+                                headers=({} if _term else {"Retry-After": "3"}))
         if not getattr(lm.spec, "is_embedding", False):
             return JSONResponse(
                 {"error": f"model '{friendly}' is not an embedding model; use /api/chat"},

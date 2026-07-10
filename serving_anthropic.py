@@ -80,12 +80,29 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         if getattr(lm.spec, "is_embedding", False):   # encoder can't decode -> reject
             raise ValueError(f"model '{friendly}' is an embedding model; use /api/embed")
         tok = lm.tokenizer
+    except ValueError as exc:
+        # Misuse of a KNOWN model (embedding model on a chat endpoint) -> 400; transient
+        # controller state ("updating", or an auto_load-flipped-off race reaching the "not
+        # loaded" refusal) -> retryable 503. Never not_found — the model exists.
+        _inflight_release(rec)
+        _retry = ("updating" in str(exc)) or ("not loaded" in str(exc))
+        return JSONResponse({"type": "error", "error": {
+            "type": "overloaded_error" if _retry else "invalid_request_error",
+            "message": str(exc)}}, status_code=503 if _retry else 400,
+            headers=({"Retry-After": "3"} if _retry else {}))
     except Exception as exc:
         _inflight_release(rec)
-        # Claude Code reads this on model-selection: surface a clean Anthropic error.
-        return JSONResponse({"type": "error",
-                             "error": {"type": "not_found_error", "message": str(exc)}},
-                            status_code=404)
+        # #cold-contract + #at-capacity: a LOAD failure is NOT "model not found" — the model is
+        # cataloged (unknown names already 404'd at resolve above). Previously this returned 404
+        # not_found_error, so a capacity problem looked like a nonexistent model to Claude Code.
+        # Retryable (busy/transient) -> 503 overloaded_error + Retry-After; a TERMINAL capacity
+        # failure (auto-unload off / all pinned) -> 503 api_error "at_capacity", NO Retry-After.
+        _term = isinstance(exc, CapacityError) and getattr(exc, "terminal", False)
+        return JSONResponse({"type": "error", "error": {
+            "type": "api_error" if _term else "overloaded_error",
+            "message": f"{type(exc).__name__}: {exc}" + (
+                " (at_capacity — a retry cannot succeed until a model is unloaded)" if _term else "")}},
+            status_code=503, headers=({} if _term else {"Retry-After": "3"}))
 
     # #22 inc 3b/5c: pull any images + audio out so the chat template renders the per-item
     # placeholder (keep_images/keep_audio), then expand + splice their embeds below. Decode/

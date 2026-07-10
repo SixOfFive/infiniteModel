@@ -40,6 +40,18 @@ class EngineLoadMixin:
                 return aligned, pa
         return best_ctx, best_plan
 
+    def _cap_terminal(self) -> bool:
+        """#at-capacity: True when NOTHING could ever be auto-evicted to make room — auto-unload
+        is off, or every resident is no_unload-pinned. Busy-ness is transient (a busy victim goes
+        idle and a retry succeeds); the off switch and pins only clear when an operator acts, so
+        a capacity failure in this state is PERMANENT and serving must NOT promise Retry-After.
+        (No residents at all is also terminal: there is nothing to evict, the model simply does
+        not fit the pool.)"""
+        if not bool(ENGINE_CONFIG.get("auto_unload", True)):
+            return True
+        no_unload = set(ENGINE_CONFIG.get("no_unload_models") or {})
+        return not any((m.base or m.friendly) not in no_unload for m in self.models.values())
+
     async def ensure_loaded(self, friendly: str, ctx: int,
                             cpu_only: bool = False, auto_load: bool = False) -> LoadedModel:
         # If the model is resident we serve it as-is (ctx/cpu_only ignored for a live model — we
@@ -57,38 +69,63 @@ class EngineLoadMixin:
         if self.updating:   # forced update in progress -> don't reload into a box being torn down
             raise ValueError(f"model '{friendly}' is not loaded — controller is updating, retry shortly")
         if auto_load and ENGINE_CONFIG.get("auto_load", True):
-            # #autoload-smallest: an auto-loaded (requested-but-not-resident) model defaults to the
-            # SMALLEST quant — int4 — so a request never streams the full bf16 just to serve it (int4
-            # is ~1/4 the memory, fits more nodes, and serves PRE-PACKED when a shard cache exists).
-            # Tunable via ENGINE_CONFIG `autoload_quant` (int4|int8|none). If int4/int8 fails for a
-            # model the quantizer can't handle, fall back ONCE to bf16 so the request still succeeds
-            # rather than erroring out — "int4 in almost all cases", bf16 for the rest. (CancelledError
-            # is a BaseException, not Exception, so a client disconnect still aborts — never retried.)
-            # #auto-defaults: an auto-load uses the SAME configured defaults as the dashboard's per-model
-            # Load button — quant (int4), context (8k), and placement mode — so request-triggered loads
-            # and click-loads behave identically. The request's own ctx (>0) still overrides the default.
-            aq = str(ENGINE_CONFIG.get("autoload_quant", "int4") or "none")
-            a_ctx = int(ENGINE_CONFIG.get("autoload_ctx", DEFAULT_CTX) or 0)
-            use_ctx = ctx if (ctx and ctx > 0) else a_ctx
-            a_mode = str(ENGINE_CONFIG.get("autoload_mode", "auto") or "auto")
-            _cons, _pv = LOAD_MODES.get(a_mode, LOAD_MODES["auto"])
-            _spread, _prop = (a_mode == "spread"), (a_mode == "proportional")
-            _gpus = (a_mode == "all-gpu")
-            log_activity(f"{friendly}: auto-load on request (not resident) -> mode={a_mode}, "
-                         f"quant={aq}, ctx={use_ctx or 'train'}" + (" (CPU-only)" if cpu_only else ""))
-            try:
-                await self._precompile_int4(friendly, aq, 1)   # #cache-on-first-load: auto-load parity
-                return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
-                                       quant=aq, cpu_only=cpu_only, spread=_spread,
-                                       proportional=_prop, gpu_spread=_gpus)
-            except Exception as e:
-                if aq != "none":
-                    log_activity(f"{friendly}: auto-load at {aq} failed ({e!r}) -> retry at bf16")
-                    return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
-                                           quant="none", cpu_only=cpu_only, spread=_spread,
-                                           proportional=_prop, gpu_spread=_gpus)
-                raise
+            # #autoload-herd: ONE shared load task per cold model. Every concurrent request — and
+            # every Retry-After-honoring retry that lands while the load is still running — awaits
+            # the SAME task instead of calling load() again. A duplicate load() would queue on the
+            # engine lock and, on finally acquiring it, find the model resident and treat it as an
+            # explicit RELOAD (unload+reload churn, serially, once per stacked request — killing
+            # the very generation the first request just started). shield() keeps the shared load
+            # alive when the request that spawned it disconnects: the other waiters still need it,
+            # and the finished load serves every future request (Ollama semantics).
+            t = self._autoload_tasks.get(friendly)
+            if t is None:
+                t = asyncio.create_task(self._autoload_shared(friendly, ctx, cpu_only))
+                self._autoload_tasks[friendly] = t
+                t.add_done_callback(lambda _t, _f=friendly: self._autoload_tasks.pop(_f, None))
+            return await asyncio.shield(t)
         raise ValueError(f"model '{friendly}' is not loaded — load it first")
+
+    async def _autoload_shared(self, friendly: str, ctx: int, cpu_only: bool) -> LoadedModel:
+        """Body of one request-triggered auto-load; ensure_loaded runs this as the per-model
+        shared task (#autoload-herd) so N concurrent cold requests trigger exactly one load."""
+        m = self.models.get(friendly)   # lost a check-then-spawn race -> already resident
+        if m is not None:
+            m.last_used = time.time()
+            return m
+        # #autoload-smallest: an auto-loaded (requested-but-not-resident) model defaults to the
+        # SMALLEST quant — int4 — so a request never streams the full bf16 just to serve it (int4
+        # is ~1/4 the memory, fits more nodes, and serves PRE-PACKED when a shard cache exists).
+        # Tunable via ENGINE_CONFIG `autoload_quant` (int4|int8|none). If int4/int8 fails for a
+        # model the quantizer can't handle, fall back ONCE to bf16 so the request still succeeds
+        # rather than erroring out — "int4 in almost all cases", bf16 for the rest. (CancelledError
+        # is a BaseException, not Exception, so a client disconnect still aborts — never retried.)
+        # #auto-defaults: an auto-load uses the SAME configured defaults as the dashboard's per-model
+        # Load button — quant (int4), context (8k), and placement mode — so request-triggered loads
+        # and click-loads behave identically. The request's own ctx (>0) still overrides the default.
+        aq = str(ENGINE_CONFIG.get("autoload_quant", "int4") or "none")
+        a_ctx = int(ENGINE_CONFIG.get("autoload_ctx", DEFAULT_CTX) or 0)
+        use_ctx = ctx if (ctx and ctx > 0) else a_ctx
+        a_mode = str(ENGINE_CONFIG.get("autoload_mode", "auto") or "auto")
+        _cons, _pv = LOAD_MODES.get(a_mode, LOAD_MODES["auto"])
+        _spread, _prop = (a_mode == "spread"), (a_mode == "proportional")
+        _gpus = (a_mode == "all-gpu")
+        log_activity(f"{friendly}: auto-load on request (not resident) -> mode={a_mode}, "
+                     f"quant={aq}, ctx={use_ctx or 'train'}" + (" (CPU-only)" if cpu_only else ""))
+        try:
+            await self._precompile_int4(friendly, aq, 1)   # #cache-on-first-load: auto-load parity
+            return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
+                                   quant=aq, cpu_only=cpu_only, spread=_spread,
+                                   proportional=_prop, gpu_spread=_gpus)
+        except Exception as e:
+            # #at-capacity: a CapacityError verdict only gets WORSE at a bigger size — bf16 is
+            # strictly larger than int4/int8, and the resident-cap check doesn't depend on size
+            # at all — so the bf16 fallback can only fail the same way while doubling the noise.
+            if aq != "none" and not isinstance(e, CapacityError):
+                log_activity(f"{friendly}: auto-load at {aq} failed ({e!r}) -> retry at bf16")
+                return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
+                                       quant="none", cpu_only=cpu_only, spread=_spread,
+                                       proportional=_prop, gpu_spread=_gpus)
+            raise
 
     async def _precompile_int4(self, friendly: str, quant: str, tp: int) -> None:
         """#cache-on-first-load: for an int4/int2 load with NO shard cache yet, BUILD it first
@@ -459,10 +496,13 @@ class EngineLoadMixin:
             while len(self.models) >= max_loaded:
                 victim = self._lru_evictable() if auto_unload else None
                 if victim is None:
-                    raise RuntimeError(
-                        f"at the max of {max_loaded} resident model(s) and " +
-                        ("all are busy serving requests" if auto_unload else "auto-unload is off") +
-                        f" — unload one before loading '{friendly}'")
+                    _term = self._cap_terminal()   # #at-capacity: retryable (busy) vs permanent
+                    _why = ("auto-unload is off" if not auto_unload else
+                            "the rest are pinned no_unload" if _term else
+                            "all are busy serving requests")
+                    raise CapacityError(
+                        f"at the max of {max_loaded} resident model(s) and {_why}"
+                        f" — unload one before loading '{friendly}'", terminal=_term)
                 await self._unload_model_locked(victim, f"evict idle LRU (cap {max_loaded})")
                 await self._await_free_refresh()
             if self.models:
@@ -589,8 +629,9 @@ class EngineLoadMixin:
                         await self._await_free_refresh()
                         continue
                     if self.models:
-                        raise RuntimeError("no room for the new model and resident model(s) are "
-                                           + ("busy serving" if auto_unload else "kept (auto-unload off)"))
+                        raise CapacityError("no room for the new model and resident model(s) are "
+                                            + ("busy serving" if auto_unload else "kept (auto-unload off)"),
+                                            terminal=self._cap_terminal())   # #at-capacity
                     raise RuntimeError("no capable worker nodes connected "
                                        "(all missing inference deps, or both tiers disabled)")
                 pv_eff = prefer_vram and not cpu_only
@@ -617,12 +658,13 @@ class EngineLoadMixin:
                               f"full-ctx KV + weights)")
                         ctx, plan = fit_ctx, fplan
                     else:
-                        raise RuntimeError((plan.error or "planning failed")
-                                           + f" — even ctx {CTX_AUTOFIT_FLOOR} won't fit; the model's "
-                                             "weights exceed the usable pool (free memory or use a "
-                                             "smaller quant)" + (
+                        raise CapacityError((plan.error or "planning failed")
+                                            + f" — even ctx {CTX_AUTOFIT_FLOOR} won't fit; the model's "
+                                              "weights exceed the usable pool (free memory or use a "
+                                              "smaller quant)" + (
                             "; resident model(s) busy serving" if (self.models and auto_unload)
-                            else "" if self.models else ""))
+                            else "" if self.models else ""),
+                            terminal=self._cap_terminal())   # #at-capacity
                 stages = plan.stages
                 # #76 guardrail: estimate the VRAM/RAM split for weights + full-ctx KV on THIS
                 # placement (the plan only proved it fits each node's TOTAL RAM+VRAM, not that KV

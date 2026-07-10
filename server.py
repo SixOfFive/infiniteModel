@@ -744,6 +744,20 @@ LOAD_MODES: dict[str, tuple] = {
     #                                  (MiniMax-M2) too big for the GPU-first subset.
 }
 
+
+class CapacityError(RuntimeError):
+    """#at-capacity: a load was rejected for lack of room (resident-model cap or no placement).
+    `terminal` picks the serving contract: False = eviction is possible but blocked RIGHT NOW
+    (residents busy serving) — genuinely retryable, serve 503 + Retry-After; True = no automatic
+    recovery exists (auto-unload off, or every resident no_unload-pinned) so a retry can NEVER
+    succeed until an operator unloads/frees something — serve 503 + code "at_capacity" and NO
+    Retry-After. A Retry-After on a terminal condition is a promise the server can't keep: an
+    honest client that honors it retries forever (the om3nbox 25×503-over-90s transcript)."""
+    def __init__(self, msg: str, terminal: bool = False):
+        super().__init__(msg)
+        self.terminal = terminal
+
+
 FRAMEWORK_OVERHEAD_GB = 1.0
 WEIGHT_DTYPE_BYTES = 2
 KV_DTYPE_BYTES = 2
@@ -1872,6 +1886,13 @@ class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin, EngineSpeech
         # load so loading copy N+1 can't evict copy N as "idle LRU".
         self._rr: dict[str, int] = {}
         self._no_evict_base: Optional[str] = None
+        # #autoload-herd: friendly -> the in-flight auto-load task. Concurrent requests for the
+        # same cold model (including Retry-After-honoring retries that land mid-load) AWAIT one
+        # shared load instead of stacking duplicate load() calls behind the engine lock — each
+        # later duplicate would acquire the lock AFTER the first load finished, see the model
+        # resident, and RELOAD it (serial unload+reload churn that can kill the generation the
+        # first request just started).
+        self._autoload_tasks: dict[str, asyncio.Task] = {}
         self.pending: dict[int, asyncio.Future] = {}
         self.pending_model: dict[int, str] = {}   # req_id -> model target_id (so a dropped
         #   data connection fails ONLY its own models' requests, not every model's)

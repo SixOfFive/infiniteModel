@@ -684,15 +684,26 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         log_activity(f"generate {model}: prepare FAILED — {exc!r}")
         # Resident-but-failed (e.g. ctx-too-long) = a genuine bad request -> 400 (not retryable).
         # Not-resident = the LOAD itself failed (capacity/placement) -> retryable 503 + Retry-After.
+        # #at-capacity: EXCEPT a TERMINAL CapacityError (auto-unload off / every resident pinned):
+        # retrying can never succeed until an operator unloads something, so the 503 carries code
+        # "at_capacity" and NO Retry-After — Retry-After here made an honest retrying client loop
+        # forever (the om3nbox 25×503-in-90s transcript).
+        _term = isinstance(exc, CapacityError) and getattr(exc, "terminal", False)
         _bad_req = friendly in engine.models
         _code = 400 if _bad_req else 503
-        _hdr = {} if _bad_req else {"Retry-After": "3"}
+        _hdr = {} if (_bad_req or _term) else {"Retry-After": "3"}
         _emsg = f"{type(exc).__name__}: {exc}"
         if mode in ("openai", "openai_text"):
-            return JSONResponse({"error": {"message": _emsg,
-                                 "type": "invalid_request_error" if _bad_req else "model_loading"}},
-                                status_code=_code, headers=_hdr)
-        return JSONResponse({"error": _emsg, "model": friendly}, status_code=_code, headers=_hdr)
+            _err = {"message": _emsg,
+                    "type": ("invalid_request_error" if _bad_req else
+                             "server_error" if _term else "model_loading")}
+            if _term:
+                _err["code"] = "at_capacity"
+            return JSONResponse({"error": _err}, status_code=_code, headers=_hdr)
+        _out = {"error": _emsg, "model": friendly}
+        if _term:
+            _out["state"] = "at_capacity"
+        return JSONResponse(_out, status_code=_code, headers=_hdr)
     if emsg is not None:   # couldn't load (auto-load off / capacity / embedding) -> RETRYABLE typed 503
         _inflight_release(rec)
         if mode in ("openai", "openai_text"):
