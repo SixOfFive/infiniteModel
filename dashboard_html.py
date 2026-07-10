@@ -774,12 +774,15 @@ async function openDetail(name){
   const m=(LAST.models||[]).find(x=>x.name===name); if(!m)return;
   DETAIL_OPEN=name;
   const cz=m.cached||{};
-  // precache (shard cache): compile int4/int8 so future loads serve from cache instantly.
+  // precache (shard cache): compile int4/int8/int2 so future loads serve from cache instantly.
+  // int2 is explicit-build ONLY (never on first load): RTN-int2 quality is collapsed until the
+  // calibrated packer lands, so the button carries the caveat. t2i checkpoints have no shard
+  // cache (diffusers layout — the LLM compiler can't parse them).
   let pre='';
-  if(m.ready){ let chips='';
-    for(const q of ['int4','int8']){
+  if(m.ready&&!(m.capabilities||[]).includes('t2i')){ let chips='';
+    for(const q of ['int4','int8','int2']){
       if(cz[q]&&cz[q].ok) chips+='<span class="chip al">'+q+' cached '+gb(cz[q].size_gb)+'</span> ';
-      else chips+='<button class="btn sm ghost" onclick="compileShards(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
+      else chips+='<button class="btn sm ghost" '+(q==='int2'?'title="~2.5 bits/weight capacity tier, half the int4 cache size. CAVEAT: the current round-to-nearest int2 packing collapses generation quality on dense LLMs — build for experiments only until the calibrated (GPTQ-class) packer lands. Never auto-built on first load; an existing cache does serve int2 loads." ':'')+'onclick="compileShards(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
     }
     pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
   }

@@ -128,15 +128,19 @@ class EngineLoadMixin:
             raise
 
     async def _precompile_int4(self, friendly: str, quant: str, tp: int) -> None:
-        """#cache-on-first-load: for an int4/int2 load with NO shard cache yet, BUILD it first
+        """#cache-on-first-load: for an int4 load with NO shard cache yet, BUILD it first
         (blocks until written) so THIS load — and every future load — serves the small pre-packed
         layers instead of streaming full bf16 and re-quantizing on the fly. No-op when that tier's
-        cache already exists, when quant is none/int8, or for tp>1 (its dispatch path doesn't read
-        the whole-layer cache). Reuses the /compile_shards SUBPROCESS (deprioritized, GIL-safe — an
-        in-process compile would starve the event loop / drop live generations). Non-fatal: ANY
-        failure falls through to the normal cold load. Shared by the /load route AND the auto-load
-        path (ensure_loaded) so request-triggered loads compile-on-first-load identically."""
-        if not (quant in ("int4", "int2") and tp <= 1):
+        cache already exists, when quant is anything but int4, or for tp>1 (its dispatch path
+        doesn't read the whole-layer cache). int4 ONLY by design: an int2 cache is never auto-built
+        on first load (RTN-int2 output is collapsed until the calibrated packer lands) — an
+        operator builds one deliberately via the dashboard Precache button / POST /compile_shards,
+        and an EXISTING int2 cache still serves (the serve gate is separate). Reuses the
+        /compile_shards SUBPROCESS (deprioritized, GIL-safe — an in-process compile would starve
+        the event loop / drop live generations). Non-fatal: ANY failure falls through to the
+        normal cold load. Shared by the /load route AND the auto-load path (ensure_loaded) so
+        request-triggered loads compile-on-first-load identically."""
+        if not (quant == "int4" and tp <= 1):
             return
         try:
             import shard_compile as _sh   # code-split Inc 9: shard_cache_status moved
