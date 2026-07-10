@@ -122,6 +122,29 @@ class EngineLoadMixin:
         except Exception as _ce:
             log_activity(f"{_ollama_name(friendly)}: pre-load cache build skipped ({_ce!r}) — cold load")
 
+    def _lan_visible_host(self, host, receiver, link):
+        """#loopback-nexthop: translate a LOOPBACK data-plane address to one the RECEIVING worker
+        can actually reach. A worker co-located with the controller advertises 127.0.0.1 (fastest
+        for the controller's OWN dials, see _dial_host) — but as a next-hop / TP-root handed to a
+        REMOTE worker, a loopback dials that remote worker ITSELF (self-loop: stage outputs feed
+        back into stage inputs — the 2026-07-09/10 wedge-storm engine). Returns `host` unchanged
+        when it isn't loopback or when the receiver is ALSO controller-local (on-box loopback is
+        correct + fastest); otherwise our address on the receiver's control link (its sockname),
+        falling back to this box's first LAN IP."""
+        _h = str(host or "")
+        if not _h.startswith(("127.", "::1", "localhost")):
+            return host
+        _rh = str(getattr(receiver, "data_host", "") or "")
+        if _rh in _LOCAL_IPS or _rh.startswith(("127.", "::1")):
+            return host                       # receiver shares this box — loopback is right
+        _lan = None
+        with contextlib.suppress(Exception):
+            _sn = link.writer.get_extra_info("sockname") if link is not None else None
+            _lan = _sn[0] if _sn else None
+        if not _lan or _lan.startswith(("127.", "::1")):
+            _lan = next((ip for ip in sorted(_LOCAL_IPS) if not ip.startswith("127.")), None)
+        return _lan or host
+
     def _reserved_bytes(self, exclude_key: Optional[str] = None) -> tuple[dict, dict]:
         """Sum the in-flight load reservations (RAM, VRAM) per node, EXCLUDING `exclude_key` (a
         load never reserves against itself). Returns (ram_by_node, vram_by_node) in bytes. Used by
@@ -706,6 +729,15 @@ class EngineLoadMixin:
                     link = self.links.get(st.node_id)
                     if link is None:
                         raise RuntimeError(f"no control link to {st.node_id}")
+                    # #loopback-nexthop: a worker CO-LOCATED with the controller advertises a
+                    # LOOPBACK data_host (fastest for the controller's own stage0 dials) — but
+                    # handed verbatim to a REMOTE stage as its next hop, "127.0.0.1:50200" dials
+                    # the REMOTE WORKER ITSELF: every stage output loops straight back into its
+                    # own input (stage0 then eats its own bf16 hidden as "ids"), and on the OLD
+                    # code even the error frames cycled on the self-hop forever — the engine of
+                    # the 2026-07-09/10 qwen2.5-vl wedge storm that fed beast's kernel panic
+                    # (placements failing EXACTLY when a remote node's next stage sat on beast).
+                    next_host = self._lan_visible_host(next_host, nd, link)
                     nd.stage = i
                     nd.layer_start, nd.layer_end = st.layer_start, st.layer_end
                     nd.load_state = "loading"     # red on the dashboard until this shard reports ready
@@ -1358,7 +1390,12 @@ class EngineLoadMixin:
                    # ("" -> worker cpu+gpu default, or "gpu"); a CPU rank gets explicit 'cpu'.
                    "device": n.load_device() if rank_is_gpu[rank] else "cpu",
                    "quant": quant, "tp_rank": rank, "tp_size": tp,
-                   "tp_root_host": root.data_host, "tp_root_port": tp_port,
+                   # #loopback-nexthop (same translation as the pipeline wiring): a controller-
+                   # co-located rank0 advertises a loopback data_host; a REMOTE rank dialing that
+                   # as the mesh root would connect to ITSELF. Swap in our address as this rank's
+                   # control link reaches us; loopback stays for a local rank (fastest on-box).
+                   "tp_root_host": self._lan_visible_host(root.data_host, n, link),
+                   "tp_root_port": tp_port,
                    # #68: per-rank capacity weights (None when ~equal) -> heterogeneous split; every
                    # rank gets the SAME list so wire._tp_hetsplit is identical on all ranks + the serve.
                    "tp_weights": tp_weights,
