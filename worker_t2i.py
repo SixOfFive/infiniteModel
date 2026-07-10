@@ -60,7 +60,12 @@ class T2IPipeline:
         from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
         self.model_dir = model_dir
-        self.device = device if device not in ("", None) else "cpu"
+        # normalize fleet tier strings ('gpu', 'cpu+gpu') to a real torch device — torch.to()
+        # rejects them; anything GPU-flavored means "use the GPU here"
+        _dv = str(device or "")
+        if not _dv or "gpu" in _dv:
+            _dv = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = _dv
         self.quant = quant
         self.edge = max(0, int(edge))
         self._gen_lock = threading.Lock()

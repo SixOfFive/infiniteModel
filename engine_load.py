@@ -1253,7 +1253,10 @@ class EngineLoadMixin:
             "model_dir": model_dir, "quant": quant, "t2i_edge": edge,
             "controller_http_port": ARGS.http_port,
             "next_host": None, "next_port": ARGS.data_port,
-            "device": node.load_device(),
+            # a plain torch device, NOT load_device() — that returns the worker's tier mode
+            # ('cpu+gpu'), which the Shard placement interprets but torch .to() rejects; the
+            # t2i path only ever places on GPU nodes, so 'cuda' is always right here.
+            "device": "cuda",
         })
         try:
             r = await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
