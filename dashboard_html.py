@@ -381,7 +381,9 @@ function mstate(m,cl){
   if(ld) return {k:'loading',c:'var(--warn)',rank:1,ld};
   const cp=compiling.find(x=>x.model===id||x.display_model===m.name);
   if(cp) return {k:'compiling',c:'var(--warn)',rank:1,ld:cp};
-  if((m.status||'')==='downloading') return {k:'downloading',c:'var(--accent)',rank:2};
+  const st=m.status||'';
+  if(st==='downloading'||st==='pausing'||st==='stopping') return {k:'downloading',c:'var(--accent)',rank:2};
+  if(st==='paused'||st==='stopped') return {k:'dlhalt',c:'var(--warn)',rank:2};
   if(m.loaded) return {k:'loaded',c:'var(--good)',rank:0};
   if(m.ready) return {k:'registered',c:'var(--dim)',rank:3};
   return {k:'notdl',c:'var(--bad)',rank:4};
@@ -394,7 +396,7 @@ function renderModels(d,cl){
   $('#mcount').textContent=ms.length+' model'+(ms.length==1?'':'s');
   if(!ms.length){ $('#models').innerHTML='<div class="empty">no models'+(f?' match "'+esc(f)+'"':'')+'</div>'; return; }
   let html='', grp='';
-  const GN={loaded:'Loaded',loading:'Loading',compiling:'Compiling',downloading:'Downloading',registered:'Registered · on disk',notdl:'Not downloaded'};
+  const GN={loaded:'Loaded',loading:'Loading',compiling:'Compiling',downloading:'Downloading',dlhalt:'Download paused',registered:'Registered · on disk',notdl:'Not downloaded'};
   for(const {m,s} of ms){
     if(s.k!==grp){ grp=s.k; html+='<div class="grp">'+GN[grp]+'</div>'; }
     html+=modelRow(m,s);
@@ -440,7 +442,25 @@ function modelRow(m,s){
         +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
     acts='<button class="btn sm ghost" disabled>…</button>';
   } else if(s.k==='downloading'){
-    meta='downloading weights…'; acts='<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'stop\')">Stop</button>';
+    // live download progress — the /status entry carries dl_done_gb/dl_total_gb/dl_pct plus a
+    // rolling rate + ETA; render them like the load/compile cards instead of a static line
+    // (a static "downloading weights…" reads as a crashed pull on a multi-hour download).
+    const p=(m.dl_pct!=null)?m.dl_pct:null;
+    meta='downloading · '+gb(m.dl_done_gb||0)+(m.dl_total_gb?' / '+gb(m.dl_total_gb):'')
+        +(p!=null?' · '+p.toFixed(1)+'%':'')
+        +(m.dl_rate_mbps?' · '+m.dl_rate_mbps.toFixed(1)+' MiB/s':'')
+        +(m.dl_eta_s&&m.dl_rate_mbps?' · eta '+dur(m.dl_eta_s):'')
+        +((m.status||'')!=='downloading'?' · <span class="em">'+esc(m.status)+'…</span>':'')
+        +'<div class="miniprog"><i style="width:'+(p||0)+'%"></i></div>';
+    acts='<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'pause\')" title="Pause after the current file — kept resumable">Pause</button>'
+        +'<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'stop\')" title="Stop after the current file — downloaded files are kept, Resume continues from here">Stop</button>';
+  } else if(s.k==='dlhalt'){
+    const p=(m.dl_pct!=null)?m.dl_pct:null;
+    meta='<span class="em">'+esc(m.status)+'</span> at '+gb(m.dl_done_gb||0)
+        +(m.dl_total_gb?' / '+gb(m.dl_total_gb):'')+(p!=null?' · '+p.toFixed(1)+'%':'')
+        +'<div class="miniprog"><i style="width:'+(p||0)+'%"></i></div>';
+    acts='<button class="btn sm pri" onclick="dl(\''+esc(m.name)+'\',\'resume\')">Resume</button>'
+        +'<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'clear\')" title="Discard the partially downloaded files">Clear</button>';
   } else if(s.k==='registered'){
     meta=fitMeta(m);
     acts=t2i?'<button class="btn sm ghost" disabled title="Weights are on disk and ready; the image-generation serving pipeline is not implemented yet, so there is nothing to load them into.">pipeline pending</button>'
