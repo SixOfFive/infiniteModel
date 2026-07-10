@@ -372,17 +372,22 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 _f = engine.pending.pop(_rid, None)
                 engine.pending_model.pop(_rid, None)
                 engine.pending_friendly.pop(_rid, None)
-                if _f is not None and not _f.done():
-                    _err = str(msg.get("error") or "stage compute error")
+                _err = str(msg.get("error") or "stage compute error")
+                _live = _f is not None and not _f.done()
+                if _live:
                     with contextlib.suppress(Exception):
                         _f.set_exception(RuntimeError(
                             f"stage {msg.get('stage')} on {node.hostname} failed: {_err}"))
                     _m = engine.models.get(_fr) if _fr else None
                     if _m is not None:
                         _m.last_token_ts = time.time()
-                    log_activity(f"stage_error: {_ollama_name(_fr or msg.get('model_id') or '?')} "
-                                 f"stage {msg.get('stage')} on {node.hostname} — {_err[:200]} — "
-                                 f"failed req {_rid} fast")
+                # Log EVERY arrival, matched or not — an unmatched stage_error (request already
+                # resolved/reclaimed, or an ORPHANED forward failing after its gen was taken away)
+                # is still the only controller-side trace that a worker stage blew up.
+                log_activity(f"stage_error: {_ollama_name(_fr or msg.get('model_id') or '?')} "
+                             f"stage {msg.get('stage')} on {node.hostname} — {_err[:200]} — "
+                             + (f"failed req {_rid} fast" if _live
+                                else f"(req {_rid} not pending — already resolved/reclaimed)"))
             elif mtype in ("ready", "error"):
                 _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":
