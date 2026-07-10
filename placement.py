@@ -111,8 +111,10 @@ class ModelSpec:
         packs) the quantized footprint. KV cache is unaffected (it stays bf16 activations).
         int8 weight-only halves the Linear weights (decoder layers + lm_head). int4 is
         group-wise ~4.25-bit (~0.27x bf16) on the decoder layers; the lm_head stays bf16
-        (logit-sensitive). Embeddings and norms are never quantized. Works on measured or
-        formula-based specs alike."""
+        (logit-sensitive). int2 (#int2) is group-wise ~2.5-bit / group 64 (~0.16x bf16) on the
+        decoder layers, head bf16 like int4 (sized at 0.2x for planner headroom, mirroring
+        int4's 0.27->0.3 cushion). Embeddings and norms are never quantized. Works on measured
+        or formula-based specs alike."""
         if quant == "int8":
             return replace(self,
                            meas_layer_w=self.per_layer_weight_bytes // 2,
@@ -122,6 +124,12 @@ class ModelSpec:
         if quant == "int4":
             return replace(self,
                            meas_layer_w=self.per_layer_weight_bytes * 3 // 10,  # ~4.25-bit + group scale/zero
+                           meas_head=self.head_bytes,        # head kept bf16
+                           meas_embed=self.embed_bytes,
+                           meas_norm=self.final_norm_bytes)
+        if quant == "int2":
+            return replace(self,
+                           meas_layer_w=self.per_layer_weight_bytes * 2 // 10,  # ~2.5-bit + group scale/zero
                            meas_head=self.head_bytes,        # head kept bf16
                            meas_embed=self.embed_bytes,
                            meas_norm=self.final_norm_bytes)

@@ -73,8 +73,8 @@ def register(app):
         import urllib.parse as _up
         import urllib.request as _ur
         from safetensors.torch import load as _stload, save as _stsave
-        if quant not in ("int4", "int8"):
-            return JSONResponse({"ok": False, "error": "int4|int8 only"}, status_code=400)
+        if quant not in ("int4", "int8", "int2"):
+            return JSONResponse({"ok": False, "error": "int4|int8|int2 only"}, status_code=400)
         try:
             friendly = resolve_model_name(model)
         except ValueError as exc:
@@ -160,8 +160,8 @@ def register(app):
         import urllib.parse as _up
         import urllib.request as _ur
         from safetensors.torch import load as _stload, save as _stsave
-        if quant not in ("int4", "int8"):
-            return JSONResponse({"ok": False, "error": "int4|int8 only"}, status_code=400)
+        if quant not in ("int4", "int8", "int2"):
+            return JSONResponse({"ok": False, "error": "int4|int8|int2 only"}, status_code=400)
         try:
             friendly = resolve_model_name(model)
         except ValueError as exc:
@@ -313,8 +313,8 @@ def register(app):
 
     @app.post("/compile_shards")        # #shard-cache: compile a model's pre-quantized cache on beast
     async def compile_shards_ep(model: str, quant: str = "int4") -> JSONResponse:
-        if quant not in ("int4", "int8"):
-            return JSONResponse({"ok": False, "error": f"shard cache supports int4|int8 (got '{quant}')"},
+        if quant not in ("int4", "int8", "int2"):
+            return JSONResponse({"ok": False, "error": f"shard cache supports int4|int8|int2 (got '{quant}')"},
                                 status_code=400)
         try:
             friendly = resolve_model_name(model)

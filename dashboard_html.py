@@ -548,7 +548,7 @@ function openLoad(name){
   const ctxDefault = dc>=131072 ? 16384 : (dc||8192);
   const qopt=q=>'<option value="'+q+'">'+q+(cz[q]&&cz[q].ok?' · '+gb(cz[q].size_gb)+' cached':'')+'</option>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load '+esc(name)+'</h3>'
-   +'<div class="grid2"><div><label>Quant</label><select id="l-q" onchange="previewSoon(\''+esc(name)+'\')">'+qopt('int4')+qopt('int8')+'<option value="none">none (bf16)'+(cz.none&&cz.none.ok?' · '+gb(cz.none.size_gb)+' cached':(m.size_gb?' · '+gb(m.size_gb):''))+'</option></select></div>'
+   +'<div class="grid2"><div><label>Quant</label><select id="l-q" onchange="previewSoon(\''+esc(name)+'\')">'+qopt('int4')+qopt('int2')+qopt('int8')+'<option value="none">none (bf16)'+(cz.none&&cz.none.ok?' · '+gb(cz.none.size_gb)+' cached':(m.size_gb?' · '+gb(m.size_gb):''))+'</option></select></div>'
    +'<div><label>Context length</label><input id="l-ctx" type="number" value="'+ctxDefault+'" oninput="previewSoon(\''+esc(name)+'\')"></div></div>'
    +'<label>Placement</label><select id="l-place" onchange="_placeChg();previewSoon(\''+esc(name)+'\')">'
    +'<optgroup label="Auto / distribute"><option value="m:auto">auto · GPU-first</option><option value="m:all-gpu">all-GPU</option>'
@@ -937,7 +937,7 @@ CONFIG_HTML = r"""<!doctype html>
   <div class="frm">
     <div class="fld"><label>Max concurrent loaded models</label><input id="max_loaded" type="number" min="1"></div>
     <div class="fld"><label>Per-model queue depth</label><input id="queue_depth" type="number" min="1"></div>
-    <div class="fld"><label>Auto-load default quant</label><select id="autoload_quant"><option>int4</option><option>int8</option><option value="none">none (bf16)</option></select></div>
+    <div class="fld"><label>Auto-load default quant</label><select id="autoload_quant"><option>int4</option><option>int2</option><option>int8</option><option value="none">none (bf16)</option></select></div>
     <div class="fld"><label>Auto-load default ctx (0 = native)</label><input id="autoload_ctx" type="number" min="0"></div>
     <div class="fld"><label>Auto-load placement mode</label><select id="autoload_mode"><option>auto</option><option>all-gpu</option><option>distribute</option><option>proportional</option><option>single</option></select></div>
     <div class="fld"><label>Prefill stall-watchdog (s, 0=off)</label><input id="gen_stall_s" type="number" min="0"></div>

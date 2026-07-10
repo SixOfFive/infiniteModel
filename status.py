@@ -276,7 +276,8 @@ def build_status() -> dict:
                  if (_f != 1.0 and plan_spec.meas_layer_w is not None) else plan_spec)
         quant_gb = {"none": round(plan_spec.total_weight_bytes / GB, 2),          # native dtype size
                     "int8": round(qspec.for_quant("int8").total_weight_bytes / GB, 2),
-                    "int4": round(qspec.for_quant("int4").total_weight_bytes / GB, 2)}
+                    "int4": round(qspec.for_quant("int4").total_weight_bytes / GB, 2),
+                    "int2": round(qspec.for_quant("int2").total_weight_bytes / GB, 2)}   # #int2
         quant_fits = {q: (g <= round(pool_usable, 2)) for q, g in quant_gb.items()}
         fits_ram = bool(nodes) and plan_pipeline(plan_spec, mems, DEFAULT_CTX).ok
         fits_disk = dl or ctrl_free_gb >= size_gb

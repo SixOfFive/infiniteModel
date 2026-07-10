@@ -27,6 +27,9 @@ from wire import _tp_hetsplit, _fuse_moe_experts   # noqa: F401  (het-TP geometr
 # so a controller-compiled shard cache is byte-identical to what the worker quantizes at load
 # time (#shard-cache).
 INT4_GROUP = 128
+# Shared int2 group size — MUST match worker_quant.py _INT2_GROUP, same byte-identity contract.
+# Finer than int4's 128: 2-bit RTN needs smaller groups to stay usable (~2.5 bits/weight eff.).
+INT2_GROUP = 64
 
 # code-split Inc 9: the pack family (PACKER_VERSION/_packer_tag/pack_linear_*/pack_unit_tensors)
 # + _shard_cache_root live in shard_compile.py now (VERBATIM). INT4_GROUP above STAYS here --

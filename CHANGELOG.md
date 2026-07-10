@@ -24,6 +24,22 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   serve-time dequant of **fp8** and **nvfp4** checkpoints. Selecting **int8 on a MoE auto-downgrades to
   int4** (with a loud log line): the int8 path only quantizes 2D Linears, so a MoE's fused-3D routed
   experts would otherwise stay bf16 → a near-bf16 footprint (OOM/CPU-spill); int4 packs the experts.
+- **int2 (#int2) — a 2-bit CAPACITY tier.** `quant=int2` on `/load`/`/reconfigure`/auto-load config:
+  group-wise asymmetric 2-bit (4 values/byte, group 64 — finer than int4's 128 because 2-bit RTN
+  needs it), ~2.5 bits/weight effective (~1/6 of bf16); head/embed/norms/router stay bf16 exactly
+  like int4. The int4 architecture cloned end-to-end: naive dequant path everywhere (CPU big-M gets
+  the fp32-GEMM treatment), a **Triton w2a16** batch + split-K-GEMV kernel (same autotune space and
+  dram-dealias row pad as w4a16) as the fused decode path on **both CUDA and ROCm** (int2 has no torch
+  tinygemm; no-triton workers self-gate to naive), self-checked vs naive at placement with automatic
+  fallback (`IM_FUSED_INT2=0` kill-switch). **Shard cache included**: `_shards/int2/` compiles via the
+  same shared bit-identical packer (`pack_linear_int2` == the worker's `_quantize_linear2` by
+  construction), cache-on-first-load fires for int2 loads, serve-from-cache installs QuantLinear2
+  holders directly. **Dense models only**: int2 on a MoE auto-downgrades to int4 (no 2-bit 3D-expert
+  packer/kernel), mirroring the int8-on-MoE rule; MoE cache compiles reject non-int4 as before.
+  Planner/status size the tier at 0.2× layer weights (`for_quant`), `/status` quant_gb/quant_fits
+  carry an int2 entry, and the dashboard's Load + auto-load-default selects offer it. The shipped
+  **auto-load default remains int4** — int2 is an explicit operator choice: a capacity tier with
+  VISIBLE quality loss (use it to fit a model that otherwise can't load at all, not to speed one up).
 - **Hybrid models reserve KV only on their attention layers:** a Gated-DeltaNet hybrid (qwen3-next /
   qwen3.6) grows a full-context KV only on its `full_attention` layers (the linear-attn layers keep a
   small fixed recurrent state). KV reservation — both the GPU placement budget and the pre-alloc probe,

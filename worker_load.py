@@ -30,10 +30,11 @@ class WorkerLoadMixin:
         # routed-expert block in CPU RAM (llama.cpp --override-tensor experts=CPU, intra-layer).
         # Pipeline-only (the TP path ignores it); the worker further gates to int4 experts.
         moe_offload = bool(a.get("moe_offload", False))
-        # #shard-cache Inc 2 (serve-from-cache): controller flags '' | 'int4'. When 'int4', fetch
-        # PRE-PACKED int4 layer units (cache=int4 on /weights) and install them directly — no bf16
-        # stream, no per-layer re-quant. Pipeline + int4 only (the controller never sets it for TP).
-        cache = (a.get("cache", "") or "") if quant == "int4" else ""
+        # #shard-cache Inc 2 (serve-from-cache): controller flags '' | 'int4' | 'int2'. When set,
+        # fetch PRE-PACKED layer units (cache=<quant> on /weights) and install them directly — no
+        # bf16 stream, no per-layer re-quant. Pipeline only (the controller never sets it for TP);
+        # gated to the matching quant so a stale flag can never install a cross-tier cache.
+        cache = (a.get("cache", "") or "") if quant in ("int4", "int2") else ""
         if tp_size <= 1:
             # DEFAULT PATH: stream each slice ONE LAYER AT A TIME straight into RAM bytes, then
             # st_load -> HEAP tensors (m4c25). NO temp files anywhere. The old path staged each slice

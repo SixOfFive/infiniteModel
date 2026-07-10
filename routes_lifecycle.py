@@ -35,13 +35,15 @@ def register(app):
         #   spread     (F, F) FORCE a stage on every capable node (incl. tiny ones)
         #   proportional (F, F) layers across EVERY capable node PROPORTIONAL to its capacity
         #                 (#78: big int4 MoE — MiniMax-M2 — too big for the GPU-first subset)
-        # `quant`: 'none' (bf16), 'int8' (~1/2), or 'int4' (group-wise ~4.25-bit, ~1/4 — for
-        # 200B+ MoEs that won't fit at int8). `tp` (M4): tensor-parallel group
+        # `quant`: 'none' (bf16), 'int8' (~1/2), 'int4' (group-wise ~4.25-bit, ~1/4 — for
+        # 200B+ MoEs that won't fit at int8), or 'int2' (#int2: group-wise ~2.5-bit, ~1/6 —
+        # a CAPACITY tier for dense models that won't fit at int4; visible quality loss; MoE
+        # auto-downgrades to int4). `tp` (M4): tensor-parallel group
         # size — split every layer across `tp` GPU nodes (rank 0 drives the group over the
         # all-reduce mesh). tp>1 overrides mode. tp must divide num_key_value_heads.
         # Legacy: if mode is omitted but consolidate=false is passed, honor it.
-        if quant not in ("none", "int8", "int4"):
-            return JSONResponse({"ok": False, "error": f"bad quant '{quant}' (none|int8|int4)"},
+        if quant not in ("none", "int8", "int4", "int2"):
+            return JSONResponse({"ok": False, "error": f"bad quant '{quant}' (none|int8|int4|int2)"},
                                 status_code=400)
         # #172 TurboQuant KV preset. Empty -> _load_impl inherits the ENGINE_CONFIG knob (default 'none').
         if kv_quant and kv_quant not in ("none", "turbo2", "turbo3", "turbo4"):
@@ -110,7 +112,10 @@ def register(app):
             # CPU-spill. Auto-DOWNGRADE to int4 (which DOES pack experts) so the user gets a real memory
             # reduction. Reuse the controller's existing MoE detector (weight-map -> _has_moe_experts).
             # Best-effort: if we can't introspect the model, fall through and honor int8 as requested.
-            if quant == "int8":
+            if quant in ("int8", "int2"):
+                # #int2: same shape of problem as int8-on-MoE — the int2 walker only quantizes 2D
+                # nn.Linears (no 2-bit 3D-expert packer/kernel), so a MoE at int2 would keep its
+                # routed experts (the bulk of the model) bf16. int4 DOES pack experts — downgrade.
                 try:
                     import shards as _sh
                     _tgt = MODELS[friendly][0] if friendly in MODELS else friendly
@@ -118,13 +123,13 @@ def register(app):
                     if _mdir:
                         _wm = await asyncio.to_thread(_sh._weight_map, _mdir)
                         if await asyncio.to_thread(_sh._has_moe_experts, _wm):
-                            log_activity(f"{_ollama_name(friendly)}: int8 on a MoE keeps experts bf16 "
-                                         "(no int8 3D-expert quantizer) — DOWNGRADING to int4 for a real "
-                                         "memory reduction")
+                            log_activity(f"{_ollama_name(friendly)}: {quant} on a MoE keeps experts bf16 "
+                                         f"(no {quant} 3D-expert quantizer) — DOWNGRADING to int4 for a "
+                                         "real memory reduction")
                             quant = "int4"
                 except Exception as _moe_exc:
-                    log_activity(f"{_ollama_name(friendly)}: MoE check for int8 downgrade failed "
-                                 f"({_moe_exc}) — honoring int8 as requested")
+                    log_activity(f"{_ollama_name(friendly)}: MoE check for {quant} downgrade failed "
+                                 f"({_moe_exc}) — honoring {quant} as requested")
             # #cache-on-first-load: for an int4 load with no shard cache yet, BUILD the cache first so
             # THIS load — and every future load — serves the small pre-packed int4 layers instead of
             # streaming full bf16 and re-quantizing on the fly. precompile=0 opts out. Shared with the
@@ -362,8 +367,8 @@ def register(app):
         if getattr(lm, "active", 0) > 0:   # never tear a model down mid-generate
             return JSONResponse({"ok": False, "error": f"'{friendly}' is busy ({lm.active} active "
                                  f"request(s)) — retry when idle"}, status_code=409)
-        if quant not in ("keep", "none", "int8", "int4"):
-            return JSONResponse({"ok": False, "error": f"bad quant '{quant}' (keep|none|int8|int4)"},
+        if quant not in ("keep", "none", "int8", "int4", "int2"):
+            return JSONResponse({"ok": False, "error": f"bad quant '{quant}' (keep|none|int8|int4|int2)"},
                                 status_code=400)
         new_ctx = ctx if (ctx and ctx > 0) else lm.ctx
         new_quant = (lm.quant or "none") if quant == "keep" else quant

@@ -30,15 +30,18 @@ dashboard.
   worker holds a contiguous block of layers; add machines to fit bigger models.
 - **Goes faster where it can.** Tensor parallelism within a stage (capacity-proportional, GPU+CPU
   mixed meshes) and opt-in speculative decoding.
-- **Quantization.** int4 (group-wise, fused tinygemm GEMM) and int8 (per-channel) at load time;
+- **Quantization.** int4 (group-wise, fused tinygemm GEMM), int8 (per-channel), and **int2**
+  (group-wise ~2.5-bit, group 64 — a *capacity* tier for dense models that won't fit at int4;
+  expect visible quality loss; MoE auto-downgrades to int4) at load time;
   serves fp8 and nvfp4 checkpoints by dequantizing on the fly. Decode-kernel acceleration is
   **platform-tiered** — torch tinygemm int4 on NVIDIA/CPU, a Triton w4a16 + split-K kernel on **AMD
-  GPUs (ROCm/RDNA)**, and an **opt-in fused MoE-expert kernel on Linux+NVIDIA**
+  GPUs (ROCm/RDNA)**, a Triton **w2a16** kernel for int2 on both GPU stacks, and an **opt-in fused
+  MoE-expert kernel on Linux+NVIDIA**
   ([docs/ACCELERATION.md](docs/ACCELERATION.md)). Runs on AMD **1:1 with CUDA via HIP**
   ([docs/ROCM.md](docs/ROCM.md)).
 - **Pre-compiled shard cache.** The controller quantizes a model once to `_shards/<quant>/`, so later
-  loads stream small **pre-packed** int4/int8 layers instead of bf16 + re-quantizing — for dense
-  models *and* MoE (fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load. Any model
+  loads stream small **pre-packed** int4/int2/int8 layers instead of bf16 + re-quantizing — for dense
+  models *and* MoE (int4: fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load. Any model
   without an int4 cache shows a one-click **`⚡ int4` compile badge** on the models page (hover for
   the estimated on-disk size and free-disk check); compiles run in a background subprocess with live
   progress on the model's row.

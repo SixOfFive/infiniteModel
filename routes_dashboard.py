@@ -132,7 +132,7 @@ def register(app):
             spec = await asyncio.to_thread(spec_with_measurements, spec, _pd)
         if ctx <= 0:   # default to the model's native training context (from spec)
             ctx = spec.max_ctx or DEFAULT_CTX
-        spec = spec.for_quant(quant) if quant in ("int8", "int4") else spec   # size the real footprint
+        spec = spec.for_quant(quant) if quant in ("int8", "int4", "int2") else spec   # size the real footprint
         cons, pv = LOAD_MODES.get(mode, LOAD_MODES["auto"])   # mirror /load's mode -> placement flags
         mems = []
         node_by_id = {}
@@ -156,7 +156,7 @@ def register(app):
         # even when the plan does NOT fit (then est_vram/est_ram are absent, but weights+KV explain why).
         _wt_gb = spec.total_weight_bytes / GB
         _kv_gb = spec.kv_bytes_per_layer(ctx) * spec.num_layers / GB
-        d["mem"] = {"quant": (quant if quant in ("int8", "int4") else "none"), "ctx": ctx,
+        d["mem"] = {"quant": (quant if quant in ("int8", "int4", "int2") else "none"), "ctx": ctx,
                     "weights_gb": round(_wt_gb, 2), "kv_gb": round(_kv_gb, 2),
                     "kv_per_1k_gb": round(_kv_gb / max(1, ctx) * 1000, 3),
                     "total_gb": round(_wt_gb + _kv_gb, 2)}
@@ -342,8 +342,8 @@ def register(app):
         if auto_load is not None:                        # auto-load a requested model that isn't resident
             ENGINE_CONFIG["auto_load"] = bool(auto_load)
         if autoload_quant is not None:                   # #autoload-smallest: quant for auto-loads
-            _aq = str(autoload_quant).lower()
-            if _aq in ("int4", "int8", "none"):
+            _aq = str(autoload_quant).lower()            # int2 accepted as an OPERATOR choice —
+            if _aq in ("int4", "int8", "none", "int2"):  # the shipped default stays int4 (#int2)
                 ENGINE_CONFIG["autoload_quant"] = _aq
         if autoload_ctx is not None:                      # #auto-defaults: default ctx for auto/click loads
             ENGINE_CONFIG["autoload_ctx"] = max(0, int(autoload_ctx))

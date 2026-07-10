@@ -91,15 +91,15 @@ class EngineLoadMixin:
         raise ValueError(f"model '{friendly}' is not loaded — load it first")
 
     async def _precompile_int4(self, friendly: str, quant: str, tp: int) -> None:
-        """#cache-on-first-load: for an int4 load with NO shard cache yet, BUILD it first (blocks
-        until written) so THIS load — and every future load — serves the small pre-packed int4
-        layers instead of streaming full bf16 and re-quantizing on the fly. No-op when an int4 cache
-        already exists, when quant != int4, or for tp>1 (its dispatch path doesn't read the whole-
-        layer cache). Reuses the /compile_shards SUBPROCESS (deprioritized, GIL-safe — an in-process
-        compile would starve the event loop / drop live generations). Non-fatal: ANY failure falls
-        through to the normal cold load. Shared by the /load route AND the auto-load path
-        (ensure_loaded) so request-triggered loads compile-on-first-load identically to click-loads."""
-        if not (quant == "int4" and tp <= 1):
+        """#cache-on-first-load: for an int4/int2 load with NO shard cache yet, BUILD it first
+        (blocks until written) so THIS load — and every future load — serves the small pre-packed
+        layers instead of streaming full bf16 and re-quantizing on the fly. No-op when that tier's
+        cache already exists, when quant is none/int8, or for tp>1 (its dispatch path doesn't read
+        the whole-layer cache). Reuses the /compile_shards SUBPROCESS (deprioritized, GIL-safe — an
+        in-process compile would starve the event loop / drop live generations). Non-fatal: ANY
+        failure falls through to the normal cold load. Shared by the /load route AND the auto-load
+        path (ensure_loaded) so request-triggered loads compile-on-first-load identically."""
+        if not (quant in ("int4", "int2") and tp <= 1):
             return
         try:
             import shard_compile as _sh   # code-split Inc 9: shard_cache_status moved
@@ -107,11 +107,11 @@ class EngineLoadMixin:
             _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
             _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
             _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
-            if _cdir and not (_cst.get("int4") or {}).get("ok"):
-                log_activity(f"{_ollama_name(friendly)}: no int4 shard cache — building it now so this "
+            if _cdir and not (_cst.get(quant) or {}).get("ok"):
+                log_activity(f"{_ollama_name(friendly)}: no {quant} shard cache — building it now so this "
                              "and every future load serve pre-packed (first load is slower)…")
                 _curl = (f"http://127.0.0.1:{ARGS.http_port}/compile_shards"
-                         f"?model={_up.quote(friendly)}&quant=int4")
+                         f"?model={_up.quote(friendly)}&quant={quant}")
 
                 def _build_cache():
                     import urllib.request as _u
@@ -684,12 +684,12 @@ class EngineLoadMixin:
                 # controller falls back to bf16 PER UNIT if any cache file is missing, and an old
                 # worker that ignores the `cache` key just streams bf16 — both safe.
                 _cache_quant = ""
-                if quant == "int4":
+                if quant in ("int4", "int2"):
                     try:
                         _cdir = await asyncio.to_thread(_controller_model_dir, target_id)
-                        if _cdir and await asyncio.to_thread(_shard_cache_ok, _cdir, "int4"):
-                            _cache_quant = "int4"
-                            log_activity(f"{friendly}: serving from int4 shard cache "
+                        if _cdir and await asyncio.to_thread(_shard_cache_ok, _cdir, quant):
+                            _cache_quant = quant
+                            log_activity(f"{friendly}: serving from {quant} shard cache "
                                          f"(skip bf16 stream + per-layer re-quant)")
                     except Exception as _ce:
                         log_activity(f"{friendly}: shard-cache check failed ({_ce!r}) -> bf16 stream")
@@ -744,8 +744,8 @@ class EngineLoadMixin:
                         "device": "cpu" if cpu_only else nd.load_device(),
                         "gpu_budget_gb": round(_gpu_budget_gb, 3),   # #95: committed-aware GPU cap for this stage
                         "moe_offload": moe_offload,  # #moe-offload: split MoE layers (attn->GPU, experts->CPU RAM)
-                        "cache": _cache_quant,       # #shard-cache Inc 2: '' | 'int4' -> fetch pre-packed cache
-                        "quant": quant,              # 'none' | 'int8' (load-time choice)
+                        "cache": _cache_quant,       # #shard-cache Inc 2: '' | 'int4' | 'int2' -> fetch pre-packed cache
+                        "quant": quant,              # 'none' | 'int8' | 'int4' | 'int2' (load-time choice)
                         "kv_quant": kv_quant,        # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4)
                         "kv_offload": kv_offload,    # #kv-offload: KV cache in system RAM (OffloadedCache)
                         "ctx": ctx,                  # full ctx -> worker pre-reserves KV (fail-fast)
@@ -1387,7 +1387,8 @@ class EngineLoadMixin:
         # still streams its full bf16 slice and quantizes after, so a flat 900 s timed out big loads.
         # spec is already for_quant'd here -> recover ~bf16 (int4 ~/0.3, int8 x2). Clamp [15 min, 4 h].
         _tpb = getattr(spec, "total_weight_bytes", 0) or 0
-        _tpb = int(_tpb / 0.3) if quant == "int4" else (_tpb * 2 if quant == "int8" else _tpb)
+        _tpb = (int(_tpb / 0.3) if quant == "int4" else int(_tpb / 0.2) if quant == "int2"
+                else (_tpb * 2 if quant == "int8" else _tpb))
         tp_load_timeout = max(900, min(int(_tpb / (35 * 1024 * 1024)) + 300, 4 * 3600))
         results = await asyncio.gather(
             *[asyncio.wait_for(f, timeout=tp_load_timeout) for f in futs.values()], return_exceptions=True)

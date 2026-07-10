@@ -529,7 +529,8 @@ from worker_quant import (_quantize_int4_, _quantize_int8_, _quantize_experts4_,
                           _quantize_experts4_streamed_nonfused, _quant4_linear_cls,
                           _packed4_3d_cls, _INT4_GROUP, _install_fused_moe_forward,
                           _w4a16_triton_op, _w4a16_moe_op, _pack4_expert,
-                          _pack4_3d)   # noqa: E402,F401
+                          _pack4_3d, _quantize_int2_, _quantize_linear2,
+                          _quant2_linear_cls, _INT2_GROUP)   # noqa: E402,F401
 # Inc 10 NOTE: the quant FLAGS (_CPU_FP32_GEMM, _CPU_FP32_MIN_ROWS, _CPU_BF16_GEMM_OK,
 # _FUSED_INT4) are deliberately NOT back-imported — they are rebound at runtime inside
 # worker_quant (tune_cpu_threads / --no-cpu-fp32) and a from-import would freeze a stale
@@ -671,10 +672,13 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         # weight-only quant (before device placement, so we move quantized weights not bf16).
         # int8: ~1/2 footprint, head quantized too. int4: ~1/4 footprint, head LEFT bf16
         # (logits are quant-sensitive; the head is one matrix so the memory cost is small).
+        # int2 (#int2): ~1/6 footprint (2-bit, group 64), head LEFT bf16 like int4; DENSE only
+        # (the /load route downgrades int2-on-MoE to int4 — no 2-bit expert packer).
         self.quant = quant
         self.kv_quant = kv_quant   # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4); read in shard_forward
-        if quant in ("int8", "int4"):
-            qlayer = _quantize_int4_ if quant == "int4" else _quantize_int8_
+        if quant in ("int8", "int4", "int2"):
+            qlayer = (_quantize_int4_ if quant == "int4"
+                      else _quantize_int2_ if quant == "int2" else _quantize_int8_)
             for lyr in self.owned_layers:
                 qlayer(lyr)
                 if quant == "int4":
@@ -1247,11 +1251,13 @@ def parse_args() -> argparse.Namespace:
                         "and shapes — so it adapts automatically. 'eager': plain additive-"
                         "mask matmul, bit-exact and reproducible (for correctness checks) "
                         "but slower; pick it only when you need deterministic logits.")
-    p.add_argument("--quant", default="none", choices=["none", "int8", "int4"],
+    p.add_argument("--quant", default="none", choices=["none", "int8", "int4", "int2"],
                    help="weight quantization: 'none' (bf16, default), 'int8' "
-                        "(per-channel weight-only — halves the footprint), or 'int4' "
+                        "(per-channel weight-only — halves the footprint), 'int4' "
                         "(group-wise ~4.25-bit weight-only — ~1/4 footprint, for 200B+ "
-                        "MoEs that won't fit at int8; small decode-speed cost). The "
+                        "MoEs that won't fit at int8; small decode-speed cost), or 'int2' "
+                        "(group-wise ~2.5-bit weight-only — ~1/6 footprint, dense models "
+                        "only; a CAPACITY tier with visible quality loss). The "
                         "per-model quant in the controller's load message overrides this.")
     p.add_argument("--clean", action="store_true",
                    help="OPT-IN: purge cached models/chunks on startup. OFF by "

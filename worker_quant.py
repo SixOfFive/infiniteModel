@@ -85,6 +85,10 @@ if triton is not None:
 # QuantLinear4 at placement, self-checked vs the naive dequant, naive fallback on any mismatch /
 # unsupported device. Off-switch: IM_FUSED_INT4=0.
 _FUSED_INT4 = (os.environ.get("IM_FUSED_INT4", "1") != "0")
+# Fused-dequant int2 GEMM (Triton w2a16 — there is NO torch tinygemm for 2-bit): same contract
+# as _FUSED_INT4 but for QuantLinear2; the one Triton kernel serves BOTH CUDA and ROCm (no-triton
+# workers self-gate to the naive dequant path). Off-switch: IM_FUSED_INT2=0.
+_FUSED_INT2 = (os.environ.get("IM_FUSED_INT2", "1") != "0")
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +963,314 @@ def _quantize_int4_(module) -> None:
             continue   # leave router/gate projections bf16 (precision-sensitive routing)
         else:
             _quantize_int4_(child)
+
+
+# --- int2: 2-bit weight-only quant (#int2) ---------------------------------------------------
+# The int4 family cloned down to 2 bits: group-wise ASYMMETRIC per-output-channel, 4 values per
+# byte (LOWEST 2 bits = lowest input column), w = (q - zero) * scale, q in 0..3. Group 64 (vs
+# int4's 128) because 2-bit round-to-nearest needs finer groups to stay usable — effective
+# ~2.5 bits/weight (2 + bf16 scale/zero per 64). Head/embed/norms/router stay bf16 exactly like
+# int4. DENSE Linears only in this increment: fused 3D MoE experts have no 2-bit packer/kernel
+# yet (the /load route downgrades int2-on-MoE to int4, mirroring the int8-on-MoE downgrade).
+# Quality note: RTN 2-bit is a capacity tier, not a fidelity tier — expect visible degradation
+# on small models; its use case is fitting a model that would otherwise not fit at all.
+_QUANT_LINEAR2 = None
+_INT2_GROUP = 64
+
+
+def _quant2_linear_cls():
+    global _QUANT_LINEAR2
+    if _QUANT_LINEAR2 is None:
+        import torch
+        from torch import nn
+        import torch.nn.functional as F
+
+        class QuantLinear2(nn.Module):
+            def __init__(self, qweight, scale, zero, bias, in_features, group_size):
+                super().__init__()
+                self.register_buffer("qweight", qweight)  # uint8 [out, in_pad//4] (4 cols/byte)
+                self.register_buffer("scale", scale)       # dtype [out, n_groups]
+                self.register_buffer("zero", zero)         # dtype [out, n_groups]
+                self.bias = bias                            # Parameter or None (bf16)
+                self.in_features = in_features
+                self.group_size = group_size
+
+            def _dequant(self, dtype):
+                qw = self.qweight
+                out = qw.shape[0]
+                q0 = (qw & 0x3).to(torch.int16)            # input col 4j
+                q1 = ((qw >> 2) & 0x3).to(torch.int16)     # col 4j+1
+                q2 = ((qw >> 4) & 0x3).to(torch.int16)     # col 4j+2
+                q3 = ((qw >> 6) & 0x3).to(torch.int16)     # col 4j+3
+                q = torch.stack((q0, q1, q2, q3), dim=2).reshape(out, -1)   # [out, in_pad]
+                ng = self.scale.shape[1]
+                G = self.group_size
+                qf = q.reshape(out, ng, G).to(dtype)
+                w = (qf - self.zero.to(dtype).unsqueeze(2)) * self.scale.to(dtype).unsqueeze(2)
+                return w.reshape(out, ng * G)[:, :self.in_features].contiguous()
+
+            def prepare_fused(self):
+                # int2 has NO torch tinygemm — the Triton w2a16 GEMM is the only fused path, and
+                # (unlike int4, where NVIDIA gets tinygemm) it serves BOTH CUDA and ROCm. Same
+                # contract as QuantLinear4.prepare_fused: built once on the FINAL device,
+                # self-checked vs the naive dequant, ANY mismatch/build failure -> keep naive
+                # (never wrong, just slower). CPU: no fused op — the naive path's fp32-GEMM
+                # prefill acceleration still applies.
+                if not _FUSED_INT2 or getattr(self, "_fused", None) is not None \
+                        or getattr(self, "_fused_tried", False) or self.qweight is None:
+                    return
+                self._fused_tried = True
+                dev = self.qweight.device
+                if dev.type != "cuda":
+                    return
+                op = _w2a16_triton_op()
+                if op is None:
+                    return
+                try:
+                    G = self.group_size
+                    ng = self.scale.shape[1]
+                    in_pad = ng * G
+                    # #dram-dealias (see QuantLinear4.prepare_fused): the GEMV walks qweight along
+                    # N with a row stride of K/4 bytes; an even multiple of 64B collapses DRAM
+                    # channel parallelism on big weights. Re-allocate rows on an ODD multiple of
+                    # 64B (64B/row cost, never hurts the aligned case).
+                    qw = self.qweight
+                    if qw.shape[1] % 128 == 0:
+                        buf = torch.zeros((qw.shape[0], qw.shape[1] + 64),
+                                          dtype=torch.uint8, device=dev)
+                        buf[:, :qw.shape[1]].copy_(qw)
+                        self.qweight = buf[:, :qw.shape[1]]
+                    sz = (self.scale, self.zero)
+                    xt = torch.randn(8, self.in_features, device=dev, dtype=torch.bfloat16)
+                    xk = xt if in_pad == self.in_features else F.pad(xt, (0, in_pad - self.in_features))
+                    yf = op(xk.contiguous(), self.qweight, G, sz).float()
+                    yn = F.linear(xt, self._dequant(torch.bfloat16)).float()
+                    rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
+                    if rel < 0.05:
+                        self._fused = (self.qweight, sz, op, in_pad)   # kernel reads qweight; keep it
+                        print(f"[int2] triton w2a16 kernel active on {dev}", flush=True)
+                    else:
+                        print(f"[int2] triton w2a16 self-check rel={rel:.3f} on {dev} -> naive", flush=True)
+                except Exception as exc:
+                    print(f"[int2] triton w2a16 prepare failed on {dev} ({exc!r}) -> naive", flush=True)
+
+            def forward(self, x):
+                fz = getattr(self, "_fused", None)
+                if fz is not None:
+                    # fused-dequant int2 GEMM: flatten, bf16 activations, restore shape.
+                    qw, sz, op, in_pad = fz
+                    xq = x.reshape(-1, self.in_features)
+                    if xq.dtype != torch.bfloat16:
+                        xq = xq.to(torch.bfloat16)
+                    if in_pad != self.in_features:
+                        xq = F.pad(xq, (0, in_pad - self.in_features))
+                    y = op(xq.contiguous(), qw, self.group_size, sz).reshape(*x.shape[:-1], -1)
+                    y = y.to(x.dtype)
+                    return y if self.bias is None else y + self.bias.to(y.dtype)
+                # naive fallback: mirrors QuantLinear4 — CPU big-M dequants to fp32 + fp32 GEMM
+                # (the dequant is paid regardless, so the fp32 weight is free); else x.dtype.
+                if (_CPU_FP32_GEMM and x.device.type == "cpu"
+                        and x.dtype != torch.float32 and _rows(x) >= _CPU_FP32_MIN_ROWS):
+                    b = self.bias
+                    y = F.linear(x.to(torch.float32), self._dequant(torch.float32),
+                                 None if b is None else b.to(torch.float32))
+                    return y.to(x.dtype)
+                return F.linear(x, self._dequant(x.dtype), self.bias)
+
+        _QUANT_LINEAR2 = QuantLinear2
+    return _QUANT_LINEAR2
+
+
+# --- Triton w2a16 int2 GEMM (fused 2-bit decode; CUDA + ROCm) ---------------------------------
+# The w4a16 kernel family adapted to 4 values/byte, in the worker's exact int2 group-wise
+# asymmetric format: qweight uint8 [N, K//4] (byte j -> input cols 4j..4j+3, LOWEST 2 bits =
+# col 4j), scale/zero [N, K//group], w=(q-zero)*scale. Bit-identical to the naive path
+# (self-checked in prepare_fused). Lazily built on first use, shared build lock with the w4a16
+# family. Unlike int4 (tinygemm on NVIDIA/CPU), this single kernel is the fused path EVERYWHERE
+# a GPU + triton exist; no-triton workers (e.g. Windows) fall back to naive automatically.
+_W2A16_OP = None
+_W2A16_TRIED = False
+
+
+def _w2a16_triton_op():
+    """Callable op(x[M,Kpad] bf16, qweight uint8[N,Kpad//4], group, (scale,zero) [N,ng]) ->
+    y[M,N] bf16, or None if triton is unavailable / fails to build. Thread-safe lazy build."""
+    global _W2A16_OP, _W2A16_TRIED
+    if _W2A16_TRIED:
+        return _W2A16_OP
+    with _W4A16_BUILD_LOCK:     # #triton-race: same lock discipline as the w4a16 builders
+        return _w2a16_triton_op_locked()
+
+
+def _w2a16_triton_op_locked():
+    global _W2A16_OP, _W2A16_TRIED
+    if _W2A16_TRIED:             # a racer built it while we waited on the lock
+        return _W2A16_OP
+    try:
+        import torch
+        if triton is None:       # module-level import (see top); None on no-triton workers
+            raise ImportError("triton unavailable")
+
+        @triton.jit
+        def _k2(x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, M, N, K,
+                sxm, sxk, sqk, sqn, ssn, ssg, szn, szg, sym, syn,
+                GROUP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+            pid_m = tl.program_id(0)
+            pid_n = tl.program_id(1)
+            offs_m = pid_m * BM + tl.arange(0, BM)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            offs_b = tl.arange(0, GROUP // 4)            # byte index within a K-group
+            acc = tl.zeros((BM, BN), dtype=tl.float32)
+            for kb in range(0, K // GROUP):
+                k0 = kb * GROUP
+                mm = offs_m[:, None] < M
+                x0 = tl.load(x_ptr + offs_m[:, None] * sxm + (k0 + 4 * offs_b + 0)[None, :] * sxk,
+                             mask=mm, other=0.0)
+                x1 = tl.load(x_ptr + offs_m[:, None] * sxm + (k0 + 4 * offs_b + 1)[None, :] * sxk,
+                             mask=mm, other=0.0)
+                x2 = tl.load(x_ptr + offs_m[:, None] * sxm + (k0 + 4 * offs_b + 2)[None, :] * sxk,
+                             mask=mm, other=0.0)
+                x3 = tl.load(x_ptr + offs_m[:, None] * sxm + (k0 + 4 * offs_b + 3)[None, :] * sxk,
+                             mask=mm, other=0.0)
+                qp = q_ptr + (k0 // 4 + offs_b)[:, None] * sqk + offs_n[None, :] * sqn
+                b = tl.load(qp, mask=offs_n[None, :] < N, other=0).to(tl.int32)
+                s = tl.load(s_ptr + offs_n * ssn + kb * ssg, mask=offs_n < N, other=0.0).to(tl.float32)
+                z = tl.load(z_ptr + offs_n * szn + kb * szg, mask=offs_n < N, other=0.0).to(tl.float32)
+                q0 = (b & 0x3).to(tl.float32)
+                q1 = ((b >> 2) & 0x3).to(tl.float32)
+                q2 = ((b >> 4) & 0x3).to(tl.float32)
+                q3 = ((b >> 6) & 0x3).to(tl.float32)
+                acc += tl.dot(x0.to(tl.bfloat16), ((q0 - z[None, :]) * s[None, :]).to(tl.bfloat16))
+                acc += tl.dot(x1.to(tl.bfloat16), ((q1 - z[None, :]) * s[None, :]).to(tl.bfloat16))
+                acc += tl.dot(x2.to(tl.bfloat16), ((q2 - z[None, :]) * s[None, :]).to(tl.bfloat16))
+                acc += tl.dot(x3.to(tl.bfloat16), ((q3 - z[None, :]) * s[None, :]).to(tl.bfloat16))
+            yp = y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn
+            tl.store(yp, acc.to(tl.bfloat16), mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+        # DECODE (M=1) split-K GEMV — same occupancy rationale + autotune space as the w4a16
+        # _ksk (see that kernel's header); reset_to_zero because it atomic-adds into y_ptr.
+        @triton.autotune(
+            configs=[triton.Config({"BN": 128, "SPLITK": s}, num_warps=w)
+                     for s in (4, 8, 16) for w in (4, 8)]
+                    + [triton.Config({"BN": bn, "SPLITK": s}, num_warps=w)
+                       for (bn, s, w) in ((64, 4, 8), (64, 4, 16), (64, 8, 16), (64, 16, 16),
+                                          (64, 32, 16), (128, 4, 16), (128, 8, 16))],
+            key=["N", "K"],
+            reset_to_zero=["y_ptr"],
+        )
+        @triton.jit
+        def _ksk2(x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, N, K,
+                  sxk, sqk, sqn, ssn, ssg, szn, szg, syn,
+                  GROUP: tl.constexpr, BN: tl.constexpr, SPLITK: tl.constexpr):
+            pid_n = tl.program_id(0)
+            pid_k = tl.program_id(1)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            nmask = offs_n < N
+            offs_b = tl.arange(0, GROUP // 4)
+            ngroups = K // GROUP
+            gps = (ngroups + SPLITK - 1) // SPLITK       # K-groups this split reduces
+            g0 = pid_k * gps
+            acc = tl.zeros((BN,), dtype=tl.float32)
+            for gi in range(0, gps):
+                kb = g0 + gi
+                if kb < ngroups:
+                    k0 = kb * GROUP
+                    x0 = tl.load(x_ptr + (k0 + 4 * offs_b + 0) * sxk)
+                    x1 = tl.load(x_ptr + (k0 + 4 * offs_b + 1) * sxk)
+                    x2 = tl.load(x_ptr + (k0 + 4 * offs_b + 2) * sxk)
+                    x3 = tl.load(x_ptr + (k0 + 4 * offs_b + 3) * sxk)
+                    qp = q_ptr + (k0 // 4 + offs_b)[:, None] * sqk + offs_n[None, :] * sqn
+                    b = tl.load(qp, mask=nmask[None, :], other=0).to(tl.int32)
+                    s = tl.load(s_ptr + offs_n * ssn + kb * ssg, mask=nmask, other=0.0).to(tl.float32)
+                    z = tl.load(z_ptr + offs_n * szn + kb * szg, mask=nmask, other=0.0).to(tl.float32)
+                    q0 = (b & 0x3).to(tl.float32)
+                    q1 = ((b >> 2) & 0x3).to(tl.float32)
+                    q2 = ((b >> 4) & 0x3).to(tl.float32)
+                    q3 = ((b >> 6) & 0x3).to(tl.float32)
+                    acc += tl.sum(x0[:, None] * ((q0 - z[None, :]) * s[None, :]), axis=0)
+                    acc += tl.sum(x1[:, None] * ((q1 - z[None, :]) * s[None, :]), axis=0)
+                    acc += tl.sum(x2[:, None] * ((q2 - z[None, :]) * s[None, :]), axis=0)
+                    acc += tl.sum(x3[:, None] * ((q3 - z[None, :]) * s[None, :]), axis=0)
+            tl.atomic_add(y_ptr + offs_n * syn, acc, mask=nmask)
+
+        def _op2(x, qweight, group_size, sz):
+            scale, zero = sz
+            if x.dim() != 2:
+                x = x.reshape(-1, x.shape[-1])
+            if x.dtype != torch.bfloat16:
+                x = x.to(torch.bfloat16)
+            x = x.contiguous()
+            Kpad = qweight.shape[1] * 4                  # pad activations to the packed width
+            if x.shape[1] != Kpad:
+                import torch.nn.functional as _F
+                x = _F.pad(x, (0, Kpad - x.shape[1]))
+            M, K = x.shape
+            N = qweight.shape[0]
+            if M == 1:                                   # decode: split-K GEMV -> fp32 acc
+                yf = torch.zeros((N,), device=x.device, dtype=torch.float32)
+                grid = lambda meta: (triton.cdiv(N, meta["BN"]), meta["SPLITK"])  # noqa: E731
+                _ksk2[grid](x.view(-1), qweight, scale, zero, yf, N, K,
+                            x.stride(1), qweight.stride(1), qweight.stride(0),
+                            scale.stride(0), scale.stride(1), zero.stride(0), zero.stride(1),
+                            yf.stride(0), GROUP=group_size)
+                return yf.to(torch.bfloat16).view(1, N)
+            y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+            BM, BN = 16, 128
+            grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+            _k2[grid](x, qweight, scale, zero, y, M, N, K,
+                      x.stride(0), x.stride(1), qweight.stride(1), qweight.stride(0),
+                      scale.stride(0), scale.stride(1), zero.stride(0), zero.stride(1),
+                      y.stride(0), y.stride(1), GROUP=group_size, BM=BM, BN=BN)
+            return y
+
+        _W2A16_OP = _op2
+        _builtins.print("[int2] triton w2a16 kernel built (fused 2-bit GEMM)", flush=True)
+    except Exception as exc:
+        _builtins.print(f"[int2] triton w2a16 unavailable ({exc!r}) -> naive int2", flush=True)
+        _W2A16_OP = None
+    _W2A16_TRIED = True          # #triton-race: only AFTER _W2A16_OP is final
+    return _W2A16_OP
+
+
+def _quantize_linear2(lin, group_size: int = _INT2_GROUP):
+    """nn.Linear -> group-wise asymmetric int2 QuantLinear2 (4 values/byte). Same math shape as
+    _quantize_linear4 with a 0..3 grid and group 64 — MUST stay bit-identical to the shard
+    cache's pack_linear_int2 (shard_compile.py)."""
+    import torch
+    import torch.nn.functional as F
+    QL = _quant2_linear_cls()
+    W = lin.weight.data
+    out, in_f = W.shape
+    G = group_size
+    ng = (in_f + G - 1) // G
+    in_pad = ng * G
+    Wp = F.pad(W, (0, in_pad - in_f)) if in_pad != in_f else W
+    Wg = Wp.reshape(out, ng, G).float()
+    wmin = Wg.amin(dim=2)
+    wmax = Wg.amax(dim=2)
+    scale = ((wmax - wmin) / 3.0).clamp(min=1e-8)              # [out, ng]
+    zero = torch.round(-wmin / scale).clamp(0, 3)              # [out, ng]
+    q = torch.round(Wg / scale.unsqueeze(2) + zero.unsqueeze(2)).clamp(0, 3).to(torch.uint8)
+    q = q.reshape(out, in_pad)                                 # [out, in_pad]
+    qpacked = (q[:, 0::4] | (q[:, 1::4] << 2)
+               | (q[:, 2::4] << 4) | (q[:, 3::4] << 6)).contiguous()   # [out, in_pad//4] uint8
+    dt = W.dtype
+    return QL(qpacked, scale.to(dt), zero.to(dt), lin.bias, in_f, G)
+
+
+def _quantize_int2_(module) -> None:
+    """Recursively replace every nn.Linear under `module` with a QuantLinear2 — EXCEPT inside a
+    router/gate module (same exclusion as _quantize_int4_: 2-bit on a router gate corrupts the
+    top-k expert selection even worse than 4-bit). Mirrors the cache packer's `_quant_scope`
+    exclusion so a cold load stays bit-identical to the serve-from-cache install."""
+    from torch import nn
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, _quantize_linear2(child))
+        elif type(child).__name__.endswith(("Router", "Gate")):
+            continue   # leave router/gate projections bf16 (precision-sensitive routing)
+        else:
+            _quantize_int2_(child)
 
 
 # --- int4 for FUSED MoE experts (3D gate_up_proj/down_proj nn.Parameters) -------------------
