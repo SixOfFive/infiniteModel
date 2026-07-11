@@ -74,20 +74,34 @@ def _dump_live_cuda(top: int = 8) -> None:
         for (shape, dt), (n, tot) in top_g:
             _builtins.print(f"[vram-live] {n}x {shape} {dt} = {tot / (1024 ** 3):.2f} GB",
                             flush=True)
-        if biggest is not None:
-            def _describe(o):
-                with contextlib.suppress(Exception):
-                    if isinstance(o, dict):
-                        return f"dict keys={[str(k)[:40] for k in list(o.keys())[:4]]}"
-                    if isinstance(o, (tuple, list)):
-                        return f"{type(o).__name__} len={len(o)} items={[type(x).__name__ for x in o[:4]]}"
-                return type(o).__name__
-            for r1 in _gc.get_referrers(biggest[1])[:4]:
-                _builtins.print(f"[vram-live] L1 holder: {_describe(r1)}", flush=True)
-                for r2 in _gc.get_referrers(r1)[:4]:
-                    _builtins.print(f"[vram-live]   L2: {_describe(r2)}", flush=True)
-                    for r3 in _gc.get_referrers(r2)[:3]:
-                        _builtins.print(f"[vram-live]     L3: {_describe(r3)}", flush=True)
+        # name the OWNER: find lists of (int, big-cuda-Tensor) tuples, then the object whose
+        # attribute (or the dict key / module global) holds each list.
+        allobjs = _gc.get_objects()
+        _seenl = 0
+        for o in allobjs:
+            try:
+                if not (isinstance(o, list) and o and isinstance(o[0], tuple) and len(o[0]) == 2
+                        and isinstance(o[0][0], int) and torch.is_tensor(o[0][1])
+                        and o[0][1].is_cuda
+                        and o[0][1].numel() * o[0][1].element_size() > (1 << 27)):
+                    continue
+            except Exception:
+                continue
+            _seenl += 1
+            if _seenl > 3:
+                break
+            _builtins.print(f"[vram-live] holder list: len={len(o)} first=(int {o[0][0]}, "
+                            f"{tuple(o[0][1].shape)} {o[0][1].dtype})", flush=True)
+            for r in _gc.get_referrers(o)[:6]:
+                if isinstance(r, dict):
+                    key = next((str(k)[:60] for k, v in r.items() if v is o), "?")
+                    owner = next((type(x).__name__ for x in allobjs
+                                  if getattr(x, "__dict__", None) is r), "module/plain-dict")
+                    _builtins.print(f"[vram-live]   owner: {owner}.{key}", flush=True)
+                elif isinstance(r, (list, tuple)):
+                    _builtins.print(f"[vram-live]   in {type(r).__name__} len={len(r)}", flush=True)
+                elif type(r).__name__ not in ("frame", "list_iterator"):
+                    _builtins.print(f"[vram-live]   ref: {type(r).__name__}", flush=True)
 
 
 def _release_ram(trim_working_set: bool = False) -> None:
