@@ -428,6 +428,17 @@ class WorkerLoadMixin:
                     if id(t) in seen:
                         continue
                     seen.add(id(t))
+                    # #39 ROOT CAUSE: the #dram-dealias pad registers a VIEW (buf[:, :rs]) as the
+                    # buffer; emptying only the view leaves the padded BASE's full storage alive
+                    # through the C-level ._base reference (invisible to gc referrers) — measured
+                    # ~10 GB surviving a qwen3-30b unload (48 padded expert stacks + dense pads).
+                    # Empty the BASE first, then the view.
+                    with _cl.suppress(Exception):
+                        b = getattr(t, "_base", None)
+                        if b is not None and getattr(b, "device", None) is not None \
+                                and b.device.type == "cuda" and id(b) not in seen:
+                            seen.add(id(b))
+                            b.data = torch.empty(0, dtype=b.dtype, device=b.device)
                     with _cl.suppress(Exception):
                         t.data = torch.empty(0, dtype=t.dtype, device=t.device)
             with _cl.suppress(Exception):   # drop each int4 layer's cached fused tuple (qweight + op)

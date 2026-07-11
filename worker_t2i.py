@@ -182,6 +182,12 @@ class T2IPipeline:
                     if id(t) in seen:
                         continue
                     seen.add(id(t))
+                    with _cl.suppress(Exception):   # #39: empty a padded view's BASE too
+                        b = getattr(t, "_base", None)
+                        if b is not None and getattr(b, "device", None) is not None \
+                                and b.device.type == "cuda" and id(b) not in seen:
+                            seen.add(id(b))
+                            b.data = torch.empty(0, dtype=b.dtype, device=b.device)
                     with _cl.suppress(Exception):
                         t.data = torch.empty(0, dtype=t.dtype, device=t.device)
         with _cl.suppress(Exception):
