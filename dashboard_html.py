@@ -481,7 +481,7 @@ function modelRow(m,s){
         +'<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'clear\')" title="Discard the partially downloaded files">Clear</button>';
   } else if(s.k==='registered'){
     meta=fitMeta(m);
-    acts=t2i?'<button class="btn sm pri" title="Load the image pipeline onto a controller-co-located GPU: DiT mixed-edge int4 (first+last blocks bf16 — the gate-tested near-bf16 recipe), text encoder on CPU, tiled VAE. Takes a few minutes (quantize + move)." onclick="loadT2i(\''+esc(m.name)+'\')">Load 🖼</button>'
+    acts=t2i?'<button class="btn sm pri" title="Load the image pipeline onto a controller-co-located GPU: DiT mixed-edge int4 (first+last blocks bf16 — the gate-tested near-bf16 recipe), text encoder on CPU, tiled VAE. Takes a few minutes (quantize + move)." onclick="t2iLoadDlg(\''+esc(m.name)+'\')">Load 🖼</button>'
             :'<button class="btn sm pri" onclick="openLoad(\''+esc(m.name)+'\')">Load ▾</button>';
   } else { // notdl
     meta='<span class="err">not downloaded</span> · '+gb(m.size_gb); acts='<button class="btn sm" onclick="dl(\''+esc(m.name)+'\',\'start\')">Download</button>';
@@ -889,7 +889,7 @@ async function openDetail(name){
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
     +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
     +'<button class="btn sm ghost" onclick="reconf(\''+esc(name)+'\')">Reconfigure…</button>';
-  else if(_isT2i) acts='<button class="btn sm pri" onclick="closeOv();loadT2i(\''+esc(name)+'\')">Load 🖼</button> '
+  else if(_isT2i) acts='<button class="btn sm pri" onclick="t2iLoadDlg(\''+esc(name)+'\')">Load 🖼</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
@@ -921,11 +921,29 @@ async function applyRt(name){
 // #t2i-serve: load an image model (no dialog — the load path picks the gate-tested recipe
 // itself). /load blocks for the whole multi-minute build, so fire it WITHOUT awaiting: the
 // loading card appears via the status poll, exactly like the LLM load dialog's pattern.
+// #t2i-load-dlg: the Load 🖼 CONFIRM dialog — a t2i load is heavyweight (needs ~14-17 GB on the
+// controller-co-located GPU and auto-evicts idle residents to get it), so it deserves the same
+// deliberate step other loads get, and a FAILURE must be a dialog the user actually sees (the
+// old fire-and-forget toast was missed live: the load failed "nothing evictable" invisibly).
+function t2iLoadDlg(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🖼 '+esc(name)+'</h3>'
+    +'<div class="note" style="margin-top:8px">Loads the whole image pipeline onto the GPU sharing the controller box: DiT quantized to mixed-edge int4 (first + last blocks bf16 — the gate-tested near-bf16 recipe), text encoder on CPU, tiled VAE. Takes a few minutes (quantize + move).</div>'
+    +'<div class="note" style="margin-top:8px">Needs <b>~14–17 GB free VRAM</b> on that GPU. Idle loaded models are auto-evicted to make room; models actively serving are never evicted — if they hold the card, the load fails and the reason is shown here.</div>'
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2i(\''+esc(name)+'\')">Load 🖼</button> '
+    +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
+}
+function errDlg(title,msg){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(title)+'</h3>'
+    +'<div class="note" style="margin-top:8px">'+esc(msg)+'</div>'
+    +'<div style="margin-top:12px"><button class="btn sm" onclick="closeOv()">OK</button></div>';
+  $('#ov').classList.add('show');
+}
 function loadT2i(name){
   toast('loading image pipeline for '+name+' — a few minutes (quantize + move)…');
   api('/load?model='+encodeURIComponent(name)+'&quant=int4',{method:'POST'})
     .then(()=>{toast(name+' ready — open its card to generate');tick();})
-    .catch(e=>toast(String(e.message||e),1));
+    .catch(e=>errDlg('image pipeline load failed',String(e.message||e)));
   tick();
 }
 // #t2i-serve: render from the detail modal. Long await (a render is minutes) with a live
