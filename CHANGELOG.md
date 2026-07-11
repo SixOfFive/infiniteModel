@@ -727,6 +727,21 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   Separately, the om3nbox worker runs the allocator with `expandable_segments:True` (systemd
   drop-in; A/B: decode 17.7 → 18.2-18.7 tok/s, coherent, pool returns to the OS instead of
   accumulating fragmentation).
+- **t2i OFFLOAD mode (#t2i-offload, 2026-07-11) — render on a card that can't hold the DiT.**
+  `/load?model=qwen-image&t2i_offload=1` (or the Load 🖼 dialog's "offloaded" button): the bf16
+  pipeline loads into system RAM and accelerate's sequential offload streams each block to the
+  controller-co-located GPU just-in-time per forward — VRAM peak is transients (~blocks +
+  activations + VAE), so the card's resident models STAY. Placement needs only ~4 GB free VRAM
+  plus RAM for the weights and NEVER evicts (it fails with the requirement instead); bf16-only
+  (the int4 fused kernels are prepared per-device and don't survive block hopping) — which also
+  makes it the REFERENCE-quality path. Measured on beast (4070TiS 16 GB, resident models loaded):
+  first render 20 steps @1024² in **510 s (~25.5 s/step — faster than om3nbox's GPU-resident
+  int4 at ~34)**, sign text exact, **0 GB GPU resident, mid-render VRAM 0.24/15.57 GB**, load 2 s
+  from page cache (~8 min cold from the weights disk; the t2i load reply wait is 20 min for it).
+  Getting there hardened placement concurrency for ALL t2i loads: they now register in the
+  reservation ledger (concurrent auto-loads budget around the multi-minute build) AND subtract
+  other in-flight loads' reservations (a cache-served auto-load planned seconds earlier was
+  streaming toward a full card — both directions of the same race, both observed live as OOMs).
 - **Code-split round 2, increment 10 — `worker_quant.py`, client.py's flagship (m4c189, 2026-07-08):**
   the whole quant/kernel family (~1,660 lines) relocated out of client.py into a SELF-CONTAINED worker
   leaf (shard_compile precedent — deliberately NOT in `state.bind`): the guarded module-level triton/tl
