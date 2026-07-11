@@ -75,8 +75,19 @@ def _dump_live_cuda(top: int = 8) -> None:
             _builtins.print(f"[vram-live] {n}x {shape} {dt} = {tot / (1024 ** 3):.2f} GB",
                             flush=True)
         if biggest is not None:
-            refs = [type(x).__name__ for x in _gc.get_referrers(biggest[1])[:6]]
-            _builtins.print(f"[vram-live] biggest tensor referrers: {refs}", flush=True)
+            for r1 in _gc.get_referrers(biggest[1])[:4]:
+                t1 = type(r1).__name__
+                try:
+                    r2s = ", ".join(sorted({type(x).__name__ for x in _gc.get_referrers(r1)[:6]}))
+                except Exception:
+                    r2s = "?"
+                extra = ""
+                with contextlib.suppress(Exception):
+                    if isinstance(r1, dict):
+                        extra = f" keys={list(r1.keys())[:4]}"
+                    elif isinstance(r1, (tuple, list)):
+                        extra = f" len={len(r1)} items={[type(x).__name__ for x in r1[:5]]}"
+                _builtins.print(f"[vram-live] holder: {t1}{extra} <- held by: {r2s}", flush=True)
 
 
 def _release_ram(trim_working_set: bool = False) -> None:
