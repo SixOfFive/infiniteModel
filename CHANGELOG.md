@@ -717,7 +717,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   PAD (0.088 -> 0.052 ms, 1.7x; e2e 15.75 -> 16.34 tok/s clean A/B), its down + both gemma shapes
   keep-unpadded (gemma's live tensors never collapsed; e2e ~20.5 tok/s unchanged). fused-MoE
   self-checks all `-> ACTIVE` (rel ~0.006), gemma `/api/chat` coherent, qwen output text identical
-  to baseline at temp 0.
+  to baseline at temp 0. **Unload leak fixed (#39, 2026-07-11):** the pad registers a VIEW
+  (`buf[:, :rs]`) as the buffer, and the unload storage-release emptied only the view — the padded
+  BASE's full storage stayed alive through the C-level `._base` reference (invisible to gc
+  referrers; measured ~10 GB surviving a qwen3-30b unload: 48 padded expert stacks + dense pads).
+  `_release_shard_vram` (and the t2i release) now empty `t._base` before `t.data`; verified live —
+  an unload leaves 0.03 GB allocated (was 10.04). A `[vram-live]` gc diagnostic stays armed in
+  worker_hw, printing the live-tensor groups whenever an unload leaves >2 GB allocated.
+  Separately, the om3nbox worker runs the allocator with `expandable_segments:True` (systemd
+  drop-in; A/B: decode 17.7 → 18.2-18.7 tok/s, coherent, pool returns to the OS instead of
+  accumulating fragmentation).
 - **Code-split round 2, increment 10 — `worker_quant.py`, client.py's flagship (m4c189, 2026-07-08):**
   the whole quant/kernel family (~1,660 lines) relocated out of client.py into a SELF-CONTAINED worker
   leaf (shard_compile precedent — deliberately NOT in `state.bind`): the guarded module-level triton/tl
