@@ -404,10 +404,19 @@ function renderModels(d,cl){
   $('#models').innerHTML=html;
 }
 function modelRow(m,s){
-  // #t2i: diffusers image-generation checkpoint — download/registry work like any model,
-  // but there is no LLM Load for it (the serving pipeline is a separate, pending feature).
   const t2i=(m.capabilities||[]).includes('t2i');
-  const arch=archChip(m)+(t2i?'<span class="chip" title="Text-to-image (diffusers) checkpoint — downloadable and managed like any model; the image-generation serving pipeline is coming.">🖼 t2i</span>':'');
+  // #cap-badges: every MODALITY capability gets a chip beside the model (config-inferred,
+  // see status._model_caps). 'tools' stays out of the row (most chat models have it — noise);
+  // it still shows in the detail modal's capabilities line.
+  const CAPB={t2i:['🖼 t2i','Text-to-image (diffusers) checkpoint — loads onto a controller-co-located GPU and serves POST /v1/images/generations + the Generate panel.'],
+    image:['👁 vision','Accepts image input (vision encoder in the checkpoint) — image→text on all three chat APIs.'],
+    video:['🎞 video','Accepts video input (video token support in the checkpoint).'],
+    stt:['🎤 stt','Accepts audio input (speech understanding — ask it what was said).'],
+    tts:['🔊 tts','Speech output — synthesize WAV via /v1/audio/speech or the Text-to-speech panel in the model detail.'],
+    ocr:['🔤 ocr','OCR-specialist checkpoint — built for document/text extraction from images (beyond generic vision).'],
+    embedding:['🧮 embed','Embedding encoder — /api/embed + /v1/embeddings, not a chat model.']};
+  const capChips=(m.capabilities||[]).filter(c=>CAPB[c]).map(c=>'<span class="chip" title="'+CAPB[c][1]+'">'+CAPB[c][0]+'</span>').join('');
+  const arch=archChip(m)+capChips;
   const al=(m.aliases||[]).map(a=>'<span class="chip al">'+esc(a)+'</span>').join('');
   let meta='', acts='';
   if(s.k==='loaded'&&m.t2i){

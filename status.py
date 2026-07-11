@@ -512,6 +512,14 @@ def _model_caps(tgt: str, spec=None) -> list:
             mt = (cfgd.get("model_type") or "").lower()
             if "omni" in mt or cfgd.get("talker_config") or _b.get("talker_config"):
                 caps.append("tts")
+            # #ocr: OCR-SPECIALIST checkpoints (GOT-OCR2 model_type 'got_ocr2', DeepSeek-OCR,
+            # olmOCR — a qwen2-vl arch whose repo name carries it) get their own badge; a generic
+            # VL model can read text too but stays 'image' only — the badge marks models BUILT
+            # for document/text extraction. Config-only signals: model_type, architectures, or
+            # the model dir name.
+            _arches = " ".join(cfgd.get("architectures") or []).lower()
+            if "ocr" in mt or "ocr" in _arches or "ocr" in os.path.basename(d or "").lower():
+                caps.append("ocr")
         if not caps and spec is not None and getattr(spec, "is_embedding", False):
             caps = ["embedding"]
         # #tools: native tool-calling badge (from the chat template). A causal chat LM whose template

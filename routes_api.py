@@ -218,6 +218,9 @@ def register(app):
                 caps.append("tools")
             if "image" in _mcaps:            # Ollama names the vision capability "vision"
                 caps.append("vision")
+            for _extra in ("video", "stt", "tts", "ocr"):   # modality badges beyond Ollama's set
+                if _extra in _mcaps:
+                    caps.append(_extra)
         # #model-detail: surface the RAW on-disk config.json + generation_config.json so the dashboard
         # detail view can show EVERYTHING about a model (loaded or not) — rope theta, sliding window,
         # expert counts, sampling defaults, etc. that the curated model_info doesn't carry. Best-effort;
