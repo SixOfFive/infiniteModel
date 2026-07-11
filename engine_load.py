@@ -1300,6 +1300,15 @@ class EngineLoadMixin:
                         "warnings": [], "node_ids": [node.node_id],
                         "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
+        # Register in the RESERVATION ledger so CONCURRENT loads budget around this one — without
+        # it, resident auto-loads filled the card to ~0 free during the multi-minute t2i build and
+        # even the offload mode's small transient allocations OOM'd (observed live on beast: the
+        # post-update resident reload raced the offload load to 96 MB free). Offload reserves its
+        # VRAM transient + the bf16 weights in RAM; the GPU path reserves its full estimate. The
+        # load() wrapper's finally pops self._reservations[reg_key] on every exit path.
+        self._reservations[reg_key] = {node.node_id: {
+            "ram": int((all_b + 6 * GB) if offload else 2 * GB),
+            "vram": int((_OFFLOAD_VRAM_GB if offload else (_est_gb(edge) + _MARGIN_GB)) * GB)}}
         link = self.links.get(node.node_id)
         if link is None:
             self.loadings.pop(reg_key, None)
