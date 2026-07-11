@@ -19,7 +19,8 @@ def register(app):
                    node: str = "", kv_quant: str = "",
                    kv_offload: bool = False, temperature: str = "",
                    min_p: str = "", precompile: bool = True,
-                   draft_gpu: bool = False, draft_margin_gb: str = "") -> JSONResponse:
+                   draft_gpu: bool = False, draft_margin_gb: str = "",
+                   t2i_offload: bool = False) -> JSONResponse:
         _req_ip = _client_ip(request)   # #connections: attribute this load to its requester
         # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
@@ -161,7 +162,8 @@ def register(app):
                                    kv_quant=kv_quant, kv_offload=kv_offload,
                                    default_temp=default_temp, default_min_p=default_min_p,
                                    requested_by=_req_ip,
-                                   draft_gpu=draft_gpu, draft_margin_gb=_draft_margin)
+                                   draft_gpu=draft_gpu, draft_margin_gb=_draft_margin,
+                                   t2i_offload=t2i_offload)
             _modelbl = ("pin:%s/%s" % (node, "cpu" if cpu_only else "gpu")) if node else \
                        (((("tp%d-cpu" % tp) if cpu_only else ("tp%d" % tp)) if tp > 1 else mode))
             return JSONResponse({"ok": True, "model": lm.friendly, "ctx": lm.ctx,

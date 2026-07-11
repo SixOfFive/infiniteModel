@@ -928,8 +928,10 @@ async function applyRt(name){
 function t2iLoadDlg(name){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🖼 '+esc(name)+'</h3>'
     +'<div class="note" style="margin-top:8px">Loads the whole image pipeline onto the GPU sharing the controller box: DiT quantized to mixed-edge int4 (first + last blocks bf16 — the gate-tested near-bf16 recipe), text encoder on CPU, tiled VAE. Takes a few minutes (quantize + move).</div>'
-    +'<div class="note" style="margin-top:8px">Needs <b>~14–17 GB free VRAM</b> on that GPU. Idle loaded models are auto-evicted to make room; models actively serving are never evicted — if they hold the card, the load fails and the reason is shown here.</div>'
-    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2i(\''+esc(name)+'\')">Load 🖼</button> '
+    +'<div class="note" style="margin-top:8px"><b>GPU</b>: needs <b>~14–17 GB free VRAM</b>. Idle loaded models are auto-evicted to make room; models actively serving are never evicted — if they hold the card, the load fails and the reason is shown here. Fastest renders.</div>'
+    +'<div class="note" style="margin-top:8px"><b>Offloaded</b>: the DiT rests bf16 in system RAM (~47 GB) and blocks stream to the GPU each step — needs only <b>~4 GB VRAM</b>, NEVER evicts anything, ~2–3× slower per step. For cards too small or too busy to host the weights.</div>'
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2i(\''+esc(name)+'\')">Load 🖼 to GPU</button> '
+    +'<button class="btn sm" onclick="closeOv();loadT2i(\''+esc(name)+'\',1)">Load 🖼 offloaded</button> '
     +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
   $('#ov').classList.add('show');
 }
@@ -939,9 +941,9 @@ function errDlg(title,msg){
     +'<div style="margin-top:12px"><button class="btn sm" onclick="closeOv()">OK</button></div>';
   $('#ov').classList.add('show');
 }
-function loadT2i(name){
-  toast('loading image pipeline for '+name+' — a few minutes (quantize + move)…');
-  api('/load?model='+encodeURIComponent(name)+'&quant=int4',{method:'POST'})
+function loadT2i(name,off){
+  toast('loading image pipeline for '+name+(off?' (offloaded — DiT into RAM)':'')+' — a few minutes…');
+  api('/load?model='+encodeURIComponent(name)+'&quant=int4'+(off?'&t2i_offload=1':''),{method:'POST'})
     .then(()=>{toast(name+' ready — open its card to generate');tick();})
     .catch(e=>errDlg('image pipeline load failed',String(e.message||e)));
   tick();

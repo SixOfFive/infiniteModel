@@ -215,7 +215,8 @@ class EngineLoadMixin:
                    default_min_p: Optional[float] = None,
                    requested_by: str = "",
                    draft_gpu: bool = False,
-                   draft_margin_gb: float = 4.0) -> LoadedModel:
+                   draft_margin_gb: float = 4.0,
+                   t2i_offload: bool = False) -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -239,6 +240,7 @@ class EngineLoadMixin:
                                          default_min_p=default_min_p,
                                          requested_by=requested_by,
                                          draft_gpu=draft_gpu, draft_margin_gb=draft_margin_gb,
+                                         t2i_offload=t2i_offload,
                                          _own=_own)
         finally:
             if _own["v"]:
@@ -262,6 +264,7 @@ class EngineLoadMixin:
                    requested_by: str = "",
                    draft_gpu: bool = False,
                    draft_margin_gb: float = 4.0,
+                   t2i_offload: bool = False,
                    _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
@@ -327,7 +330,8 @@ class EngineLoadMixin:
                 _d = _local_model_dir(_tgt)
                 if _d and _is_diffusers_dir(_d):
                     return await self._load_t2i_locked(friendly, _tgt, reg_key or friendly,
-                                                       quant, replica_idx=replica_idx)
+                                                       quant, replica_idx=replica_idx,
+                                                       offload=t2i_offload)
                 raise ValueError(f"unknown model '{friendly}'")
             target_id = MODELS[friendly][0] if friendly in MODELS else friendly
             # ENCODER / sentence-embedding model: a whole-model single-node load (no pipeline/TP/KV
@@ -1169,7 +1173,8 @@ class EngineLoadMixin:
         return lm
 
     async def _load_t2i_locked(self, friendly: str, target_id: str, reg_key: str,
-                               quant: str = "int4", replica_idx: int = 0) -> LoadedModel:
+                               quant: str = "int4", replica_idx: int = 0,
+                               offload: bool = False) -> LoadedModel:
         """#t2i-serve (task #37): load a DIFFUSERS image-generation checkpoint (Qwen-Image
         class) WHOLE onto ONE controller-CO-LOCATED GPU worker — the diffusion sibling of
         _load_embedding_locked. v1 constraints, by design: the worker must share this box's
@@ -1184,6 +1189,14 @@ class EngineLoadMixin:
         if quant in ("int8", "int2"):
             log_activity(f"{_ollama_name(friendly)}: {quant} is not a t2i tier — using int4 (mixed-edge)")
             quant = "int4"
+        # #t2i-offload (v2): the DiT rests bf16 in system RAM and accelerate streams each block
+        # to the GPU just-in-time per forward — VRAM peak drops to transients (~blocks +
+        # activations + VAE), so the card's residents stay loaded. bf16-only: the int4 fused
+        # kernels are prepared per-device and don't survive block hopping; RAM is the budget
+        # instead (~weights + slack). Slower per step (PCIe transfer each pass) — the
+        # no-eviction trade for tight cards like beast's 16 GB.
+        if offload:
+            quant = "none"
         # Real dims from the shipped transformer config (generic across Edit variants etc.).
         _tc = {}
         with contextlib.suppress(Exception):
@@ -1212,6 +1225,7 @@ class EngineLoadMixin:
             return (0.284 * dit_b + 2 * edge * blk * 0.716) / GB + 0.5
 
         _MARGIN_GB = 2.2   # step activations (~1.8 GB @1024^2 with CFG) + allocator headroom
+        _OFFLOAD_VRAM_GB = 4.0   # #t2i-offload: transient blocks + activations + VAE only
         want_edge = 2 if quant != "none" else 0
         await self.ensure_data_listener()
         if reg_key in self.models:
@@ -1233,6 +1247,13 @@ class EngineLoadMixin:
                 return x.vram_total_gb - x.vram_used_gb + getattr(x, "vram_reusable_gb", 0.0)
             for n in sorted(cand, key=_t2i_free, reverse=True):
                 free = _t2i_free(n)
+                if offload:
+                    # #t2i-offload: only transient VRAM + enough free RAM for the bf16 weights.
+                    # NEVER evicts — not disturbing residents is this mode's whole purpose.
+                    if free >= _OFFLOAD_VRAM_GB and (n.free_mem_gb or 0) >= all_b / GB + 6.0:
+                        node, edge = n, 0
+                        break
+                    continue
                 for e in ([want_edge, 1] if quant != "none" else [0]):
                     if free >= _est_gb(e) + _MARGIN_GB:
                         node, edge = n, e
@@ -1241,8 +1262,19 @@ class EngineLoadMixin:
                     break
             if node is not None:
                 break
-            victim = self._lru_evictable() if bool(ENGINE_CONFIG.get("auto_unload", True)) else None
+            victim = (self._lru_evictable()
+                      if (not offload and bool(ENGINE_CONFIG.get("auto_unload", True))) else None)
             if victim is None:
+                if offload:
+                    if not _refreshed:
+                        _refreshed = True
+                        await self._await_free_refresh()
+                        continue
+                    raise RuntimeError(
+                        f"t2i offload needs ~{_OFFLOAD_VRAM_GB:.0f} GB free VRAM (transients) and "
+                        f"~{all_b / GB + 6.0:.0f} GB free RAM on the controller-co-located GPU node "
+                        "— it never evicts residents (that is its point); free some VRAM/RAM or "
+                        "use the normal GPU load")
                 # right after a restart/unload the heartbeat can still show the OLD vram_used —
                 # wait one stats refresh and re-check ONCE before declaring no room (bit us live:
                 # a load fired seconds after /update saw pre-unload numbers + nothing evictable)
@@ -1264,7 +1296,7 @@ class EngineLoadMixin:
                         "target": target_id, "total": 1, "ready": 0,
                         "stages_total": 1, "stages_ready": 0,
                         "basis": f"t2i: single-node ({node.hostname}, "
-                                 f"{quant if quant == 'none' else f'int4 edge{edge}'})",
+                                 f"{'bf16 OFFLOAD (DiT in RAM)' if offload else (quant if quant == 'none' else f'int4 edge{edge}')})",
                         "warnings": [], "node_ids": [node.node_id],
                         "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
@@ -1278,6 +1310,7 @@ class EngineLoadMixin:
         await link.send({
             "type": "load", "kind": "t2i", "model_id": target_id,
             "model_dir": model_dir, "quant": quant, "t2i_edge": edge,
+            "t2i_offload": bool(offload),
             "controller_http_port": ARGS.http_port,
             "next_host": None, "next_port": ARGS.data_port,
             # a plain torch device, NOT load_device() — that returns the worker's tier mode
@@ -1286,7 +1319,10 @@ class EngineLoadMixin:
             "device": "cuda",
         })
         try:
-            r = await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
+            # 20 min: an OFFLOAD load reads the full ~58 GB bf16 pipeline from the weights disk
+            # into RAM (~8 min on beast's spinning drive when quiet, worse under contention);
+            # the GPU int4 path finishes far sooner and is unaffected by the roomier ceiling.
+            r = await asyncio.wait_for(fut, timeout=max(GEN_TIMEOUT_S, 1200.0))
         except Exception as exc:
             self.loadings.pop(reg_key, None)
             raise RuntimeError(f"t2i load on {node.hostname} failed: {exc!r}")
@@ -1311,7 +1347,8 @@ class EngineLoadMixin:
         now = time.time()
         lm = LoadedModel(reg_key, target_id, spec, 0, plan,
                          [node.node_id], None, set(), now,
-                         quant=("none" if quant == "none" else f"int4-e{edge}"),
+                         quant=("bf16-off" if offload else
+                                ("none" if quant == "none" else f"int4-e{edge}")),
                          stage0_writer=stage0_writer, last_used=now,
                          stage0_dial=_dial, last_send_ts=now)
         lm.base, lm.replica_idx = friendly, replica_idx
@@ -1323,7 +1360,7 @@ class EngineLoadMixin:
         print(f"[load] {reg_key} t2i on {node.hostname} "
               f"({tot_b / GB:.1f} GB total, {gpu_b / GB:.1f} GB GPU)")
         log_activity(f"{reg_key} READY (t2i, {node.hostname}, "
-                     f"{'bf16' if quant == 'none' else f'int4 edge{edge}'}) "
+                     f"{'bf16 OFFLOAD — DiT in RAM, blocks stream to GPU' if offload else ('bf16' if quant == 'none' else f'int4 edge{edge}')}) "
                      f"[{len(self.models)} model(s) resident]")
         return lm
 
