@@ -599,9 +599,7 @@ class EngineLoadMixin:
                     # counters report it as used, but a new load in that worker allocates from it
                     # first (only a worker restart returns it to the OS; big on ROCm after churn:
                     # om3nbox measured ~13 GB "used" that was actually empty pool).
-                    live_free = max(0.0, n.vram_total_gb - n.vram_used_gb
-                                    + getattr(n, "vram_reusable_gb", 0.0)
-                                    - _res_vram.get(n.node_id, 0) / GB)
+                    live_free = self._node_live_free_vram_gb(n, res_vram=_res_vram)
                     # #vram-weights-first: budget weights against PHYSICALLY-free VRAM (live_free already
                     # excludes resident weights + actually-faulted KV + other in-flight loads), so a new
                     # model uses resident models' reserved-but-unused KV headroom instead of spilling its
@@ -1879,6 +1877,24 @@ class EngineLoadMixin:
         except Exception:
             return 0.0
 
+    def _node_live_free_vram_gb(self, n, *, own_bytes: int = 0,
+                                res_vram: Optional[dict] = None) -> float:
+        """The single source of truth for 'how much VRAM can a (re)placement actually use on
+        node `n` right now'. = the heartbeat's LIVE `vram_total - vram_used`, PLUS the worker's
+        vacant allocator pool (#vram-reusable — a new alloc reuses it even though device counters
+        report it 'used'), PLUS `own_bytes` (VRAM the model being re-placed already holds here and
+        reclaims on reload), MINUS other in-flight loads' reservations. Deliberately NOT
+        `usable_vram_gb` (= vram_total - a static reserve): that ceiling ignores resident models
+        and never moves when VRAM frees — using it silently pinned the juggler's fit-check and its
+        anti-churn guard to a value that could never change, so a hybrid model never relocated even
+        after a co-resident unloaded and freed the GPU. Both the load planner (below) and the
+        juggler budget against THIS number so they can never disagree again."""
+        rv = (res_vram.get(n.node_id, 0) if res_vram else 0)
+        return max(0.0, n.vram_total_gb - n.vram_used_gb
+                   + getattr(n, "vram_reusable_gb", 0.0)
+                   + own_bytes / GB
+                   - rv / GB)
+
     async def _juggle_would_fit_vram(self, m) -> bool:
         """Dry-run the VRAM-first planner for `m` against the LIVE free VRAM PLUS this model's own
         on-GPU bytes (which a reload reclaims), and return True only when every weight lands on GPU.
@@ -1888,9 +1904,16 @@ class EngineLoadMixin:
             own = {}   # per-node VRAM this model holds now -> reclaimed on reload, so add it back
             for s in m.plan.stages:
                 own[s.node_id] = own.get(s.node_id, 0) + (getattr(s, "gpu_bytes", 0) or 0)
+            _, _res_vram = self._reserved_bytes()   # other in-flight loads' reservations
             mems = []
             for n in registry.alive_sorted():
-                fv = max(0.0, n.eff_vram_gb - PLAN_VRAM_FLOOR_GB) + own.get(n.node_id, 0) / GB
+                # LIVE-free VRAM (heartbeat vram_total-vram_used + reusable pool), NOT the static
+                # usable_vram ceiling, + this model's own reclaimable bytes, then the runtime floor —
+                # the SAME basis the load planner budgets weights against, so a 'would it fit
+                # VRAM-only?' answer actually matches what a real re-place can achieve (a resident
+                # co-tenant now correctly shrinks the target, and a freed GPU correctly opens up).
+                fv = max(0.0, self._node_live_free_vram_gb(
+                    n, own_bytes=own.get(n.node_id, 0), res_vram=_res_vram) - PLAN_VRAM_FLOOR_GB)
                 ram = n.eff_ram_gb - (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
                 mems.append(NodeMem(n.node_id, n.hostname,
                                     int((max(0.0, ram) + fv) * GB), int(fv * GB)))
@@ -1927,9 +1950,12 @@ class EngineLoadMixin:
             # 1) rank the PROMOTABLE hybrids by hotness (freshest use first, so a 'constantly in use'
             #    model wins). Skip embeddings/encoders (CPU-by-design, not served through the barrier)
             #    and anything already ~all-GPU (nothing to promote).
-            _fleet_free = sum(max(0.0, n.eff_vram_gb - PLAN_VRAM_FLOOR_GB)
+            # #anti-churn basis: LIVE-free fleet VRAM (so it actually rises when a co-resident
+            # unloads), NOT the static usable_vram sum (which is invariant to load/unload and made
+            # the "won't retry until the fleet frees more VRAM" guard latch forever).
+            _fleet_free = sum(max(0.0, self._node_live_free_vram_gb(n) - PLAN_VRAM_FLOOR_GB)
                               for n in registry.alive_sorted()
-                              if getattr(n, "can_infer", False) and n.eff_vram_gb > 0)
+                              if getattr(n, "can_infer", False) and n.vram_total_gb > 0)
             cands = []
             for fr, m in list(self.models.items()):
                 if getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False):

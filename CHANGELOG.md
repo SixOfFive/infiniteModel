@@ -560,6 +560,20 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   delay** (`autostart_delay_s`, default 60 s) makes the startup reload of persisted models wait at
   least that long — on top of the fleet-settle wait — so API clients reconnect before the controller
   gets busy streaming weights.
+- **#juggler-live-free — the juggler now measures free VRAM the way the load planner does
+  (2026-07-11).** Its promotion fit-check and its anti-churn guard had budgeted against
+  `usable_vram_gb` (= `vram_total − a static reserve`) — a per-node *capacity* ceiling that ignores
+  resident models and never moves when VRAM frees. Two failures fell out of that: the fit-check
+  thought a node was free when a co-resident occupied it, so it fired a disruptive re-place that
+  could only land hybrid again; and the anti-churn record ("won't retry until the fleet frees more
+  VRAM") compared two copies of that static number, so once a model latched it *never* retried —
+  a hybrid model stayed split GPU+RAM forever even after a co-resident idle-unloaded and freed the
+  whole GPU (observed: a 4B model pinned 22%-on-CPU on a 12 GB card while a 16 GB card sat empty).
+  Fix: one shared `_node_live_free_vram_gb` helper — heartbeat `vram_total − vram_used` + the
+  worker's reusable allocator pool + the model's own reclaimable bytes − other in-flight
+  reservations — is now the single basis for the load planner's weights budget, the juggler's
+  fit-check, and the anti-churn measure. The guard now actually clears when VRAM frees, so a freed
+  GPU triggers relocation on the next sweep.
 
 ## Public release
 - Central `config.json` (all hosts/ports + the self-update source; no addresses baked into code);
