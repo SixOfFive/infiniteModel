@@ -137,7 +137,13 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   torch device normalization, a one-refresh retry on stale post-update heartbeats, and the
   **fwd-watchdog defers its exit(42) relaunch while a render is active** — a co-resident text
   forward stalling under a render's GPU+CPU saturation is contention, not a poisoned forward
-  (observed: the relaunch killed a healthy render at step 9/20).
+  (observed: the relaunch killed a healthy render at step 9/20). Post-ship hardening from live
+  incidents: **unload actually frees the DiT's VRAM** (`T2IPipeline.release_vram` empties GPU
+  storages in place — the generic shard release walks attrs a t2i pipeline doesn't have, so ~12 GB
+  stayed pinned on ROCm; render-safe: an unload during a live render defers the free to the
+  render's end), and **live renders block disruptive lifecycle ops** — `/update` and `/restart`
+  refuse while a render is in flight (a forced update mid-render orphaned a finished PNG into a
+  broken pipe, observed) and the worker's idle-gated self-update waits for it; `force=1` overrides.
 - **Diffusers-layout repos are first-class downloads (#t2i, 2026-07-10).** A multi-component
   image-generation checkpoint (`model_index.json` + `transformer/`/`text_encoder/`/`vae/`/`tokenizer/`
   subfolders — Qwen-Image class) now flows through the normal `/add_model` → background pull →
