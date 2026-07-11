@@ -13,7 +13,7 @@ It speaks **Ollama-, OpenAI-, and Anthropic-compatible** HTTP APIs, so tools you
 (Ollama clients, OpenAI SDKs, Claude Code) can point at the cluster unchanged, plus a live web
 dashboard.
 
-![InfiniteModel dashboard — three models resident across a 12-node fleet](docs/dashboard.png)
+![InfiniteModel dashboard — four models resident across a 12-node fleet, with per-model capability badges (vision, video, STT, TTS, embeddings, text-to-image)](docs/dashboard.png)
 
 > Personal research project — expect rough edges. Hugging Face **safetensors** models only (no GGUF).
 
