@@ -69,6 +69,7 @@ class T2IPipeline:
         self.quant = quant
         self.edge = max(0, int(edge))
         self._gen_lock = threading.Lock()
+        self._doomed = False   # #t2i-vram-release: unload arrived mid-render -> free after it ends
         t0 = time.time()
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -140,12 +141,74 @@ class T2IPipeline:
         print(f"[t2i] ready on {self.device} in {time.time() - t0:.0f}s "
               f"(GPU {self.gpu_bytes / GB:.1f} GB, total {self.loaded_bytes / GB:.1f} GB)", flush=True)
 
+    # -- unload -------------------------------------------------------------------------
+
+    def release_vram(self) -> None:
+        """#t2i-vram-release: free this pipeline's GPU tensor STORAGES IN PLACE on unload. The
+        generic _release_shard_vram walk frees nothing here (a T2IPipeline has no model/embed/
+        head attrs), and on ROCm a dropped ref + empty_cache does NOT return the DiT's ~12 GB
+        (same lingering-ref behavior the shard path already works around) — observed pinned live.
+        RENDER-SAFE: a live generate() still computes on these tensors (an unload-all can arrive
+        mid-render — observed at step 5/20), so under a held _gen_lock we only mark _doomed and
+        the render's own finally frees the moment it completes."""
+        if self._gen_lock.locked():
+            self._doomed = True
+            print("[t2i] unload during a live render — VRAM release deferred to render end",
+                  flush=True)
+            return
+        self._free_now()
+
+    def _free_now(self) -> None:
+        import contextlib as _cl
+        import torch
+        seen: set = set()
+        for mod in (getattr(self.pipe, "transformer", None), getattr(self.pipe, "vae", None)):
+            if mod is None or not hasattr(mod, "parameters"):
+                continue
+            with _cl.suppress(Exception):
+                for sub in mod.modules():   # drop fused tuples first (they alias qweight)
+                    if getattr(sub, "_fused", None) is not None:
+                        sub._fused = None
+                    for _b in ("qweight", "scale", "zero"):
+                        t = getattr(sub, _b, None)
+                        if t is not None and getattr(t, "device", None) is not None \
+                                and t.device.type == "cuda" and id(t) not in seen:
+                            seen.add(id(t))
+                            with _cl.suppress(Exception):
+                                setattr(sub, _b, torch.empty(0, dtype=t.dtype, device=t.device))
+                for t in list(mod.parameters(recurse=True)) + list(mod.buffers(recurse=True)):
+                    if t is None or getattr(t, "device", None) is None or t.device.type != "cuda":
+                        continue
+                    if id(t) in seen:
+                        continue
+                    seen.add(id(t))
+                    with _cl.suppress(Exception):
+                        t.data = torch.empty(0, dtype=t.dtype, device=t.device)
+        with _cl.suppress(Exception):
+            if str(self.device).startswith("cuda"):
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+        print(f"[t2i] {os.path.basename(self.model_dir)}: GPU storages released "
+              f"({len(seen)} tensors emptied)", flush=True)
+
     # -- generation ---------------------------------------------------------------------
 
     def generate(self, prompt: str, negative_prompt: str, width: int, height: int,
                  steps: int, cfg: float, seed, on_step=None) -> tuple[str, float]:
         """Render one image; returns (png_path, seconds). Runs in a worker thread
         (asyncio.to_thread) — one at a time per model via _gen_lock."""
+        try:
+            return self._generate(prompt, negative_prompt, width, height, steps, cfg, seed,
+                                  on_step)
+        finally:
+            if self._doomed:   # unloaded mid-render (#t2i-vram-release) -> free now that it's over
+                print("[t2i] deferred VRAM release: freeing the unloaded pipeline post-render",
+                      flush=True)
+                self._free_now()
+
+    def _generate(self, prompt: str, negative_prompt: str, width: int, height: int,
+                  steps: int, cfg: float, seed, on_step=None) -> tuple[str, float]:
         import torch
         with self._gen_lock:
             t0 = time.time()

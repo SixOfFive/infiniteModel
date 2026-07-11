@@ -403,6 +403,14 @@ class WorkerLoadMixin:
         CPU-resident shard; harmless on CUDA (frees a touch earlier). Safe at unload (model idle)."""
         import torch
         import contextlib as _cl
+        if getattr(shard, "kind", "") == "t2i":
+            # #t2i-vram-release: a T2IPipeline has NONE of the shard attrs walked below
+            # (model/embed/norm/head/encoder), so this generic pass freed NOTHING and the DiT's
+            # ~12 GB stayed pinned on ROCm after unload (observed live). Its own release is also
+            # RENDER-SAFE: under a live generate it defers the free to the render's end.
+            with _cl.suppress(Exception):
+                shard.release_vram()
+            return
         m = getattr(shard, "model", None)
         mods = [m] if m is not None else []
         for _attr in ("embed", "norm", "head", "encoder"):

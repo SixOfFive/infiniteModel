@@ -417,13 +417,15 @@ def register(app):
         # workers=0 -> restart the controller only. GENTLER (#100): refuse while a load is IN PROGRESS
         # — restarting mid-build drops a node from the load (and can leave it not cleanly rejoining);
         # pass force=1 to abort a wedged/doomed load anyway (the original escape-hatch behavior).
-        # Blocks on in-flight LOADS or COMPILES (both lose work on restart); force=1 overrides.
-        if (engine.loadings or engine.compiling) and not force:
+        # Blocks on in-flight LOADS, COMPILES or RENDERS (all lose work on restart); force=1 overrides.
+        _renders = getattr(engine, "_t2i_pending", None) or {}
+        if (engine.loadings or engine.compiling or _renders) and not force:
             return JSONResponse({"ok": False, "status": "load_in_progress",
-                                 "reason": "a model load/compile is in progress; pass force=1 to restart "
-                                           "anyway (aborts it)",
+                                 "reason": "a model load/compile/render is in progress; pass force=1 "
+                                           "to restart anyway (aborts it)",
                                  "loading": [c.get("model") for c in engine.loadings.values()],
-                                 "compiling": [c.get("model") for c in engine.compiling.values()]},
+                                 "compiling": [c.get("model") for c in engine.compiling.values()],
+                                 "rendering": len(_renders)},
                                 status_code=409)
         signaled = []
         if workers:
@@ -444,13 +446,25 @@ def register(app):
                              "workers_signaled": signaled, "worker_count": len(signaled)})
 
     @app.post("/update")
-    async def update_endpoint(request: Request, workers: int = 0) -> JSONResponse:
+    async def update_endpoint(request: Request, workers: int = 0, force: bool = False) -> JSONResponse:
         # FORCED UPDATE (dashboard 'Update' button / deploy API): pull the latest code from GitHub
         # and restart NOW — do NOT wait for idle. Mitigates the auto-load race: set engine.updating
         # so no request reloads a model mid-swap, UNLOAD all models, tell every worker to FREE its
         # RAM (and restart too if workers=1), then swap changed files + exit(42) -> supervisor
         # relaunches on the new code. (Plain /restart relaunches the CURRENT code; this updates first.)
         who = _client_ip(request)
+        # #t2i: refuse while an image render is in flight — the render survives worker-side but its
+        # result is ORPHANED (t2i_done hits the restarted controller's dead link; observed live: a
+        # 12-min render finished into a broken pipe). Renders are minutes-bounded; wait or force=1.
+        _renders = getattr(engine, "_t2i_pending", None) or {}
+        if _renders and not force:
+            _pg = getattr(engine, "_t2i_progress", None) or {}
+            _steps = [f"{(_pg.get(r) or (0, 0))[0]}/{(_pg.get(r) or (0, 0))[1]}" for r in _renders]
+            return JSONResponse({"ok": False, "status": "render_in_progress",
+                                 "reason": "a text-to-image render is in flight (step "
+                                           + ", ".join(_steps) + ") — updating now would orphan its "
+                                           "result; retry after it completes or pass force=1",
+                                 "rendering": len(_renders)}, status_code=409)
         engine.updating = True               # block auto-load immediately (anti-reload-race)
         names = list(engine.models.keys())
         with contextlib.suppress(Exception):     # best-effort graceful unload (don't block on a

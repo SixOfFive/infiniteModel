@@ -1147,8 +1147,12 @@ async def run(args: argparse.Namespace) -> None:
     # something is loaded — download, apply, restart). The ONLY guard is a build IN PROGRESS: restarting
     # mid-stream wedges the load (and a build isn't "loaded" yet). A resident/serving shard no longer
     # blocks the swap — the restart drops in-flight gens (recoverable; the controller re-streams).
+    # #t2i: a live image render ALSO blocks the swap — unlike a text gen (recoverable: the
+    # controller re-streams), a restart throws away a multi-minute render outright.
     asyncio.create_task(_self_update_loop(
-        "client.py", lambda: not worker._building))
+        "client.py", lambda: not worker._building and not any(
+            getattr(s, "kind", "") == "t2i" and getattr(s, "_gen_lock", None) is not None
+            and s._gen_lock.locked() for s in list(worker.shards.values()))))
     asyncio.create_task(mem_maintenance_loop(worker, reg.get("hostname") or args.name or "worker"))
     print(f"InfiniteModel worker {VERSION} - {reg['hostname']} "
           f"({reg['device']}) device-mode={args.device}")
