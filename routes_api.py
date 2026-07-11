@@ -142,6 +142,66 @@ def register(app):
                 {"error": f"model '{friendly}' is not downloaded on the controller"},
                 status_code=404)
         d = _local_model_dir(target)             # real measured params/size (MoE-correct)
+        # #t2i: a diffusers image checkpoint has NO top-level config.json, so resolve_spec is None
+        # and the LLM fields below would 500 (spec.arch on None — the dashboard modal's "full model
+        # info unavailable: HTTP 500"). Build the detail view from the diffusers layout instead:
+        # model_index.json names the pipeline + its components, transformer/config.json carries the
+        # DiT dims, and parameters come from the recursive weight sum (bf16 → ~2 bytes/param).
+        if spec is None and d:
+            import model_store as _ms
+            if _ms._is_diffusers_dir(d):
+                import asyncio as _aio
+                import os as _os, json as _json
+
+                def _jload(*parts):
+                    try:
+                        with open(_os.path.join(d, *parts), encoding="utf-8") as _f:
+                            return _json.load(_f)
+                    except Exception:
+                        return {}
+                _mi = _jload("model_index.json")
+                _tcfg = _jload("transformer", "config.json")
+                _comps = sorted(k for k, v in _mi.items()
+                                if not k.startswith("_") and isinstance(v, (list, tuple)) and v[0])
+                _pclass = str(_mi.get("_class_name") or "diffusers")
+                try:
+                    _wb = int(await _aio.to_thread(_ms._tree_weight_bytes, d))
+                except Exception:
+                    _wb = 0
+                _pcount = (_wb // 2) or None            # bf16 checkpoint -> ~2 bytes/param
+                _heads = _tcfg.get("num_attention_heads")
+                _hdim = _tcfg.get("attention_head_dim")
+                _minfo = {"general.architecture": _pclass,
+                          "general.parameter_count": _pcount,
+                          "diffusers.pipeline_class": _pclass,
+                          "diffusers.components": ", ".join(_comps),
+                          "diffusers.transformer.block_count": _tcfg.get("num_layers"),
+                          "diffusers.transformer.hidden_size":
+                              (_heads * _hdim) if (_heads and _hdim) else None,
+                          "diffusers.transformer.attention.head_count": _heads,
+                          "diffusers.transformer.attention.key_length": _hdim,
+                          "diffusers.transformer.joint_attention_dim":
+                              _tcfg.get("joint_attention_dim"),
+                          "diffusers.transformer.in_channels": _tcfg.get("in_channels"),
+                          "diffusers.transformer.patch_size": _tcfg.get("patch_size")}
+                return JSONResponse({
+                    "license": "see model card",
+                    "modelfile": f"# InfiniteModel text-to-image (diffusers)\nFROM {target}",
+                    "parameters": "", "template": "",
+                    "details": {"parent_model": "", "format": "diffusers", "family": _pclass,
+                                "families": [_pclass],
+                                "parameter_size": (f"{_pcount / 1e9:.1f}B" if _pcount else ""),
+                                "quantization_level": "BF16"},
+                    "model_info": {k: v for k, v in _minfo.items() if v is not None},
+                    "capabilities": ["t2i"],
+                    "infinitemodel": {"target": target, "engine": VERSION, "t2i": True,
+                                      "distributed": False,   # v1: one controller-co-located GPU node
+                                      "num_params": _pcount,
+                                      "num_layers": _tcfg.get("num_layers"),
+                                      "components": _comps, "config": _tcfg,
+                                      "text_encoder_config": _jload("text_encoder", "config.json"),
+                                      "vae_config": _jload("vae", "config.json")},
+                })
         if d and spec:
             spec = spec_with_measurements(spec, d)
         # Ollama-style capabilities list. Single-sourced from status._model_caps (config-only:
@@ -193,7 +253,13 @@ def register(app):
         return JSONResponse({
             "license": "see model card", "modelfile": f"# InfiniteModel distributed\nFROM {target}",
             "parameters": "", "template": "{{ .Prompt }}",
-            "details": _details(spec), "model_info": _model_info(spec),
+            # spec can be None for a registered dir the spec builder can't parse — degrade to
+            # empty detail blocks instead of 500ing the whole endpoint (spec.arch on None)
+            "details": _details(spec) if spec else {"parent_model": "", "format": "safetensors",
+                                                    "family": "", "families": [],
+                                                    "parameter_size": "",
+                                                    "quantization_level": "BF16"},
+            "model_info": _model_info(spec) if spec else {},
             "capabilities": caps,
             "infinitemodel": im,
         })
