@@ -13,8 +13,8 @@ gotchas, grounded in the cross-platform references:
 
 | Doc | Host(s) | GPU / SoC | Arch | VRAM | OS | Role |
 |---|---|---|---|---|---|---|
-| [4070-ti-super.md](4070-ti-super.md) | `beast` | RTX 4070 Ti SUPER | Ada `sm_89` | 16 GB | Windows 11 | **controller** + GPU worker |
-| [3060.md](3060.md) | `theocomp`, `mobile` | RTX 3060 / 3060 Laptop | Ampere `sm_86` | 12 GB / 6 GB | Linux / Windows | GPU worker |
+| [4070-ti-super.md](4070-ti-super.md) | `beast` | RTX 4070 Ti SUPER | Ada `sm_89` | 16 GB | Linux (Proxmox VE — see [../PROXMOX9_NVIDIA.md](../PROXMOX9_NVIDIA.md)) | **controller** + GPU worker |
+| [3060.md](3060.md) | `amdcomp`, `mobile` | RTX 3060 / 3060 Laptop | Ampere `sm_86` | 12 GB / 6 GB | Linux / Windows | GPU worker |
 | [p620.md](p620.md) | `work` | Quadro P620 | Pascal `sm_61` | ~4 GB | Linux | small GPU helper |
 | [strix-halo.md](strix-halo.md) | `om3nbox` | Ryzen AI Max+ 395 (gfx1151) | RDNA3.5 (ROCm) | ~60 GB unified | Ubuntu | standalone controller+worker |
 | [steam-deck.md](steam-deck.md) | `steamdeck` | Van Gogh (gfx1033) | RDNA2 | small UMA | SteamOS | CPU worker (ROCm experimental) |

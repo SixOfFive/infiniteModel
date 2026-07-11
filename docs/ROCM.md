@@ -191,6 +191,24 @@ surface, and the dashboard.
 
 ## Notes / gotchas
 
+- **Allocator pool on unified memory (recommended: `expandable_segments`).** torch's caching
+  allocator holds freed VRAM inside the process, and on an APU the device-level "used" counter
+  (GTT) counts that vacant pool — so an idle worker can *look* like it's holding tens of GB.
+  Two layers handle this: workers report their reusable pool over the heartbeat and the
+  controller's planner **credits it back** automatically (no phantom memory pressure); and
+  setting `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` in the worker's environment makes
+  freed segments actually return to the OS — measured **zero decode cost** on gfx1151. Set it
+  in the worker unit's environment and restart the worker.
+- `/load?kv_offload=1` is **force-disabled on ROCm** workers (it garbles output on gfx1151);
+  the load proceeds with KV on-device.
+- **Text-to-image on gfx1151:** int4-quantizing the DiT is *slower* than bf16 here (the dequant
+  tax outweighs the bandwidth savings at diffusion's large batch shapes) — int4 is the
+  *capacity* recipe for fitting the DiT, not a speed win. Use bf16 (or the offload mode) when
+  it fits. See [T2I.md](T2I.md).
+- **CUDA-graph decode is broken on TheRock rocm7.13** — capture/replay run but replay computes
+  wrong logits; the first-decode self-check auto-disables it (serving stays eager and correct).
+  Leave `INFINITEMODEL_CUDA_GRAPH` unset on ROCm; details in
+  [ACCELERATION.md](ACCELERATION.md).
 - `/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory` printed by ROCr is
   **cosmetic** (device-name lookup table); ignore it.
 - Add the user to **`render`** (for `/dev/kfd` + `/dev/dri/renderD*`) and **`video`**;

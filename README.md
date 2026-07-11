@@ -15,7 +15,9 @@ dashboard.
 
 ![InfiniteModel dashboard — four models resident across a 12-node fleet, with per-model capability badges (vision, video, STT, TTS, embeddings, text-to-image)](docs/dashboard.png)
 
-> Personal research project — expect rough edges. Hugging Face **safetensors** models only (no GGUF).
+> Personal research project — expect rough edges. Hugging Face **safetensors** is the native
+> format; a model that ships only as a single-file **GGUF** is converted to safetensors
+> automatically at add time (split multi-part GGUFs aren't supported).
 
 > **A note from the author:** I'm fairly new to actually *using* git, so please go easy on me if the
 > history or workflow isn't textbook — I'm still learning the etiquette. I built this for my own
@@ -31,10 +33,10 @@ dashboard.
 - **Goes faster where it can.** Tensor parallelism within a stage (capacity-proportional, GPU+CPU
   mixed meshes) and opt-in speculative decoding.
 - **Quantization.** int4 (group-wise, fused tinygemm GEMM), int8 (per-channel), and **int2**
-  (group-wise ~2.5-bit, group 64 — a *capacity* tier for dense models that won't fit at int4;
-  MoE auto-downgrades to int4. ⚠ the current round-to-nearest packer **collapses model quality
-  at 2 bits** — the tier is complete infrastructure awaiting a GPTQ-class calibrated packer,
-  which slots into the same format/kernels/cache) at load time;
+  (group-wise ~2.5-bit, group 64 — a *capacity* tier for **big dense** models that won't fit at
+  int4; MoE experts auto-downgrade to int4. int2 is **GPTQ-calibrated at compile time** and
+  explicit-compile only: a load without its calibrated cache **fails loud** instead of serving
+  a degraded model. At ≤7B, int4 is strictly better) at load time;
   serves fp8 and nvfp4 checkpoints by dequantizing on the fly. Decode-kernel acceleration is
   **platform-tiered** — torch tinygemm int4 on NVIDIA/CPU, a Triton w4a16 + split-K kernel on **AMD
   GPUs (ROCm/RDNA)**, a Triton **w2a16** kernel for int2 on both GPU stacks, and an **opt-in fused
@@ -50,11 +52,16 @@ dashboard.
   the estimated on-disk size and free-disk check); compiles run in a background subprocess with live
   progress on the model's row.
 - **MoE & multimodal.** Mixture-of-Experts (incl. attention-on-GPU / experts-in-CPU-RAM offload), and
-  distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3): image/audio → text.
-- **Text-to-image.** Diffusers-layout checkpoints (Qwen-Image) serve `POST /v1/images/generations`
-  on a controller-co-located GPU worker — DiT in mixed-edge int4 (first/last blocks bf16 ≈ bf16
-  quality), text encoder on CPU, tiled VAE — with live per-step progress and a dashboard Generate
-  panel.
+  distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3/Pixtral, Gemma 4 — both
+  its encoder-free and ViT-tower variants): image/audio → text, plus **speech out** (TTS) via
+  `/v1/audio/speech` (Qwen2.5-Omni Talker), and **embeddings** via `/api/embed` / `/v1/embeddings`.
+- **Text-to-image.** Diffusers-layout checkpoints (Qwen-Image) download like any other model and
+  serve `POST /v1/images/generations` on a controller-co-located GPU worker, with live per-step
+  progress and a dashboard Generate panel. Two serve modes: **GPU-resident** — DiT in mixed-edge
+  int4 (first/last blocks bf16 ≈ bf16 quality), text encoder on CPU, tiled VAE — or **offload**
+  (`t2i_offload=1`, or the Load 🖼 dialog): the bf16 pipeline rests in system RAM and blocks
+  stream to the GPU per step, so a 16 GB card renders at reference quality on ~4 GB of VRAM and
+  **never evicts** resident LLMs. Full guide → [docs/T2I.md](docs/T2I.md).
 - **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
   object args), OpenAI `/v1/chat/completions` (`tool_calls` + `finish_reason:"tool_calls"`), and
   Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming, including the full
@@ -70,7 +77,8 @@ dashboard.
   **do-not-auto-unload** veto), and the opt-in **juggler** — a ~60 s sweep that *hitlessly*
   promotes the hottest GPU+RAM-split model to VRAM-only once room frees (new requests just pause
   on their open connection during the re-place; busy models are skipped, never stalled). A live
-  dashboard (placement preview, per-load progress, fleet memory/throughput, bandwidth,
+  dashboard (placement preview, per-load progress, per-model **capability badges** —
+  vision / video / STT / TTS / OCR / embeddings / t2i — fleet memory/throughput, bandwidth,
   per-client connections), curl-able fleet logs (`/logs?node=…`), and idle-gated self-update.
   **Full guide → [docs/OPERATIONS.md](docs/OPERATIONS.md).**
 - **Self-healing under load and failure.** Honest overload behavior: contention degrades into
@@ -177,6 +185,8 @@ path that matches the worker's hardware:**
 pip install torch transformers safetensors huggingface_hub numpy psutil
 pip install einops                 # some models' trust_remote_code (e.g. nomic-embed-text)
 pip install nvidia-ml-py           # optional, NVIDIA GPU nodes only (VRAM reporting)
+pip install diffusers accelerate   # optional — only the GPU worker that will serve
+                                   # text-to-image (accelerate is what the offload mode uses)
 ```
 
 - **CPU-only:** `pip install torch --index-url https://download.pytorch.org/whl/cpu`
@@ -228,7 +238,8 @@ Each worker registers within a couple seconds and appears on the dashboard.
 **4. Load a model across the fleet and use it** — from the dashboard, or via the API:
 
 ```bash
-# plan + distribute (quant optional: int4 / int8)
+# plan + distribute (quant optional: int4 / int8 / int2 — int2 needs a pre-compiled
+# calibrated cache; see POST /compile_shards in docs/OPERATIONS.md)
 curl -X POST "http://<controller>:21434/load?model=qwen2.5-0.5b&ctx=2048&quant=int4"
 
 # generate (Ollama-style; the first request for a model also auto-loads it)
@@ -236,9 +247,10 @@ curl -X POST http://<controller>:21434/api/generate \
      -d '{"model":"qwen2.5-0.5b","prompt":"The capital of France is","stream":false}'
 ```
 
-**API surface:** Ollama (`/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, …),
-OpenAI (`/v1/chat/completions`, `/v1/models`), and Anthropic (`/v1/messages`). Point existing tooling
-at `http://<controller>:21434`.
+**API surface:** Ollama (`/api/generate`, `/api/chat`, `/api/embed`, `/api/tags`, `/api/show`,
+`/api/ps`, `/api/pull`, …), OpenAI (`/v1/chat/completions`, `/v1/completions`, `/v1/models`,
+`/v1/embeddings`, `/v1/audio/speech`, `/v1/images/generations`), and Anthropic (`/v1/messages`).
+Point existing tooling at `http://<controller>:21434`.
 
 ## Configuration & secrets
 

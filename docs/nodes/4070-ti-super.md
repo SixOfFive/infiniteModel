@@ -1,8 +1,14 @@
 # Node: RTX 4070 Ti SUPER — `beast` (controller + GPU worker)
 
+> **⚠ Migrated to Linux (Proxmox VE).** This box no longer runs Windows: it is now a
+> Proxmox VE host running the controller + worker as systemd units with the CUDA stack on
+> the host — the current setup lives in [../PROXMOX9_NVIDIA.md](../PROXMOX9_NVIDIA.md).
+> The Windows-era instructions below are kept as the reference recipe for a **Windows**
+> controller+worker box; the hardware facts (GPU, VRAM, bandwidth, placement guidance)
+> still apply.
+
 The fleet's primary box. It runs **both** the InfiniteModel **controller** (`:21434`,
-serving the Ollama + OpenAI + Anthropic APIs from `D:\infinitemodel`) **and** a GPU
-worker on the same machine.
+serving the Ollama + OpenAI + Anthropic APIs) **and** a GPU worker on the same machine.
 
 See also: [../ACCELERATION.md](../ACCELERATION.md) (int4 decode kernel matrix, the
 Windows + NVIDIA MoE setup, prefill chunking) and [../ROCM.md](../ROCM.md) (AMD recipe —

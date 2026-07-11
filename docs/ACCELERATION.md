@@ -19,13 +19,32 @@ There are two hot matmul classes per layer:
 | **NVIDIA · Linux** | torch **tinygemm** — fast | **fused Triton w4a16** (opt-in, **Ampere/sm_80+**) *or* bf16 remat (default) | dense auto; experts **opt-in** |
 | **AMD ROCm · RDNA** (e.g. Strix Halo gfx1151) | **Triton w4a16 + split-K** GEMV | **fused Triton w4a16** | automatic (only fast path here) |
 | **CPU** | tinygemm-cpu (`_weight_int4pack_mm_for_cpu`) | bf16 rematerialize per expert | automatic (default) |
+| **int2 — any GPU** | Triton **w2a16** batch + split-K GEMV (CUDA *and* ROCm — no torch 2-bit kernel exists) | experts auto-downgrade to **int4** | automatic w/ self-check; naive fallback where Triton is absent |
+
+**Quantization boundaries (all tiers):** embeddings, the LM head, norms, and a MoE's **router
+gate** always stay bf16 — the router is never quantized (quantizing it corrupts expert routing).
+Selecting **int8 on a MoE auto-downgrades to int4** with a loud log line: the int8 path only
+quantizes 2D Linears, so a MoE's fused-3D routed experts would otherwise stay full-size.
 
 **int2 (dense only):** there is no torch tinygemm for 2-bit, so a Triton **w2a16** batch +
 split-K-GEMV pair (same structure and autotune space as the w4a16 family) is the fused path on
 **both** CUDA and ROCm — self-checked vs the naive dequant at placement, automatic naive fallback,
 `IM_FUSED_INT2=0` kill-switch; no-triton workers (e.g. Windows) fall back to naive automatically.
-(Note: the int2 *tier* is currently infrastructure-complete but its plain-RTN packer collapses
-model quality — see the CHANGELOG entry; the kernels are exact and ready for a calibrated packer.)
+MoE routed experts have no 2-bit 3D packer/kernel — selecting int2 on a MoE quantizes the experts
+at **int4**.
+
+**How int2 weights are produced (GPTQ-calibrated packer, `gptq_pack.py`):** plain round-to-nearest
+collapses model quality at 2 bits, so int2 shard caches are built by **sequential per-layer GPTQ**:
+real forwards over a bundled offline calibration corpus accumulate each layer's input Hessian, each
+layer is quantized against the *previous layers' already-quantized* outputs (error propagation),
+with Cholesky column-by-column error compensation and a per-group MSE shrink search. Emits the same
+crumb format these kernels read — cache tag `v2-g64-int2-gptq` (stale v1 RTN caches fail
+verification and are rebuilt). Compile-side tuning env vars: `INFINITEMODEL_GPTQ_SAMPLES`,
+`_SEQLEN`, `_PERCDAMP`, `_GRID`. Because calibration is sequential (hours for a big model), int2 is
+**explicit-compile only** (`POST /compile_shards?quant=int2` — see OPERATIONS.md) and **fail-loud**:
+an int2 load without a valid calibrated cache refuses rather than serving a collapsed RTN model.
+Quality guidance: a **capacity tier for big dense models** that can't fit at int4 (a 70B packs to
+~19 GB); at ≤7B the output is coherent-but-degraded and int4 is strictly better.
 
 ### Why the split
 
@@ -87,6 +106,7 @@ here, not load-bearing as it was on RDNA (where no vendor int4 GEMM exists at al
 |---|---|
 | `INFINITEMODEL_CUDA_FUSED_MOE=1` | **Linux + NVIDIA Ampere (sm_80+) opt-in:** use the fused Triton MoE-expert kernel instead of bf16 remat. No effect on ROCm (already on); on pre-Ampere NVIDIA the bf16 kernel won't compile and the self-check falls back to the default. |
 | `INFINITEMODEL_NO_FUSED_MOE=1` | Kill switch: force the bf16-remat (default) expert path everywhere, incl. ROCm. Use to A/B the fused kernel on/off. |
+| `IM_FUSED_INT2=0` | Kill switch for the int2 Triton w2a16 kernels — force the naive int2 dequant path. Use to A/B; mirrors `INFINITEMODEL_NO_FUSED_MOE`. |
 | `INFINITEMODEL_CUDA_GRAPH=<ctx>` | Opt-in CUDA-graph decode (single-node, standard-attention, uniform-CUDA models; `<ctx>` sizes the StaticCache mirror — set it to the serving ctx). Copy-handoff design: prefill/verify stay on the proven eager DynamicCache path; the first decode captures `model.forward` over a StaticCache mirror, the second **replays at a new position** and self-checks against the eager DynamicCache decode — activates only on a match (`[cudagraph] decode ACTIVE`), else latches off permanently and serving stays eager (byte-identical). Default-OFF (inert without this var). **HIP/ROCm gfx1151: tested 2026-07-08 (TheRock torch 2.12.0a0+rocm7.13, HIP 7.13.60980, llama-3.3-70b int4) — capture and replay execute without error, but the replayed logits are ~71–74% off (`rel=0.740`/`0.714`, two independent loads); the self-check DISABLES it every time. Leave unset on ROCm until a TheRock/HIP build replays faithfully; NVIDIA is the intended target.** |
 | `INFINITEMODEL_PREFILL_CHUNK=<tokens>` | **Default 2048 (ON).** Processes a long-prompt **prefill** in query-chunks of this many tokens so SDPA never materializes the full `[1, H, q, total]` attention-score tensor. An explicit additive mask disables SDPA's flash backend; on a device without the mem-efficient backend (**ROCm gfx1151**, the CPU math path) SDPA otherwise falls to the math backend and allocates the whole `O(H·q²)` matrix → OOM on long prompts (the 43 GiB single-alloc seen on the Strix Halo). Chunking caps peak score memory to `O(H·C·q)`. Math-identical to the unchunked pass (validated); **standard-attention models only** (per-type/hybrid/omni keep the full pass); decode is unaffected. Set `0` to disable (single full pass); lower it (512–1024) for very long contexts on memory-tight boxes. |
 
@@ -139,12 +159,23 @@ incomplete) and the safe bf16-remat path is in use.
 
 ## Safety
 
-Whenever the fused MoE kernel installs, it runs a **one-time self-check** on the first decode: it compares
-its output against the genuine bf16 reference for that exact module and only activates if the relative
-error is within decode tolerance (mean `rel < 0.03`, worst-element `< 0.1`); otherwise it logs and falls
-back to the per-expert path. Every call also falls back on any runtime exception. So enabling the opt-in
-is safe — a build failure, numeric mismatch, or unsupported arch degrades to the default, never to wrong
-output. Look for `[int4] fused-MoE self-check ... -> ACTIVE` (or `-> fallback`) in the worker log.
+**Every fused kernel install self-checks before activating** — not just the MoE opt-in. At
+placement/first-decode, each path compares its output against the genuine reference for that exact
+module and only activates within tolerance, else it logs and falls back to the correct
+slower path; every call also falls back on any runtime exception:
+
+- **Fused MoE** (`[int4] fused-MoE self-check ... -> ACTIVE` / `-> fallback`) — vs the bf16
+  per-expert reference (mean `rel < 0.03`, worst-element `< 0.1`).
+- **Dense Triton w4a16 / split-K** (`[int4] triton w4a16 self-check ...`) — vs the naive dequant.
+- **The tinygemm zero-point rewrite** and the **int2 w2a16** path
+  (`[int2] triton w2a16 self-check ...`) — vs naive dequant, `rel < 0.05`. (The int2 check runs
+  at a small batch shape; the M=1 GEMV variant shares the kernel family but isn't separately
+  checked.)
+- **CUDA-graph decode** — the second decode replays at a new position and self-checks against the
+  eager DynamicCache path; any mismatch latches it off permanently (see the env-switch table).
+
+So enabling any opt-in is safe — a build failure, numeric mismatch, or unsupported arch degrades
+to the default, never to wrong output.
 
 ## The optimization stack & measured speedups
 
@@ -157,7 +188,7 @@ platform. This table is the whole story — what each one does, where it runs, a
 | 2 | **Fused dense int4 GEMM** (torch tinygemm `_weight_int4pack_mm`) | dequantizes *inside* the GEMM — no bf16 rematerialize | NVIDIA, CPU, CDNA2+ | int4 7B **3.25 → 21.13 tok/s**; int4 now beats bf16 |
 | 3 | **Triton w4a16 dense** | hand-rolled substitute where tinygemm is absent | AMD RDNA only | **5–20×** over naive (14× @4096², 20× @5120²) |
 | 4 | **Split-K dense GEMV** (M=1 decode) | splits K across more programs to saturate the bus at batch-1 | AMD RDNA only | **3.5–3.9×** on the dense GEMV |
-| 4b | **DRAM channel de-aliasing** (#dram-dealias, padded qweight rows) | when the packed row stride (K/2 bytes) is an even multiple of 64B — worst case a power of two, e.g. K=8192 → 4096B — every row maps to the same DRAM channels/banks and any matrix too big for the 32MB MALL collapses (17–67 GB/s); `prepare_fused` re-allocates rows on an **odd** multiple of 64B (+64B/row, no kernel change) and the GEMV autotune space gains the `BN=64/warps=16` family these shapes want | AMD RDNA only | worst GEMV (28672×8192) **17 → 175 GB/s**; **llama-3.3-70b e2e 0.61 → 1.73 tok/s (2.8×)**; the 32B/5120-dim shapes got faster too (never worse) |
+| 4b | **DRAM channel de-aliasing** (#dram-dealias, padded qweight rows) | when the packed row stride (K/2 bytes) is an even multiple of 64B — worst case a power of two, e.g. K=8192 → 4096B — every row maps to the same DRAM channels/banks and any matrix too big for the 32MB MALL collapses (17–67 GB/s); `prepare_fused` re-allocates rows on an **odd** multiple of 64B (+64B/row, no kernel change) and the GEMV autotune space gains the `BN=64/warps=16` family these shapes want | AMD RDNA only | worst GEMV (28672×8192) **17 → 175 GB/s**; **llama-3.3-70b e2e 0.61 → 3.5 tok/s (~5.7×**, clean box — see the correction note in the Strix Halo section); the 32B/5120-dim shapes got faster too (never worse) |
 | 4c | **MoE expert-row de-aliasing — measured** (#dram-dealias MoE, `Packed4Tensor3D.prepare_fused`) | within-expert rows sit `K_pad/2` bytes apart in the `[E,N,rs]` stack and a layer's experts (134–280 MB) blow past the MALL — but unlike dense the collapse is **allocation-dependent, not a stride rule** (the same shape collapsed in the synthetic bench and ran clean live, and vice-versa — the channel hash apparently involves physical-page bits), so the loader **times** the fused op unpadded vs row-padded (+64B/row strided view) on the *actual tensor* per `(E,N,rs)` on DRAM-cold expert subsets and keeps the winner; `sqn` joins the autotune key so the variants tune apart (side effect: MoE decode autotune moves to load time) | AMD RDNA only | live om3nbox: qwen3.6-35b gate_up **PAD, 0.088 → 0.052 ms (1.7×)**, e2e **15.75 → 16.34 tok/s**; gemma-4-26b live tensors never collapsed → kept unpadded, e2e ~20.5 unchanged (synthetic allocs of the same shapes swung up to **2.9× either way** — why it's measured) |
 | 5 | **Fused grouped MoE GEMV** (`_w4a16_moe_op`) | all `top_k` experts' int4 GEMVs in ONE launch (kills the per-expert Python loop) | ROCm (auto), NVIDIA (opt-in) | **~3.7×** on the expert GEMM (per-platform below) |
 | 6 | **MoE autotune** `(BN, warps, stages)` | best tile per `(B,N,K)` per GPU | ROCm, NVIDIA | up to **1.18×** (shape-dependent) |
