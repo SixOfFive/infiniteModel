@@ -75,19 +75,19 @@ def _dump_live_cuda(top: int = 8) -> None:
             _builtins.print(f"[vram-live] {n}x {shape} {dt} = {tot / (1024 ** 3):.2f} GB",
                             flush=True)
         if biggest is not None:
-            for r1 in _gc.get_referrers(biggest[1])[:4]:
-                t1 = type(r1).__name__
-                try:
-                    r2s = ", ".join(sorted({type(x).__name__ for x in _gc.get_referrers(r1)[:6]}))
-                except Exception:
-                    r2s = "?"
-                extra = ""
+            def _describe(o):
                 with contextlib.suppress(Exception):
-                    if isinstance(r1, dict):
-                        extra = f" keys={list(r1.keys())[:4]}"
-                    elif isinstance(r1, (tuple, list)):
-                        extra = f" len={len(r1)} items={[type(x).__name__ for x in r1[:5]]}"
-                _builtins.print(f"[vram-live] holder: {t1}{extra} <- held by: {r2s}", flush=True)
+                    if isinstance(o, dict):
+                        return f"dict keys={[str(k)[:40] for k in list(o.keys())[:4]]}"
+                    if isinstance(o, (tuple, list)):
+                        return f"{type(o).__name__} len={len(o)} items={[type(x).__name__ for x in o[:4]]}"
+                return type(o).__name__
+            for r1 in _gc.get_referrers(biggest[1])[:4]:
+                _builtins.print(f"[vram-live] L1 holder: {_describe(r1)}", flush=True)
+                for r2 in _gc.get_referrers(r1)[:4]:
+                    _builtins.print(f"[vram-live]   L2: {_describe(r2)}", flush=True)
+                    for r3 in _gc.get_referrers(r2)[:3]:
+                        _builtins.print(f"[vram-live]     L3: {_describe(r3)}", flush=True)
 
 
 def _release_ram(trim_working_set: bool = False) -> None:
