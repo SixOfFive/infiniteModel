@@ -43,7 +43,9 @@ dashboard.
   ([docs/ROCM.md](docs/ROCM.md)).
 - **Pre-compiled shard cache.** The controller quantizes a model once to `_shards/<quant>/`, so later
   loads stream small **pre-packed** int4/int2/int8 layers instead of bf16 + re-quantizing — for dense
-  models *and* MoE (int4: fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load. Any model
+  models *and* MoE (int4: fused-3D and per-expert Mixtral/OLMoE), bit-identical to a cold load.
+  int2 is **GPTQ-calibrated** at compile (Hessian-guided error compensation over a bundled offline
+  corpus — plain RTN collapses at 2 bits) and refuses to serve without its calibrated cache. Any model
   without an int4 cache shows a one-click **`⚡ int4` compile badge** on the models page (hover for
   the estimated on-disk size and free-disk check); compiles run in a background subprocess with live
   progress on the model's row.

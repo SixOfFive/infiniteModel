@@ -63,6 +63,25 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   format through the same kernels, cache layout and serve path (a packer-only follow-up;
   `packer_hash` in the cache manifest auto-invalidates stale int2 caches when it lands). Until
   then int2 is machinery-complete but NOT usable for real serving.
+- **int2 GPTQ-calibrated packer (#38, 2026-07-11) — the follow-up above, landed.** `gptq_pack.py`
+  replaces the int2 compile with sequential per-layer **GPTQ**: Hessians `E[x xᵀ]` estimated per
+  Linear from real forwards over a bundled offline corpus (`calib_corpus.txt`: public-domain novel
+  + RFC 9110 + this repo's own Python; 32×512 tokens default, `INFINITEMODEL_GPTQ_SAMPLES/_SEQLEN/
+  _PERCDAMP/_GRID` to tune), Cholesky error compensation column-by-column, group scale/zero by MSE
+  shrink search, intra-layer stage order (qkv→o→gate/up→down, each stage seeing earlier stages
+  already quantized), and each layer's QUANTIZED outputs feeding the next layer's calibration.
+  Output format is byte-compatible with the RTN packer (same crumbs/scale/zero/g64), so
+  QuantLinear2, the w2a16 kernels and serve-from-cache run it unchanged. `packer_hash` bumps to
+  `v2-g<G>-int2-gptq` — v1 RTN caches fail verify with "recompile", and an int2 **load** without a
+  valid v2 cache now FAILS LOUD with the compile instruction instead of silently falling back to
+  the RTN cold path (which is salad). int2 stays explicit-compile (never auto-built on first load);
+  /pack_probe + /compile_dist reject int2 (layer N's calibration needs layer N-1's quantized
+  outputs — inherently sequential; compile subprocess uses the local GPU when present).
+  **Measured**: synthetic activation MSE 25× lower than RTN; qwen2.5-0.5B/7B lift from token salad
+  to grammatical, fact-retrieving output ("The capital of France is Paris") that still loops/
+  degrades on open prose — consistent with GPTQ-2bit literature at small scale. The tier's real
+  audience stays BIG dense models that otherwise cannot fit (a 70B at ~19 GB); at 7B-and-below,
+  int4 exists and is strictly better.
 - **Hybrid models reserve KV only on their attention layers:** a Gated-DeltaNet hybrid (qwen3-next /
   qwen3.6) grows a full-context KV only on its `full_attention` layers (the linear-attn layers keep a
   small fixed recurrent state). KV reservation — both the GPU placement budget and the pre-alloc probe,
