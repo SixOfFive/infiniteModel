@@ -591,7 +591,12 @@ class EngineLoadMixin:
                     # usable_vram (≈ total - reserve) ignores non-fleet GPU usage, so on a desktop-
                     # shared card (beast) it over-budgets; capping by live-free spreads layers to a
                     # genuinely-free GPU node (a headless worker) instead of overloading it -> CPU.
+                    # #vram-reusable: credit back the worker's VACANT allocator pool — device
+                    # counters report it as used, but a new load in that worker allocates from it
+                    # first (only a worker restart returns it to the OS; big on ROCm after churn:
+                    # om3nbox measured ~13 GB "used" that was actually empty pool).
                     live_free = max(0.0, n.vram_total_gb - n.vram_used_gb
+                                    + getattr(n, "vram_reusable_gb", 0.0)
                                     - _res_vram.get(n.node_id, 0) / GB)
                     # #vram-weights-first: budget weights against PHYSICALLY-free VRAM (live_free already
                     # excludes resident weights + actually-faulted KV + other in-flight loads), so a new
@@ -815,6 +820,7 @@ class EngineLoadMixin:
                     # #vram-weights-first: budget against live-free (use resident models' reserved-but-
                     # unfaulted KV headroom); off -> the conservative #95 min() (also subtract reserved KV).
                     _live_free_gb = max(0.0, nd.vram_total_gb - nd.vram_used_gb
+                                        + getattr(nd, "vram_reusable_gb", 0.0)   # #vram-reusable
                                         - _res_vram.get(st.node_id, 0) / GB)
                     if cpu_only:
                         _gpu_budget_gb = 0.0
@@ -1223,8 +1229,10 @@ class EngineLoadMixin:
                     and (n.hostname == _ctrl_host
                          or str(n.data_host).startswith(("127.", "::1"))
                          or str(n.data_host) in _LOCAL_IPS)]
-            for n in sorted(cand, key=lambda x: x.vram_total_gb - x.vram_used_gb, reverse=True):
-                free = n.vram_total_gb - n.vram_used_gb
+            def _t2i_free(x):   # #vram-reusable: vacant pool counts as free (see the LLM planner)
+                return x.vram_total_gb - x.vram_used_gb + getattr(x, "vram_reusable_gb", 0.0)
+            for n in sorted(cand, key=_t2i_free, reverse=True):
+                free = _t2i_free(n)
                 for e in ([want_edge, 1] if quant != "none" else [0]):
                     if free >= _est_gb(e) + _MARGIN_GB:
                         node, edge = n, e

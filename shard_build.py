@@ -115,6 +115,13 @@ class ShardBuildMixin:
 
         gpu = torch.device("cuda:0")
         free, _total = torch.cuda.mem_get_info(0)
+        # #vram-reusable: this process's VACANT allocator pool is invisible to mem_get_info (the
+        # driver counts it as used) but torch reuses it FIRST for new allocations here — credit
+        # it, or a churned worker under-places (om3nbox: ~13 GB of empty pool read as "used").
+        try:
+            free += max(0, torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0))
+        except Exception:
+            pass
         # NEVER oversubscribe the card: the controller may plan GPU placement optimistically (sizing
         # against an EMPTY GPU), but coexisting models already hold VRAM. Bound EVERY GPU budget by
         # the LIVE free VRAM (mem_get_info reflects what other resident models hold right now), and

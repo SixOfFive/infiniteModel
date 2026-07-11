@@ -930,6 +930,15 @@ async def _heartbeat_loop(writer: asyncio.StreamWriter, lock: asyncio.Lock,
             used, total = _gpu_mem_gb()
             hb["vram_used_gb"] = round(used, 2)
             hb["vram_total_gb"] = round(total, 2)
+            # #vram-reusable: this process's VACANT torch allocator pool (reserved - allocated).
+            # Device counters report it as USED, but any new torch allocation in THIS worker
+            # reuses it first — the planner credits it back as free (it only returns to the OS
+            # on a worker restart; on ROCm it can reach many GB after model churn).
+            with contextlib.suppress(Exception):
+                import torch
+                hb["vram_reusable_gb"] = round(sum(
+                    max(0, torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i))
+                    for i in range(torch.cuda.device_count())) / GB, 2)
             with contextlib.suppress(Exception):   # GPU compute utilization % (#46; needs pynvml)
                 import torch
                 hb["gpu_util"] = float(torch.cuda.utilization(0))

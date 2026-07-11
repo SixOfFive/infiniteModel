@@ -265,6 +265,8 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     node.proc_rss_gb = float(msg.get("proc_rss_gb", 0.0))
                 if "vram_used_gb" in msg:   # worker-reported GPU memory
                     node.vram_used_gb = float(msg.get("vram_used_gb", 0.0))
+                if "vram_reusable_gb" in msg:   # #vram-reusable: worker's vacant allocator pool
+                    node.vram_reusable_gb = float(msg.get("vram_reusable_gb", 0.0))
                     node.vram_total_gb = float(msg.get("vram_total_gb", node.vram_total_gb))
                 if "gpu_util" in msg:       # worker-reported GPU compute utilization %
                     node.gpu_util = float(msg.get("gpu_util", 0.0))

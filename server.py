@@ -512,6 +512,11 @@ class Node:
     # Non-zero only when the worker runs on a GPU (--device gpu/cpu+gpu).
     vram_total_gb: float = 0.0
     vram_used_gb: float = 0.0
+    # #vram-reusable: the worker process's VACANT torch allocator pool (reserved - allocated).
+    # Device counters (mem_get_info / GTT) report it as USED, but any new torch allocation in
+    # that worker reuses it first — so it is FREE for the planner's purposes (a fresh load lands
+    # into it). Only fully returns to the OS on worker restart (ROCm pool fragmentation).
+    vram_reusable_gb: float = 0.0
     gpu_util: float = 0.0      # GPU compute utilization % (worker heartbeat, GPU nodes only)
     cores: int = 0             # logical CPU cores (registration) — capacity weight for load
     # --- pipeline assignment (set on load); reserved tp_* for the M4 grid ---
@@ -617,6 +622,7 @@ class Node:
             "can_infer": self.can_infer, "incapable_reason": self.incapable_reason,
             "vram_total_gb": round(self.vram_total_gb, 2),
             "vram_used_gb": round(self.vram_used_gb, 2),
+            "vram_reusable_gb": round(self.vram_reusable_gb, 2),   # #vram-reusable: vacant pool
             "gpu_util": round(self.gpu_util, 1),
             "cores": self.cores,
             "usable_vram_gb": round(self.usable_vram_gb, 2),
