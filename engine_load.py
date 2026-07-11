@@ -1243,14 +1243,23 @@ class EngineLoadMixin:
                     and (n.hostname == _ctrl_host
                          or str(n.data_host).startswith(("127.", "::1"))
                          or str(n.data_host) in _LOCAL_IPS)]
+            # In-flight loads' reservations count as USED (they're streaming toward that size —
+            # observed: a cache-served 14b auto-load planned seconds before this one filled the
+            # card mid-t2i-build and OOM'd even the offload transients). Same discipline as the
+            # LLM planner's _res_vram subtraction; recomputed each retry pass.
+            _res_ram_b, _res_vram_b = self._reserved_bytes(exclude_key=reg_key)
+
             def _t2i_free(x):   # #vram-reusable: vacant pool counts as free (see the LLM planner)
-                return x.vram_total_gb - x.vram_used_gb + getattr(x, "vram_reusable_gb", 0.0)
+                return (x.vram_total_gb - x.vram_used_gb + getattr(x, "vram_reusable_gb", 0.0)
+                        - _res_vram_b.get(x.node_id, 0) / GB)
             for n in sorted(cand, key=_t2i_free, reverse=True):
                 free = _t2i_free(n)
                 if offload:
                     # #t2i-offload: only transient VRAM + enough free RAM for the bf16 weights.
                     # NEVER evicts — not disturbing residents is this mode's whole purpose.
-                    if free >= _OFFLOAD_VRAM_GB and (n.free_mem_gb or 0) >= all_b / GB + 6.0:
+                    if free >= _OFFLOAD_VRAM_GB and \
+                            ((n.free_mem_gb or 0) - _res_ram_b.get(n.node_id, 0) / GB) \
+                            >= all_b / GB + 6.0:
                         node, edge = n, 0
                         break
                     continue
