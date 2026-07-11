@@ -48,7 +48,8 @@ class T2IPipeline:
 
     kind = "t2i"
 
-    def __init__(self, model_dir: str, device: str, quant: str = "int4", edge: int = 2):
+    def __init__(self, model_dir: str, device: str, quant: str = "int4", edge: int = 2,
+                 offload: bool = False):
         try:
             from diffusers import (AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler,
                                    QwenImagePipeline, QwenImageTransformer2DModel)
@@ -66,7 +67,8 @@ class T2IPipeline:
         if not _dv or "gpu" in _dv:
             _dv = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = _dv
-        self.quant = quant
+        self.quant = "none" if offload else quant   # #t2i-offload: bf16-only (see below)
+        self.offload = bool(offload)
         self.edge = max(0, int(edge))
         self._gen_lock = threading.Lock()
         self._doomed = False   # #t2i-vram-release: unload arrived mid-render -> free after it ends
@@ -98,8 +100,15 @@ class T2IPipeline:
                 n_quant += 1
         transformer.eval()
 
-        transformer.to(self.device)
-        vae.to(self.device)
+        # #t2i-offload (v2): the bf16 DiT RESTS in system RAM; accelerate's sequential offload
+        # hooks stream each submodule to the GPU just-in-time per forward, so VRAM peak is
+        # transients (~blocks + activations + VAE) instead of ~14 GB resident — the no-eviction
+        # mode for tight cards. bf16-only: the int4 fused kernels are prepared per-device and
+        # do not survive block hopping. Hooks are installed on the RENDER view below (the CPU
+        # text encoder is exempt by design either way).
+        if not self.offload:
+            transformer.to(self.device)
+            vae.to(self.device)
         if self.quant.startswith("int4"):
             import worker_quant
             QL = worker_quant._quant4_linear_cls()
@@ -127,18 +136,27 @@ class T2IPipeline:
                                      tokenizer=tokenizer, transformer=None)
         self.pipe = QwenImagePipeline(scheduler=scheduler, vae=vae, text_encoder=None,
                                       tokenizer=None, transformer=transformer)
+        if self.offload:
+            try:
+                self.pipe.enable_sequential_cpu_offload(device=self.device)
+            except Exception as exc:
+                raise RuntimeError(
+                    "t2i offload needs the `accelerate` package on this worker "
+                    f"(pip install accelerate) — enable failed: {exc!r}") from exc
 
         def _module_bytes(mod) -> int:
             return sum(p.numel() * p.element_size() for p in mod.parameters()) + \
                 sum(b.numel() * b.element_size() for b in mod.buffers())
 
         dit_b = _module_bytes(transformer)
-        self.gpu_bytes = (dit_b + _module_bytes(vae)) if str(self.device).startswith("cuda") else 0
+        self.gpu_bytes = 0 if self.offload else \
+            ((dit_b + _module_bytes(vae)) if str(self.device).startswith("cuda") else 0)
         self.loaded_bytes = dit_b + _module_bytes(vae) + _module_bytes(text_encoder)
         self.loaded_params = sum(p.numel() for p in transformer.parameters()) \
             + sum(p.numel() for p in text_encoder.parameters())
         self.last_gen_s = 0.0
-        print(f"[t2i] ready on {self.device} in {time.time() - t0:.0f}s "
+        print(f"[t2i] ready on {self.device}{' OFFLOAD (DiT in RAM, blocks stream per step)' if self.offload else ''} "
+              f"in {time.time() - t0:.0f}s "
               f"(GPU {self.gpu_bytes / GB:.1f} GB, total {self.loaded_bytes / GB:.1f} GB)", flush=True)
 
     # -- unload -------------------------------------------------------------------------
@@ -161,6 +179,8 @@ class T2IPipeline:
     def _free_now(self) -> None:
         import contextlib as _cl
         import torch
+        with _cl.suppress(Exception):   # #t2i-offload: detach accelerate hooks before freeing
+            self.pipe.remove_all_hooks()
         seen: set = set()
         for mod in (getattr(self.pipe, "transformer", None), getattr(self.pipe, "vae", None)):
             if mod is None or not hasattr(mod, "parameters"):
