@@ -258,9 +258,16 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 # Net rates are measured by the controller itself (NODE_NET +
                 # metrics_sampler); we deliberately ignore any client-reported
                 # net_in_bps/net_out_bps here — the server watches its own wire.
-                await registry.heartbeat(node.node_id, float(msg.get("free_mem_gb", 0.0)),
-                                         float(msg.get("cpu_percent", 0.0)),
-                                         float(msg.get("free_disk_gb", 0.0)))
+                known = await registry.heartbeat(node.node_id, float(msg.get("free_mem_gb", 0.0)),
+                                                 float(msg.get("cpu_percent", 0.0)),
+                                                 float(msg.get("free_disk_gb", 0.0)))
+                if not known:
+                    # #reap-close-link belt: the registry dropped this node while its socket
+                    # stayed up (reap race, stale #77 dupe). Heartbeating into a dead entry
+                    # can never revive it — close the link so the worker re-registers fresh.
+                    print(f"[!] heartbeat from unregistered {node.node_id} ({node.hostname}) "
+                          f"— closing link to force re-register")
+                    break
                 if "proc_rss_gb" in msg:    # worker python RSS (engine-memory split)
                     node.proc_rss_gb = float(msg.get("proc_rss_gb", 0.0))
                 if "vram_used_gb" in msg:   # worker-reported GPU memory
@@ -447,6 +454,17 @@ async def reaper_loop() -> None:
             print(f"[-] reaped {n.node_id} ({n.hostname}, heartbeat timeout)")
             for fr in [fr for fr, m in engine.models.items() if n.node_id in m.stage_node_ids]:
                 engine.invalidate_model(fr, f"node {n.hostname} reaped (heartbeat timeout)")
+            # #reap-close-link: a reap only deletes the registry entry. If the worker's TCP
+            # connection SURVIVED the network blip that made it miss heartbeats (half-open or
+            # fully healed), the worker keeps heartbeating into a socket whose node id no longer
+            # exists — heartbeat() no-ops for unknown ids — and since registration only happens
+            # on a fresh connect, it stays a zombie forever (2026-07-11: prodesk/steamdeck/work
+            # orphaned for hours after a LAN blip). Close the link so handle_control's finally
+            # tears it down and the worker's reconnect loop re-registers within seconds.
+            link = engine.links.get(n.node_id)
+            if link is not None:
+                with contextlib.suppress(Exception):
+                    link.writer.close()
 
 
 async def gen_stall_watchdog() -> None:

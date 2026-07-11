@@ -692,7 +692,9 @@ class Registry:
                 self.dirty = True
 
     async def heartbeat(self, node_id: str, free_mem_gb: float, cpu_percent: float,
-                        free_disk_gb: float = 0.0) -> None:
+                        free_disk_gb: float = 0.0) -> bool:
+        """Returns False when node_id is no longer registered (reaped while its socket
+        stayed up) so the control handler can drop the link and force a re-register."""
         async with self._lock:
             n = self._nodes.get(node_id)
             if n:
@@ -701,6 +703,7 @@ class Registry:
                 n.cpu_percent = cpu_percent
                 if free_disk_gb:
                     n.free_disk_gb = free_disk_gb
+            return n is not None
 
     async def reap_dead(self) -> list[Node]:
         async with self._lock:
