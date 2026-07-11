@@ -33,6 +33,18 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   Caught within minutes by the silent-wedge hardening below (the dtype door-guard named the
   looped frame; the control-link stage_error delivered it) — the two fixes together close both
   the cause and the blindness.
+- **#reap-close-link — reaped nodes' surviving control links get closed (2026-07-11).** A
+  heartbeat-timeout reap only deleted the registry entry; if the worker's TCP connection
+  *survived* the network blip that caused the missed heartbeats (half-open, or fully healed),
+  the worker kept heartbeating into a socket whose node id no longer existed — and since
+  registration only happens on a fresh connect, it stayed an invisible zombie forever. A
+  morning LAN blip (2026-07-11 ~07:43) demonstrated it at scale: seven nodes reaped, three
+  reconnected on their own (their sockets broke), and four — prodesk / steamdeck / work /
+  zippy — sat orphaned for hours with healthy worker processes heartbeating on live sockets
+  the controller ignored. Two-sided fix: the reaper now **closes the reaped node's control
+  link** (the handler tears down; the worker's reconnect loop re-registers in seconds), and a
+  heartbeat arriving for an **unregistered node id** drops the link as a belt (covers reap
+  races and stale #77 duplicate connections).
 
 ## Memory, quantization & the shard cache
 - **int4** (group-wise asymmetric, fused tinygemm GEMM) and **int8** (per-channel) load-time quant;
