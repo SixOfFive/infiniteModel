@@ -596,7 +596,7 @@ function _devOpts(){
 function openLoad(name){
   const m=(LAST.models||[]).find(x=>x.name===name)||{};
   const cz=m.cached||{}; const dc=m.default_ctx||0;
-  const ctxDefault = dc>=131072 ? 16384 : (dc||8192);
+  const ctxDefault = dc>=131072 ? 16384 : (dc||32767);
   const qopt=q=>'<option value="'+q+'">'+q+(cz[q]&&cz[q].ok?' · '+gb(cz[q].size_gb)+' cached':'')+'</option>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load '+esc(name)+'</h3>'
    +'<div class="grid2"><div><label>Quant</label><select id="l-q" onchange="previewSoon(\''+esc(name)+'\')">'+qopt('int4')+qopt('int2')+qopt('int8')+'<option value="none">none (bf16)'+(cz.none&&cz.none.ok?' · '+gb(cz.none.size_gb)+' cached':(m.size_gb?' · '+gb(m.size_gb):''))+'</option></select></div>'
