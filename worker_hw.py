@@ -45,6 +45,38 @@ def _release_vram() -> None:
                                     f"allocated={a:.2f}GB reserved={r:.2f}GB "
                                     f"({'LIVE-REF leak' if a > 1.0 else 'pool reclaimed' if r < 1.0 else 'POOL held'})",
                                     flush=True)
+                    if a > 2.0:   # #39: name WHAT is still live so the leak stops being a mystery
+                        _dump_live_cuda()
+
+
+def _dump_live_cuda(top: int = 8) -> None:
+    """#39 diagnostic: when an unload leaves GBs ALLOCATED (live refs, not pool), walk gc for
+    live CUDA tensors, group by (shape, dtype), and print the top groups + the REFERRER type
+    names of the biggest tensor — enough to name the holder (KV cache list? module? closure?).
+    Best-effort and cheap relative to an unload; only called on the >2 GB residue path."""
+    import gc as _gc
+    with contextlib.suppress(Exception):
+        import torch
+        groups: dict = {}
+        biggest = None
+        for o in _gc.get_objects():
+            try:
+                if torch.is_tensor(o) and o.is_cuda:
+                    b = o.numel() * o.element_size()
+                    k = (tuple(o.shape), str(o.dtype))
+                    n, tot = groups.get(k, (0, 0))
+                    groups[k] = (n + 1, tot + b)
+                    if biggest is None or b > biggest[0]:
+                        biggest = (b, o)
+            except Exception:
+                continue
+        top_g = sorted(groups.items(), key=lambda kv: kv[1][1], reverse=True)[:top]
+        for (shape, dt), (n, tot) in top_g:
+            _builtins.print(f"[vram-live] {n}x {shape} {dt} = {tot / (1024 ** 3):.2f} GB",
+                            flush=True)
+        if biggest is not None:
+            refs = [type(x).__name__ for x in _gc.get_referrers(biggest[1])[:6]]
+            _builtins.print(f"[vram-live] biggest tensor referrers: {refs}", flush=True)
 
 
 def _release_ram(trim_working_set: bool = False) -> None:
