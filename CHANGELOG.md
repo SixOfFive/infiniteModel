@@ -33,6 +33,13 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   Caught within minutes by the silent-wedge hardening below (the dtype door-guard named the
   looped frame; the control-link stage_error delivered it) — the two fixes together close both
   the cause and the blindness.
+- **#load-default-quant — `/load` without a quant defaults to int4, not bf16 (2026-07-11).**
+  The `/load` endpoint hardcoded `quant="none"` (bf16) as its default, so any API caller that
+  omitted the quant loaded a full-size bf16 copy — on a shared box a 30B MoE became ~57 GB that
+  spilled onto CPU and evicted its neighbours. That default was inconsistent with every other
+  path: the dashboard load dialog defaults to int4, and auto-loads use `autoload_quant` (int4).
+  An unspecified quant now inherits `autoload_quant` (normally int4); an explicit `quant=none`
+  still loads bf16 on purpose.
 - **#reap-close-link — reaped nodes' surviving control links get closed (2026-07-11).** A
   heartbeat-timeout reap only deleted the registry entry; if the worker's TCP connection
   *survived* the network blip that caused the missed heartbeats (half-open, or fully healed),

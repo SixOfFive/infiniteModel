@@ -164,8 +164,9 @@ All runtime knobs persist across restarts and are settable from the dashboard se
 | `wedge_reload_n` | 3 | Auto re-place after N watchdog reclaims of one model in 15 min (0 = off). |
 | `vram_weights_first` | true | Budget new weights against live-free VRAM. |
 
-Per-load knobs (query params on `/load`): `quant` (`none|int8|int4|int2` — int2 requires its
-pre-compiled calibrated cache, see Shard-cache ops), `ctx`, `mode`
+Per-load knobs (query params on `/load`): `quant` (`none|int8|int4|int2` — **omitted ⇒ the
+`autoload_quant` default, normally int4**, NOT bf16; pass `quant=none` explicitly for bf16; int2
+requires its pre-compiled calibrated cache, see Shard-cache ops), `ctx`, `mode`
 (`auto|single|gpu-spread|all-gpu|distribute|spread|proportional`), `node` (pin to one node),
 `tp` (tensor-parallel width), `replicas`, `kv_offload=1` (KV cache in system RAM — frees the VRAM
 KV reserve for layers; CUDA only, force-disabled on ROCm), `kv_quant` (`turbo2|turbo3|turbo4`),

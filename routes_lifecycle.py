@@ -13,7 +13,7 @@ def register(app):
 
     @app.post("/load")
     async def load(request: Request, model: str, ctx: int = 0, mode: str = "auto",
-                   consolidate: bool = True, quant: str = "none", tp: int = 1,
+                   consolidate: bool = True, quant: str = "", tp: int = 1,
                    replicas: int = 1, cpu_only: bool = False,
                    moe_offload: bool = False, force: bool = False,
                    node: str = "", kv_quant: str = "",
@@ -43,6 +43,14 @@ def register(app):
         # size — split every layer across `tp` GPU nodes (rank 0 drives the group over the
         # all-reduce mesh). tp>1 overrides mode. tp must divide num_key_value_heads.
         # Legacy: if mode is omitted but consolidate=false is passed, honor it.
+        # #load-default-quant: an UNSPECIFIED quant inherits the fleet default (`autoload_quant`,
+        # normally int4) — NOT bf16. The old hardcoded "none" default silently loaded a full-size
+        # bf16 copy for any caller that omitted quant (a 30B MoE -> ~57 GB that spilled to CPU and
+        # evicted its neighbours on a shared box), inconsistent with BOTH the dashboard load dialog
+        # (defaults int4) and the auto-load path (autoload_quant). Explicit `quant=none` still loads
+        # bf16 on purpose; the dashboard/T2I paths always send an explicit quant so are unaffected.
+        if not quant:
+            quant = str(ENGINE_CONFIG.get("autoload_quant") or "int4")
         if quant not in ("none", "int8", "int4", "int2"):
             return JSONResponse({"ok": False, "error": f"bad quant '{quant}' (none|int8|int4|int2)"},
                                 status_code=400)
