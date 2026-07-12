@@ -17,7 +17,8 @@ dashboard.
 
 > Personal research project — expect rough edges. Hugging Face **safetensors** is the native
 > format; a model that ships only as a single-file **GGUF** is converted to safetensors
-> automatically at add time (split multi-part GGUFs aren't supported).
+> automatically at add time (split multi-part GGUFs aren't supported) — see
+> **[docs/GGUF.md](docs/GGUF.md)**.
 
 > **A note from the author:** I'm fairly new to actually *using* git, so please go easy on me if the
 > history or workflow isn't textbook — I'm still learning the etiquette. I built this for my own
@@ -51,6 +52,11 @@ dashboard.
   without an int4 cache shows a one-click **`⚡ int4` compile badge** on the models page (hover for
   the estimated on-disk size and free-disk check); compiles run in a background subprocess with live
   progress on the model's row.
+- **GGUF ingestion.** A model published only as a llama.cpp **`.gguf`** is normalized to a standard
+  safetensors checkpoint once at add time, then runs as an ordinary model (int4/int8 shard-cached,
+  distributed) — no GGUF awareness downstream. Unlocks the large pool of GGUF-only community
+  weights. Single-file quants; add via `/add_model?...&gguf_file=<one>.gguf` or the dashboard's GGUF
+  field. Full details → **[docs/GGUF.md](docs/GGUF.md)**.
 - **MoE & multimodal.** Mixture-of-Experts (incl. attention-on-GPU / experts-in-CPU-RAM offload), and
   distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3/Pixtral, Gemma 4 — both
   its encoder-free and ViT-tower variants): image/audio → text, plus **speech out** (TTS) via
