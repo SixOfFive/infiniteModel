@@ -138,7 +138,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;}
   a{color:var(--accent);text-decoration:none}
-  .wrap{max-width:1180px;margin:0 auto;padding:18px 20px 60px;}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 60px;}
   /* header */
   header{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap}
   .brand{font-size:20px;font-weight:600;letter-spacing:.2px}
@@ -202,7 +202,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .miniprog > i{display:block;height:100%;background:var(--warn)}
   .grp{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:8px 15px 4px;background:var(--bg)}
   /* nodes */
-  .node{display:grid;grid-template-columns:210px 1fr 1fr 56px;align-items:center;gap:14px;padding:8px 15px;border-bottom:1px solid var(--border);font-size:13px}
+  .node{display:grid;grid-template-columns:210px 1fr 1fr 96px;align-items:center;gap:14px;padding:8px 15px;border-bottom:1px solid var(--border);font-size:13px}
   .node:last-child{border-bottom:none}
   .node .nn{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .node .nn small{font-weight:400;color:var(--dim);font-size:11px}
@@ -211,6 +211,8 @@ DASHBOARD_HTML = r"""<!doctype html>
   .node .mb .bar{flex:1}
   .node .mb .num{font-size:11px;color:var(--muted);white-space:nowrap;flex:none;width:82px;text-align:right}
   .node .util{font-size:11px;color:var(--dim);text-align:right}
+  .node .ver{font-size:10px;color:var(--dim);font-family:var(--mono);margin-top:2px}
+  .node .ver.stale{color:var(--warn)}
   /* overlay/modal */
   .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-start;justify-content:center;z-index:50}
   .ov.show{display:flex}
@@ -533,6 +535,10 @@ function int4Badge(m){
 function renderNodes(d){
   const ns=(d.nodes||[]).slice().sort((a,b)=>(b.has_gpu?1:0)-(a.has_gpu?1:0)||a.hostname.localeCompare(b.hostname));
   $('#ncount').textContent=ns.length+' nodes';
+  // fleet-consensus version = the most common client_version among nodes; a node that differs from it
+  // is flagged (warn) so a worker that missed a restart/update stands out. When all match, nothing flags.
+  const _vc={}; ns.forEach(n=>{ if(n.client_version) _vc[n.client_version]=(_vc[n.client_version]||0)+1; });
+  const _consensus=Object.keys(_vc).sort((a,b)=>_vc[b]-_vc[a])[0]||null;
   // #node-split: per node, GREEN = what InfiniteModel itself uses on THAT node — RAM = the worker
   // process RSS (proc_rss_gb), VRAM = the sum of loaded models' per-stage GPU bytes placed here —
   // vs BLUE = the rest of the physical usage (OS / other processes), so it stands out from everything
@@ -558,9 +564,11 @@ function renderNodes(d){
     // cell empty so their RAM bar still aligns with the GPU nodes' RAM column.
     const ramUsed=Math.max(0,(n.total_mem_gb||0)-(n.free_mem_gb||0));
     const vram=gpu?memRow('VRAM',(imVram[n.hostname]||0),(n.vram_used_gb||0),(n.vram_total_gb||0)):'<div class="mb"></div>';
+    const cv=n.client_version||''; const _stale=(_consensus&&cv&&cv!==_consensus)?' stale':'';
+    const verCell='<div class="ver'+_stale+'"'+(_stale?' title="version differs from fleet consensus '+esc(_consensus)+'"':'')+'>'+(cv?'v'+esc(cv):'—')+'</div>';
     return '<div class="node"><div class="nn">'+esc(n.hostname)+' <small>'+esc(dev)+'</small>'+off+'</div>'
       +vram+memRow('RAM',(n.proc_rss_gb||0),ramUsed,(n.total_mem_gb||0))
-      +'<div class="util">'+util+'</div></div>';
+      +'<div class="util">'+util+verCell+'</div></div>';
   }).join('');
 }
 
@@ -1042,7 +1050,7 @@ CONFIG_HTML = r"""<!doctype html>
     --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
   a{color:var(--accent);text-decoration:none}
-  .wrap{max-width:980px;margin:0 auto;padding:18px 20px 60px}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 60px}
   header{display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap}
   .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
   nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
@@ -1169,7 +1177,7 @@ CHAT_HTML = r"""<!doctype html>
     --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
   a{color:var(--accent);text-decoration:none}
-  .wrap{max-width:980px;margin:0 auto;padding:18px 20px 30px}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 30px}
   header{display:flex;align-items:center;gap:14px;margin-bottom:14px;flex-wrap:wrap}
   .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
   nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
@@ -1272,7 +1280,7 @@ LOGS_HTML = r"""<!doctype html>
     --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
   a{color:var(--accent);text-decoration:none}
-  .wrap{max-width:1180px;margin:0 auto;padding:18px 20px 40px}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 40px}
   header{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap}
   .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
   nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
