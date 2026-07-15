@@ -153,10 +153,14 @@ def build_status() -> dict:
             _media = dict(getattr(lm, "media", None) or {})
             _media["device"] = ("GPU" if any(getattr(s, "gpu_bytes", 0) > 0
                                              for s in lm.plan.stages) else "CPU")
-            # measured weight size from the worker-reported stage bytes — the tts/t2i ModelSpec
-            # carries dummy dims (num_layers=1 etc.), so spec.total_weight_bytes is ~0 for them.
-            _lb = sum(getattr(s, "loaded_bytes", 0) or 0 for s in lm.plan.stages)
-            _media["size_gb"] = round((_lb or lm.spec.total_weight_bytes) / GB, 2)
+            # measured weight size — prefer the worker's directly-reported loaded_bytes (rides in
+            # `media`), else the stage bytes; the tts/t2i ModelSpec carries dummy dims so
+            # spec.total_weight_bytes is ~0. (The CPU-load path can leave the stage bytes 0.)
+            _lb = (_media.get("loaded_bytes")
+                   or sum(getattr(s, "loaded_bytes", 0) or 0 for s in lm.plan.stages)
+                   or lm.spec.total_weight_bytes)
+            _media["size_gb"] = round(_lb / GB, 2)
+            _media.pop("loaded_bytes", None)   # internal — size_gb is the public field
             if not _media.get("kind"):
                 _media["kind"] = ("tts" if getattr(lm, "is_tts", False)
                                   else "t2i" if getattr(lm, "is_t2i", False) else "t2a")

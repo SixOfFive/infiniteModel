@@ -240,7 +240,8 @@ class KokoroPipeline:
         voices = self.list_voices()
         return {"kind": "tts", "engine": "kokoro", "device": str(self.device),
                 "sample_rate": SR, "n_voices": len(voices), "voices": voices,
-                "default_voice": self.DEFAULT_VOICE, "params": int(self.loaded_params)}
+                "default_voice": self.DEFAULT_VOICE, "params": int(self.loaded_params),
+                "loaded_bytes": int(self.loaded_bytes)}
 
     # -- unload -------------------------------------------------------------------------
 
