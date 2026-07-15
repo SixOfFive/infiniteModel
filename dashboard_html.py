@@ -725,7 +725,8 @@ function detailLive(name){
     oadd('state', gen?('<span style="color:var(--good)">● generating'+((m.active||0)>1?(' ×'+m.active):'')+'</span>'):'<span class="em">idle</span>');
     if((m.queued||0)>0) oadd('queue','<span style="color:var(--warn)">'+m.queued+' waiting</span>');
     oadd('device', md.device==='GPU'?'<span style="color:var(--good)">GPU</span>':'<span class="em">CPU</span>');
-    oadd('parameters',esc(m.params||''));
+    const _pf=n=>(n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(0)+'M':n>=1e3?(n/1e3).toFixed(0)+'K':String(n));
+    oadd('parameters', md.params?_pf(md.params):esc(m.params||''));
     oadd('weights',gb(md.size_gb));
     oadd('VRAM',gb(m.vram_used_gb));
     if((m.ram_used_gb||0)>0.01) oadd('RAM',gb(m.ram_used_gb));
