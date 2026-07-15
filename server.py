@@ -123,6 +123,8 @@ def _fetch_repo_file(fname: str):
 # Extra repo files (besides the primary entry point) to keep in sync on self-update. Extracted
 # modules go here; a client+server SHARED module (wire.py) is listed in BOTH server.py + client.py.
 EXTRA_UPDATE_FILES: list[str] = ["worker_t2i.py",   # #t2i-serve: worker diffusion engine
+                                 "worker_tts.py",   # #tts-serve: worker Kokoro speech engine
+                                 "worker_t2a.py",   # #t2a-serve: worker ACE-Step music engine
                                  "gptq_pack.py",       # #38: calibrated int2 compile (controller-only)
                                  "calib_corpus.txt",   # #38: its bundled calibration text
                                  "wire.py", "dashboard_html.py", "placement.py", "shards.py",
@@ -1438,7 +1440,7 @@ from model_store import (MODELS_DIR, _safe_name, _dir_has_model, _controller_mod
                          _READY_CACHE, _invalidate_ready_cache, _purge_hf_cache,
                          gc_redundant_cache, delete_model_cache,
                          convert_gguf_to_model_dir,
-                         _is_diffusers_dir, _tree_weight_bytes)   # noqa: E402,F401
+                         _is_diffusers_dir, _is_kokoro_dir, _tree_weight_bytes)   # noqa: E402,F401
 model_store.set_hf_token_provider(lambda: HF_TOKEN)
 # GGUF source lookup: a target (HF repo) in GGUF_FILES is normalized to safetensors at acquisition
 # instead of pulled as safetensors. Set after GGUF_FILES is populated by load_custom_models() too,

@@ -147,8 +147,9 @@ class EngineLoadMixin:
             import urllib.parse as _up
             _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
             _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
-            if _cdir and _is_diffusers_dir(_cdir):
-                return   # #t2i-serve: image checkpoints have no LLM shard cache to compile
+            if _cdir and (_is_diffusers_dir(_cdir) or _is_kokoro_dir(_cdir)
+                          or os.path.isdir(os.path.join(_cdir, "ace_step_transformer"))):
+                return   # #t2i/#t2a/#tts: image/audio checkpoints have no LLM shard cache to compile
             _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
             if _cdir and not (_cst.get(quant) or {}).get("ok"):
                 log_activity(f"{_ollama_name(friendly)}: no {quant} shard cache — building it now so this "
@@ -328,6 +329,17 @@ class EngineLoadMixin:
                 # it loads via the single-node image path instead (task #37).
                 _tgt = MODELS[friendly][0] if friendly in MODELS else friendly
                 _d = _local_model_dir(_tgt)
+                # #t2a-serve: an ACE-Step music checkpoint (ace_step_transformer/ subfolder, no
+                # model_index.json) isn't a diffusers-pipeline dir — route it to the audio path.
+                if _d and os.path.isdir(os.path.join(_d, "ace_step_transformer")):
+                    return await self._load_t2a_locked(friendly, _tgt, reg_key or friendly,
+                                                       quant, replica_idx=replica_idx,
+                                                       offload=t2i_offload)
+                # #tts-serve: a Kokoro speech checkpoint (kokoro-v1_0.pth + voices/, no
+                # safetensors, no model_index.json) loads via the single-node speech path.
+                if _d and _is_kokoro_dir(_d):
+                    return await self._load_tts_locked(friendly, _tgt, reg_key or friendly,
+                                                       replica_idx=replica_idx)
                 if _d and _is_diffusers_dir(_d):
                     return await self._load_t2i_locked(friendly, _tgt, reg_key or friendly,
                                                        quant, replica_idx=replica_idx,
@@ -1436,6 +1448,149 @@ class EngineLoadMixin:
             return data, {"seconds": r.get("seconds"), "steps": int(steps),
                           "width": int(width), "height": int(height), "seed": seed}
 
+    async def _load_tts_locked(self, friendly: str, target_id: str, reg_key: str,
+                               replica_idx: int = 0) -> LoadedModel:
+        """#tts-serve: load a Kokoro-82M speech checkpoint WHOLE onto ONE controller-
+        CO-LOCATED worker — the speech sibling of _load_t2i_locked, but tiny (~0.33 GB),
+        so no VRAM edge/quant tiers and no eviction dance. Prefers a co-located GPU
+        (beast: CUDA ~4x realtime); a CPU-only co-located node — or a GPU whose MIOpen
+        JIT-fails (handled by the leaf's CPU fallback) — serves on CPU. MUST hold
+        self.lock (reached only from load())."""
+        model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+        await self.ensure_data_listener()
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (tts)")
+            await self._await_free_refresh()
+        _ctrl_host = socket.gethostname()
+        cand = [n for n in registry.alive_sorted()
+                if n.can_infer and (n.hostname == _ctrl_host
+                     or str(n.data_host).startswith(("127.", "::1"))
+                     or str(n.data_host) in _LOCAL_IPS)]
+        if not cand:
+            raise RuntimeError("no controller-co-located worker for the tts (Kokoro) model "
+                               "— v1 serves speech models only on a worker sharing the "
+                               "controller's box")
+        # prefer a GPU-capable co-located node (faster); fall back to a CPU node.
+        node = next((n for n in cand if n.vram_total_gb > 0), cand[0])
+        device = "cuda" if node.vram_total_gb > 0 else "cpu"
+        # Kokoro is ~0.33 GB — a small reservation so a concurrent big load budgets around it.
+        self._reservations[reg_key] = {node.node_id: {
+            "ram": int(1.5 * GB), "vram": int(1.0 * GB) if device == "cuda" else 0}}
+        self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
+                        "target": target_id, "total": 1, "ready": 0,
+                        "stages_total": 1, "stages_ready": 0,
+                        "basis": f"tts: single-node ({node.hostname}, kokoro/{device})",
+                        "warnings": [], "node_ids": [node.node_id],
+                        "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
+                        "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
+        link = self.links.get(node.node_id)
+        if link is None:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"no control link to {node.node_id}")
+        fut = asyncio.get_event_loop().create_future()
+        link.pending_loads[target_id] = fut
+        await link.send({"type": "load", "kind": "tts", "model_id": target_id,
+                         "model_dir": model_dir, "quant": "none",
+                         "controller_http_port": ARGS.http_port,
+                         "next_host": None, "next_port": ARGS.data_port,
+                         "device": device})
+        try:
+            r = await asyncio.wait_for(fut, timeout=max(GEN_TIMEOUT_S, 600.0))
+        except Exception as exc:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"tts load on {node.hostname} failed: {exc!r}")
+        if isinstance(r, dict) and r.get("type") == "error":
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"tts load on {node.hostname} failed: {r.get('error')}")
+        gpu_b = int(r.get("gpu_bytes", 0)) if isinstance(r, dict) else 0
+        tot_b = int(r.get("loaded_bytes", 0)) if isinstance(r, dict) else 0
+        spec = ModelSpec(name=friendly, hidden_size=1, num_layers=1, num_heads=1,
+                         num_kv_heads=1, head_dim=1, intermediate_size=1, vocab_size=0,
+                         tie_embeddings=True, max_ctx=0, arch="tts",
+                         meas_layer_w=1, meas_embed=0, meas_head=0, meas_norm=0,
+                         meas_params=max(1, tot_b))
+        stage = StageAssign(node_id=node.node_id, hostname=node.hostname,
+                            layer_start=0, layer_end=1, has_embed=True, has_head=True,
+                            est_bytes=tot_b or 1, usable_bytes=int(node.usable_total_gb * GB),
+                            gpu_bytes=gpu_b, loaded_bytes=tot_b)
+        plan = PlanResult(ok=True, model=spec.name, ctx_len=0, num_layers=1,
+                          pool_usable_gb=node.usable_total_gb,
+                          required_gb=(tot_b or 1) / GB, stages=[stage])
+        node.shard_gpu_bytes = gpu_b
+        _dial = (_dial_host(node.data_host), node.data_port)
+        stage0_writer = await self._connect_retry(*_dial)
+        now = time.time()
+        lm = LoadedModel(reg_key, target_id, spec, 0, plan, [node.node_id], None, set(), now,
+                         quant="none", stage0_writer=stage0_writer, last_used=now,
+                         stage0_dial=_dial, last_send_ts=now)
+        lm.base, lm.replica_idx = friendly, replica_idx
+        lm.plan_basis = "tts: single-node"
+        lm.is_tts = True
+        lm.is_kokoro = True
+        self.models[reg_key] = lm
+        self.loadings.pop(reg_key, None)
+        registry.dirty = False
+        print(f"[load] {reg_key} tts (kokoro) on {node.hostname} "
+              f"({tot_b / GB:.2f} GB, {gpu_b / GB:.2f} GB GPU, {device})")
+        log_activity(f"{reg_key} READY (tts/kokoro, {node.hostname}, {device}) "
+                     f"[{len(self.models)} model(s) resident]")
+        return lm
+
+    async def tts_generate(self, friendly: str, text: str, voice: str = "",
+                           speed: float = 1.0, fmt: str = "wav") -> tuple[bytes, dict]:
+        """#tts-serve: synthesize speech on the model's Kokoro worker. Serializes per model
+        on LoadedModel.lock (same discipline as text/image gens); the request travels the
+        control link, per-chunk progress arrives as tts_step (see control_plane + /status),
+        and the finished WAV comes back as a LOCAL path (co-located worker) read + deleted
+        here. Returns (audio_bytes, meta)."""
+        lm = self.models.get(friendly)
+        if lm is None:
+            raise ValueError(f"model '{friendly}' is not loaded — load it first")
+        if not getattr(lm, "is_tts", False):
+            raise ValueError(f"'{friendly}' is not a speech (tts) model")
+        async with lm.lock:
+            lm.last_used = time.time()
+            link = self.links.get(lm.stage_node_ids[0])
+            if link is None:
+                raise RuntimeError("the tts model's worker is disconnected — reload the model")
+            rid = self._tts_rid = getattr(self, "_tts_rid", 0) + 1
+            pend = getattr(self, "_tts_pending", None)
+            if pend is None:
+                pend = self._tts_pending = {}
+            fut = asyncio.get_event_loop().create_future()
+            pend[rid] = fut
+            lm.active = 1
+            lm.tts_req = rid            # status: lets the card find this render's progress
+            try:
+                await link.send({"type": "tts_gen", "model_id": lm.target_id, "req_id": rid,
+                                 "text": str(text), "voice": str(voice or ""),
+                                 "speed": float(speed or 1.0), "fmt": str(fmt or "wav")})
+                # CPU synthesis runs ~4x realtime; scale the ceiling to the text length.
+                r = await asyncio.wait_for(
+                    fut, timeout=max(GEN_TIMEOUT_S, 60.0 + len(str(text)) * 0.5))
+            finally:
+                lm.active = 0
+                lm.tts_req = None
+                pend.pop(rid, None)
+                getattr(self, "_tts_progress", {}).pop(rid, None)
+            if not isinstance(r, dict) or r.get("type") == "tts_err":
+                raise RuntimeError(f"speech generation failed: "
+                                   f"{(r or {}).get('error', 'no result')}")
+            path = r.get("path") or ""
+
+            def _read() -> bytes:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                return data
+
+            data = await asyncio.to_thread(_read)
+            lm.last_used = time.time()
+            log_activity(f"{_ollama_name(friendly)}: speech {r.get('seconds', '?')}s "
+                         f"({len(data) / 1e6:.2f} MB)")
+            return data, {"seconds": r.get("seconds"), "voice": voice, "format": fmt}
+
     async def replicate(self, friendly: str, ctx: int, count: int,
                         consolidate: bool = True, prefer_vram: bool = True,
                         quant: str = "none", kv_quant: str = "",
@@ -1965,7 +2120,8 @@ class EngineLoadMixin:
                 # 16 GB card), not a hybrid to promote. The juggler re-placing it unloads a
                 # healthy pipeline (observed live: 'promoting qwen-image (56% was on CPU)'
                 # 25s after its first load). Skip like embeddings.
-                if getattr(m, "is_t2i", False):
+                if getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False) \
+                        or getattr(m, "is_tts", False):
                     continue
                 if self._model_cpu_frac(m) <= 0.02:
                     continue

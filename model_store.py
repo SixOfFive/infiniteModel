@@ -192,6 +192,37 @@ def _is_diffusers_dir(d: str) -> bool:
     return os.path.exists(os.path.join(d, "model_index.json"))
 
 
+def _is_kokoro_dir(d: str) -> bool:
+    """A Kokoro TTS checkpoint (#tts): a StyleTTS2 ``kokoro-v1_0.pth`` at the root plus a
+    ``voices/`` pack dir — NO safetensors and NO diffusers ``model_index.json``, so every
+    flat/diffusers layout assumption is wrong for it. It must be recognized explicitly or
+    the flat check false-positives it as ready on ``config.json`` alone (its config has no
+    weight_map) and the migration path would drop the .pth/.pt weights and purge the cache."""
+    try:
+        vdir = os.path.join(d, "voices")
+        has_pth = any(f.endswith(".pth") and f.startswith("kokoro")
+                      for f in os.listdir(d))
+        has_voices = os.path.isdir(vdir) and any(f.endswith(".pt") for f in os.listdir(vdir))
+        return bool(has_pth and has_voices)
+    except Exception:
+        return False
+
+
+def _kokoro_cache_dir(model_id: str):
+    """The HF-cache snapshot dir for a Kokoro repo, iff it's COMPLETE (.pth + voices),
+    else None. Kokoro is served straight from the cache (never migrated to models/) —
+    the generic migration copies only safetensors/json and then purges the cache, which
+    would destroy the Kokoro weights. No network (local_files_only)."""
+    try:
+        from huggingface_hub import snapshot_download
+        d = snapshot_download(model_id,
+                              allow_patterns=["*.json", "*.pth", "voices/*.pt", "*.md"],
+                              local_files_only=True)
+        return d if _is_kokoro_dir(d) else None
+    except Exception:
+        return None
+
+
 def _diffusers_complete(d: str) -> bool:
     """Completeness for a diffusers-layout dir (#t2i): every weight-bearing component subdir
     (marked by its config.json) holds at least one .safetensors; sharded components
@@ -250,6 +281,8 @@ def _dir_has_model(d: str) -> bool:
     try:
         if _is_diffusers_dir(d):
             return _diffusers_complete(d)
+        if _is_kokoro_dir(d):
+            return True                    # #tts: .pth + voices/*.pt present == complete
         return (os.path.exists(os.path.join(d, "config.json"))
                 and all(os.path.exists(p) for p in set(_weight_map(d).values())))
     except Exception:
@@ -285,6 +318,14 @@ def _controller_model_dir(model_id: str) -> str:
     downloading — then it lives in models/ for good. Called on every /weights +
     /modelmeta fetch, so the already-present fast-path is just a dir check."""
     local = os.path.join(MODELS_DIR, _safe_name(model_id))
+    # #tts: Kokoro (.pth + voices/*.pt) is served straight from its complete HF-cache
+    # snapshot — the generic migration below copies only safetensors/json and then PURGES
+    # the cache, which would destroy the Kokoro weights. Never migrate it to models/.
+    if _is_kokoro_dir(local):
+        return local
+    _ksnap = _kokoro_cache_dir(model_id)
+    if _ksnap:
+        return _ksnap
     if _dir_has_model(local):
         _ensure_template_files(model_id, local)   # self-heal chat_template.jinja missed by an
         return local                              # earlier *.safetensors+*.json-only pull
@@ -488,6 +529,14 @@ def _local_model_dir(target_id: str):
         return hit
     result = None
     local = os.path.join(MODELS_DIR, _safe_name(target_id))
+    # #tts: Kokoro serves from its cache snapshot (never migrated) — check both.
+    if _is_kokoro_dir(local):
+        _LOCAL_DIR_CACHE[target_id] = local
+        return local
+    _ks = _kokoro_cache_dir(target_id)
+    if _ks:
+        _LOCAL_DIR_CACHE[target_id] = _ks
+        return _ks
     if _dir_has_model(local):
         result = local
     else:

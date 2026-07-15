@@ -244,6 +244,43 @@ class WorkerLoadMixin:
                 return {"loaded_params": eng.loaded_params,
                         "loaded_bytes": eng.loaded_bytes,
                         "gpu_bytes": eng.gpu_bytes}
+            # TTS load (#tts-serve): a Kokoro speech model builds WHOLE on THIS node (co-located
+            # with the controller — reads the model dir directly, hands back WAV paths). worker_tts
+            # is imported lazily with the same fetch-if-missing bridge as worker_t2i. The leaf falls
+            # back to CPU on its own if the GPU's MIOpen kernels fail to JIT-compile (gfx1151).
+            if a.get("kind") == "tts":
+                mdir = a.get("model_dir") or ""
+                if not os.path.isdir(mdir):
+                    raise RuntimeError(
+                        f"tts model dir not visible on this worker: {mdir!r} — v1 serves "
+                        "speech models only on a worker co-located with the controller")
+                try:
+                    import worker_tts
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_tts.py")
+                    if not _src:
+                        raise RuntimeError("worker_tts.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_tts.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_tts
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_tts.KokoroPipeline, mdir, device,
+                        str(a.get("quant") or "none"), False)
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes}
             self._building += 1   # mark BUSY across the build so reclaim/self-update can't kill it
             try:
                 shard = await asyncio.to_thread(self._build_shard, base, model_id, a)
@@ -404,10 +441,11 @@ class WorkerLoadMixin:
         CPU-resident shard; harmless on CUDA (frees a touch earlier). Safe at unload (model idle)."""
         import torch
         import contextlib as _cl
-        if getattr(shard, "kind", "") == "t2i":
-            # #t2i-vram-release: a T2IPipeline has NONE of the shard attrs walked below
-            # (model/embed/norm/head/encoder), so this generic pass freed NOTHING and the DiT's
-            # ~12 GB stayed pinned on ROCm after unload (observed live). Its own release is also
+        if getattr(shard, "kind", "") in ("t2i", "t2a", "tts"):
+            # #t2i/#t2a/#tts-vram-release: a media pipeline (T2IPipeline / T2APipeline /
+            # KokoroPipeline) has NONE of the shard attrs walked below (model/embed/norm/head/
+            # encoder), so this generic pass freed NOTHING and the weights stayed pinned on
+            # ROCm/CUDA after unload (observed live for t2i's ~12 GB DiT). Their own release is
             # RENDER-SAFE: under a live generate it defers the free to the render's end.
             with _cl.suppress(Exception):
                 shard.release_vram()
@@ -540,6 +578,45 @@ class WorkerLoadMixin:
                 await reply({"type": "t2i_err", "req_id": rid, "model_id": mid,
                              "error": repr(exc)})
             print(f"[t2i] generate FAILED: {exc!r}", flush=True)
+
+    async def handle_tts_gen(self, msg: dict, reply) -> None:
+        """#tts-serve: run ONE speech synthesis on this worker's resident KokoroPipeline and
+        mirror the result over the control link. Dispatched as a TASK by command_loop (a long
+        text takes many seconds — awaiting inline would block unload/ping handling), so replies
+        are keyed by req_id. Per-chunk progress mirrors as `tts_step` (scheduled threadsafe from
+        the synth thread); the finished WAV's LOCAL path returns in `tts_done` (controller is
+        co-located, v1). _building marks the worker busy so self-update/reclaim won't kill it."""
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "tts":
+            await reply({"type": "tts_err", "req_id": rid, "model_id": mid,
+                         "error": "tts model not resident on this worker"})
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_step(i: int, n: int) -> None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(
+                    reply({"type": "tts_step", "req_id": rid, "model_id": mid,
+                           "step": i, "total": n}), loop)
+
+        try:
+            self._building += 1
+            try:
+                path, secs = await asyncio.to_thread(
+                    eng.generate, str(msg.get("text") or ""),
+                    str(msg.get("voice") or ""), float(msg.get("speed", 1.0)),
+                    str(msg.get("fmt") or "wav"), _on_step)
+            finally:
+                self._building -= 1
+            await reply({"type": "tts_done", "req_id": rid, "model_id": mid,
+                         "path": path, "seconds": round(secs, 1)})
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "tts_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[tts] generate FAILED: {exc!r}", flush=True)
 
     async def handle_pack(self, msg: dict) -> dict:
         """#distributed-packing Inc 1b/3b: pack ONE shard-cache unit FOR the controller (offloads the

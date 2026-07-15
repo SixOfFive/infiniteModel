@@ -394,11 +394,60 @@ def register(app):
         text = (body.get("input") or "").strip()
         if not text:
             return JSONResponse({"error": {"message": "'input' is required"}}, status_code=400)
+        fmt = (body.get("response_format") or "wav").lower()
+        # #tts-serve: if the requested model is a Kokoro speech checkpoint, route to the
+        # single-node KokoroPipeline (engine.tts_generate). Anything else — or no model at
+        # all — falls through to the distributed Qwen2.5-Omni speech path below.
+        _req_model = (body.get("model") or "").strip()
+        if _req_model:
+            try:
+                _kf = resolve_model_name(_req_model)
+                _ktgt = MODELS[_kf][0] if _kf in MODELS else _kf
+                _is_kok = bool(_is_kokoro_dir(_local_model_dir(_ktgt) or ""))
+            except Exception:
+                _kf, _is_kok = None, False
+            if _is_kok:
+                def _kvoice(v):
+                    v = (v or "").strip()
+                    if not v:
+                        return "af_heart"
+                    if "_" in v:                       # already a Kokoro voice id
+                        return v
+                    return {"alloy": "af_alloy", "echo": "am_echo", "fable": "bm_fable",
+                            "onyx": "am_onyx", "nova": "af_nova", "shimmer": "af_bella",
+                            "coral": "af_kore", "sage": "af_sarah", "ash": "am_adam",
+                            "ballad": "bm_george", "verse": "am_michael"}.get(v.lower(), "af_heart")
+                rec = _inflight_admit(ip, _kf)
+                if rec is None:
+                    return JSONResponse({"error": {"message": "server busy (speech queue full)"}},
+                                        status_code=503)
+                try:
+                    try:
+                        await engine.ensure_loaded(_kf, 0, auto_load=True)
+                    except Exception as exc:
+                        return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
+                    try:
+                        _speed = float(body.get("speed") or 1.0)
+                    except Exception:
+                        _speed = 1.0
+                    _kv = _kvoice(body.get("voice"))
+                    audio_bytes, _meta = await engine.tts_generate(
+                        _kf, text, voice=_kv, speed=_speed, fmt=fmt)
+                    _media = "audio/wav" if fmt in ("wav", "") else f"audio/{fmt}"
+                    print(f"[v1/audio/speech] kokoro '{text[:40]}...' voice={_kv} "
+                          f"-> {_meta.get('seconds')}s")
+                    return Response(content=audio_bytes, media_type=_media)
+                except Exception as exc:
+                    import traceback
+                    print(f"[v1/audio/speech kokoro] error: {exc!r}\n{traceback.format_exc()[-1000:]}")
+                    return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
+                                        status_code=500)
+                finally:
+                    _inflight_release(rec)
         try:
             friendly = resolve_model_name(body.get("model", "") or "qwen2.5-omni-7b")
         except Exception as exc:
             return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
-        fmt = (body.get("response_format") or "wav").lower()
         voice = body.get("voice") or "Chelsie"
         # admit (1 slot + queue) so concurrent TTS doesn't pile onto the CPU vocoder
         rec = _inflight_admit(ip, friendly)

@@ -488,6 +488,11 @@ def _model_caps(tgt: str, spec=None) -> list:
         if d and _is_diffusers_dir(d):
             _CAPS_CACHE[tgt] = ["t2i"]
             return ["t2i"]
+        # #tts: a Kokoro speech checkpoint (kokoro-v1_0.pth + voices/) — badge it and, like
+        # t2i, hide the (unsupported) LLM Load action in favor of the speech load/generate path.
+        if d and _is_kokoro_dir(d):
+            _CAPS_CACHE[tgt] = ["tts"]
+            return ["tts"]
         cfgd = None
         if d:
             p = os.path.join(d, "config.json")
