@@ -702,11 +702,15 @@ def _hf_total_bytes(repo_id: str) -> int:
     try:
         from huggingface_hub import HfApi
         info = HfApi(token=_HF_TOKEN_FN()).model_info(repo_id, files_metadata=True)
+        sib = info.siblings or []
         # extension set MUST mirror _pull_repo_interruptible's wanted list, or the progress
-        # %/ETA denominator drifts from what is actually pulled
-        return sum(int(s.size or 0) for s in (info.siblings or [])
-                   if s.rfilename.endswith((".safetensors", ".json", ".jinja",
-                                            ".txt", ".model", ".py")))
+        # %/ETA denominator drifts from what is actually pulled — including the #tts .pth/.pt
+        # branch (a repo with no safetensors ships weights as .pth/.pt, e.g. Kokoro).
+        _ext = [".safetensors", ".json", ".jinja", ".txt", ".model", ".py"]
+        if not any((s.rfilename or "").endswith(".safetensors") for s in sib):
+            _ext += [".pth", ".pt"]
+        return sum(int(s.size or 0) for s in sib
+                   if (s.rfilename or "").endswith(tuple(_ext)))
     except Exception:
         return 0
 

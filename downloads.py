@@ -48,7 +48,8 @@ def _pull_repo_interruptible(friendly: str, repo_id: str):
                 print(f"[model] {friendly}: repo listing failed -> non-interruptible "
                       f"snapshot_download fallback (pause/stop won't apply this run)")
                 snapshot_download(repo_id, allow_patterns=["*.safetensors", "*.json", "*.py",
-                                                           "*.jinja", "*.txt", "*.model"], token=tok)
+                                                           "*.jinja", "*.txt", "*.model",
+                                                           "*.pth", "*.pt"], token=tok)
                 return "done"
     # include *.py: trust_remote_code models (auto_map) ship their modeling/configuration code as
     # .py — without them a worker builds the native class for the model_type (wrong arch -> meta
@@ -57,8 +58,14 @@ def _pull_repo_interruptible(friendly: str, repo_id: str):
     # sentencepiece .model) — diffusers repos (#t2i) ship the tokenizer under tokenizer/ with
     # these, and Mistral3-style LLMs ship chat_template.jinja. Extension set mirrors
     # _hf_total_bytes so the progress denominator matches what is pulled.
-    wanted = [f for f in files if f.endswith((".safetensors", ".json", ".py",
-                                              ".jinja", ".txt", ".model"))]
+    _ext = [".safetensors", ".json", ".py", ".jinja", ".txt", ".model"]
+    # #tts: a repo with NO safetensors ships its weights as .pth/.pt (Kokoro = kokoro-v1_0.pth
+    # + voices/*.pt). Pull those too so "+ Add model" fetches a COMPLETE non-safetensors model
+    # instead of just config.json. Gated on "no safetensors" so ordinary checkpoints never pull
+    # redundant/stray .pt (training snapshots, EMA copies) alongside their real safetensors.
+    if not any(f.endswith(".safetensors") for f in files):
+        _ext += [".pth", ".pt"]
+    wanted = [f for f in files if f.endswith(tuple(_ext))]
     for f in wanted:
         ctrl = DOWNLOAD_CONTROL.get(friendly)        # checked BETWEEN files (cheap dict read)
         if ctrl in ("pause", "stop"):
