@@ -303,6 +303,11 @@ def _dir_has_model(d: str) -> bool:
             return _diffusers_complete(d)
         if _is_kokoro_dir(d):
             return True                    # #tts: .pth + voices/*.pt present == complete
+        if os.path.isdir(os.path.join(d, "ace_step_transformer")):
+            # #t2a: ACE-Step component layout (no top-level safetensors / model_index.json) —
+            # complete when all four component subfolders are present.
+            return all(os.path.isdir(os.path.join(d, s)) for s in
+                       ("ace_step_transformer", "music_dcae_f8c8", "music_vocoder", "umt5-base"))
         return (os.path.exists(os.path.join(d, "config.json"))
                 and all(os.path.exists(p) for p in set(_weight_map(d).values())))
     except Exception:
