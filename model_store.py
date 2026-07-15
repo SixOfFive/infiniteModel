@@ -212,13 +212,24 @@ def _kokoro_cache_dir(model_id: str):
     """The HF-cache snapshot dir for a Kokoro repo, iff it's COMPLETE (.pth + voices),
     else None. Kokoro is served straight from the cache (never migrated to models/) —
     the generic migration copies only safetensors/json and then purges the cache, which
-    would destroy the Kokoro weights. No network (local_files_only)."""
+    would destroy the Kokoro weights.
+
+    Scans the cache FILESYSTEM directly (models--<id>/snapshots/<rev>/) rather than calling
+    snapshot_download(local_files_only=True): inside the long-running controller the latter
+    returned None for a fully-cached Kokoro repo (huggingface_hub in-process ref/no_exist
+    state after the registration's json-only pull), which then fell through to migration and
+    destroyed resolution. A plain os.walk of the cache is deterministic and side-effect free."""
     try:
-        from huggingface_hub import snapshot_download
-        d = snapshot_download(model_id,
-                              allow_patterns=["*.json", "*.pth", "voices/*.pt", "*.md"],
-                              local_files_only=True)
-        return d if _is_kokoro_dir(d) else None
+        from huggingface_hub import constants
+        base = os.path.join(constants.HF_HUB_CACHE, "models--" + model_id.replace("/", "--"))
+        snaps = os.path.join(base, "snapshots")
+        if not os.path.isdir(snaps):
+            return None
+        for rev in sorted(os.listdir(snaps), reverse=True):   # newest-rev first
+            d = os.path.join(snaps, rev)
+            if _is_kokoro_dir(d):
+                return d
+        return None
     except Exception:
         return None
 
