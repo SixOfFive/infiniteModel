@@ -59,8 +59,8 @@ dashboard.
   field. Full details → **[docs/GGUF.md](docs/GGUF.md)**.
 - **MoE & multimodal.** Mixture-of-Experts (incl. attention-on-GPU / experts-in-CPU-RAM offload), and
   distributed vision + audio (Qwen2.5-Omni, Qwen2.5-VL, Qwen3.6, Mistral3/Pixtral, Gemma 4 — both
-  its encoder-free and ViT-tower variants): image/audio → text, plus **speech out** (TTS) via
-  `/v1/audio/speech` (Qwen2.5-Omni Talker), and **embeddings** via `/api/embed` / `/v1/embeddings`.
+  its encoder-free and ViT-tower variants): image/audio → text, plus **embeddings** via
+  `/api/embed` / `/v1/embeddings`. **Speech out** (TTS) is served by a dedicated engine — see below.
 - **Text-to-image.** Diffusers-layout checkpoints (Qwen-Image) download like any other model and
   serve `POST /v1/images/generations` on a controller-co-located GPU worker, with live per-step
   progress and a dashboard Generate panel. Two serve modes: **GPU-resident** — DiT in mixed-edge
@@ -68,6 +68,14 @@ dashboard.
   (`t2i_offload=1`, or the Load 🖼 dialog): the bf16 pipeline rests in system RAM and blocks
   stream to the GPU per step, so a 16 GB card renders at reference quality on ~4 GB of VRAM and
   **never evicts** resident LLMs. Full guide → [docs/T2I.md](docs/T2I.md).
+- **Text-to-speech.** A dedicated **Kokoro-82M** engine (~0.3 GB, 54 voices) serves
+  `POST /v1/audio/speech` (OpenAI Speech shape, `voice` name-mapped to Kokoro speakers) on a
+  controller-co-located worker — clean 24 kHz WAV, ~4× realtime on a GPU with a transparent
+  **CPU fallback** where the GPU can't JIT Kokoro's kernels (e.g. gfx1151). Downloads via
+  **+ Add model** (`hexgrad/Kokoro-82M`) like any other model. It replaces the Qwen2.5-Omni Talker
+  as the recommended speech path — the Omni Talker output is intrinsically choppy on that checkpoint
+  (the Omni route still answers `/v1/audio/speech` for callers that request an Omni model by name).
+  Full guide → [docs/TTS.md](docs/TTS.md).
 - **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
   object args), OpenAI `/v1/chat/completions` (`tool_calls` + `finish_reason:"tool_calls"`), and
   Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming, including the full

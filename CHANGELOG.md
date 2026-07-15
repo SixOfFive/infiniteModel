@@ -163,6 +163,38 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   render's end), and **live renders block disruptive lifecycle ops** — `/update` and `/restart`
   refuse while a render is in flight (a forced update mid-render orphaned a finished PNG into a
   broken pipe, observed) and the worker's idle-gated self-update waits for it; `force=1` overrides.
+- **Text-to-speech serving (#tts-serve, 2026-07-15): a dedicated TTS engine, Kokoro-82M.** A
+  purpose-built speech model (StyleTTS2, Apache-2.0, ~82M params / ~0.3 GB, 54 voices) now serves
+  `POST /v1/audio/speech` (OpenAI Speech shape; `voice` passes a Kokoro id through or maps an
+  OpenAI name — `nova → af_nova` etc. — to a speaker; `speed`; `wav`/`pcm` out) on ONE
+  controller-co-located worker, the same single-node media pattern as t2i (`tts_gen` → per-chunk
+  `tts_step` → `tts_done` over the control link; result written to the shared filesystem). Loads
+  at ~0.3 GB, auto-loads on a cold speech request, and skips the juggler / int4-int2 compile paths
+  (nothing to promote or quantize). This **replaces the Qwen2.5-Omni Talker as the recommended
+  speech path** — Omni's Token2Wav output is intrinsically choppy on that checkpoint (reproduced
+  under HF-native transformers too), so the Omni checkpoint was retired from the speech role and
+  `/v1/audio/speech` now routes a Kokoro model to the KokoroPipeline, falling through to the Omni
+  path only when a caller names an Omni model. Two bring-up specifics baked in: (1) **spacy-free** —
+  Kokoro's `KPipeline` pulls `misaki.en → spacy → thinc → blis` and blis won't build on py3.13/3.14,
+  so the leaf installs `kokoro`/`misaki` `--no-deps`, drives `KModel` directly, phonemizes via
+  `misaki.espeak.EspeakFallback` (pip-bundled `espeakng-loader`, no system espeak-ng), and stubs
+  `sys.modules['spacy']` so the import chain completes; (2) **GPU→CPU auto-fallback** — on gfx1151
+  MIOpen JIT-fails Kokoro's LSTM kernel, so a GPU warmup that raises a HIP/MIOpen compile error
+  transparently rebuilds the model on CPU (82M params → ~2× realtime on CPU; ~4× on an NVIDIA GPU).
+  `+ Add model` with `hexgrad/Kokoro-82M` downloads it complete (see the `.pth`/`.pt` fix below),
+  and the models page badges it **🔊 tts**. Full guide → [docs/TTS.md](docs/TTS.md).
+- **Weight-only repos download completely (#tts-serve, 2026-07-15).** `+ Add model` / `/add_model`
+  now pull `.pth`/`.pt` files for any repo that ships **no safetensors** (previously such a repo
+  grabbed only `config.json`, so a Kokoro-style checkpoint + its `voices/` pack arrived empty). The
+  weight-total measurement (`_hf_total_bytes`) falls back to `.pth`/`.pt` the same way, so the size
+  and download-% denominator are honest for weight-only and voice-pack repos.
+- **Media-model detail view (#tts-serve, 2026-07-15).** Clicking a media model (tts / t2i / t2a) on
+  the models page now shows a media-appropriate Operational block instead of the LLM layout's zeros.
+  The worker's `media_info()` (device, params, weight bytes, sample rate, voice list, default voice)
+  rides the load reply; `/status` exposes a `media` block (device derived from stage GPU placement,
+  weight size from the worker's `loaded_bytes` since a media ModelSpec has dummy dims, last-run RTF)
+  and the dashboard `detailLive` branches on it — type / device / parameters / weights / VRAM|RAM /
+  sample rate / expandable voice list / default voice / last-synthesis N× realtime / requests / uptime.
 - **Diffusers-layout repos are first-class downloads (#t2i, 2026-07-10).** A multi-component
   image-generation checkpoint (`model_index.json` + `transformer/`/`text_encoder/`/`vae/`/`tokenizer/`
   subfolders — Qwen-Image class) now flows through the normal `/add_model` → background pull →
@@ -294,13 +326,17 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   guidance); one quant per repo. Unlocks the large pool of GGUF-only community models.
 - **MoE**: fused + non-fused experts; optional intra-layer offload (attention on GPU, routed experts in
   CPU RAM). Loaded + validated across Mixtral, OLMoE, Qwen3-MoE / Qwen3.6-A3B, MiniMax-M2.
-- **Multimodal**: distributed vision + audio (Qwen2.5-Omni) — image/audio → text, 3D mRoPE positions;
-  speech-out via the controller-side Talker + Token2Wav (`/v1/audio/speech`). Omni's checkpoint declares
-  `architectures=["Qwen2_5OmniModel"]` (a bare `*Model` name), which the conservative encoder heuristic
-  mis-read as an embedding model and routed to a single-node `AutoModel` build transformers can't
-  construct; composite generative checkpoints (thinker/talker/token2wav/text/vision/audio sub-configs)
-  are now excluded from that heuristic, keeping Omni on the pipeline Thinker path (re-validated end-to-end
-  — load, text, and WAV — under transformers 5.12.1).
+- **Multimodal**: distributed vision + audio (Qwen2.5-Omni) — image/audio → text, 3D mRoPE positions.
+  Omni's checkpoint declares `architectures=["Qwen2_5OmniModel"]` (a bare `*Model` name), which the
+  conservative encoder heuristic mis-read as an embedding model and routed to a single-node `AutoModel`
+  build transformers can't construct; composite generative checkpoints
+  (thinker/talker/token2wav/text/vision/audio sub-configs) are now excluded from that heuristic, keeping
+  Omni on the pipeline Thinker path (re-validated end-to-end — load, text, and vision — under
+  transformers 5.12.1). **Speech-out is now the dedicated Kokoro engine (see Text-to-speech, above):**
+  Omni's Talker + Token2Wav path works but is intrinsically choppy on that checkpoint (reproduced under
+  HF-native transformers 5.12 and 4.52 — checkpoint, not a serving bug), so it was retired from the
+  speech role; `/v1/audio/speech` prefers Kokoro and only falls through to Omni when a caller names an
+  Omni model.
 - Hybrid architectures (Gated-DeltaNet + mRoPE), multimodal text-config models, and a range of dense
   decoders (Qwen2.5/3, Llama, Mistral/Devstral, DeepSeek).
 
