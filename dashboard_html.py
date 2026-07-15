@@ -913,6 +913,30 @@ async function openDetail(name){
       +'<span id="t2i-status" class="em" style="font-size:11px"></span></div>'
       +'<div id="t2i-out" style="margin-top:8px"></div>';
   }
+  // #t2a-serve: music-generation box — style/genre tags + optional lyrics + all render knobs,
+  // POST /v1/audio/music, play the WAV inline + download. STATIC (outside #dlive) so the per-poll
+  // live refresh can\'t wipe the fields mid-typing. Served from the controller (not sandboxed) so
+  // the download link works here — unlike a shared artifact.
+  let t2ag='';
+  if(m.loaded && (m.capabilities||[]).includes('t2a')){
+    const _ig='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    t2ag='<h3 style="font-size:13px;margin-top:14px">Generate music <span class="em" style="font-weight:normal">· ACE-Step flow-matching render on the model\'s GPU worker</span></h3>'
+      +'<textarea id="t2a-prompt" rows="2" placeholder="Style / genre tags — e.g. melodic techno, warm analog pads, driving sub-bass, 124 bpm, instrumental" style="width:100%;box-sizing:border-box;resize:vertical;'+_ig+'"></textarea>'
+      +'<textarea id="t2a-lyrics" rows="2" placeholder="Lyrics (optional — blank = instrumental). [verse] / [chorus] tags give it structure." style="width:100%;box-sizing:border-box;resize:vertical;margin-top:6px;'+_ig+'"></textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Clip length in seconds (3–240; ACE-Step caps at ~4 min). Longer clips develop more; short ones can loop.">Duration</label>'
+      +'<input id="t2a-dur" type="number" value="30" min="3" max="240" style="width:66px;'+_ig+'"><span class="em" style="font-size:11px;margin-left:-4px">s</span>'
+      +'<label style="font-size:12px;color:var(--muted)" title="Diffusion steps: 60 default; more = higher quality + slower, fewer = rougher">Steps</label>'
+      +'<input id="t2a-steps" type="number" value="60" min="1" max="200" style="width:60px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Guidance scale: how literally it follows the prompt (higher = more on-prompt but less varied). 12–15 typical.">Guidance</label>'
+      +'<input id="t2a-guid" type="number" value="12" step="0.5" min="0" max="30" style="width:60px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Blank = random. Same seed + prompt + settings = the same track every time.">Seed</label>'
+      +'<input id="t2a-seed" type="number" placeholder="rnd" style="width:84px;'+_ig+'">'
+      +'<button class="btn sm pri" id="t2a-go" onclick="t2aGen(\''+esc(name)+'\')">Generate ▶</button>'
+      +'<span id="t2a-status" class="em" style="font-size:11px"></span></div>'
+      +'<audio id="t2a-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
+      +'<div><a id="t2a-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
+  }
   // #persist / #no-unload: per-model lifecycle pins (work for loaded AND not-loaded models — the
   // controller reports current state via LAST.controller.{persist_models,no_unload_models}).
   const _pc=(LAST&&LAST.controller)||{}, _pk=m.internal_name||m.friendly||name;
@@ -925,7 +949,8 @@ async function openDetail(name){
     +'<input type="checkbox" style="width:auto"'+(_isNU?' checked':'')+' onchange="setPin(\''+esc(name)+'\',\'no_unload\',this.checked)"> Do not auto-unload</label>';
   let acts='';
   const _isT2i=(m.capabilities||[]).includes('t2i');
-  if(m.loaded&&_isT2i) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button>';
+  const _isT2a=(m.capabilities||[]).includes('t2a');
+  if(m.loaded&&(_isT2i||_isT2a)) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button>';
   else if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
     +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
@@ -933,11 +958,14 @@ async function openDetail(name){
   else if(_isT2i) acts='<button class="btn sm pri" onclick="t2iLoadDlg(\''+esc(name)+'\')">Load 🖼</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
+  else if(_isT2a) acts='<button class="btn sm pri" onclick="t2aLoadDlg(\''+esc(name)+'\')">Load 🎵</button> '
+    +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
+    +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+t2ig+tts+pre+pers
+    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+t2ig+t2ag+tts+pre+pers
     +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
@@ -975,6 +1003,26 @@ function t2iLoadDlg(name){
     +'<button class="btn sm" onclick="closeOv();loadT2i(\''+esc(name)+'\',1)">Load 🖼 offloaded</button> '
     +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
   $('#ov').classList.add('show');
+}
+// #t2a-serve: the Load 🎵 dialog. Offload is RECOMMENDED — the DiT rests in RAM and streams to the
+// GPU per render, so a multi-minute clip's activations don't OOM a tight card beside other residents
+// (GPU-resident holds ~8 GB and long clips can OOM on a 16 GB card).
+function t2aLoadDlg(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🎵 '+esc(name)+'</h3>'
+    +'<div class="note" style="margin-top:8px">Loads the ACE-Step music pipeline (DiT + VAE + text encoder, ~8 GB bf16) onto the GPU sharing the controller box. Then open its card to generate music.</div>'
+    +'<div class="note" style="margin-top:8px"><b>Offloaded (recommended)</b>: components rest in system RAM and the DiT streams to the GPU per render — ~0 GB resident, leaves headroom for long-clip activations, never evicts residents.</div>'
+    +'<div class="note" style="margin-top:8px"><b>GPU-resident</b>: the whole pipeline stays on the GPU (~8 GB) — quicker to start each render, but long (multi-minute) clips can OOM on a 16 GB card beside other residents.</div>'
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2a(\''+esc(name)+'\',1)">Load 🎵 offloaded</button> '
+    +'<button class="btn sm" onclick="closeOv();loadT2a(\''+esc(name)+'\')">Load 🎵 GPU-resident</button> '
+    +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
+}
+function loadT2a(name,off){
+  toast('loading music pipeline for '+name+(off?' (offloaded — components in RAM)':'')+' — up to a minute…');
+  api('/load?model='+encodeURIComponent(name)+(off?'&t2i_offload=1':''),{method:'POST'})
+    .then(()=>{toast(name+' ready — open its card to generate');tick();})
+    .catch(e=>errDlg('music pipeline load failed',String(e.message||e)));
+  tick();
 }
 function errDlg(title,msg){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(title)+'</h3>'
@@ -1016,6 +1064,36 @@ async function t2iGen(name){
       +'<span class="em" style="font-size:11px;margin-left:8px">'
       +Math.round((Date.now()-t0)/1000)+'s · '+esc(sz)+' · '+steps+' steps</span></div>';
     st.textContent='';
+  }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
+  finally{ clearInterval(tick_); btn.disabled=false; }
+}
+// #t2a-serve: render music from the detail modal. Raw fetch (NOT api()) — /v1/audio/music returns
+// binary WAV; read it as a blob, play it, and offer a working download (object URL revoked on the
+// next run so repeats don\'t leak). Errors (503 load/capacity, 400 no prompt) arrive as a JSON body
+// even on this binary endpoint, so decode + surface them. A live step i/n rides the status poll.
+async function t2aGen(name){
+  const p=($('#t2a-prompt').value||'').trim(); if(!p){ toast('enter style / genre tags',1); return; }
+  const lyrics=($('#t2a-lyrics').value||'').trim();
+  const durS=parseInt($('#t2a-dur').value||'30')||30;
+  const steps=parseInt($('#t2a-steps').value||'60')||60;
+  const guid=parseFloat($('#t2a-guid').value||'12'); const seed=($('#t2a-seed').value||'').trim();
+  const btn=$('#t2a-go'), st=$('#t2a-status'), au=$('#t2a-audio'), dl=$('#t2a-dl');
+  btn.disabled=true; const t0=Date.now();
+  const tick_=setInterval(()=>{ if(st){ const m=(LAST.models||[]).find(x=>x.name===name)||{};
+    st.textContent='rendering '+durS+'s… '+Math.round((Date.now()-t0)/1000)+'s'
+      +(m.t2a_step?(' · step '+m.t2a_step+'/'+(m.t2a_total||'?')):''); } },1000);
+  try{
+    const body={model:name,prompt:p,duration:durS,steps:steps,guidance:guid,response_format:'wav'};
+    if(lyrics!=='')body.lyrics=lyrics;
+    if(seed!=='')body.seed=parseInt(seed);
+    const r=await fetch('/v1/audio/music',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){ let msg='HTTP '+r.status; try{ const j=await r.json(); msg=(j.error&&j.error.message)||j.error||msg; }catch(e){} throw new Error(msg); }
+    const blob=await r.blob();
+    if(au._url)URL.revokeObjectURL(au._url);
+    const url=URL.createObjectURL(blob); au._url=url;
+    au.src=url; au.style.display='block'; au.play().catch(()=>{});
+    dl.href=url; dl.download=name.replace(/[^a-z0-9]+/gi,'_')+'_'+durS+'s_'+Date.now()+'.wav'; dl.style.display='inline';
+    st.textContent='done · '+durS+'s · '+(blob.size/1e6).toFixed(1)+' MB · rendered in '+((Date.now()-t0)/1000).toFixed(1)+'s';
   }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
   finally{ clearInterval(tick_); btn.disabled=false; }
 }

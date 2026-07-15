@@ -523,6 +523,11 @@ def _model_caps(tgt: str, spec=None) -> list:
         if d and _is_kokoro_dir(d):
             _CAPS_CACHE[tgt] = ["tts"]
             return ["tts"]
+        # #t2a: an ACE-Step music checkpoint (ace_step_transformer/ component layout) — badge it
+        # and offer the music load/generate path, like t2i/tts (no LLM Load action).
+        if d and os.path.isdir(os.path.join(d, "ace_step_transformer")):
+            _CAPS_CACHE[tgt] = ["t2a"]
+            return ["t2a"]
         cfgd = None
         if d:
             p = os.path.join(d, "config.json")
@@ -623,6 +628,11 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
             _pr = getattr(engine, "_t2i_progress", {}).get(getattr(lm, "t2i_req", None))
             if _pr:
                 entry["t2i_step"], entry["t2i_total"] = _pr[0], _pr[1]
+        if getattr(lm, "is_t2a", False):         # #t2a-serve: music model — live render progress
+            entry["t2a"] = True
+            _pr = getattr(engine, "_t2a_progress", {}).get(getattr(lm, "t2a_req", None))
+            if _pr:
+                entry["t2a_step"], entry["t2a_total"] = _pr[0], _pr[1]
     if status in ("downloading", "pausing", "stopping", "paused", "stopped"):
         pr = DOWNLOAD_PROGRESS.get(name) or {}     # frozen at the halt point for paused/stopped
         dl, tot = pr.get("downloaded", 0), pr.get("total", 0)
