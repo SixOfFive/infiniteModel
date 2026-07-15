@@ -383,12 +383,14 @@ def register(app):
         body = await req.json()
         return await _count_tokens_anthropic(body)
 
-    # ---- OpenAI-compatible Text-To-Speech (distributed Qwen2.5-Omni speech-out) ----
+    # ---- OpenAI-compatible Text-To-Speech (Kokoro TTS; Omni Talker fallback) ----
     @app.post("/v1/audio/speech")
     async def v1_audio_speech(req: Request):
-        """OpenAI /v1/audio/speech: {model, input, voice, response_format}. Speaks `input`
-        through the distributed Omni speech pipeline and returns the raw audio bytes
-        (wav | pcm). `voice` maps OpenAI names -> our speakers (Chelsie/Ethan)."""
+        """OpenAI /v1/audio/speech: {model, input, voice, speed, response_format}. Speaks
+        `input` and returns the raw audio bytes (wav | pcm). A Kokoro model routes to the
+        dedicated single-node KokoroPipeline (#tts-serve); any other model — or none — falls
+        through to the distributed Qwen2.5-Omni Talker path (choppy on that checkpoint; kept
+        as a fallback). `voice` maps OpenAI names -> the target engine's speakers."""
         body = await req.json()
         ip = _client_ip(req)
         text = (body.get("input") or "").strip()
@@ -489,6 +491,65 @@ def register(app):
         except Exception as exc:
             import traceback
             print(f"[v1/audio/speech] error: {exc!r}\n{traceback.format_exc()[-1200:]}")
+            return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
+                                status_code=500)
+        finally:
+            _inflight_release(rec)
+
+    @app.post("/v1/audio/music")
+    async def v1_audio_music(req: Request):
+        """#t2a-serve (M1): text-to-music. {model, prompt|input, lyrics, duration, steps,
+        guidance, seed, response_format}. Renders `prompt` (genre/style tags; optional `lyrics`
+        for vocals) through the single-node ACE-Step pipeline (engine.t2a_generate) and returns
+        the WAV bytes. `model` must be a registered ACE-Step music checkpoint. If the model isn't
+        resident it auto-loads GPU-resident (~11 GB); pre-load with t2i_offload=1 on tight cards."""
+        body = await req.json()
+        ip = _client_ip(req)
+        prompt = (body.get("prompt") or body.get("input") or "").strip()
+        if not prompt:
+            return JSONResponse({"error": {"message": "'prompt' is required"}}, status_code=400)
+        _req_model = (body.get("model") or "").strip()
+        if not _req_model:
+            return JSONResponse({"error": {"message": "'model' is required (an ACE-Step music model)"}},
+                                status_code=400)
+        try:
+            friendly = resolve_model_name(_req_model)
+        except Exception as exc:
+            return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
+        fmt = (body.get("response_format") or "wav").lower()
+
+        def _f(key, default):
+            try:
+                return float(body.get(key, default))
+            except Exception:
+                return default
+
+        def _i(key, default):
+            try:
+                return int(body.get(key, default))
+            except Exception:
+                return default
+
+        rec = _inflight_admit(ip, friendly)
+        if rec is None:
+            return JSONResponse({"error": {"message": "server busy (music queue full)"}},
+                                status_code=503)
+        try:
+            try:
+                await engine.ensure_loaded(friendly, 0, auto_load=True)
+            except Exception as exc:
+                return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
+            audio_bytes, meta = await engine.t2a_generate(
+                friendly, prompt, lyrics=(body.get("lyrics") or ""),
+                duration=_f("duration", 30.0), steps=_i("steps", 60),
+                guidance=_f("guidance", 15.0), seed=body.get("seed"), fmt=fmt)
+            _media = "audio/wav" if fmt in ("wav", "") else f"audio/{fmt}"
+            print(f"[v1/audio/music] '{prompt[:40]}...' {meta.get('audio_s')}s audio "
+                  f"-> render {meta.get('seconds')}s")
+            return Response(content=audio_bytes, media_type=_media)
+        except Exception as exc:
+            import traceback
+            print(f"[v1/audio/music] error: {exc!r}\n{traceback.format_exc()[-1200:]}")
             return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
                                 status_code=500)
         finally:

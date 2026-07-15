@@ -1448,6 +1448,141 @@ class EngineLoadMixin:
             return data, {"seconds": r.get("seconds"), "steps": int(steps),
                           "width": int(width), "height": int(height), "seed": seed}
 
+    async def _load_t2a_locked(self, friendly: str, target_id: str, reg_key: str,
+                               quant: str = "none", replica_idx: int = 0,
+                               offload: bool = False) -> LoadedModel:
+        """#t2a-serve (M1): load an ACE-Step music checkpoint WHOLE onto ONE controller-
+        CO-LOCATED GPU worker — the audio sibling of _load_t2i_locked. bf16-only for M1
+        (edge-int4 is M2). offload=True keeps ACE-Step's components in RAM and hops the whole
+        ~6.6 GB DiT to the GPU per render (low resident VRAM, ~8 GB transient, never evicts);
+        offload=False keeps the ~8.3 GB pipeline GPU-resident (faster). v1 co-location
+        constraint (shared FS: model dir read + WAV path back). MUST hold self.lock."""
+        model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+        if quant and quant not in ("none", ""):
+            log_activity(f"{_ollama_name(friendly)}: {quant} is not a t2a tier (M1 bf16-only) — using bf16")
+        quant = "none"
+        dit_b = await asyncio.to_thread(_tree_weight_bytes,
+                                        os.path.join(model_dir, "ace_step_transformer"))
+        all_b = await asyncio.to_thread(_tree_weight_bytes, model_dir)
+        spec = ModelSpec(name=friendly, hidden_size=2560, num_layers=24, num_heads=20,
+                         num_kv_heads=20, head_dim=128, intermediate_size=6400,
+                         vocab_size=0, tie_embeddings=True, max_ctx=0, arch="t2a",
+                         meas_layer_w=max(1, dit_b // 24), meas_embed=0, meas_head=0,
+                         meas_norm=0, meas_params=max(1, all_b // 2))
+        _T2A_OFFLOAD_VRAM_GB = 8.0   # M0 whole-DiT-hop peak 6.67 GB + decode/activation margin
+        _MARGIN_GB = 2.5             # ~8.3 GB resident + activation/decode headroom
+        def _need_gb() -> float:
+            return _T2A_OFFLOAD_VRAM_GB if offload else (all_b / GB + _MARGIN_GB)
+        await self.ensure_data_listener()
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (t2a)")
+            await self._await_free_refresh()
+        node = None
+        _ctrl_host = socket.gethostname()
+        _refreshed = False
+        while True:
+            cand = [n for n in registry.alive_sorted()
+                    if n.can_infer and n.vram_total_gb > 0
+                    and (n.hostname == _ctrl_host
+                         or str(n.data_host).startswith(("127.", "::1"))
+                         or str(n.data_host) in _LOCAL_IPS)]
+            # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
+            _res_ram_b, _res_vram_b = self._reserved_bytes(exclude_key=reg_key)
+            def _t2a_free(x):
+                return (x.vram_total_gb - x.vram_used_gb + getattr(x, "vram_reusable_gb", 0.0)
+                        - _res_vram_b.get(x.node_id, 0) / GB)
+            for n in sorted(cand, key=_t2a_free, reverse=True):
+                free = _t2a_free(n)
+                if offload:
+                    # never evicts (its point): needs only the transient VRAM + RAM for the weights
+                    if free >= _T2A_OFFLOAD_VRAM_GB and \
+                            ((n.free_mem_gb or 0) - _res_ram_b.get(n.node_id, 0) / GB) \
+                            >= all_b / GB + 4.0:
+                        node = n
+                        break
+                    continue
+                if free >= _need_gb():
+                    node = n
+                    break
+            if node is not None:
+                break
+            victim = (self._lru_evictable()
+                      if (not offload and bool(ENGINE_CONFIG.get("auto_unload", True))) else None)
+            if victim is None:
+                if not _refreshed:      # a just-freed heartbeat can lag one refresh — re-check once
+                    _refreshed = True
+                    await self._await_free_refresh()
+                    continue
+                raise RuntimeError(
+                    f"no controller-co-located GPU has ~{_need_gb():.1f} GB free VRAM for the music "
+                    f"model ({'no co-located GPU workers connected' if not cand else 'and nothing evictable'})"
+                    " — v1 serves t2a only on a GPU sharing the controller's box"
+                    + (f"; or use offload (t2i_offload=1): ~{_T2A_OFFLOAD_VRAM_GB:.0f} GB transient "
+                       f"+ ~{all_b / GB + 4.0:.0f} GB RAM, never evicts" if not offload else ""))
+            await self._unload_model_locked(victim, "evict idle LRU: music model needs VRAM")
+            await self._await_free_refresh()
+        self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
+                        "target": target_id, "total": 1, "ready": 0,
+                        "stages_total": 1, "stages_ready": 0,
+                        "basis": f"t2a: single-node ({node.hostname}, "
+                                 f"{'bf16 OFFLOAD (components in RAM)' if offload else 'bf16 GPU-resident'})",
+                        "warnings": [], "node_ids": [node.node_id],
+                        "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
+                        "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
+        self._reservations[reg_key] = {node.node_id: {
+            "ram": int((all_b + 4 * GB) if offload else 2 * GB),
+            "vram": int((_T2A_OFFLOAD_VRAM_GB if offload else _need_gb()) * GB)}}
+        link = self.links.get(node.node_id)
+        if link is None:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"no control link to {node.node_id}")
+        fut = asyncio.get_event_loop().create_future()
+        link.pending_loads[target_id] = fut
+        await link.send({"type": "load", "kind": "t2a", "model_id": target_id,
+                         "model_dir": model_dir, "quant": "none",
+                         "t2a_offload": bool(offload),
+                         "controller_http_port": ARGS.http_port,
+                         "next_host": None, "next_port": ARGS.data_port,
+                         "device": "cuda"})
+        try:
+            # generous: an offload load reads the ~8.3 GB pipeline into RAM then builds
+            r = await asyncio.wait_for(fut, timeout=max(GEN_TIMEOUT_S, 1200.0))
+        except Exception as exc:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"t2a load on {node.hostname} failed: {exc!r}")
+        if isinstance(r, dict) and r.get("type") == "error":
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"t2a load on {node.hostname} failed: {r.get('error')}")
+        gpu_b = int(r.get("gpu_bytes", 0)) if isinstance(r, dict) else 0
+        tot_b = int(r.get("loaded_bytes", 0)) if isinstance(r, dict) else 0
+        stage = StageAssign(node_id=node.node_id, hostname=node.hostname,
+                            layer_start=0, layer_end=1, has_embed=True, has_head=True,
+                            est_bytes=tot_b or 1, usable_bytes=int(node.usable_total_gb * GB),
+                            gpu_bytes=gpu_b, loaded_bytes=tot_b)
+        plan = PlanResult(ok=True, model=spec.name, ctx_len=0, num_layers=1,
+                          pool_usable_gb=node.usable_total_gb,
+                          required_gb=(tot_b or 1) / GB, stages=[stage])
+        node.shard_gpu_bytes = gpu_b
+        _dial = (_dial_host(node.data_host), node.data_port)
+        stage0_writer = await self._connect_retry(*_dial)
+        now = time.time()
+        lm = LoadedModel(reg_key, target_id, spec, 0, plan, [node.node_id], None, set(), now,
+                         quant="none", stage0_writer=stage0_writer, last_used=now,
+                         stage0_dial=_dial, last_send_ts=now)
+        lm.base, lm.replica_idx = friendly, replica_idx
+        lm.plan_basis = "t2a: single-node"
+        lm.is_t2a = True
+        lm.t2a_offload = bool(offload)
+        lm.media = r.get("media") if isinstance(r, dict) else None   # #media-detail (may be None)
+        self.models[reg_key] = lm
+        self.loadings.pop(reg_key, None)
+        registry.dirty = False
+        print(f"[load] {reg_key} t2a (ace-step) on {node.hostname} "
+              f"({tot_b / GB:.2f} GB, {gpu_b / GB:.2f} GB GPU, {'offload' if offload else 'resident'})")
+        log_activity(f"{reg_key} READY (t2a/ace-step, {node.hostname}, "
+                     f"{'offload' if offload else 'resident'}) [{len(self.models)} model(s) resident]")
+        return lm
+
     async def _load_tts_locked(self, friendly: str, target_id: str, reg_key: str,
                                replica_idx: int = 0) -> LoadedModel:
         """#tts-serve: load a Kokoro-82M speech checkpoint WHOLE onto ONE controller-
@@ -1593,6 +1728,67 @@ class EngineLoadMixin:
             log_activity(f"{_ollama_name(friendly)}: speech {r.get('seconds', '?')}s "
                          f"({len(data) / 1e6:.2f} MB)")
             return data, {"seconds": r.get("seconds"), "voice": voice, "format": fmt}
+
+    async def t2a_generate(self, friendly: str, prompt: str, lyrics: str = "",
+                           duration: float = 30.0, steps: int = 60, guidance: float = 15.0,
+                           seed=None, fmt: str = "wav") -> tuple[bytes, dict]:
+        """#t2a-serve: render one music clip on the model's ACE-Step worker. Serializes per model
+        on LoadedModel.lock (same discipline as text/image/speech gens); the request travels the
+        control link, per-step progress arrives as t2a_step (see control_plane + /status), and the
+        finished WAV comes back as a LOCAL path (co-located worker) read + deleted here. Returns
+        (audio_bytes, meta)."""
+        lm = self.models.get(friendly)
+        if lm is None:
+            raise ValueError(f"model '{friendly}' is not loaded — load it first")
+        if not getattr(lm, "is_t2a", False):
+            raise ValueError(f"'{friendly}' is not a music (t2a) model")
+        async with lm.lock:
+            lm.last_used = time.time()
+            link = self.links.get(lm.stage_node_ids[0])
+            if link is None:
+                raise RuntimeError("the t2a model's worker is disconnected — reload the model")
+            rid = self._t2a_rid = getattr(self, "_t2a_rid", 0) + 1
+            pend = getattr(self, "_t2a_pending", None)
+            if pend is None:
+                pend = self._t2a_pending = {}
+            fut = asyncio.get_event_loop().create_future()
+            pend[rid] = fut
+            lm.active = 1
+            lm.t2a_req = rid            # status: lets the card find this render's progress
+            _dur = max(3.0, min(240.0, float(duration)))
+            try:
+                await link.send({"type": "t2a_gen", "model_id": lm.target_id, "req_id": rid,
+                                 "prompt": str(prompt or ""), "lyrics": str(lyrics or ""),
+                                 "duration": _dur, "steps": int(steps),
+                                 "guidance": float(guidance), "seed": seed})
+                # GPU render is ~2x realtime (M0); CPU/offload much slower — scale by clip length.
+                r = await asyncio.wait_for(
+                    fut, timeout=max(GEN_TIMEOUT_S, 120.0 + _dur * 20.0))
+            finally:
+                lm.active = 0
+                lm.t2a_req = None
+                pend.pop(rid, None)
+                getattr(self, "_t2a_progress", {}).pop(rid, None)
+            if not isinstance(r, dict) or r.get("type") == "t2a_err":
+                raise RuntimeError(f"music generation failed: "
+                                   f"{(r or {}).get('error', 'no result')}")
+            lm.last_render_s = r.get("seconds")      # wall time of this render (#media-detail)
+            lm.last_audio_s = r.get("audio_s")       # audio duration -> RTF in the modal
+            path = r.get("path") or ""
+
+            def _read() -> bytes:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                return data
+
+            data = await asyncio.to_thread(_read)
+            lm.last_used = time.time()
+            log_activity(f"{_ollama_name(friendly)}: music {r.get('seconds', '?')}s "
+                         f"({len(data) / 1e6:.2f} MB)")
+            return data, {"seconds": r.get("seconds"), "audio_s": r.get("audio_s"),
+                          "format": fmt}
 
     async def replicate(self, friendly: str, ctx: int, count: int,
                         consolidate: bool = True, prefer_vram: bool = True,

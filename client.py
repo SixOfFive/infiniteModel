@@ -806,7 +806,8 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py",
                                  "kv_quant.py",   # TurboQuant KV-cache quantizer (#172)
                                  "worker_quant.py",   # code-split Inc 10: quant/kernel family
                                  "worker_t2i.py",   # #t2i-serve: diffusion image engine (lazy import)
-                                 "worker_tts.py"]   # #tts-serve: Kokoro speech engine (lazy import)
+                                 "worker_tts.py",   # #tts-serve: Kokoro speech engine (lazy import)
+                                 "worker_t2a.py"]   # #t2a-serve: ACE-Step music engine (lazy import)
 # (#distributed-packing) synced like a module — shards.pack_unit_tensors is the shared packer the
 # remote-pack handler calls, so a worker-packed cache unit is bit-identical to a controller-compiled one.
 
@@ -1066,6 +1067,10 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     # #tts-serve: speech synthesis (esp. on CPU) takes many seconds — dispatch
                     # as a task so this loop keeps serving; handler replies keyed by req_id.
                     asyncio.create_task(worker.handle_tts_gen(msg, reply))
+                elif mtype == "t2a_gen":
+                    # #t2a-serve: a music render takes many seconds — dispatch as a task so this
+                    # loop keeps serving unload/ping; handler replies keyed by req_id.
+                    asyncio.create_task(worker.handle_t2a_gen(msg, reply))
                 elif mtype == "unload":
                     await worker.handle_unload(msg.get("model_id"))
                     await reply({"type": "unloaded", "node_id": node_id,

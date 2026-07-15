@@ -428,6 +428,21 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 if _fut is not None and not _fut.done():
                     _fut.set_result(msg)
                 getattr(engine, "_tts_progress", {}).pop(msg.get("req_id"), None)
+            elif mtype == "t2a_step":
+                # #t2a-serve: per-step music render progress (dashboard "step i/n"); stamps the
+                # progress time so a wedged render is distinguishable from a slow one.
+                _ap = getattr(engine, "_t2a_progress", None)
+                if _ap is None:
+                    _ap = engine._t2a_progress = {}
+                _ap[msg.get("req_id")] = (int(msg.get("step", 0)), int(msg.get("total", 0)),
+                                          time.time())
+            elif mtype in ("t2a_done", "t2a_err"):
+                # #t2a-serve: final music result — resolve the waiting t2a_generate future.
+                _pend = getattr(engine, "_t2a_pending", None) or {}
+                _fut = _pend.pop(msg.get("req_id"), None)
+                if _fut is not None and not _fut.done():
+                    _fut.set_result(msg)
+                getattr(engine, "_t2a_progress", {}).pop(msg.get("req_id"), None)
             elif mtype in ("ready", "error"):
                 _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":

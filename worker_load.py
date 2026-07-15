@@ -282,6 +282,42 @@ class WorkerLoadMixin:
                         "loaded_bytes": eng.loaded_bytes,
                         "gpu_bytes": eng.gpu_bytes,
                         "media": eng.media_info()}   # #media-detail: voices/device/sr for /status
+            # T2A load (#t2a-serve): an ACE-Step music pipeline builds WHOLE on THIS node (co-located
+            # with the controller — reads the model dir directly, hands back WAV paths). worker_t2a is
+            # imported lazily with the same fetch-if-missing bridge as worker_t2i/worker_tts.
+            if a.get("kind") == "t2a":
+                mdir = a.get("model_dir") or ""
+                if not os.path.isdir(mdir):
+                    raise RuntimeError(
+                        f"t2a model dir not visible on this worker: {mdir!r} — v1 serves "
+                        "music models only on a worker co-located with the controller")
+                try:
+                    import worker_t2a
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_t2a.py")
+                    if not _src:
+                        raise RuntimeError("worker_t2a.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_t2a.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_t2a
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_t2a.T2APipeline, mdir, device,
+                        "none", bool(a.get("t2a_offload", False)))
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes}
             self._building += 1   # mark BUSY across the build so reclaim/self-update can't kill it
             try:
                 shard = await asyncio.to_thread(self._build_shard, base, model_id, a)
@@ -619,6 +655,48 @@ class WorkerLoadMixin:
                 await reply({"type": "tts_err", "req_id": rid, "model_id": mid,
                              "error": repr(exc)})
             print(f"[tts] generate FAILED: {exc!r}", flush=True)
+
+    async def handle_t2a_gen(self, msg: dict, reply) -> None:
+        """#t2a-serve: run ONE music render on this worker's resident T2APipeline and mirror the
+        result over the control link. Dispatched as a TASK by command_loop (a render takes many
+        seconds — awaiting inline would block unload/ping handling), so replies are keyed by
+        req_id. Per-step progress mirrors as `t2a_step` (scheduled threadsafe from the render
+        thread); the finished WAV's LOCAL path returns in `t2a_done` (controller is co-located,
+        v1). _building marks the worker busy so self-update/reclaim won't kill a live render."""
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "t2a":
+            await reply({"type": "t2a_err", "req_id": rid, "model_id": mid,
+                         "error": "t2a model not resident on this worker"})
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_step(i: int, n: int) -> None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(
+                    reply({"type": "t2a_step", "req_id": rid, "model_id": mid,
+                           "step": i, "total": n}), loop)
+
+        try:
+            _dur = float(msg.get("duration", 30.0))
+            self._building += 1
+            try:
+                path, secs = await asyncio.to_thread(
+                    eng.generate, str(msg.get("prompt") or ""),
+                    str(msg.get("lyrics") or ""), _dur,
+                    int(msg.get("steps", 60)), float(msg.get("guidance", 15.0)),
+                    msg.get("seed"), _on_step)
+            finally:
+                self._building -= 1
+            await reply({"type": "t2a_done", "req_id": rid, "model_id": mid,
+                         "path": path, "seconds": round(secs, 1),
+                         "audio_s": round(_dur, 1)})   # #media-detail: for RTF in the modal
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "t2a_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[t2a] generate FAILED: {exc!r}", flush=True)
 
     async def handle_pack(self, msg: dict) -> dict:
         """#distributed-packing Inc 1b/3b: pack ONE shard-cache unit FOR the controller (offloads the
