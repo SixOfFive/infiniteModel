@@ -505,6 +505,11 @@ class Node:
     client_version: str = ""
     wire: bool = False   # worker imported wire.py (vs the inline fallback) — code-split verify
     ram: str = ""   # e.g. "2x DDR4-2666" / "4x LPDDR5-5500"
+    # #worker-roles: role restriction advertised at registration (e.g. ["t2a"] for a dedicated
+    # ACE-Step worker). EMPTY = a normal all-purpose worker (legacy: llm/t2i/tts/embedding, never
+    # t2a). Non-empty without "llm" -> can_infer forced False so it's kept out of LLM/t2i/tts/embed
+    # planning; media loaders route by cap instead (see _load_t2a_locked).
+    caps: list = field(default_factory=list)
     # False once a node proves it can't run a stage (e.g. no torch installed) —
     # such a node is kept visible but excluded from load planning so one
     # half-provisioned box can't break every load. Reset on reconnect.
@@ -664,7 +669,14 @@ class Registry:
                 ram=reg.get("ram", ""),
                 vram_total_gb=float(reg.get("vram_total_gb", 0.0)),
                 cores=int(reg.get("cores", 0)),
+                caps=list(reg.get("caps") or []),
             )
+            # #worker-roles: a role-limited worker that isn't an LLM server is kept out of ALL
+            # existing planning paths (they all filter on can_infer) by clearing can_infer here;
+            # its media role(s) are routed by cap in the media loaders, not can_infer.
+            if node.caps and "llm" not in node.caps:
+                node.can_infer = False
+                node.incapable_reason = f"role-limited to {node.caps}"
             self._nodes[node_id] = node
             # NOTE: a node JOINING is just added capacity — it must NOT force resident models
             # to reload (that caused a worker reconnect/flap to re-stream the whole 35B). New
