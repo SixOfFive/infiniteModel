@@ -1481,11 +1481,8 @@ class EngineLoadMixin:
         _ctrl_host = socket.gethostname()
         _refreshed = False
         while True:
-            # #worker-roles: t2a routes to a worker that ADVERTISES the "t2a" cap (a dedicated
-            # ACE-Step worker on its own venv) — NOT by can_infer (that worker has can_infer=False
-            # to stay out of LLM/other planning). Still requires co-location (v1 shared-FS) + a GPU.
             cand = [n for n in registry.alive_sorted()
-                    if ("t2a" in getattr(n, "caps", [])) and n.vram_total_gb > 0
+                    if n.can_infer and n.vram_total_gb > 0
                     and (n.hostname == _ctrl_host
                          or str(n.data_host).startswith(("127.", "::1"))
                          or str(n.data_host) in _LOCAL_IPS)]
@@ -1516,16 +1513,10 @@ class EngineLoadMixin:
                     _refreshed = True
                     await self._await_free_refresh()
                     continue
-                if not cand:
-                    raise RuntimeError(
-                        "no controller-co-located worker advertises the 't2a' role — start a "
-                        "dedicated ACE-Step worker on its acestep venv, e.g. "
-                        "`/root/acestep-venv/bin/python client.py --controller 127.0.0.1 "
-                        "--device gpu --roles t2a --data-port 50210` (v1: it must share the "
-                        "controller's box / filesystem)")
                 raise RuntimeError(
-                    f"the co-located t2a worker has no ~{_need_gb():.1f} GB free VRAM for the music "
-                    "model (nothing evictable)"
+                    f"no controller-co-located GPU has ~{_need_gb():.1f} GB free VRAM for the music "
+                    f"model ({'no co-located GPU workers connected' if not cand else 'and nothing evictable'})"
+                    " — v1 serves t2a only on a GPU sharing the controller's box"
                     + (f"; or use offload (t2i_offload=1): ~{_T2A_OFFLOAD_VRAM_GB:.0f} GB transient "
                        f"+ ~{all_b / GB + 4.0:.0f} GB RAM, never evicts" if not offload else ""))
             await self._unload_model_locked(victim, "evict idle LRU: music model needs VRAM")

@@ -480,12 +480,6 @@ def build_registration(args: argparse.Namespace) -> dict:
         "client_version": VERSION,
         "wire": ("wire" in sys.modules),   # True once wire.py is imported (not the inline fallback)
     }
-    # #worker-roles: a role-limited worker (e.g. --roles t2a for a dedicated ACE-Step worker on a
-    # venv the LLM stack can't share) advertises exactly what it serves. The controller routes only
-    # those roles to it and, unless "llm" is among them, keeps it out of LLM/t2i/tts/embed planning.
-    _roles = [r.strip() for r in str(getattr(args, "roles", "") or "").split(",") if r.strip()]
-    if _roles:
-        reg["caps"] = _roles
     if _using_gpu(args):
         reg["vram_total_gb"] = round(_gpu_mem_gb()[1], 2)
     return reg

@@ -1275,11 +1275,6 @@ def parse_args() -> argparse.Namespace:
                         "this default applies.")
     p.add_argument("--gpu-mem-gb", type=float, default=0.0,
                    help="VRAM budget for hybrid placement (0 = auto: ~85%% of free VRAM)")
-    p.add_argument("--roles", default="",
-                   help="comma-separated worker roles (e.g. 't2a' for a dedicated ACE-Step music "
-                        "worker on a separate venv). A role-limited worker serves ONLY these and is "
-                        "excluded from LLM/t2i/tts/embedding placement. Empty = a normal all-purpose "
-                        "worker.")
     p.add_argument("--attn", default="sdpa", choices=["eager", "sdpa"],
                    help="attention kernel. Default 'sdpa': torch scaled_dot_product_"
                         "attention, which itself auto-selects the fastest backend per "
