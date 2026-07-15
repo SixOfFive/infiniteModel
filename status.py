@@ -145,6 +145,25 @@ def build_status() -> dict:
         # best-effort MoE flag for the detail modal: fused/per-expert MoE arches all contain one of
         # these tokens ('moe' covers olmoe/qwen3*_moe; mixtral/minimax/deepseek_v2,v3 named directly).
         _is_moe = any(k in _arch for k in ("moe", "mixtral", "minimax", "deepseek_v"))
+        # #media-detail: rich info block for a media (tts/t2i/t2a) model's detail modal — the
+        # worker-reported metadata (voices/sample_rate/device for tts) plus derived device (from
+        # whether any stage placed weights on GPU), weight size, and the last render's speed (RTF).
+        _media = None
+        if any(getattr(lm, f, False) for f in ("is_tts", "is_t2i", "is_t2a")):
+            _media = dict(getattr(lm, "media", None) or {})
+            _media["device"] = ("GPU" if any(getattr(s, "gpu_bytes", 0) > 0
+                                             for s in lm.plan.stages) else "CPU")
+            _media["size_gb"] = round(lm.spec.total_weight_bytes / GB, 2)
+            if not _media.get("kind"):
+                _media["kind"] = ("tts" if getattr(lm, "is_tts", False)
+                                  else "t2i" if getattr(lm, "is_t2i", False) else "t2a")
+            _lr, _la = getattr(lm, "last_render_s", None), getattr(lm, "last_audio_s", None)
+            if _lr is not None:
+                _media["last_render_s"] = round(float(_lr), 2)
+            if _la is not None:
+                _media["last_audio_s"] = round(float(_la), 2)
+            if _lr and _la and float(_la) > 0:
+                _media["last_rtf"] = round(float(_lr) / float(_la), 2)
         return {
             "friendly": lm.friendly, "display_name": _ollama_name(lm.friendly),  # 'qwen3:4b'
             "aliases": _aliases_for(lm.base or lm.friendly),  # display-form alias(es) -> shown under the name
@@ -205,6 +224,9 @@ def build_status() -> dict:
             # --- #model-detail (click-to-expand modal): arch/tags + lifetime stats ---
             "arch": getattr(lm.spec, "arch", ""),
             "is_moe": _is_moe,
+            "is_tts": bool(getattr(lm, "is_tts", False)),
+            "is_t2a": bool(getattr(lm, "is_t2a", False)),
+            "media": _media,   # #media-detail: None for LLMs; dict for tts/t2i/t2a
             "is_embedding": bool(getattr(lm.spec, "is_embedding", False)),
             "load_seconds": round(getattr(lm, "load_seconds", 0.0), 1),
             "req_total": getattr(lm, "req_total", 0),
@@ -342,6 +364,7 @@ def build_status() -> dict:
                      "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",
                      "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
                      "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe",
+                     "is_tts", "is_t2a", "media",   # #media-detail: media-model info block
                      "persist", "no_unload")
     for _e in model_cards:
         if _e.get("loaded"):

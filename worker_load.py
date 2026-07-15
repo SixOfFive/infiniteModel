@@ -280,7 +280,8 @@ class WorkerLoadMixin:
                 self.next_peer[model_id] = "controller"
                 return {"loaded_params": eng.loaded_params,
                         "loaded_bytes": eng.loaded_bytes,
-                        "gpu_bytes": eng.gpu_bytes}
+                        "gpu_bytes": eng.gpu_bytes,
+                        "media": eng.media_info()}   # #media-detail: voices/device/sr for /status
             self._building += 1   # mark BUSY across the build so reclaim/self-update can't kill it
             try:
                 shard = await asyncio.to_thread(self._build_shard, base, model_id, a)
@@ -604,14 +605,15 @@ class WorkerLoadMixin:
         try:
             self._building += 1
             try:
-                path, secs = await asyncio.to_thread(
+                path, secs, audio_s = await asyncio.to_thread(
                     eng.generate, str(msg.get("text") or ""),
                     str(msg.get("voice") or ""), float(msg.get("speed", 1.0)),
                     str(msg.get("fmt") or "wav"), _on_step)
             finally:
                 self._building -= 1
             await reply({"type": "tts_done", "req_id": rid, "model_id": mid,
-                         "path": path, "seconds": round(secs, 1)})
+                         "path": path, "seconds": round(secs, 1),
+                         "audio_s": round(audio_s, 1)})   # #media-detail: for RTF in the modal
         except Exception as exc:
             with contextlib.suppress(Exception):
                 await reply({"type": "tts_err", "req_id": rid, "model_id": mid,

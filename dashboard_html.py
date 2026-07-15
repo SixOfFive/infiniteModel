@@ -711,10 +711,42 @@ function detailLive(name){
   const cz=m.cached||{}; const now=Date.now()/1000;
   let rows=''; const add=(k,v)=>{ if(v!=null&&v!=='') rows+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
   add('HF id',esc(m.target)); add('arch',esc(m.arch||'')); add('status',esc(m.status));
-  add('aliases',(m.aliases||[]).map(esc).join(', ')); add('weights size',gb(m.size_gb));
+  add('aliases',(m.aliases||[]).map(esc).join(', '));
+  add('weights size', m.size_gb!=null?gb(m.size_gb):((m.media&&m.media.size_gb!=null)?gb(m.media.size_gb):''));
   add('cached quants',Object.keys(cz).filter(q=>cz[q]&&cz[q].ok).map(q=>q+' '+gb(cz[q].size_gb)).join(', '));
   let out='<table class="kv">'+rows+'</table>';
-  if(m.loaded){
+  // #media-detail: a media model (tts/t2i/t2a) gets a media-appropriate operational block — the
+  // LLM section below (tok/s, context, KV, tokens, layers) is all zeros/meaningless for it.
+  if(m.loaded && m.media){
+    const md=m.media; let o=''; const oadd=(k,v)=>{ if(v!=null&&v!=='') o+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
+    const gen=(m.active||0)>0;
+    const KIND={tts:'Text-to-speech',t2i:'Text-to-image',t2a:'Text-to-audio (music)'};
+    oadd('type',esc(KIND[md.kind]||md.kind||'media')+(md.engine?(' · '+esc(md.engine)):''));
+    oadd('state', gen?('<span style="color:var(--good)">● generating'+((m.active||0)>1?(' ×'+m.active):'')+'</span>'):'<span class="em">idle</span>');
+    if((m.queued||0)>0) oadd('queue','<span style="color:var(--warn)">'+m.queued+' waiting</span>');
+    oadd('device', md.device==='GPU'?'<span style="color:var(--good)">GPU</span>':'<span class="em">CPU</span>');
+    oadd('parameters',esc(m.params||''));
+    oadd('weights',gb(md.size_gb));
+    oadd('VRAM',gb(m.vram_used_gb));
+    if((m.ram_used_gb||0)>0.01) oadd('RAM',gb(m.ram_used_gb));
+    if(md.sample_rate) oadd('sample rate',(md.sample_rate/1000)+' kHz');
+    if(md.n_voices){
+      const vlist=(md.voices||[]);
+      oadd('voices', vlist.length
+        ? '<details><summary style="cursor:pointer;color:var(--accent)">'+md.n_voices+' available</summary><div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:5px;line-height:1.8">'+vlist.map(esc).join(' · ')+'</div></details>'
+        : md.n_voices);
+    }
+    if(md.default_voice) oadd('default voice','<span style="font-family:var(--mono)">'+esc(md.default_voice)+'</span>');
+    if(md.last_render_s!=null){
+      const spd=(md.last_audio_s>0&&md.last_render_s>0)?(md.last_audio_s/md.last_render_s):null;
+      oadd('last render',(md.last_audio_s!=null?(md.last_audio_s+'s audio '):'')+'in '+md.last_render_s+'s'+(spd!=null?(' · '+spd.toFixed(1)+'× real time'):''));
+    }
+    oadd('requests served', m.req_total!=null?m.req_total:'');
+    if(m.loaded_at_ts) oadd('uptime',dur(now-m.loaded_at_ts)+(m.load_seconds?(' · load took '+m.load_seconds+'s'):''));
+    if(m.last_used_ts) oadd('last request', gen?'now':(dur(now-m.last_used_ts)+' ago'));
+    oadd('placement basis',esc(m.plan_basis||''));
+    out+='<h3 style="font-size:13px;margin-top:14px">'+esc(KIND[md.kind]||'Media')+(gen?' · <span style="color:var(--good)">running</span>':'')+'</h3><table class="kv">'+o+'</table>';
+  } else if(m.loaded){
     let o=''; const oadd=(k,v)=>{ if(v!=null&&v!=='') o+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
     const gen=(m.active||0)>0;
     oadd('state', gen?('<span style="color:var(--good)">● generating'+((m.active||0)>1?(' ×'+m.active):'')+'</span>'):'<span class="em">idle</span>');

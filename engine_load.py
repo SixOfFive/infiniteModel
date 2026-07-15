@@ -1527,6 +1527,7 @@ class EngineLoadMixin:
         lm.plan_basis = "tts: single-node"
         lm.is_tts = True
         lm.is_kokoro = True
+        lm.media = r.get("media") if isinstance(r, dict) else None   # voices/device/sr (#media-detail)
         self.models[reg_key] = lm
         self.loadings.pop(reg_key, None)
         registry.dirty = False
@@ -1576,6 +1577,8 @@ class EngineLoadMixin:
             if not isinstance(r, dict) or r.get("type") == "tts_err":
                 raise RuntimeError(f"speech generation failed: "
                                    f"{(r or {}).get('error', 'no result')}")
+            lm.last_render_s = r.get("seconds")      # wall time of this synth (#media-detail)
+            lm.last_audio_s = r.get("audio_s")       # audio duration -> RTF in the modal
             path = r.get("path") or ""
 
             def _read() -> bytes:

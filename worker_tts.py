@@ -234,6 +234,14 @@ class KokoroPipeline:
             return []
         return sorted(f[:-3] for f in os.listdir(self._voices_dir) if f.endswith(".pt"))
 
+    def media_info(self) -> dict:
+        """Static metadata for the controller's /status + detail modal (reported in the load
+        reply). Device is the ACTUAL device after any GPU->CPU fallback."""
+        voices = self.list_voices()
+        return {"kind": "tts", "engine": "kokoro", "device": str(self.device),
+                "sample_rate": SR, "n_voices": len(voices), "voices": voices,
+                "default_voice": self.DEFAULT_VOICE, "params": int(self.loaded_params)}
+
     # -- unload -------------------------------------------------------------------------
 
     def release_vram(self) -> None:
@@ -283,8 +291,8 @@ class KokoroPipeline:
 
     def generate(self, text: str, voice: str = "", speed: float = 1.0,
                  fmt: str = "wav", on_step=None) -> tuple:
-        """Synthesize `text` in `voice`; returns (audio_path, seconds). Runs in a
-        worker thread (asyncio.to_thread) — one at a time per model via _gen_lock."""
+        """Synthesize `text` in `voice`; returns (audio_path, wall_seconds, audio_seconds).
+        Runs in a worker thread (asyncio.to_thread) — one at a time per model via _gen_lock."""
         try:
             return self._generate(text, voice, speed, fmt, on_step)
         finally:
@@ -323,10 +331,11 @@ class KokoroPipeline:
             sf.write(path, wav, SR)
             self.last_gen_s = time.time() - t0
             secs = len(wav) / float(SR)
+            self.last_audio_s = secs
             print(f"[tts] voice={voice} {total} chunk(s) -> {secs:.1f}s audio "
                   f"in {self.last_gen_s:.1f}s (RTF {self.last_gen_s / max(secs, 1e-6):.2f}) "
                   f"-> {path}", flush=True)
-            return path, self.last_gen_s
+            return path, self.last_gen_s, secs
 
 
 class _suppress:
