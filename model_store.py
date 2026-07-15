@@ -200,10 +200,19 @@ def _is_kokoro_dir(d: str) -> bool:
     weight_map) and the migration path would drop the .pth/.pt weights and purge the cache."""
     try:
         vdir = os.path.join(d, "voices")
-        has_pth = any(f.endswith(".pth") and f.startswith("kokoro")
-                      for f in os.listdir(d))
-        has_voices = os.path.isdir(vdir) and any(f.endswith(".pt") for f in os.listdir(vdir))
-        return bool(has_pth and has_voices)
+        # os.path.exists (follows symlinks) — NOT just listdir: an HF-cache snapshot lists a
+        # file's symlink name even when its blob is gone (dangling), so a listdir-only check
+        # reported a half-present model as ready/tts-badged while the load then failed. Require
+        # the .pth weight, config.json, and >=1 voice .pt to be REAL files on disk.
+        pth = next((f for f in os.listdir(d)
+                    if f.endswith(".pth") and f.startswith("kokoro")), None)
+        if not (pth and os.path.exists(os.path.join(d, pth))):
+            return False
+        if not os.path.exists(os.path.join(d, "config.json")):
+            return False
+        return bool(os.path.isdir(vdir)
+                    and any(f.endswith(".pt") and os.path.exists(os.path.join(vdir, f))
+                            for f in os.listdir(vdir)))
     except Exception:
         return False
 
