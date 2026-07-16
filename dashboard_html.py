@@ -426,6 +426,7 @@ function modelRow(m,s){
     const parts=[];
     if(m.quant)parts.push(esc(m.quant));
     if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
+    if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');   // t2i uses RAM too (CPU text encoder + VAE; whole DiT in offload)
     if(m.active>0)parts.push('<span style="color:var(--good)">● rendering'
       +(m.t2i_step?(' step '+m.t2i_step+'/'+(m.t2i_total||'?')):'')+'</span>');
     meta=parts.join(' · ');
