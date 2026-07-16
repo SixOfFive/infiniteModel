@@ -994,15 +994,39 @@ async function applyRt(name){
 // controller-co-located GPU and auto-evicts idle residents to get it), so it deserves the same
 // deliberate step other loads get, and a FAILURE must be a dialog the user actually sees (the
 // old fire-and-forget toast was missed live: the load failed "nothing evictable" invisibly).
+// #t2i-load-dlg v2: a REAL form (placement + precision), not two opaque buttons. Every
+// option maps to a supported /load param — quant (int4 mixed-edge | none=bf16) and
+// t2i_offload — so nothing is "magic". t2i v1 runs the WHOLE pipeline on one
+// controller-co-located GPU (no fleet split), so there is no distributed/TP option here;
+// the note says so explicitly rather than leaving it a mysterious omission.
 function t2iLoadDlg(name){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🖼 '+esc(name)+'</h3>'
-    +'<div class="note" style="margin-top:8px">Loads the whole image pipeline onto the GPU sharing the controller box: DiT quantized to mixed-edge int4 (first + last blocks bf16 — the gate-tested near-bf16 recipe), text encoder on CPU, tiled VAE. Takes a few minutes (quantize + move).</div>'
-    +'<div class="note" style="margin-top:8px"><b>GPU</b>: needs <b>~14–17 GB free VRAM</b>. Idle loaded models are auto-evicted to make room; models actively serving are never evicted — if they hold the card, the load fails and the reason is shown here. Fastest renders.</div>'
-    +'<div class="note" style="margin-top:8px"><b>Offloaded</b>: the DiT rests bf16 in system RAM (~47 GB) and blocks stream to the GPU each step — needs only <b>~4 GB VRAM</b>, NEVER evicts anything, ~2–3× slower per step. For cards too small or too busy to host the weights.</div>'
-    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2i(\''+esc(name)+'\')">Load 🖼 to GPU</button> '
-    +'<button class="btn sm" onclick="closeOv();loadT2i(\''+esc(name)+'\',1)">Load 🖼 offloaded</button> '
+    +'<div class="note" style="margin-top:8px">The image pipeline (v1) runs <b>whole on one GPU that shares the controller box</b> — it is not split across the fleet like an LLM, so there is no distributed / tensor-parallel option. Text encoder runs on that box\'s CPU, VAE decodes tiled. Choose how the DiT weights sit on the GPU:</div>'
+    +'<label style="margin-top:10px">Placement</label>'
+    +'<select id="t-place" onchange="_t2iPlaceChg()">'
+    +'<option value="auto">Auto — GPU int4, spill to CPU if it won\'t fit (recommended)</option>'
+    +'<option value="gpu">GPU-resident — weights stay on the GPU</option>'
+    +'<option value="offload">CPU offload — weights in RAM, streamed to the GPU</option>'
+    +'</select>'
+    +'<div id="t-precwrap" style="display:none;margin-top:8px"><label>Precision</label>'
+    +'<select id="t-prec">'
+    +'<option value="int4">int4 mixed-edge (~13.5 GB — first+last blocks bf16 ≈ bf16 quality)</option>'
+    +'<option value="none">bf16 full (~41 GB — needs a big-VRAM / unified-memory card)</option>'
+    +'</select></div>'
+    +'<div id="t-note" class="note" style="margin-top:10px"></div>'
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="loadT2i(\''+esc(name)+'\')">Load 🖼</button> '
     +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
   $('#ov').classList.add('show');
+  _t2iPlaceChg();
+}
+// Show the precision picker only for a GPU-resident load, and explain the current choice.
+function _t2iPlaceChg(){
+  var v=$('#t-place')?$('#t-place').value:'auto';
+  var pw=$('#t-precwrap'); if(pw) pw.style.display=(v==='gpu')?'block':'none';
+  var n=$('#t-note'); if(!n) return;
+  if(v==='auto') n.innerHTML='Tries <b>int4 on the GPU</b> (~14–17 GB free VRAM; idle models auto-evict, active ones never do). If it can\'t fit there, it <b>automatically spills to CPU offload</b> — DiT bf16 in RAM (~47 GB), only ~4 GB VRAM, nothing evicted. Fast when there is room, always loads.';
+  else if(v==='gpu') n.innerHTML='Weights live on the GPU — fastest renders. <b>int4</b> needs ~14–17 GB free VRAM; <b>bf16</b> needs ~41 GB (om3nbox-class unified memory). Idle residents auto-evict to make room; a model actively serving is never evicted — if it holds the card the load fails with the reason shown.';
+  else n.innerHTML='DiT rests <b>bf16 in system RAM</b> (~47 GB) and blocks stream to the GPU each step — needs only <b>~4 GB VRAM</b>, <b>NEVER evicts</b> anything, ~2–3× slower per step. The safe choice on a tight or busy card (e.g. beast\'s 16 GB).';
 }
 // #t2a-serve: the Load 🎵 dialog. Offload is RECOMMENDED — the DiT rests in RAM and streams to the
 // GPU per render, so a multi-minute clip's activations don't OOM a tight card beside other residents
@@ -1030,11 +1054,36 @@ function errDlg(title,msg){
     +'<div style="margin-top:12px"><button class="btn sm" onclick="closeOv()">OK</button></div>';
   $('#ov').classList.add('show');
 }
-function loadT2i(name,off){
-  toast('loading image pipeline for '+name+(off?' (offloaded — DiT into RAM)':'')+' — a few minutes…');
-  api('/load?model='+encodeURIComponent(name)+'&quant=int4'+(off?'&t2i_offload=1':''),{method:'POST'})
+// Fire one t2i load with an explicit query string, surfacing failures in a dialog the user sees.
+function _t2iFire(name,qs,label){
+  toast('loading image pipeline for '+name+(label||'')+' — a few minutes…');
+  api('/load?model='+encodeURIComponent(name)+qs,{method:'POST'})
     .then(()=>{toast(name+' ready — open its card to generate');tick();})
     .catch(e=>errDlg('image pipeline load failed',String(e.message||e)));
+  tick();
+}
+// Read the load dialog and dispatch. Auto = GPU int4, and on a capacity/eviction failure
+// (nothing evictable / not enough co-located VRAM) AUTO-SPILL to CPU offload — the
+// "GPU by default, spill to CPU as needed" behavior, done transparently with a toast.
+function loadT2i(name){
+  var place=$('#t-place')?$('#t-place').value:'auto';
+  var prec=$('#t-prec')?$('#t-prec').value:'int4';
+  closeOv();
+  if(place==='offload'){ _t2iFire(name,'&t2i_offload=1',' (CPU offload — DiT in RAM)'); return; }
+  if(place==='gpu'){ _t2iFire(name,'&quant='+encodeURIComponent(prec),
+      prec==='none'?' (GPU-resident bf16)':' (GPU-resident int4)'); return; }
+  toast('loading '+name+' — GPU int4, will spill to CPU offload if it won\'t fit…');
+  api('/load?model='+encodeURIComponent(name)+'&quant=int4',{method:'POST'})
+    .then(()=>{toast(name+' ready on GPU (int4)');tick();})
+    .catch(e=>{ var msg=String(e.message||e);
+      if(/vram|evict|co-located gpu|no room|nothing/i.test(msg.toLowerCase())){
+        toast('GPU full — spilling to CPU offload…');
+        api('/load?model='+encodeURIComponent(name)+'&t2i_offload=1',{method:'POST'})
+          .then(()=>{toast(name+' ready (CPU offload — spilled)');tick();})
+          .catch(e2=>errDlg('image pipeline load failed',String(e2.message||e2)));
+      } else { errDlg('image pipeline load failed',msg); }
+      tick();
+    });
   tick();
 }
 // #t2i-serve: render from the detail modal. Long await (a render is minutes) with a live
