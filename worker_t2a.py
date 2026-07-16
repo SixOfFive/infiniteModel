@@ -206,18 +206,36 @@ class T2APipeline:
                 with contextlib.suppress(Exception):
                     hook = dit.register_forward_pre_hook(_pre_hook)
 
+            # #gpu-share: render on a SEPARATE side stream (same fix as worker_t2i): on the
+            # shared default stream a music render's minutes-deep kernel backlog starves a
+            # co-resident LLM decode to ~0 tok/s; on a side stream the hardware interleaves
+            # both queues at kernel boundaries. CPU device / failure -> old inline behavior.
+            _rs = None
+            with contextlib.suppress(Exception):
+                if str(self.device).startswith("cuda"):
+                    import torch
+                    _rs = torch.cuda.Stream(device=self.device)
+            if _rs is not None:
+                import torch
+                _sctx = torch.cuda.stream(_rs)
+            else:
+                _sctx = contextlib.nullcontext()
             try:
-                self.pipe(
-                    prompt=prompt or "",
-                    lyrics=lyrics or "",
-                    audio_duration=duration,
-                    infer_step=steps,
-                    guidance_scale=guidance,
-                    manual_seeds=[int(seed)],
-                    save_path=path,
-                    format="wav",
-                    batch_size=1,
-                )
+                with _sctx:
+                    self.pipe(
+                        prompt=prompt or "",
+                        lyrics=lyrics or "",
+                        audio_duration=duration,
+                        infer_step=steps,
+                        guidance_scale=guidance,
+                        manual_seeds=[int(seed)],
+                        save_path=path,
+                        format="wav",
+                        batch_size=1,
+                    )
+                if _rs is not None:   # drain before the caller reads the WAV off disk
+                    with contextlib.suppress(Exception):
+                        _rs.synchronize()
             finally:
                 if hook is not None:
                     with contextlib.suppress(Exception):

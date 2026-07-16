@@ -472,6 +472,39 @@ def register(app):
                              "requested_by": who,
                              "workers_signaled": signaled, "worker_count": len(signaled)})
 
+    @app.post("/restart_node")
+    async def restart_node(request: Request, node: str = "") -> JSONResponse:
+        # #node-restart: restart ONE worker process (exit 42 -> its supervisor relaunches it) —
+        # the per-node "fresh start" that clears whatever VRAM/RAM the process is holding,
+        # without touching the controller or the rest of the fleet. Models with a stage on the
+        # node DROP (a worker restart wipes its shards) — the existing link-death invalidation
+        # cleans up their controller state and they re-load on demand; the response lists them
+        # so the caller knows what it cost. `node` matches node_id or hostname.
+        if not node:
+            return JSONResponse({"ok": False, "error": "node is required (hostname or node id)"},
+                                status_code=400)
+        nd = registry._nodes.get(node) \
+            or next((n for n in registry.alive_sorted()
+                     if n.hostname.lower() == node.strip().lower()), None)
+        if nd is None:
+            return JSONResponse({"ok": False, "error": f"unknown node '{node}'"}, status_code=404)
+        link = engine.links.get(nd.node_id)
+        if link is None:
+            return JSONResponse({"ok": False, "error": f"no control link to {nd.hostname} "
+                                 "(already down? it will relaunch on its own supervisor)"},
+                                status_code=409)
+        affected = [fr for fr, m in engine.models.items() if nd.node_id in m.stage_node_ids]
+        who = _client_ip(request)
+        try:
+            await link.send({"type": "restart"})
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": f"restart send failed: {exc!r}"},
+                                status_code=502)
+        log_activity(f"NODE RESTART: {nd.hostname} ({nd.node_id}) requested by {who}"
+                     + (f" — drops {', '.join(affected)}" if affected else ""))
+        return JSONResponse({"ok": True, "node": nd.hostname, "node_id": nd.node_id,
+                             "requested_by": who, "models_affected": affected})
+
     @app.post("/update")
     async def update_endpoint(request: Request, workers: int = 0, force: bool = False) -> JSONResponse:
         # FORCED UPDATE (dashboard 'Update' button / deploy API): pull the latest code from GitHub

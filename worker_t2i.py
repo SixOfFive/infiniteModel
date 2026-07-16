@@ -249,7 +249,22 @@ class T2IPipeline:
                 seed = int.from_bytes(os.urandom(4), "big")
             g = torch.Generator("cpu").manual_seed(int(seed))
 
-            with torch.no_grad():
+            # #gpu-share: render on a SEPARATE side stream, never the default stream. Both a
+            # render and a co-resident LLM decode used to submit to the ONE default stream —
+            # strict FIFO — so the DiT's minutes-deep kernel backlog sat in front of every
+            # tiny decode kernel and starved co-resident text models to ~0 tok/s for the
+            # whole render. On a side stream the hardware scheduler interleaves the two
+            # queues at kernel boundaries: the decode keeps flowing while the render uses
+            # the gaps (true parallel sharing, no locks, no round-robin scheduling needed).
+            # CPU device (or stream-creation failure) degrades to the old inline behavior.
+            import contextlib as _cl
+            _rs = None
+            if str(dev).startswith("cuda"):
+                with _cl.suppress(Exception):
+                    _rs = torch.cuda.Stream(device=dev)
+            _sctx = torch.cuda.stream(_rs) if _rs is not None else _cl.nullcontext()
+
+            with _sctx, torch.no_grad():
                 # Encode on CPU via the ENCODER view (the TE lives there); masks may
                 # legitimately come back None (this diffusers build drops an all-ones mask).
                 pe, pm = self.enc.encode_prompt(prompt=prompt, device="cpu")[:2]
@@ -274,6 +289,9 @@ class T2IPipeline:
                            output_type="latent", callback_on_step_end=_cb)
                 latents = out.images
                 img = self._decode(latents, height, width)
+            if _rs is not None:   # drain the side stream before touching the image on CPU
+                with _cl.suppress(Exception):
+                    _rs.synchronize()
 
             path = os.path.join(tempfile.gettempdir(),
                                 f"im_t2i_{os.getpid()}_{int(time.time() * 1000)}.png")

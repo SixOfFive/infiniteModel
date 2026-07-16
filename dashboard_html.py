@@ -206,6 +206,8 @@ DASHBOARD_HTML = r"""<!doctype html>
   .node:last-child{border-bottom:none}
   .node .nn{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .node .nn small{font-weight:400;color:var(--dim);font-size:11px}
+  .node .nn .nrst{cursor:pointer;color:var(--dim);font-weight:400;padding:0 2px;border-radius:4px}
+  .node .nn .nrst:hover{color:var(--hot);background:var(--border)}
   .node .mb{display:flex;align-items:center;gap:8px;min-width:0}
   .node .mb .lab{font-size:11px;color:var(--muted);width:34px;flex:none}
   .node .mb .bar{flex:1}
@@ -567,10 +569,22 @@ function renderNodes(d){
     const vram=gpu?memRow('VRAM',(imVram[n.hostname]||0),(n.vram_used_gb||0),(n.vram_total_gb||0)):'<div class="mb"></div>';
     const cv=n.client_version||''; const _stale=(_consensus&&cv&&cv!==_consensus)?' stale':'';
     const verCell='<div class="ver'+_stale+'"'+(_stale?' title="version differs from fleet consensus '+esc(_consensus)+'"':'')+'>'+(cv?'v'+esc(cv):'—')+'</div>';
-    return '<div class="node"><div class="nn">'+esc(n.hostname)+' <small>'+esc(dev)+'</small>'+off+'</div>'
+    // #node-restart: per-node fresh start — restarts just this worker process (supervisor
+    // relaunches it; clears whatever VRAM/RAM it holds). Models with a stage here drop and
+    // re-load on demand — the confirm says so. Hidden for offline nodes (nothing to signal).
+    const rbtn=n.alive?' <a class="nrst" title="Restart this worker process (fresh start: clears its VRAM/RAM; models on it drop and re-load on demand)" onclick="restartNode(\''+esc(n.hostname)+'\')">↻</a>':'';
+    return '<div class="node"><div class="nn">'+esc(n.hostname)+rbtn+' <small>'+esc(dev)+'</small>'+off+'</div>'
       +vram+memRow('RAM',(n.proc_rss_gb||0),ramUsed,(n.total_mem_gb||0))
       +'<div class="util">'+util+verCell+'</div></div>';
   }).join('');
+}
+async function restartNode(host){
+  if(!confirm('Restart the worker on '+host+'?\n\nFresh start for that node: the process relaunches and its VRAM/RAM clears. Any model with a stage on it drops and re-loads on demand.'))return;
+  try{
+    const r=await api('/restart_node?node='+encodeURIComponent(host),{method:'POST'});
+    toast(host+' restarting'+((r.models_affected||[]).length?' — drops '+r.models_affected.join(', '):''));
+    tick();
+  }catch(e){ toast(String(e.message||e),1); }
 }
 
 // ---------- actions ----------
