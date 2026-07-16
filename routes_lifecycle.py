@@ -477,9 +477,13 @@ def register(app):
         # #node-restart: restart ONE worker process (exit 42 -> its supervisor relaunches it) —
         # the per-node "fresh start" that clears whatever VRAM/RAM the process is holding,
         # without touching the controller or the rest of the fleet. Models with a stage on the
-        # node DROP (a worker restart wipes its shards) — the existing link-death invalidation
-        # cleans up their controller state and they re-load on demand; the response lists them
-        # so the caller knows what it cost. `node` matches node_id or hostname.
+        # node DROP (a worker restart wipes its shards); the existing link-death invalidation
+        # cleans up their controller state AND frees their surviving stages on OTHER nodes, so
+        # an idle model costs nothing anywhere afterwards (it re-auto-loads on demand). A model
+        # that is IN USE (serving/queued now, or used in the last 10 min) is RECOVERED: once
+        # the invalidation lands, a background task re-loads it with its original ctx/quant/KV
+        # knobs — the planner re-places it onto whatever capacity is up (other nodes' GPU/CPU;
+        # the restarted node itself usually rejoins in seconds and is a candidate again).
         if not node:
             return JSONResponse({"ok": False, "error": "node is required (hostname or node id)"},
                                 status_code=400)
@@ -494,6 +498,29 @@ def register(app):
                                  "(already down? it will relaunch on its own supervisor)"},
                                 status_code=409)
         affected = [fr for fr, m in engine.models.items() if nd.node_id in m.stage_node_ids]
+        # Snapshot the recovery set BEFORE the restart (invalidation wipes engine.models).
+        recover: list[tuple] = []
+        _now = time.time()
+        for fr, m in engine.models.items():
+            if nd.node_id not in m.stage_node_ids:
+                continue
+            in_use = (m.active > 0 or m.queued > 0
+                      or (_now - (m.last_used or 0)) < 600)
+            if not in_use:
+                continue   # idle -> invalidation frees every stage; re-auto-loads on demand
+            if getattr(m, "replica_idx", 0):
+                log_activity(f"node-restart: replica {fr} not auto-recovered (re-add replicas "
+                             "manually)")
+                continue
+            # Normalize the resident quant back into a /load-able tier (media models carry
+            # display strings: 'int4-e2' -> int4, 'bf16-off' -> offload mode).
+            q = m.quant or "none"
+            kw = {"kv_quant": (m.kv_quant or ""), "kv_offload": bool(m.kv_offload)}
+            if q == "bf16-off":
+                q, kw["t2i_offload"] = "none", True
+            elif q.startswith("int4"):
+                q = "int4"
+            recover.append((fr, m.ctx, q, kw))
         who = _client_ip(request)
         try:
             await link.send({"type": "restart"})
@@ -502,8 +529,30 @@ def register(app):
                                 status_code=502)
         log_activity(f"NODE RESTART: {nd.hostname} ({nd.node_id}) requested by {who}"
                      + (f" — drops {', '.join(affected)}" if affected else ""))
+        if recover:
+            async def _recover():
+                # Wait for the link-death invalidation to actually drop the models (the worker
+                # exits ~instantly; the dead socket surfaces within seconds) — reloading while
+                # the old copy is still registered would be treated as a live-model reload.
+                for _ in range(30):
+                    await asyncio.sleep(1.0)
+                    if all(fr not in engine.models for fr, _c, _q, _k in recover):
+                        break
+                await engine._await_free_refresh()   # plan against post-drop free numbers
+                for fr, ctx, q, kw in recover:
+                    if fr in engine.models:      # never dropped (or already re-loaded) — done
+                        continue
+                    try:
+                        log_activity(f"node-restart recovery: {fr} was in use — re-placing it "
+                                     f"onto the available fleet (was on {nd.hostname})")
+                        await engine.load(fr, ctx, quant=q, **kw)
+                    except Exception as exc:
+                        log_activity(f"node-restart recovery: {fr} re-load FAILED ({exc!r}) — "
+                                     "it will auto-load on the next request instead")
+            asyncio.create_task(_recover())
         return JSONResponse({"ok": True, "node": nd.hostname, "node_id": nd.node_id,
-                             "requested_by": who, "models_affected": affected})
+                             "requested_by": who, "models_affected": affected,
+                             "recovering": [fr for fr, _c, _q, _k in recover]})
 
     @app.post("/update")
     async def update_endpoint(request: Request, workers: int = 0, force: bool = False) -> JSONResponse:

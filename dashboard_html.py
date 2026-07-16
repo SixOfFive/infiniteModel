@@ -582,7 +582,11 @@ async function restartNode(host){
   if(!confirm('Restart the worker on '+host+'?\n\nFresh start for that node: the process relaunches and its VRAM/RAM clears. Any model with a stage on it drops and re-loads on demand.'))return;
   try{
     const r=await api('/restart_node?node='+encodeURIComponent(host),{method:'POST'});
-    toast(host+' restarting'+((r.models_affected||[]).length?' — drops '+r.models_affected.join(', '):''));
+    const rec=r.recovering||[], drop=(r.models_affected||[]).filter(m=>!rec.includes(m));
+    let msg=host+' restarting';
+    if(rec.length)msg+=' — re-placing in-use '+rec.join(', ');
+    if(drop.length)msg+=(rec.length?'; ':' — ')+'drops idle '+drop.join(', ');
+    toast(msg);
     tick();
   }catch(e){ toast(String(e.message||e),1); }
 }

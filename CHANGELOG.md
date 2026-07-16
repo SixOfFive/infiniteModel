@@ -365,6 +365,23 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   `self_update` command to every worker (stage files NOW; restart only on VERSION bump — the same
   rule as the poll), and `/update?workers=1` sends `restart+update` so each worker stages the new
   files *before* its exit(42), relaunching straight onto fresh code instead of waiting out the poll.
+- **Renders share the GPU with LLM decode (#gpu-share, 2026-07-16).** A t2i/t2a render used to
+  starve a co-resident text model to ~0 tok/s for its whole runtime: both submitted to the ONE
+  default CUDA/HIP stream (strict FIFO), so the DiT's minutes-deep kernel backlog sat in front of
+  every tiny decode kernel. Renders now run on their OWN side stream — the hardware scheduler
+  interleaves the two queues at kernel boundaries, so decode keeps flowing while the render fills
+  the gaps (true parallel sharing; no locks, no turn-taking). CPU devices / stream-creation
+  failure degrade to the old inline behavior; streams are drained before results are read on CPU.
+- **Per-node restart with in-use recovery (#node-restart, 2026-07-16).** Every node row on the
+  models page gains an ↻ — `POST /restart_node?node=<hostname|id>` restarts JUST that worker
+  process (exit 42 → supervisor relaunch), the per-node fresh start that clears whatever VRAM/RAM
+  it holds without touching the controller or the rest of the fleet. Models with a stage on the
+  node drop, then split by usage: **in use** (serving/queued, or used in the last 10 min) →
+  auto-RECOVERED — once the invalidation lands, a background task re-loads them with their
+  original ctx/quant/KV knobs and the planner re-places onto whatever capacity is up (other
+  nodes' GPU/CPU; the restarted node usually rejoins in seconds and competes again); **idle** →
+  the invalidation frees their surviving stages on the other nodes too, so they cost nothing
+  anywhere and re-auto-load on demand. The response + toast list both sets.
 - N models resident at once, per-node sharing, concurrency + queueing, auto-load/unload, same-model
   replication + data-parallel routing.
 - **Silent-wedge hardening (the beast kernel-panic postmortem, 2026-07-10).** A poisoned 30h-old
