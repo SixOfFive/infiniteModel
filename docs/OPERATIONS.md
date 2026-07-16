@@ -213,6 +213,7 @@ Three restart shapes, all on the Config page (or `POST /restart`):
 | **Restart controller** | `/restart?workers=0` | Controller only — **hitless for loaded models**: workers keep their shards across the restart and report them on reconnect; the controller **re-adopts** the resident models from those reports instead of re-streaming them (`ADOPTED <model> from the running fleet` in the activity log). |
 | **Restart fleet** | `/restart?workers=1&controller=0` | Every **worker** process relaunches; the controller stays up. Resident models drop (a worker restart wipes its shards) and re-load on demand or via persist pins. The reset for stale worker state / wedged loads / allocator-held VRAM when the controller is healthy. |
 | **Restart all** | `/restart?workers=1` | Controller + workers — the full reset. Persisted models re-stream after startup + `autostart_delay_s`; everything else re-auto-loads on demand. |
+| **Restart one node** (↻ on each node row) | `/restart_node?node=<hostname\|id>` | Relaunches **just that one worker** process — the per-node fresh start that clears whatever VRAM/RAM it's holding, without touching the controller or the rest of the fleet. Models with a stage on the node drop, then split by usage (below). |
 
 Adoption details (controller-only restart): models re-adopt within seconds of the workers
 reconnecting. **Not adopted** — tensor-parallel models, and any model whose stage workers don't
@@ -221,6 +222,20 @@ normally). Spec-decode **drafts** are controller-local and are not re-attached �
 to restore speculative decode. A request that arrives mid-adoption waits briefly (~10 s) for the
 adoption instead of racing a duplicate load. Mixed code versions degrade safely: an old worker
 (or old controller) simply drops shards on link loss like before.
+
+Per-node restart handles the models it drops by usage, so a fresh-start on a busy node isn't
+disruptive:
+
+- **In use** (serving/queued right now, or used within the last 10 minutes) → **auto-recovered**:
+  once the node's death invalidates the model, a background task re-loads it with its original
+  ctx / quant / KV settings and the planner re-places it onto whatever capacity is up — other
+  nodes' GPU/CPU, or the restarted node itself once it rejoins (usually within seconds). A failed
+  recovery falls back to on-demand auto-load, logged loudly. (Replicas aren't auto-recovered —
+  re-add them manually.)
+- **Idle** → the surviving stages on the *other* nodes are freed too, so the model costs nothing
+  anywhere and re-auto-loads on the next request.
+
+The response and the dashboard toast list both sets (`recovering: [...]` vs the dropped ones).
 
 ## Deploy & self-update
 

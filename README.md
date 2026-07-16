@@ -90,7 +90,13 @@ dashboard.
   auto-load/unload with **idle unload**, per-model lifecycle pins (**autoload on restart**,
   **do-not-auto-unload** veto), and the opt-in **juggler** — a ~60 s sweep that *hitlessly*
   promotes the hottest GPU+RAM-split model to VRAM-only once room frees (new requests just pause
-  on their open connection during the re-place; busy models are skipped, never stalled). A live
+  on their open connection during the re-place; busy models are skipped, never stalled).
+  **Hitless controller restarts** — workers keep their shards across a controller restart and the
+  controller *re-adopts* the resident models from their reports instead of re-streaming them;
+  separate **restart-fleet** (workers only), **restart-all**, and **per-node restart** (↻ —
+  fresh-start one worker; its in-use models auto-migrate onto the rest of the fleet) shapes round
+  out the lifecycle. **Renders share the GPU** with LLM decode (a text-to-image render runs on its
+  own CUDA/HIP stream, so co-resident chat keeps decoding instead of stalling to ~0 tok/s). A live
   dashboard (placement preview, per-load progress, per-model **capability badges** —
   vision / video / STT / TTS / OCR / embeddings / t2i — fleet memory/throughput, bandwidth,
   per-client connections), curl-able fleet logs (`/logs?node=…`), and idle-gated self-update.

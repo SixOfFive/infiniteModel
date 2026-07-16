@@ -187,7 +187,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   now pull `.pth`/`.pt` files for any repo that ships **no safetensors** (previously such a repo
   grabbed only `config.json`, so a Kokoro-style checkpoint + its `voices/` pack arrived empty). The
   weight-total measurement (`_hf_total_bytes`) falls back to `.pth`/`.pt` the same way, so the size
-  and download-% denominator are honest for weight-only and voice-pack repos.
+  and download-% denominator are honest for weight-only and voice-pack repos. (Follow-up `2b86ad7`:
+  the models-page **on-disk size** walk got the same `.pth`/`.pt` fallback so the Kokoro row shows a
+  real size instead of a blank "on disk", and the one-click **⚡int4 compile badge** now excludes
+  `tts`/`t2a` media models — their leaves never read the shard cache — matching the embedding/t2i
+  exclusions.)
 - **Media-model detail view (#tts-serve, 2026-07-15).** Clicking a media model (tts / t2i / t2a) on
   the models page now shows a media-appropriate Operational block instead of the LLM layout's zeros.
   The worker's `media_info()` (device, params, weight bytes, sample rate, voice list, default voice)
@@ -357,7 +361,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   split three ways on the Config page: **Restart controller** (`/restart?workers=0`, hitless via
   adoption), **Restart fleet** (`/restart?workers=1&controller=0` — NEW: workers only, the
   controller stays up and link-death invalidation cleans up the dropped models' state), and
-  **Restart all** (`/restart?workers=1`, the old full reset).
+  **Restart all** (`/restart?workers=1`, the old full reset). **Live-validated 2026-07-16** on both
+  controllers — single-stage, multi-stage (a 14B split beast+amdcomp), embedding, and **t2i-media**
+  (qwen-image, which rendered after adoption) — which surfaced one fix (`25bc53f`): a target
+  registered under BOTH an alias and its canonical key was adopted under the *alias*, making the row
+  unaddressable (`resolve_model_name` maps aliases away, so unload/load by name hit the canonical
+  entry and a later load built a doppelgänger); adoption now re-keys under the canonical key.
 - **Deploy cadence: 15-minute auto-poll + fleet-wide-immediate forced update (#fleet-update,
   2026-07-16).** The automatic idle self-update poll went 2 min → **15 min** on both controller and
   workers (a background safety net, not the deploy path). The forced **`POST /update`** ("Update +
