@@ -204,15 +204,37 @@ temperature.
 
 ---
 
+## Restart semantics
+
+Three restart shapes, all on the Config page (or `POST /restart`):
+
+| Button | Call | What happens |
+|---|---|---|
+| **Restart controller** | `/restart?workers=0` | Controller only — **hitless for loaded models**: workers keep their shards across the restart and report them on reconnect; the controller **re-adopts** the resident models from those reports instead of re-streaming them (`ADOPTED <model> from the running fleet` in the activity log). |
+| **Restart fleet** | `/restart?workers=1&controller=0` | Every **worker** process relaunches; the controller stays up. Resident models drop (a worker restart wipes its shards) and re-load on demand or via persist pins. The reset for stale worker state / wedged loads / allocator-held VRAM when the controller is healthy. |
+| **Restart all** | `/restart?workers=1` | Controller + workers — the full reset. Persisted models re-stream after startup + `autostart_delay_s`; everything else re-auto-loads on demand. |
+
+Adoption details (controller-only restart): models re-adopt within seconds of the workers
+reconnecting. **Not adopted** — tensor-parallel models, and any model whose stage workers don't
+all come back within the ~90 s grace (their kept shards are then freed and the model re-loads
+normally). Spec-decode **drafts** are controller-local and are not re-attached — reload the model
+to restore speculative decode. A request that arrives mid-adoption waits briefly (~10 s) for the
+adoption instead of racing a duplicate load. Mixed code versions degrade safely: an old worker
+(or old controller) simply drops shards on link loss like before.
+
 ## Deploy & self-update
 
-- **Idle self-update** applies fetched module files as they change but only *restarts* on a
-  VERSION bump. A **forced `POST /update`** fetches everything and restarts the **controller**
-  (`/update?workers=1` restarts the workers in the same pass).
-- **Worker processes do NOT restart on a plain `/update`** — files land on their disks, but the
-  running processes keep executing the old code. After a deploy that changes worker-side modules,
-  run **`POST /restart?workers=1`**. Long-lived worker processes accumulating stale state is a
-  real failure class — a periodic fleet-wide worker restart is cheap hygiene.
+- **Idle self-update** polls the repo every **15 minutes** (was 2), applies fetched module files
+  as they change, but only *restarts* on a VERSION bump. The immediate path is the forced update:
+- **Forced `POST /update` ("Update + deploy") is fleet-wide immediate**: it unloads all models,
+  pushes an **immediate update command to every worker** (files stage now; `/update?workers=1`
+  has each worker stage the new files *before* its relaunch so it comes back on fresh code), then
+  the controller swaps its own code and restarts. Deploys never wait on the 15-minute poll.
+- **Worker processes still do NOT restart on a plain `/update?workers=0`** — files land
+  immediately, but the running processes keep executing the old code until a VERSION bump or a
+  restart. After a deploy that changes worker-side modules, use `/update?workers=1` or
+  **Restart all**. Long-lived worker processes accumulating stale state is a real failure class —
+  a periodic fleet-wide worker restart is cheap hygiene.
 - **Both `/update` and `/restart` refuse (`409`) while work is in flight** — `/restart` while a
   load, compile, or text-to-image render is running; `/update` while a render is running (a
   forced update once orphaned a finished 12-minute render into a broken pipe). Renders are
@@ -220,5 +242,7 @@ temperature.
 - Raw-CDN propagation after a push is **per-file** and can lag minutes unevenly. Before a forced
   `/update`, verify **every** changed file's marker (e.g. `curl raw.../<file> | grep <marker>` or
   `GET /code_manifest?grep=` after), not just one.
-- Workers drop their shards when the controller link drops; persisted models re-stream on
-  startup (after `autostart_delay_s`), everything else re-auto-loads on demand.
+- A **controller-only** restart keeps workers' shards (see Restart semantics above); a forced
+  `/update` deliberately does NOT — a deploy may change model/worker code, so it starts clean.
+  Persisted models re-stream on startup (after `autostart_delay_s`), everything else
+  re-auto-loads on demand.

@@ -341,6 +341,30 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   decoders (Qwen2.5/3, Llama, Mistral/Devstral, DeepSeek).
 
 ## Multi-model & ops
+- **Hitless controller restart — shard adoption (#adopt, 2026-07-16).** A controller-only restart
+  no longer reloads models. Workers KEEP their loaded shards when the control link drops (gated on
+  the register ack's `adopt: true` capability flag, so mixed code versions degrade to the old
+  drop-on-disconnect in both directions) and re-register with a `loaded` inventory: the ORIGINAL
+  load message each model was sent with (kind, layer range, ctx, quant, KV flags — the complete
+  recipe, retained worker-side since the load) plus live gpu/loaded byte counts. The relaunched
+  controller REBUILDS each model's resident state from those recipes — spec/tokenizer/eos re-derive
+  from disk, stage plan from the assignments, a fresh stage0 dial — and the inter-worker data plane
+  self-heals lazily at prefill (the existing #stage0-stale-reconnect freshening). Coverage is
+  strict (every pipeline stage present + contiguous 0→N layers, else no adoption); TP models are
+  not adopted; kept shards that never assemble are freed by a 90 s grace sweep so nothing pins
+  worker memory invisibly; an auto-load racing a pending adoption waits ~10 s for it first;
+  spec-decode drafts (controller-local) are not re-attached — reload to restore. Restart semantics
+  split three ways on the Config page: **Restart controller** (`/restart?workers=0`, hitless via
+  adoption), **Restart fleet** (`/restart?workers=1&controller=0` — NEW: workers only, the
+  controller stays up and link-death invalidation cleans up the dropped models' state), and
+  **Restart all** (`/restart?workers=1`, the old full reset).
+- **Deploy cadence: 15-minute auto-poll + fleet-wide-immediate forced update (#fleet-update,
+  2026-07-16).** The automatic idle self-update poll went 2 min → **15 min** on both controller and
+  workers (a background safety net, not the deploy path). The forced **`POST /update`** ("Update +
+  deploy") is now the immediate path fleet-wide: alongside the existing unload+free, it pushes a
+  `self_update` command to every worker (stage files NOW; restart only on VERSION bump — the same
+  rule as the poll), and `/update?workers=1` sends `restart+update` so each worker stages the new
+  files *before* its exit(42), relaunching straight onto fresh code instead of waiting out the poll.
 - N models resident at once, per-node sharing, concurrency + queueing, auto-load/unload, same-model
   replication + data-parallel routing.
 - **Silent-wedge hardening (the beast kernel-panic postmortem, 2026-07-10).** A poisoned 30h-old
