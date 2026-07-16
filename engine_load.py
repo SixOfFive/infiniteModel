@@ -343,7 +343,7 @@ class EngineLoadMixin:
                 if _d and _is_diffusers_dir(_d):
                     return await self._load_t2i_locked(friendly, _tgt, reg_key or friendly,
                                                        quant, replica_idx=replica_idx,
-                                                       offload=t2i_offload)
+                                                       offload=t2i_offload, force=force)
                 raise ValueError(f"unknown model '{friendly}'")
             target_id = MODELS[friendly][0] if friendly in MODELS else friendly
             # ENCODER / sentence-embedding model: a whole-model single-node load (no pipeline/TP/KV
@@ -1184,7 +1184,7 @@ class EngineLoadMixin:
 
     async def _load_t2i_locked(self, friendly: str, target_id: str, reg_key: str,
                                quant: str = "int4", replica_idx: int = 0,
-                               offload: bool = False) -> LoadedModel:
+                               offload: bool = False, force: bool = False) -> LoadedModel:
         """#t2i-serve (task #37): load a DIFFUSERS image-generation checkpoint (Qwen-Image
         class) WHOLE onto ONE controller-CO-LOCATED GPU worker — the diffusion sibling of
         _load_embedding_locked. v1 constraints, by design: the worker must share this box's
@@ -1207,6 +1207,27 @@ class EngineLoadMixin:
         # no-eviction trade for tight cards like beast's 16 GB.
         if offload:
             quant = "none"
+        # Idempotent re-load (mirror the pipeline-path guard in _load_impl, which the t2i branch
+        # RETURNS before ever reaching): a duplicate /load for an already-resident image model in
+        # the SAME placement + precision is a NO-OP — return the live copy instead of evicting
+        # ~tens of GB and re-quantizing/re-streaming the DiT (the `reg_key in self.models` block
+        # below rebuilds UNCONDITIONALLY otherwise, so an accidental second Load click or a repeat
+        # API load paid a full rebuild). The resident LoadedModel.quant encodes the mode:
+        # 'bf16-off' (offload) | 'none' (GPU bf16) | 'int4-e{n}' (GPU int4). Edge count is NOT
+        # compared — a redundant load shouldn't rebuild just to renegotiate edge. A DIFFERENT
+        # precision/placement, or force=1 (the stuck-load override), still reloads.
+        _resident = self.models.get(reg_key)
+        if _resident is not None and not force and getattr(_resident, "is_t2i", False):
+            _rq = _resident.quant or ""
+            _have = ("bf16-off" if _rq == "bf16-off"
+                     else "bf16-gpu" if _rq == "none"
+                     else "int4-gpu" if _rq.startswith("int4") else _rq)
+            _want = "bf16-off" if offload else ("bf16-gpu" if quant == "none" else "int4-gpu")
+            if _have == _want:
+                log_activity(f"load {_ollama_name(friendly)}: image model already resident "
+                             f"({_want}) — duplicate load ignored (no-op)")
+                _resident.last_used = time.time()
+                return _resident
         # Real dims from the shipped transformer config (generic across Edit variants etc.).
         _tc = {}
         with contextlib.suppress(Exception):
