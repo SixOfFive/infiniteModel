@@ -596,14 +596,20 @@ def _display_weight_bytes(target_id: str, spec: ModelSpec) -> int:
 def _tree_weight_bytes(d: str) -> int:
     """Recursive on-disk sum of every *.safetensors under a model dir. The size fallback for
     layouts measure_model_weights can't parse — diffusers repos (#t2i) keep weights in
-    component subfolders, so the flat top-level glob sees nothing."""
-    total = 0
+    component subfolders, so the flat top-level glob sees nothing. A repo with NO safetensors
+    at all (Kokoro-style .pth + voices/*.pt packs) falls back to summing .pth/.pt — the same
+    no-safetensors rule the downloader uses — so weight-only models show a real size instead
+    of a blank 'on disk'."""
+    total = pt_total = 0
     for root, _dirs, files in os.walk(d):
         for f in files:
             if f.endswith(".safetensors"):
                 with contextlib.suppress(OSError):
                     total += os.path.getsize(os.path.join(root, f))
-    return total
+            elif f.endswith((".pth", ".pt")):
+                with contextlib.suppress(OSError):
+                    pt_total += os.path.getsize(os.path.join(root, f))
+    return total or pt_total
 
 
 def _friendly_from_hf(hf_id: str) -> str:

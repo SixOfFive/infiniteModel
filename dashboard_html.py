@@ -521,8 +521,11 @@ function fitMeta(m){
 function int4Badge(m){
   const cz=m.cached||{};
   // embedding encoders load whole-model float32 (_load_embedding_locked) and NEVER read the
-  // shard cache — a compile would fail (decoder-shaped packer) and the payoff is false. No badge.
-  if(!m.ready||(cz.int4&&cz.int4.ok)||(m.capabilities||[]).includes('embedding')||(m.capabilities||[]).includes('t2i'))return '';
+  // shard cache — a compile would fail (decoder-shaped packer) and the payoff is false. Same
+  // for the single-node media kinds (tts/t2a — Kokoro, ACE-Step): their leaves build whole
+  // pipelines and never touch _shards/. No badge for any of them.
+  const _nocache=['embedding','t2i','tts','t2a'];
+  if(!m.ready||(cz.int4&&cz.int4.ok)||(m.capabilities||[]).some(c=>_nocache.includes(c)))return '';
   const dk=(((LAST||{}).disk||{}).models||[]).find(x=>x.name===m.name||x.internal_name===m.internal_name)||{};
   const est=(dk.quant_gb||{}).int4, free=((LAST||{}).disk||{}).controller_free_gb;
   const tip='Compile the int4 shard cache for '+m.name
