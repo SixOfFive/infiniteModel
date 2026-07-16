@@ -17,7 +17,8 @@ from __future__ import annotations
 # and exit(42) so the supervisor (systemd Restart=always on Linux / the .bat loop
 # on Windows) relaunches the new code. Idle-gated so a running model is never cut.
 # ---------------------------------------------------------------------------
-SELF_UPDATE_POLL_S = 120   # poll GitHub every 2 minutes (fast deploys; idle-gated)
+SELF_UPDATE_POLL_S = 900   # poll GitHub every 15 minutes (idle-gated); a forced controller
+                           # /update reaches workers immediately instead of waiting on this poll
 SELF_UPDATE_FETCH_TRIES = 4      # #3: bounded retry per file within a cycle (CDN propagation lag on a
 SELF_UPDATE_FETCH_BACKOFF_S = 8  # freshly-added module 404s on raw.githubusercontent until it syncs)
 

@@ -92,6 +92,23 @@ class EngineLoadMixin:
         if m is not None:
             m.last_used = time.time()
             return m
+        # #adopt: a just-restarted controller may be mid-ADOPTING this very model from the
+        # workers that kept its shards — wait briefly for the adoption instead of racing a
+        # duplicate placement into VRAM the kept shards still occupy. Bounded (~10s): if the
+        # coverage never completes, fall through to a normal auto-load (the sweep frees the
+        # kept shards after grace, so the reload plans against honest numbers).
+        _tid = MODELS[friendly][0] if friendly in MODELS else friendly
+        _pool = self.__dict__.get("_adopt_pool") or {}
+        if _tid in _pool:
+            for _ in range(40):
+                await asyncio.sleep(0.25)
+                m = self.models.get(friendly)
+                if m is not None:
+                    m.last_used = time.time()
+                    print(f"[adopt] auto-load of {friendly} satisfied by adoption")
+                    return m
+                if _tid not in (self.__dict__.get("_adopt_pool") or {}):
+                    break
         # #autoload-smallest: an auto-loaded (requested-but-not-resident) model defaults to the
         # SMALLEST quant — int4 — so a request never streams the full bf16 just to serve it (int4
         # is ~1/4 the memory, fits more nodes, and serves PRE-PACKED when a shard cache exists).
@@ -2434,3 +2451,293 @@ class EngineLoadMixin:
             if nodes and all(n.last_heartbeat >= since for n in nodes):
                 return
             await asyncio.sleep(0.5)
+
+    # ---- #adopt: controller-restart shard adoption ------------------------------------------
+    # When THIS controller restarts, workers (on adopt-capable code) KEEP their loaded shards
+    # and report them in their re-register message (`loaded`: one entry per model, carrying the
+    # ORIGINAL load-message `assign` this controller's predecessor sent, plus live byte counts).
+    # Instead of re-streaming tens of GB, the controller REBUILDS each model's LoadedModel from
+    # those recipes: spec/tokenizer/eos re-derive from the model dir on disk, StageAssign/
+    # PlanResult from the assignments, and the stage0 data connection re-dials fresh. The
+    # workers' inter-hop data plane self-heals lazily (#stage0-stale-reconnect freshens every
+    # hop at prefill), so an adopted pipeline serves its first request without ceremony.
+    # NOT adopted (reload required, shards freed by the grace sweep): tensor-parallel models
+    # (mesh state doesn't survive the controller's tp_root bookkeeping) and anything whose
+    # coverage never completes (a stage's worker stayed down). Spec-decode DRAFTS are
+    # controller-local and are not re-attached — reload to restore speculative decode.
+    _ADOPT_GRACE_S = 90.0     # unassembled reports older than this get their shards freed
+
+    def _adopt_state(self) -> tuple[dict, bool]:
+        """Lazy-init the adoption pool (engine __init__ lives in server.py; keeping state
+        creation here makes adoption self-contained for mixed-version fleets)."""
+        pool = self.__dict__.setdefault("_adopt_pool", {})
+        have_sweeper = self.__dict__.get("_adopt_sweeper") is not None
+        return pool, have_sweeper
+
+    async def adopt_worker_models(self, node, inv: list) -> None:
+        """Ingest one re-registering worker's kept-model inventory and adopt what completes.
+        Called from control_plane's register path (fire-and-forget task)."""
+        if getattr(self, "updating", False) or not inv:
+            return
+        pool, have_sweeper = self._adopt_state()
+        touched: set = set()
+        for e in inv:
+            if not isinstance(e, dict):
+                continue
+            a = e.get("assign") or {}
+            tid = e.get("model_id") or a.get("model_id")
+            if not tid or not isinstance(a, dict):
+                continue
+            rep = {"node": node, "assign": a,
+                   "gpu_bytes": int(e.get("gpu_bytes") or 0),
+                   "gpu_kv_bytes": int(e.get("gpu_kv_bytes") or 0),
+                   "loaded_bytes": int(e.get("loaded_bytes") or 0),
+                   "media": e.get("media"), "ts": time.time()}
+            slot = pool.setdefault(tid, {"reports": [], "first_ts": time.time()})
+            # A node that re-reports (reconnect flap) replaces its old entry, not duplicates it.
+            slot["reports"] = [r for r in slot["reports"]
+                               if r["node"].hostname != node.hostname] + [rep]
+            touched.add(tid)
+            print(f"[adopt] {node.hostname} holds {tid} "
+                  f"(stage {a.get('stage', 0)}, kind {a.get('kind') or 'llm'}, "
+                  f"{rep['loaded_bytes'] / GB:.1f} GB)")
+        if not have_sweeper:
+            self._adopt_sweeper = asyncio.create_task(self._adopt_sweep())
+        for tid in touched:
+            try:
+                await self._adopt_try_assemble(tid)
+            except Exception as exc:
+                # Assembly failure = fall back to a normal reload; the sweep frees the shards.
+                print(f"[adopt] {tid}: assembly failed ({exc!r}) — will free and rely on reload")
+
+    async def _adopt_try_assemble(self, target_id: str) -> None:
+        """Adopt `target_id` if its reports now cover the whole model. Holds engine.lock for
+        the state mutation (same discipline as load())."""
+        pool, _ = self._adopt_state()
+        slot = pool.get(target_id)
+        if slot is None:
+            return
+        reports = slot["reports"]
+        if not reports:
+            return
+        a0 = reports[0]["assign"]
+        kind = a0.get("kind") or ""
+        if int(a0.get("tp_size", 1) or 1) > 1:
+            return   # TP is not adoptable — the sweep frees it after grace
+        # ---- coverage check (outside the lock: read-only) ----
+        if kind in ("embedding", "t2i", "t2a", "tts"):
+            picked = [reports[0]]                       # single-node kinds: any one report serves
+        else:
+            n_stages = int(a0.get("num_stages", 0) or 0)
+            if not n_stages:
+                return   # not a pipeline recipe we understand (e.g. TP peer) — sweep frees it
+            by_stage: dict = {}
+            for r in reports:
+                by_stage.setdefault(int(r["assign"].get("stage", -1)), r)
+            if set(by_stage) != set(range(n_stages)):
+                return   # a stage's worker hasn't re-registered (yet)
+            picked = [by_stage[i] for i in range(n_stages)]
+            for i in range(1, n_stages):                # contiguous layer coverage, in order
+                if int(picked[i]["assign"].get("layer_start", -1)) != \
+                        int(picked[i - 1]["assign"].get("layer_end", -2)):
+                    return
+            if not (picked[0]["assign"].get("has_embed") and picked[-1]["assign"].get("has_head")):
+                return
+        friendly = next((f for f, v in MODELS.items()
+                         if v and v[0] == target_id), target_id)
+        reg_key = friendly
+        async with self.lock:
+            if pool.get(target_id) is not slot:          # raced with another assemble/sweep
+                return
+            if reg_key in self.models or reg_key in self.loadings or \
+                    getattr(self, "updating", False):
+                # Already resident (reloaded faster than we adopted) — these shards are
+                # superseded; leave them for the sweep to free.
+                return
+            lm = await self._adopt_build_lm(friendly, reg_key, target_id, kind, picked)
+            if lm is None:
+                return
+            self.models[reg_key] = lm
+            # Consume the used reports; replica leftovers (same target on other nodes) stay
+            # behind for the sweep to free — replica reg_keys aren't reconstructible.
+            slot["reports"] = [r for r in reports if r not in picked]
+            if not slot["reports"]:
+                pool.pop(target_id, None)
+        registry.dirty = False
+        _hosts = [s.hostname for s in lm.plan.stages]
+        _gpu = sum(s.gpu_bytes for s in lm.plan.stages) / GB
+        print(f"[adopt] ADOPTED {reg_key} from {_hosts} ({_gpu:.1f} GB GPU) — no reload")
+        log_activity(f"ADOPTED {_ollama_name(reg_key)} from the running fleet "
+                     f"({len(lm.plan.stages)} stage(s) on {', '.join(_hosts)}, "
+                     f"{_gpu:.1f} GB GPU) — controller restarted without reloading")
+
+    async def _adopt_build_lm(self, friendly: str, reg_key: str, target_id: str,
+                              kind: str, picked: list) -> Optional["LoadedModel"]:
+        """Rebuild the LoadedModel for an adopted set — the mirror of each load path's tail,
+        minus the actual weight streaming. Caller holds self.lock."""
+        await self.ensure_data_listener()
+        a0 = picked[0]["assign"]
+        node0 = picked[0]["node"]
+        now = time.time()
+        tot0 = picked[0]["loaded_bytes"]
+
+        def _stage(r, layer_start, layer_end, est):
+            st = StageAssign(node_id=r["node"].node_id, hostname=r["node"].hostname,
+                             layer_start=layer_start, layer_end=layer_end,
+                             has_embed=bool(r["assign"].get("has_embed", layer_start == 0)),
+                             has_head=bool(r["assign"].get("has_head", True)),
+                             est_bytes=int(est), usable_bytes=int(r["node"].usable_total_gb * GB),
+                             gpu_bytes=r["gpu_bytes"], loaded_bytes=r["loaded_bytes"])
+            st.gpu_kv_bytes = r["gpu_kv_bytes"]          # coexistence VRAM reserve (#95)
+            nd = r["node"]
+            nd.shard_gpu_bytes = r["gpu_bytes"]          # mirror the load tail's node bookkeeping
+            nd.load_state = "ready"
+            if nd.stage is None:
+                nd.stage, nd.layer_start, nd.layer_end = 0, layer_start, layer_end
+            return st
+
+        if kind == "embedding":
+            spec = resolve_spec(friendly)
+            model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+            spec = await asyncio.to_thread(spec_with_measurements, spec, model_dir)
+            tok = await asyncio.to_thread(_get_tokenizer, target_id)
+            st = _stage(picked[0], 0, spec.num_layers, spec.total_weight_bytes)
+            plan = PlanResult(ok=True, model=spec.name, ctx_len=spec.max_ctx,
+                              num_layers=spec.num_layers, pool_usable_gb=node0.usable_total_gb,
+                              required_gb=spec.total_weight_bytes / GB, stages=[st])
+            dial = (_dial_host(node0.data_host), node0.data_port)
+            lm = LoadedModel(reg_key, target_id, spec, spec.max_ctx, plan,
+                             [node0.node_id], tok, set(), now, quant="none",
+                             stage0_writer=await self._connect_retry(*dial),
+                             last_used=now, stage0_dial=dial, last_send_ts=now)
+            lm.base, lm.replica_idx = friendly, 0
+            lm.plan_basis = "embedding: single-node (adopted)"
+            return lm
+
+        if kind in ("t2i", "t2a", "tts"):
+            # Media kinds: one co-located worker holds the whole pipeline. Their specs carry
+            # accounting dims only (serving never consults them) — mirror each tail's shape.
+            model_dir = a0.get("model_dir") or ""
+            if kind == "t2i":
+                _tc = {}
+                with contextlib.suppress(Exception):
+                    with open(os.path.join(model_dir, "transformer", "config.json"),
+                              encoding="utf-8") as _fh:
+                        _tc = json.load(_fh)
+                _layers = int(_tc.get("num_layers") or 60)
+                _heads = int(_tc.get("num_attention_heads") or 24)
+                _hd = int(_tc.get("attention_head_dim") or 128)
+                spec = ModelSpec(name=friendly, hidden_size=_heads * _hd, num_layers=_layers,
+                                 num_heads=_heads, num_kv_heads=_heads, head_dim=_hd,
+                                 intermediate_size=int(_tc.get("joint_attention_dim") or 3584),
+                                 vocab_size=0, tie_embeddings=True, max_ctx=0, arch="t2i",
+                                 meas_layer_w=max(1, tot0 // max(1, _layers)),
+                                 meas_embed=0, meas_head=0, meas_norm=0,
+                                 meas_params=max(1, tot0))
+            elif kind == "t2a":
+                spec = ModelSpec(name=friendly, hidden_size=2560, num_layers=24, num_heads=20,
+                                 num_kv_heads=20, head_dim=128, intermediate_size=6400,
+                                 vocab_size=0, tie_embeddings=True, max_ctx=0, arch="t2a",
+                                 meas_layer_w=max(1, tot0 // 24), meas_embed=0, meas_head=0,
+                                 meas_norm=0, meas_params=max(1, tot0))
+            else:
+                spec = ModelSpec(name=friendly, hidden_size=1, num_layers=1, num_heads=1,
+                                 num_kv_heads=1, head_dim=1, intermediate_size=1, vocab_size=0,
+                                 tie_embeddings=True, max_ctx=0, arch="tts",
+                                 meas_layer_w=1, meas_embed=0, meas_head=0, meas_norm=0,
+                                 meas_params=max(1, tot0))
+            n_layers = spec.num_layers if kind == "t2i" else 1
+            st = _stage(picked[0], 0, n_layers, tot0 or 1)
+            plan = PlanResult(ok=True, model=spec.name, ctx_len=0, num_layers=n_layers,
+                              pool_usable_gb=node0.usable_total_gb,
+                              required_gb=(tot0 or 1) / GB, stages=[st])
+            dial = (_dial_host(node0.data_host), node0.data_port)
+            offload = bool(a0.get("t2i_offload") or a0.get("t2a_offload"))
+            if kind == "t2i":
+                q = ("bf16-off" if offload else
+                     ("none" if (a0.get("quant") or "none") == "none"
+                      else f"int4-e{int(a0.get('t2i_edge', 2) or 2)}"))
+            else:
+                q = "none"
+            lm = LoadedModel(reg_key, target_id, spec, 0, plan, [node0.node_id],
+                             None, set(), now, quant=q,
+                             stage0_writer=await self._connect_retry(*dial),
+                             last_used=now, stage0_dial=dial, last_send_ts=now)
+            lm.base, lm.replica_idx = friendly, 0
+            lm.plan_basis = f"{kind}: single-node (adopted)"
+            if kind == "t2i":
+                lm.is_t2i = True
+            elif kind == "t2a":
+                lm.is_t2a = True
+                lm.t2a_offload = offload
+            else:
+                lm.is_tts = True
+                lm.is_kokoro = True
+            lm.media = picked[0].get("media")            # #media-detail (may be None)
+            return lm
+
+        # ---- pipeline LLM ----
+        spec = resolve_spec(friendly)
+        model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+        spec = await asyncio.to_thread(spec_with_measurements, spec, model_dir)
+        quant = a0.get("quant") or "none"
+        spec = spec.for_quant(quant)
+        last_end = int(picked[-1]["assign"].get("layer_end", 0))
+        if last_end != spec.num_layers:
+            print(f"[adopt] {reg_key}: reported layers 0-{last_end} != spec {spec.num_layers} "
+                  f"— not adopting (model changed on disk?)")
+            return None
+        ctx = int(a0.get("ctx", 0) or 0)
+        stages = [_stage(r, int(r["assign"]["layer_start"]), int(r["assign"]["layer_end"]),
+                         r["loaded_bytes"] or max(1, spec.total_weight_bytes
+                                                  * max(1, int(r["assign"]["layer_end"])
+                                                        - int(r["assign"]["layer_start"]))
+                                                  // max(1, spec.num_layers)))
+                  for r in picked]
+        plan = PlanResult(ok=True, model=spec.name, ctx_len=ctx, num_layers=spec.num_layers,
+                          pool_usable_gb=sum(r["node"].usable_total_gb for r in picked),
+                          required_gb=sum(s.est_bytes for s in stages) / GB, stages=stages)
+        tok = await asyncio.to_thread(_get_tokenizer, target_id)
+        eos = self._eos_ids(tok)
+        dial = (_dial_host(node0.data_host), node0.data_port)
+        lm = LoadedModel(reg_key, target_id, spec, ctx, plan,
+                         [s.node_id for s in stages], tok, eos, now,
+                         quant=quant, kv_quant=(a0.get("kv_quant") or "none"),
+                         kv_offload=bool(a0.get("kv_offload")),
+                         stage0_writer=await self._connect_retry(*dial),
+                         last_used=now, stage0_dial=dial, last_send_ts=now)
+        lm.base, lm.replica_idx = friendly, 0
+        lm.plan_basis = "adopted from running workers (controller restart)"
+        return lm
+
+    async def _adopt_sweep(self) -> None:
+        """Free orphaned kept shards: reports that never assembled within the grace window
+        (a stage's worker stayed down, TP recipes, replica leftovers, or shards superseded
+        by a faster reload). Without this they'd silently pin worker RAM/VRAM forever."""
+        pool, _ = self._adopt_state()
+        try:
+            while True:
+                await asyncio.sleep(15.0)
+                if not pool:
+                    continue
+                now = time.time()
+                for tid in list(pool):
+                    slot = pool.get(tid)
+                    if not slot or now - slot["first_ts"] < self._ADOPT_GRACE_S:
+                        continue
+                    for r in slot.get("reports") or []:
+                        nid = r["node"].node_id
+                        link = self.links.get(nid)
+                        if link is not None:
+                            with contextlib.suppress(Exception):
+                                await link.send({"type": "unload", "model_id": tid})
+                        print(f"[adopt] freeing unadopted shard of {tid} on "
+                              f"{r['node'].hostname} (grace expired)")
+                    if slot.get("reports"):
+                        log_activity(f"adoption incomplete for {_ollama_name(tid)} — freed "
+                                     f"kept shard(s) on "
+                                     + ", ".join(r["node"].hostname for r in slot["reports"])
+                                     + " (reload to serve it)")
+                    pool.pop(tid, None)
+        finally:
+            self.__dict__["_adopt_sweeper"] = None

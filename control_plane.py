@@ -224,8 +224,13 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         node = await registry.add(msg, peer_host=peer_host)
         net_account(node.node_id, from_node=len(line))  # register msg, node -> controller
         engine.links[node.node_id] = ControlLink(node.node_id, writer)
+        # #adopt: advertise that THIS controller re-adopts kept shards, so the worker keeps
+        # its loaded models across a controller-only restart instead of dropping them on
+        # link loss (old workers ignore the flag; old controllers don't send it -> workers
+        # drop shards exactly as before — mixed versions degrade to the old behavior).
         reg_reply = _enc({"type": "registered", "node_id": node.node_id,
-                          "os_reserve_gb": ARGS.os_reserve_gb, "server_version": VERSION})
+                          "os_reserve_gb": ARGS.os_reserve_gb, "server_version": VERSION,
+                          "adopt": True})
         writer.write(reg_reply)
         await writer.drain()
         net_account(node.node_id, to_node=len(reg_reply))  # controller -> node
@@ -244,6 +249,15 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             await registry.remove(stale.node_id)
             print(f"[+] {node.hostname} re-registered as {node.node_id} (was {stale.node_id}); "
                   f"recovered {n_rec} model(s) the restart invalidated")
+
+        # #adopt: the register carried a kept-loaded-model inventory (this worker held its
+        # shards across a controller restart) — rebuild those models' controller state from
+        # the reported recipes instead of re-streaming them. Fire-and-forget: registration
+        # must not block on adoption, and a failed adoption falls back to normal reloads
+        # (the adopt sweep frees any shard that never assembles).
+        _inv = msg.get("loaded") or []
+        if _inv:
+            asyncio.create_task(engine.adopt_worker_models(node, _inv))
 
         link = engine.links[node.node_id]
         _fwd_seen: dict = {}   # #prefill-progress: last fwd ts seen per model on THIS connection

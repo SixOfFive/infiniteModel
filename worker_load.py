@@ -738,6 +738,29 @@ class WorkerLoadMixin:
         return {"req_id": msg.get("req_id"), "unit": msg.get("unit"),
                 "bytes": len(blob), "tensors": len(mtensors)}
 
+    def inventory(self) -> list:
+        """#adopt: describe every loaded model for the register message, so a controller that
+        restarted can RE-ADOPT them instead of re-streaming. Each entry carries the ORIGINAL
+        load message (`self.assignments[mid]` — the complete recipe the controller sent: kind,
+        layer range, ctx, quant, kv flags, device …) plus live byte counts off the shard. All
+        values came off the JSON control link or are ints, so the report is JSON-safe."""
+        out = []
+        for mid, a in list(self.assignments.items()):
+            sh = self.shards.get(mid)
+            if sh is None or not isinstance(a, dict):
+                continue
+            entry = {"model_id": mid, "assign": a,
+                     "gpu_bytes": int(getattr(sh, "gpu_bytes", 0) or 0),
+                     "gpu_kv_bytes": int(getattr(sh, "gpu_kv_bytes", 0) or 0),
+                     "loaded_bytes": int(getattr(sh, "loaded_bytes", 0) or 0),
+                     "loaded_params": int(getattr(sh, "loaded_params", 0) or 0)}
+            mi = getattr(sh, "media_info", None)   # media leaves (t2i/t2a/tts): voices/device/sr
+            if callable(mi):
+                with contextlib.suppress(Exception):
+                    entry["media"] = mi()
+            out.append(entry)
+        return out
+
     async def handle_unload(self, model_id: str | None = None) -> None:
         """Per-model unload when model_id is given; otherwise a FULL teardown of every model
         (what the controller sends today, and what the session does on disconnect)."""

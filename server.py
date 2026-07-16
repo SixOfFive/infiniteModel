@@ -84,7 +84,8 @@ def print(*args, **kwargs):  # noqa: A001 — intentional builtin shadow for tim
 # relaunches the new code. Workers reconnect automatically. ---
 import wire   # shared: cluster config (load_config) + self-update source URL. wire.py is a core file
              # present in every checkout and kept in sync via EXTRA_UPDATE_FILES.
-SELF_UPDATE_POLL_S = 120   # poll the repo every 2 minutes (fast deploys; idle-gated)
+SELF_UPDATE_POLL_S = 900   # poll the repo every 15 minutes (idle-gated); the Config page's
+                           # forced "Update + Deploy" (/update?force=1) is the immediate path
 SELF_UPDATE_FETCH_TRIES = 4      # #3: bounded retry per file within a cycle (CDN propagation lag on a
 SELF_UPDATE_FETCH_BACKOFF_S = 8  # freshly-added module 404s on raw.githubusercontent until it syncs)
 
@@ -2393,8 +2394,13 @@ def build_app() -> FastAPI:
         juggler_sweeper = asyncio.create_task(_juggler_sweep_loop())
         async def _persist_reload():
             # #77: re-load the PERSISTED models on startup so a resident model survives a controller
-            # restart/crash/deploy without a manual reload (workers drop their shards on link loss, so
-            # recovery = re-stream). Wait for capable workers + a short settle so GPU models land on
+            # restart/crash/deploy without a manual reload. #adopt made the common case hitless:
+            # workers KEEP their shards across a controller-only restart and the controller re-adopts
+            # them within seconds of reconnect (adopted models are in engine.models long before this
+            # task's settle+delay window ends, so the `name in engine.models` skip below covers them).
+            # This reloader remains the recovery for everything adoption can't carry: full-fleet
+            # restarts, worker crashes, forced updates (which unload everything). Wait for capable
+            # workers + a short settle so GPU models land on
             # the GPU, not CPU (the restart-timing trap). Idempotent / dedup-safe vs auto-load traffic.
             persist = dict(ENGINE_CONFIG.get("persist_models") or {})
             if not persist:

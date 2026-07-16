@@ -420,14 +420,22 @@ def register(app):
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     @app.post("/restart")
-    async def restart(request: Request, workers: int = 1, force: bool = False) -> JSONResponse:
-        # FULL-FLEET RESTART: signal every connected worker to restart, then restart the controller.
-        # UNLIKE the idle-gated self-update, this is an EXPLICIT command and is NOT idle-gated.
-        # Supervisors relaunch on exit 42 (server.bat / client.bat / systemd Restart=always).
-        # workers=0 -> restart the controller only. GENTLER (#100): refuse while a load is IN PROGRESS
-        # — restarting mid-build drops a node from the load (and can leave it not cleanly rejoining);
-        # pass force=1 to abort a wedged/doomed load anyway (the original escape-hatch behavior).
-        # Blocks on in-flight LOADS, COMPILES or RENDERS (all lose work on restart); force=1 overrides.
+    async def restart(request: Request, workers: int = 1, force: bool = False,
+                      controller: int = 1) -> JSONResponse:
+        # RESTART, three shapes (all EXPLICIT commands, never idle-gated; supervisors relaunch
+        # on exit 42 — server.bat / client.bat / systemd Restart=always):
+        #   workers=0            -> CONTROLLER ONLY. #adopt: workers on adopt-capable code KEEP
+        #                           their loaded shards and re-register with an inventory; the
+        #                           relaunched controller re-ADOPTS the resident models instead
+        #                           of re-streaming them — a hitless controller bounce.
+        #   workers=1&controller=0 -> WORKERS ONLY ("Restart fleet"): every worker process
+        #                           relaunches; the controller stays up. Resident models drop
+        #                           (a worker restart wipes its shards) and the existing
+        #                           link-death invalidation cleans up their controller state;
+        #                           they re-load on demand / by pins.
+        #   workers=1 (default)  -> RESTART ALL: workers + controller — the full reset that
+        #                           clears stale worker state, wedged loads and allocator VRAM.
+        # GENTLER (#100): refuse while a load/compile/render is IN PROGRESS; force=1 overrides.
         _renders = getattr(engine, "_t2i_pending", None) or {}
         if (engine.loadings or engine.compiling or _renders) and not force:
             return JSONResponse({"ok": False, "status": "load_in_progress",
@@ -437,6 +445,9 @@ def register(app):
                                  "compiling": [c.get("model") for c in engine.compiling.values()],
                                  "rendering": len(_renders)},
                                 status_code=409)
+        if not workers and not controller:
+            return JSONResponse({"ok": False, "error": "nothing to restart "
+                                 "(workers=0&controller=0)"}, status_code=400)
         signaled = []
         if workers:
             for nid, link in list(engine.links.items()):
@@ -444,15 +455,21 @@ def register(app):
                     await link.send({"type": "restart"})
                     signaled.append(nid)
         who = _client_ip(request)   # who triggered it (dashboard browser / curl host) for the log
-        msg = (f"FLEET RESTART requested by {who} -> {len(signaled)} worker(s) + controller "
-               f"(exit 42){' [controller only]' if not workers else ''}")
+        _shape = ("controller only" if not workers
+                  else ("workers only" if not controller else "workers + controller"))
+        msg = (f"RESTART ({_shape}) requested by {who} -> {len(signaled)} worker(s)"
+               f"{' + controller (exit 42)' if controller else ''}")
         log_activity(msg)
-        print(f"[restart] {msg}; controller exiting(42) in 2s")
-        async def _bye():
-            await asyncio.sleep(2.0)   # let worker frames flush + this HTTP response return
-            os._exit(42)               # server.bat supervisor relaunches on the current code
-        asyncio.create_task(_bye())
-        return JSONResponse({"ok": True, "restarting_controller": True, "requested_by": who,
+        if controller:
+            print(f"[restart] {msg}; controller exiting(42) in 2s")
+            async def _bye():
+                await asyncio.sleep(2.0)   # let worker frames flush + this HTTP response return
+                os._exit(42)               # server.bat supervisor relaunches on the current code
+            asyncio.create_task(_bye())
+        else:
+            print(f"[restart] {msg}; controller staying up")
+        return JSONResponse({"ok": True, "restarting_controller": bool(controller),
+                             "requested_by": who,
                              "workers_signaled": signaled, "worker_count": len(signaled)})
 
     @app.post("/update")
@@ -486,10 +503,20 @@ def register(app):
             with contextlib.suppress(Exception):
                 await link.send({"type": "free_memory"})      # drop shards + gc + drop OS caches
                 if workers:
-                    await link.send({"type": "restart"})      # full worker relaunch too
+                    # restart+update: the worker stages the newest files BEFORE its exit(42) so
+                    # the supervisor relaunches it on the fresh code immediately (old workers
+                    # ignore the extra key and restart on current code — their poll converges).
+                    await link.send({"type": "restart", "update": True})
+                else:
+                    # #fleet-update: command an IMMEDIATE self-update check (apply files now;
+                    # restart only on a VERSION bump — the same rule as the idle poll). This is
+                    # what makes the "Update + Deploy" button fleet-wide immediate now that the
+                    # automatic poll is 15 min. Old workers ignore the unknown message type.
+                    await link.send({"type": "self_update"})
                 freed.append(nid)
-        msg = (f"FORCED UPDATE by {who}: unloaded {names or 'none'}, freed RAM on {len(freed)} "
-               f"worker(s){' + worker restart' if workers else ''} -> swap code + restart")
+        msg = (f"FORCED UPDATE by {who}: unloaded {names or 'none'}, freed RAM + pushed update "
+               f"to {len(freed)} worker(s){' + worker restart' if workers else ''} "
+               f"-> swap code + restart")
         log_activity(msg); print(f"[update] {msg}")
         async def _go():
             await asyncio.sleep(1.5)   # let unload/free acks + this HTTP response flush

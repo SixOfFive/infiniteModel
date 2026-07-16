@@ -870,6 +870,9 @@ class Worker(WorkerLoadMixin, WorkerNetMixin):
         # plain await is safe — no cross-thread queue needed.
         self._ctrl_send = None       # Optional[Callable[[dict], Awaitable[None]]]
         self._node_id: str = ""      # our registered node id (stamped onto the hop_error frame)
+        # #adopt: True once a register-ack advertised adoption — this controller re-adopts kept
+        # shards, so the session teardown KEEPS loaded models across a controller-only restart.
+        self._ctrl_adopts: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +997,11 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
     _enable_keepalive(writer)
     wlock = asyncio.Lock()
     try:
+        # #adopt: refresh the dynamic loaded-model inventory on EVERY (re)connect — a freshly
+        # restarted controller uses it to re-ADOPT the models this worker kept across the
+        # restart (old controllers just ignore the extra field).
+        with contextlib.suppress(Exception):
+            reg["loaded"] = worker.inventory()
         async with wlock:
             writer.write(_enc(reg))
             await writer.drain()
@@ -1004,6 +1012,14 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
         if ack.get("type") != "registered":
             raise ConnectionError(f"unexpected ack: {ack}")
         node_id = ack["node_id"]
+        # #adopt: does THIS controller re-adopt kept shards? Governs the session-teardown
+        # choice below (keep vs drop). If we are holding shards kept for adoption but the
+        # controller that came back CAN'T adopt (older code / rollback), drop them now —
+        # it doesn't know about them, and they'd pin RAM/VRAM invisibly forever.
+        worker._ctrl_adopts = bool(ack.get("adopt"))
+        if not worker._ctrl_adopts and worker.shards:
+            print(f"[adopt] controller lacks adoption — dropping {len(worker.shards)} kept model(s)")
+            await worker.handle_unload()
         on_connected()  # registration succeeded -> reset reconnect backoff
         print(f"[+] registered as {node_id} on {args.controller}:{args.control_port} "
               f"(server {ack.get('server_version', '?')})")
@@ -1089,14 +1105,26 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     with contextlib.suppress(Exception):
                         await reply({"type": "freed", "node_id": node_id, "free_gb": round(freed, 2)})
                     print(f"[free] controller requested RAM release -> {freed:.1f} GB free")
+                elif mtype == "self_update":
+                    # #fleet-update: forced fleet-wide deploy — run the self-update check NOW
+                    # (apply changed files; restart only on a VERSION bump, the same rule as
+                    # the idle poll). The controller sends this right after unloading models +
+                    # free_memory, so forcing the idle gate true is safe here.
+                    print("[update] controller requested an immediate self-update check")
+                    asyncio.create_task(asyncio.to_thread(
+                        _self_update_check, "client.py", (lambda: True)))
                 elif mtype == "restart":
-                    # Controller commanded a full-fleet restart (e.g. to abort a wedged load or
-                    # force a fresh deploy). Ack, then exit(42) so the supervisor (client.bat /
-                    # systemd Restart=always) relaunches on the current code — drops any resident
-                    # shard cleanly on relaunch. (#fleet-restart)
+                    # Controller commanded a restart (fleet restart / forced deploy). Ack, then
+                    # exit(42) so the supervisor (client.bat / systemd Restart=always) relaunches
+                    # — dropping any resident shard cleanly. (#fleet-restart) With update:true
+                    # (#fleet-update), stage the newest files FIRST so the relaunch comes back on
+                    # fresh code immediately instead of waiting on the 15-min poll.
                     print("[restart] controller requested restart - exiting(42) for supervisor relaunch")
                     with contextlib.suppress(Exception):
                         await reply({"type": "restarting", "node_id": node_id})
+                    if msg.get("update"):
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(_self_update_check, "client.py", (lambda: True))
                     os._exit(42)
 
         hb = asyncio.create_task(
@@ -1114,7 +1142,17 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                 raise exc  # surfaces heartbeat-send failure -> reconnect
     finally:
         worker._ctrl_send = None   # #hop-recovery: drop the dead session's control sender
-        await worker.handle_unload()
+        # #adopt: if the controller advertises adoption, KEEP the loaded shards across the
+        # link loss — a controller-only restart re-adopts them on reconnect (no re-stream).
+        # Per-request transients still flush: staged multimodal embeds must not leak into a
+        # fresh controller epoch (req_id restarts from 0). Every other teardown reason —
+        # old controller, worker-side exit — keeps the full unload exactly as before.
+        if getattr(worker, "_ctrl_adopts", False) and worker.shards:
+            worker.pending_mm.clear()
+            print(f"[adopt] control link lost — keeping {len(worker.shards)} loaded model(s) "
+                  "for controller re-adoption")
+        else:
+            await worker.handle_unload()
         with contextlib.suppress(Exception):
             writer.close()
             await writer.wait_closed()
