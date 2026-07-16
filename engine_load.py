@@ -2543,8 +2543,17 @@ class EngineLoadMixin:
                     return
             if not (picked[0]["assign"].get("has_embed") and picked[-1]["assign"].get("has_head")):
                 return
-        friendly = next((f for f, v in MODELS.items()
-                         if v and v[0] == target_id), target_id)
+        # #adopt-canonical: a target can be registered under BOTH an alias key and its
+        # canonical key (om3nbox: 'qwen2.5-14b' aliases 'qwen2.5-14b-instruct', same HF
+        # target). First-match adoption resurrected the model under the ALIAS key — which
+        # resolve_model_name() maps AWAY from, so the adopted row was unaddressable (every
+        # unload/load by name hit the canonical entry instead, and a later canonical load
+        # built a doppelganger row). Prefer the key the resolver treats as canonical: one
+        # MODEL_ALIASES doesn't map elsewhere. (MODEL_ALIASES arrives via state.bind, like
+        # MODELS; plain dict constant — snapshot-safe.)
+        _cands = [f for f, v in MODELS.items() if v and v[0] == target_id]
+        _canon = [f for f in _cands if MODEL_ALIASES.get(f, f) == f]
+        friendly = (_canon or _cands or [target_id])[0]
         reg_key = friendly
         async with self.lock:
             if pool.get(target_id) is not slot:          # raced with another assemble/sweep
