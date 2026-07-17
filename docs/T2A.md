@@ -54,7 +54,8 @@ fleet's `torch`/`transformers`:
 # 1) the ACE-Step source (editable, --no-deps below keeps its old pins from downgrading you)
 git clone https://github.com/ace-step/ACE-Step.git /root/acestep-repo
 
-# 2) pin the versions the fleet already runs so nothing here can move them
+# 2) pin the versions the fleet already runs so nothing here can move them.
+#    numpy 2.4.6 (NOT 2.5.x) is deliberate — numba's py3.14 wheel needs numpy<2.5; see gotchas.
 cat > /root/acestep-constraints.txt <<'EOF'
 torch==2.11.0+cu128
 transformers==5.12.1
@@ -84,9 +85,68 @@ Then restart that worker (`systemctl restart im-worker`, or the controller's per
 `POST /restart_node?node=<host>`). On reconnect it advertises `can_t2a=True` and becomes a valid
 music-placement target. Verify with `/status` → the node's `can_t2a` flag.
 
-> **ROCm boxes** (Strix Halo / gfx1151): install the ROCm `torch`/`torchaudio`/`torchvision` wheels
-> instead of the `+cu128` ones (see [ROCM.md](ROCM.md)); the `--no-deps`-plus-constraints shape is
-> the same. A GPU that can't JIT-compile a kernel falls back per the engine's usual media path.
+> **ROCm boxes (Strix Halo / gfx1151) — not recommended for t2a.** Serving ACE-Step on the iGPU
+> hits two walls: there is **no torchaudio wheel matching the ROCm / nightly-torch ABI** (a
+> `pip install torchaudio` clashes), and gfx1151 diffusion is MIOpen-JIT-unreliable (the Kokoro TTS
+> leaf already falls back to CPU there). Serve music from a **remote CUDA GPU in the same pool**
+> instead — that is exactly what `#media-anywhere` is for (e.g. the om3nbox pool renders on furnace's
+> RTX 5090, never the ROCm iGPU, whose worker is left `can_t2a=False` on purpose).
+
+## Install gotchas & troubleshooting
+
+Real walls hit bringing this up on beast, amdcomp, and furnace, with their fixes:
+
+- **acestep's `requirements.txt` will downgrade your LLM stack.** It pins `transformers==4.50.0`
+  (plus old `torch`, `spacy==3.8.4`, `soundfile==0.13.1`, `pytorch_lightning==2.5.1`, …). A plain
+  `pip install acestep` drags transformers back and breaks every LLM on that worker — hence the
+  `--no-deps -e` + constraints recipe above. After installing, re-check that `transformers.__version__`
+  is unchanged. The `ace-step 0.2.0 requires transformers==4.50.0, but you have 5.x (incompatible)`
+  pip warnings are **expected and harmless** — acestep has no real transformers-5.x API break, only
+  stale pins.
+
+- **Python 3.14 + numba/numpy collision** (hit on furnace). librosa needs numba; numba's only
+  py3.14 wheel is **`numba 0.66.0 (cp314)`, which requires `numpy<2.5`**. If your constraints pin
+  `numpy==2.5.1` (furnace's stock), pip can't satisfy both, silently falls back to an *older* numba
+  with no py3.14 wheel, tries to build it from source, and **fails — rolling back the ENTIRE dep
+  install** (so `import acestep` then dies on a missing `loguru`/`librosa`). **Fix: pin
+  `numpy==2.4.6`** (what beast/amdcomp already run; torch 2.11 is fine with it). Symptom to
+  recognize: `RuntimeError: Cannot install on Python version 3.14.4; only versions >=3.10,<3.14 are
+  supported` + `ERROR: Failed to build 'numba'`.
+
+- **torchaudio / torchvision must come from the torch index, not PyPI.** They're `+cuXXX` builds
+  tied to your exact torch; install with `--index-url https://download.pytorch.org/whl/cuXXX`
+  (py3.14 cu128 wheels do exist). Plain PyPI gives a mismatched/CPU build or none.
+
+- **The torchaudio.save → torchcodec crash is already handled.** ACE-Step calls
+  `torchaudio.save(..., backend="soundfile")`, but torchaudio 2.11 routes `.save` through torchcodec
+  (not installed). `worker_t2a.py` monkeypatches `torchaudio.save` to write via `soundfile` — no
+  action needed; don't "fix" it by installing torchcodec.
+
+- **spacy pulls blis/thinc (C builds).** They built fine on py3.13 (amdcomp) and py3.14 (furnace,
+  `blis-1.3.3`), but on some Python/OS combos blis has no wheel and won't Cython-build (the same wall
+  the Kokoro TTS leaf hits). If blis fails, the interpreter is too new for that spacy — use an older
+  Python for the worker, or (last resort) stub spacy the way the Kokoro leaf does.
+
+- **Deploy order: controllers BEFORE workers.** A worker on the new `worker_load.py` returns the WAV
+  as base64 in `t2a_done`; an old controller still runs a 64 KB-capped control-reader, and that
+  multi-MB line overruns it → the link resets and every model on that node is invalidated (a churn
+  loop, not one failed render). Update/restart the controller onto the `#media-anywhere` code first,
+  then the workers. (Workers don't run pushed code until they restart, so it's not a time-bomb —
+  just never restart a worker ahead of its controller.)
+
+- **A box with acestep can still show `can_t2a=False`** until its worker restarts onto the
+  `worker_hw.py` that carries the probe. So a co-located worker that HAS acestep but hasn't been
+  restarted is deprioritized behind a remote box that DID advertise `can_t2a` — it still serves as a
+  last-resort candidate, but to make it preferred again, restart its worker. Check `/status` → each
+  node's `can_t2a`.
+
+- **Remote serving needs a public HF repo id.** A remote worker `snapshot_download`s the checkpoint
+  by its registry target; `ACE-Step/ACE-Step-v1-3.5B` works. A locally-added / non-HF checkpoint has
+  nothing to fetch → it serves only on a co-located worker (local disk); the error says so.
+
+- **Register on each controller** with `POST /add_model?model=ACE-Step/ACE-Step-v1-3.5B&name=ace-step`
+  (or **+ Add model**). This also downloads it to the controller for correct load-time sizing; the
+  remote worker still fetches its own copy.
 
 ## Loading
 
