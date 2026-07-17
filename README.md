@@ -76,6 +76,14 @@ dashboard.
   as the recommended speech path — the Omni Talker output is intrinsically choppy on that checkpoint
   (the Omni route still answers `/v1/audio/speech` for callers that request an Omni model by name).
   Full guide → [docs/TTS.md](docs/TTS.md).
+- **Text-to-music** *(optional component).* **ACE-Step v1 3.5B** serves `POST /v1/audio/music`
+  (genre/style prompt → instrumental or vocal WAV) — GPU-resident bf16 (~10 GB) or the same RAM
+  **offload** recipe as t2i. Needs the heavy `acestep` package installed on a serving worker, so it
+  is opt-in per box (a fleet without it just has no music model). As of **#media-anywhere** it is no
+  longer locked to the controller's own box: placement runs it on the co-located GPU **or any remote
+  GPU whose worker advertises the acestep runtime** (`can_t2a`), fetching the checkpoint via
+  `snapshot_download` and returning the WAV over the control link — no shared filesystem required.
+  Install recipe + API → [docs/T2A.md](docs/T2A.md).
 - **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
   object args), OpenAI `/v1/chat/completions` (`tool_calls` + `finish_reason:"tool_calls"`), and
   Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming, including the full
