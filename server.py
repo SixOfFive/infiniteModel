@@ -511,6 +511,11 @@ class Node:
     # half-provisioned box can't break every load. Reset on reconnect.
     can_infer: bool = True
     incapable_reason: str = ""
+    # #media-anywhere: worker-advertised MEDIA runtime availability (acestep / diffusers
+    # importable on that box) — lets the controller place a t2a/t2i model on a REMOTE capable
+    # GPU, not just the co-located one. False for workers that never reported it (pre-feature).
+    can_t2a: bool = False
+    can_t2i: bool = False
     # GPU memory (worker-reported; the controller can't see a worker's VRAM).
     # Non-zero only when the worker runs on a GPU (--device gpu/cpu+gpu).
     vram_total_gb: float = 0.0
@@ -623,6 +628,7 @@ class Node:
             "client_version": self.client_version, "wire": self.wire,
             "age_s": round(self.age, 1), "alive": self.alive,
             "can_infer": self.can_infer, "incapable_reason": self.incapable_reason,
+            "can_t2a": self.can_t2a, "can_t2i": self.can_t2i,
             "vram_total_gb": round(self.vram_total_gb, 2),
             "vram_used_gb": round(self.vram_used_gb, 2),
             "vram_reusable_gb": round(self.vram_reusable_gb, 2),   # #vram-reusable: vacant pool
@@ -665,6 +671,8 @@ class Registry:
                 ram=reg.get("ram", ""),
                 vram_total_gb=float(reg.get("vram_total_gb", 0.0)),
                 cores=int(reg.get("cores", 0)),
+                can_t2a=bool(reg.get("can_t2a", False)),
+                can_t2i=bool(reg.get("can_t2i", False)),
             )
             self._nodes[node_id] = node
             # NOTE: a node JOINING is just added capacity — it must NOT force resident models

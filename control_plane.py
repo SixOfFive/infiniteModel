@@ -20,6 +20,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+# #media-anywhere: the control link is line-framed (_enc = JSON + newline), read via
+# reader.readline() whose asyncio default cap is 64 KB. A t2a_done now carries the rendered WAV
+# as base64 (a REMOTE media worker has no shared filesystem to hand back a local path), which is
+# multi-MB — so the controller's control-reader is created with a generous line limit below.
+# Data-plane readers use readexactly (_read_frame) and are unaffected; controller->worker control
+# messages stay tiny, so the worker-side reader keeps the default.
+_CTRL_READER_LIMIT = 128 * 1024 * 1024
+
 async def _read_frame(reader: asyncio.StreamReader) -> tuple[dict, bytes, int]:
     """Return (header, payload, wire_bytes). wire_bytes is the exact number of
     bytes pulled off the socket, so the controller can meter its own data-in."""
@@ -147,7 +155,7 @@ async def _resilient_serve(host: Optional[str], port: int, handler, name: str) -
         # the existing handler. Guarded so one bad socket can't kill the loop.
         try:
             conn.setblocking(False)
-            reader = asyncio.StreamReader()
+            reader = asyncio.StreamReader(limit=_CTRL_READER_LIMIT)   # #media-anywhere: multi-MB t2a_done
             proto = asyncio.StreamReaderProtocol(reader)
             transport, _ = await loop.connect_accepted_socket(lambda: proto, conn)
             writer = asyncio.StreamWriter(transport, proto, reader, loop)

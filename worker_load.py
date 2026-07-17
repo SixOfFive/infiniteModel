@@ -287,10 +287,20 @@ class WorkerLoadMixin:
             # imported lazily with the same fetch-if-missing bridge as worker_t2i/worker_tts.
             if a.get("kind") == "t2a":
                 mdir = a.get("model_dir") or ""
-                if not os.path.isdir(mdir):
-                    raise RuntimeError(
-                        f"t2a model dir not visible on this worker: {mdir!r} — v1 serves "
-                        "music models only on a worker co-located with the controller")
+                # #media-anywhere: a REMOTE worker doesn't share the controller's filesystem, so
+                # the controller's model_dir won't exist here. Fetch the ACE-Step checkpoint from
+                # HF (model_id is the repo id) into this worker's local HF cache — the same
+                # snapshot_download the embedding path uses. Co-located workers keep the fast path.
+                if not (mdir and os.path.isdir(os.path.join(mdir, "ace_step_transformer"))):
+                    def _fetch_ace() -> str:
+                        from huggingface_hub import snapshot_download
+                        _loc = snapshot_download(model_id)
+                        if not os.path.isdir(os.path.join(_loc, "ace_step_transformer")):
+                            raise RuntimeError(
+                                f"fetched {model_id!r} but it has no ace_step_transformer/ — "
+                                "not a valid ACE-Step checkpoint")
+                        return _loc
+                    mdir = await asyncio.to_thread(_fetch_ace)
                 try:
                     import worker_t2a
                 except Exception:
@@ -689,8 +699,20 @@ class WorkerLoadMixin:
                     msg.get("seed"), _on_step)
             finally:
                 self._building -= 1
+            # #media-anywhere: return the WAV as base64 over the control link so a worker that
+            # ISN'T co-located with the controller (no shared FS to read a path from) still works.
+            # Read + delete the local temp here — the bytes are the deliverable now. base64 of a
+            # ~1 MB clip is cheap. (Controllers prefer audio_b64, else fall back to a legacy path.)
+            def _read_del(_p: str) -> str:
+                import base64
+                with open(_p, "rb") as _fh:
+                    _b = _fh.read()
+                with contextlib.suppress(Exception):
+                    os.remove(_p)
+                return base64.b64encode(_b).decode("ascii")
+            _ab64 = await asyncio.to_thread(_read_del, path)
             await reply({"type": "t2a_done", "req_id": rid, "model_id": mid,
-                         "path": path, "seconds": round(secs, 1),
+                         "audio_b64": _ab64, "seconds": round(secs, 1),
                          "audio_s": round(_dur, 1)})   # #media-detail: for RTF in the modal
         except Exception as exc:
             with contextlib.suppress(Exception):

@@ -1543,17 +1543,22 @@ class EngineLoadMixin:
         _ctrl_host = socket.gethostname()
         _refreshed = False
         while True:
+            def _is_colo(_n):
+                return (_n.hostname == _ctrl_host
+                        or str(_n.data_host).startswith(("127.", "::1"))
+                        or str(_n.data_host) in _LOCAL_IPS)
+            # #media-anywhere: serve on the co-located GPU OR any REMOTE GPU whose worker
+            # advertised the acestep runtime (can_t2a) — the checkpoint streams to it via
+            # snapshot_download and the WAV returns as base64 over the link, so no shared FS.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and n.vram_total_gb > 0
-                    and (n.hostname == _ctrl_host
-                         or str(n.data_host).startswith(("127.", "::1"))
-                         or str(n.data_host) in _LOCAL_IPS)]
+                    and (_is_colo(n) or getattr(n, "can_t2a", False))]
             # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
             _res_ram_b, _res_vram_b = self._reserved_bytes(exclude_key=reg_key)
             def _t2a_free(x):
                 return (x.vram_total_gb - x.vram_used_gb + getattr(x, "vram_reusable_gb", 0.0)
                         - _res_vram_b.get(x.node_id, 0) / GB)
-            for n in sorted(cand, key=_t2a_free, reverse=True):
+            for n in sorted(cand, key=lambda _n: (_is_colo(_n), _t2a_free(_n)), reverse=True):
                 free = _t2a_free(n)
                 if offload:
                     # never evicts (its point): needs only the transient VRAM + RAM for the weights
@@ -1851,16 +1856,23 @@ class EngineLoadMixin:
                                    f"{(r or {}).get('error', 'no result')}")
             lm.last_render_s = r.get("seconds")      # wall time of this render (#media-detail)
             lm.last_audio_s = r.get("audio_s")       # audio duration -> RTF in the modal
-            path = r.get("path") or ""
+            _b64 = r.get("audio_b64")
+            if _b64:
+                # #media-anywhere: a REMOTE worker (no shared FS) returns the WAV as base64 over
+                # the control link. Co-located workers may still send a local `path` (legacy).
+                import base64
+                data = base64.b64decode(_b64)
+            else:
+                path = r.get("path") or ""
 
-            def _read() -> bytes:
-                with open(path, "rb") as fh:
-                    data = fh.read()
-                with contextlib.suppress(OSError):
-                    os.remove(path)
-                return data
+                def _read() -> bytes:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    with contextlib.suppress(OSError):
+                        os.remove(path)
+                    return data
 
-            data = await asyncio.to_thread(_read)
+                data = await asyncio.to_thread(_read)
             lm.last_used = time.time()
             log_activity(f"{_ollama_name(friendly)}: music {r.get('seconds', '?')}s "
                          f"({len(data) / 1e6:.2f} MB)")

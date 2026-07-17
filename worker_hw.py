@@ -482,6 +482,17 @@ def build_registration(args: argparse.Namespace) -> dict:
     }
     if _using_gpu(args):
         reg["vram_total_gb"] = round(_gpu_mem_gb()[1], 2)
+    # #media-anywhere: advertise which MEDIA runtimes are installed on THIS worker so the
+    # controller can place a t2a/t2i model on ANY capable GPU, not only the co-located box.
+    # find_spec is a cheap, import-free probe (no heavy acestep/diffusers import at register).
+    import importlib.util as _ilu
+    def _has(_pkg: str) -> bool:
+        try:
+            return _ilu.find_spec(_pkg) is not None
+        except Exception:
+            return False
+    reg["can_t2a"] = _has("acestep")
+    reg["can_t2i"] = _has("diffusers")
     return reg
 
 
