@@ -294,7 +294,14 @@ class WorkerLoadMixin:
                 if not (mdir and os.path.isdir(os.path.join(mdir, "ace_step_transformer"))):
                     def _fetch_ace() -> str:
                         from huggingface_hub import snapshot_download
-                        _loc = snapshot_download(model_id)
+                        try:
+                            _loc = snapshot_download(model_id)
+                        except Exception as _e:
+                            raise RuntimeError(
+                                f"remote t2a worker can't fetch {model_id!r} from HuggingFace "
+                                f"({_e!r}) — a music checkpoint served on a REMOTE GPU must be a "
+                                "public HF repo id (co-located serving still works from local disk)"
+                            ) from _e
                         if not os.path.isdir(os.path.join(_loc, "ace_step_transformer")):
                             raise RuntimeError(
                                 f"fetched {model_id!r} but it has no ace_step_transformer/ — "

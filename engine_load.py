@@ -1596,9 +1596,10 @@ class EngineLoadMixin:
                     _refreshed = False
                     continue
                 raise RuntimeError(
-                    f"no controller-co-located GPU has ~{_need_gb():.1f} GB free VRAM for the music "
-                    f"model ({'no co-located GPU workers connected' if not cand else 'and nothing evictable'})"
-                    " — v1 serves t2a only on a GPU sharing the controller's box"
+                    f"no GPU has ~{_need_gb():.1f} GB free for the music model "
+                    f"({'no capable GPU worker connected' if not cand else 'and nothing evictable'})"
+                    " — t2a serves on the co-located GPU or any worker advertising the acestep "
+                    "runtime (can_t2a)"
                     + (f"; or use offload (t2i_offload=1): ~{_T2A_OFFLOAD_VRAM_GB:.0f} GB transient "
                        f"+ ~{all_b / GB + 4.0:.0f} GB RAM, never evicts" if not offload else ""))
             await self._unload_model_locked(victim, "evict idle LRU: music model needs VRAM")
@@ -1860,8 +1861,9 @@ class EngineLoadMixin:
             if _b64:
                 # #media-anywhere: a REMOTE worker (no shared FS) returns the WAV as base64 over
                 # the control link. Co-located workers may still send a local `path` (legacy).
+                # Decode off the event loop — a max-length clip is tens of MB.
                 import base64
-                data = base64.b64decode(_b64)
+                data = await asyncio.to_thread(base64.b64decode, _b64)
             else:
                 path = r.get("path") or ""
 

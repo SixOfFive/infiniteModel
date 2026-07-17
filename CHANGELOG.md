@@ -345,6 +345,24 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   decoders (Qwen2.5/3, Llama, Mistral/Devstral, DeepSeek).
 
 ## Multi-model & ops
+- **Music (t2a/ACE-Step) serves on ANY capable GPU, not just the co-located box (#media-anywhere,
+  2026-07-17).** v1 t2a could only run on a worker sharing the controller's filesystem — it read
+  the checkpoint from a local path and handed the WAV back as a local path — so music was locked
+  to the one hand-configured box (beast), and an autoload just *errored* even with an idle remote
+  GPU (amdcomp, 11 GB free) sitting right there. Decoupled from co-location: (1) workers advertise
+  `can_t2a`/`can_t2i` (an import-free `find_spec` probe) in registration, stored on the Node and
+  shown in `/status`; (2) placement now considers the co-located GPU **or any remote GPU whose
+  worker advertised the acestep runtime**, preferring co-located when it fits (no transfer),
+  otherwise the most-free capable box; (3) a remote worker fetches the checkpoint itself via
+  `snapshot_download` (the same mechanism the embedding path uses — no shared FS, no controller
+  streaming) with a clear error if the registry target isn't a public HF repo; (4) the finished
+  WAV returns as **base64 over the control link** (the controller decodes it off the event loop,
+  else falls back to the legacy local-path read). Because a `t2a_done` now carries multi-MB audio
+  through the line-framed control link, the controller's accept-bridge reader limit is raised to
+  128 MB (data-plane readers use `readexactly`, unaffected). **Deploy order matters: controllers
+  before workers** — a new worker's base64 `t2a_done` would overrun an old 64 KB-reader controller.
+  Adversarially reviewed (protocol/deploy-skew + placement/fetch) before ship. (Kokoro TTS and
+  t2i can be mirrored onto the same path next; `can_t2i` is already advertised.)
 - **Hitless controller restart — shard adoption (#adopt, 2026-07-16).** A controller-only restart
   no longer reloads models. Workers KEEP their loaded shards when the control link drops (gated on
   the register ack's `adopt: true` capability flag, so mixed code versions degrade to the old

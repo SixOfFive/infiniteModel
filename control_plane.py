@@ -23,9 +23,11 @@ from typing import Optional
 # #media-anywhere: the control link is line-framed (_enc = JSON + newline), read via
 # reader.readline() whose asyncio default cap is 64 KB. A t2a_done now carries the rendered WAV
 # as base64 (a REMOTE media worker has no shared filesystem to hand back a local path), which is
-# multi-MB — so the controller's control-reader is created with a generous line limit below.
-# Data-plane readers use readexactly (_read_frame) and are unaffected; controller->worker control
-# messages stay tiny, so the worker-side reader keeps the default.
+# multi-MB — so the accept bridge below creates every reader with a generous line limit.
+# (_bridge is shared by the control AND data listeners; the data plane reads via readexactly
+# and doesn't care about the line limit, so the bump is harmless there — it only lifts the
+# readline cap the control plane needs.) Controller->worker control messages stay tiny, so the
+# worker-side reader (client.py open_connection) keeps the asyncio default.
 _CTRL_READER_LIMIT = 128 * 1024 * 1024
 
 async def _read_frame(reader: asyncio.StreamReader) -> tuple[dict, bytes, int]:
