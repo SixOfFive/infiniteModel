@@ -398,6 +398,18 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   that fits GPU (low `cpu_weight_frac`); media loads take a separate path entirely and are never
   gated. The useless <0.3 tok/s auto-placement it blocks was never worth serving anyway; load such a
   model explicitly to force it. (Adversarially reviewed end-to-end before ship.)
+- **t2a/music auto-falls-back to RAM offload instead of failing (#t2a-offload-fallback,
+  2026-07-17).** An ACE-Step music auto-load (`/v1/audio/music`) that couldn't get its ~10 GB of
+  GPU-resident VRAM — because the co-located card was full of **un-evictable** residents (a pinned
+  model + a busy one), leaving only the idle vision/TTS models to evict — used to **raise** (and the
+  route surfaced it as a misleading 404, so the pipeline "shipped without music"). ACE-Step already
+  has an **offload** recipe (components in RAM, the ~6.6 GB DiT hopped to the GPU per render: ~8 GB
+  transient VRAM + RAM for the weights, and it **never evicts**) — it was just opt-in (`t2i_offload=1`)
+  with no automatic fallback. Now, when the bf16 GPU-resident placement can't fit and nothing is
+  evictable, the loader **flips to offload and retries** rather than failing. Resident stays the fast
+  default (it still evicts idle LRU to try resident first); offload is the last resort, and since it
+  is M1's proven serving mode it always beats a hard failure. (The symmetric gap in the t2i image
+  loader is known and left as-is — qwen-image is deliberately served on the om3nbox pool.)
 - **Per-node restart with in-use recovery (#node-restart, 2026-07-16).** Every node row on the
   models page gains an ↻ — `POST /restart_node?node=<hostname|id>` restarts JUST that worker
   process (exit 42 → supervisor relaunch), the per-node fresh start that clears whatever VRAM/RAM

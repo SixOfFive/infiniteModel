@@ -1575,6 +1575,21 @@ class EngineLoadMixin:
                     _refreshed = True
                     await self._await_free_refresh()
                     continue
+                if not offload:
+                    # #t2a-offload-fallback: bf16 GPU-resident won't fit and nothing is evictable
+                    # (pinned / busy residents hold the VRAM). Rather than fail the render, fall back
+                    # to the RAM-offload recipe — components live in RAM and the DiT hops to the GPU
+                    # per render (~8 GB transient VRAM + RAM for the weights, and it NEVER evicts). It
+                    # is M1's proven serving mode, so it always beats a hard failure. Resident stays
+                    # the fast default (we only reach here after trying it + evicting idle LRU); this
+                    # triggers only when the card is genuinely full of un-evictable models.
+                    log_activity(f"{_ollama_name(friendly)}: bf16 GPU-resident won't fit "
+                                 f"(~{_need_gb():.1f} GB, nothing evictable) — falling back to RAM "
+                                 f"offload (~{_T2A_OFFLOAD_VRAM_GB:.0f} GB transient + "
+                                 f"~{all_b / GB + 4.0:.0f} GB RAM, never evicts)")
+                    offload = True
+                    _refreshed = False
+                    continue
                 raise RuntimeError(
                     f"no controller-co-located GPU has ~{_need_gb():.1f} GB free VRAM for the music "
                     f"model ({'no co-located GPU workers connected' if not cand else 'and nothing evictable'})"
