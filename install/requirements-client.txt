@@ -4,8 +4,8 @@
 #
 # torch's CPU wheel (torch-2.12.0+cpu-...) is fetched from
 # https://download.pytorch.org/whl/cpu by install/_fetch.py and lives in the
-# same wheels/<os> dir, so `torch==2.12.0` resolves to it offline.
-torch==2.12.0
+# same wheels/<os> dir, so `torch==2.13.0` resolves to it offline.
+torch==2.13.0
 transformers==5.12.1
 safetensors==0.8.0
 huggingface_hub==1.19.0
