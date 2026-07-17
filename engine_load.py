@@ -1558,7 +1558,13 @@ class EngineLoadMixin:
             def _t2a_free(x):
                 return (x.vram_total_gb - x.vram_used_gb + getattr(x, "vram_reusable_gb", 0.0)
                         - _res_vram_b.get(x.node_id, 0) / GB)
-            for n in sorted(cand, key=lambda _n: (_is_colo(_n), _t2a_free(_n)), reverse=True):
+            # Prefer a worker that ADVERTISES the acestep runtime (can_t2a) — it's known-capable —
+            # over a co-located worker that merely might have it; among equals, co-located first
+            # (no network transfer), then most-free VRAM. So a co-located box WITHOUT acestep
+            # (can_t2a False) is a last resort, never picked ahead of a capable remote GPU that
+            # would otherwise fail the load with no failover.
+            for n in sorted(cand, key=lambda _n: (bool(getattr(_n, "can_t2a", False)),
+                                                   _is_colo(_n), _t2a_free(_n)), reverse=True):
                 free = _t2a_free(n)
                 if offload:
                     # never evicts (its point): needs only the transient VRAM + RAM for the weights
