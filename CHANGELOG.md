@@ -381,6 +381,23 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   interleaves the two queues at kernel boundaries, so decode keeps flowing while the render fills
   the gaps (true parallel sharing; no locks, no turn-taking). CPU devices / stream-creation
   failure degrade to the old inline behavior; streams are drained before results are read on CPU.
+- **Auto-load can't OOM a render off the box (#render-oom-guard, 2026-07-17).** On om3nbox (Strix
+  Halo, unified RAM=VRAM), a client repeatedly auto-requested `qwen2.5-coder:32b` — 32B, ~20 GB of
+  weights that *"won't fit GPU → run on CPU, <0.3 tok/s."* Once the resident models idled, the
+  planner stopped refusing it and instead auto-fit ctx down onto a CPU-spill placement; mmap-loading
+  20 GB of weights beside the resident qwen-image + qwen3-30b + 14b exhausted the unified pool and
+  **OOM-killed the co-located worker mid-load**, dropping all four co-resident models — a live image
+  render among them → HTTP 500 to the render client (crash-looped 3+ times in ~20 min). Fix: a
+  **request-triggered auto-load** (the new `auto=True` path, set only from `_autoload_shared`) whose
+  weights would run **mostly on CPU** (`cpu_weight_frac > 0.5`, the SEVERE band) **on the
+  controller's own co-located box while other models are resident there** is now refused — a terminal
+  `CapacityError` → `503 at_capacity` to that one request — instead of proceeding into the
+  over-commit. The load never reaches the mmap step (the gate sits after the plan/assess converge,
+  before dispatch). Scoped so it never touches an explicit `/load` (`auto=False`), an idle box (no
+  residents to endanger), a non-co-located capacity node (e.g. the dell CPU worker), or a placement
+  that fits GPU (low `cpu_weight_frac`); media loads take a separate path entirely and are never
+  gated. The useless <0.3 tok/s auto-placement it blocks was never worth serving anyway; load such a
+  model explicitly to force it. (Adversarially reviewed end-to-end before ship.)
 - **Per-node restart with in-use recovery (#node-restart, 2026-07-16).** Every node row on the
   models page gains an ↻ — `POST /restart_node?node=<hostname|id>` restarts JUST that worker
   process (exit 42 → supervisor relaunch), the per-node fresh start that clears whatever VRAM/RAM

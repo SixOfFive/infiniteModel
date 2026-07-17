@@ -132,7 +132,7 @@ class EngineLoadMixin:
             await self._precompile_int4(friendly, aq, 1)   # #cache-on-first-load: auto-load parity
             return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
                                    quant=aq, cpu_only=cpu_only, spread=_spread,
-                                   proportional=_prop, gpu_spread=_gpus)
+                                   proportional=_prop, gpu_spread=_gpus, auto=True)
         except Exception as e:
             # #at-capacity: a CapacityError verdict only gets WORSE at a bigger size — bf16 is
             # strictly larger than int4/int8, and the resident-cap check doesn't depend on size
@@ -141,7 +141,7 @@ class EngineLoadMixin:
                 log_activity(f"{friendly}: auto-load at {aq} failed ({e!r}) -> retry at bf16")
                 return await self.load(friendly, use_ctx, consolidate=_cons, prefer_vram=_pv,
                                        quant="none", cpu_only=cpu_only, spread=_spread,
-                                       proportional=_prop, gpu_spread=_gpus)
+                                       proportional=_prop, gpu_spread=_gpus, auto=True)
             raise
 
     async def _precompile_int4(self, friendly: str, quant: str, tp: int) -> None:
@@ -234,7 +234,8 @@ class EngineLoadMixin:
                    requested_by: str = "",
                    draft_gpu: bool = False,
                    draft_margin_gb: float = 4.0,
-                   t2i_offload: bool = False) -> LoadedModel:
+                   t2i_offload: bool = False,
+                   auto: bool = False) -> LoadedModel:
         # Thin wrapper over _load_impl that owns the cleanup of this load's reservation + progress card
         # + in-flight future. CRITICAL (review #parallel-load): only the call that actually CLAIMED the
         # load slot for reg_key cleans up — `_own["v"]` is set True by _load_impl iff THIS call
@@ -259,6 +260,7 @@ class EngineLoadMixin:
                                          requested_by=requested_by,
                                          draft_gpu=draft_gpu, draft_margin_gb=draft_margin_gb,
                                          t2i_offload=t2i_offload,
+                                         auto=auto,
                                          _own=_own)
         finally:
             if _own["v"]:
@@ -283,6 +285,7 @@ class EngineLoadMixin:
                    draft_gpu: bool = False,
                    draft_margin_gb: float = 4.0,
                    t2i_offload: bool = False,
+                   auto: bool = False,
                    _own: Optional[dict] = None) -> LoadedModel:
         # self.lock guards atomic engine-state mutation; it is DROPPED around the streaming gather so a
         # 2nd load AND an unload can run meanwhile. Concurrent loads stay memory-safe via the
@@ -748,6 +751,27 @@ class EngineLoadMixin:
                         # than aborting a loadable model — never silently proceed unlogged.
                         log_activity(f"{friendly}: wanted to cap ctx {ctx} -> {cap} but that replan "
                                      f"failed ({rplan.error}); keeping ctx {ctx} (warnings stand)")
+                # #render-oom-guard: an AUTO-load whose weights MOSTLY spill to CPU (SEVERE, <0.3
+                # tok/s) on the controller's OWN box, while other models are resident there, is both
+                # useless AND the exact over-commit that OOM-kills the co-located worker — dropping
+                # every co-resident model (a live render among them) with it (the om3nbox
+                # coder:32b-crashes-the-render incident, 2026-07-17). Refuse THIS request (terminal
+                # 503 at_capacity) instead of crashing the box. Scoped to auto-loads: an explicit
+                # /load (auto=False), an idle box (no residents to endanger), or a non-co-located
+                # capacity node (e.g. the dell CPU worker) still gets the intentional CPU-spill.
+                if auto and self.models and assess.get("cpu_weight_frac", 0.0) > 0.5:
+                    _colo = any(
+                        (node_by_id.get(st.node_id) is not None
+                         and node_by_id[st.node_id].data_host in _LOCAL_IPS)
+                        for st in stages)
+                    if _colo:
+                        raise CapacityError(
+                            f"'{friendly}' would run {assess['cpu_weight_frac']*100:.0f}% on CPU "
+                            f"here (~{assess.get('cpu_weight_gb', 0):.0f} GB of weights spilled to "
+                            f"RAM, <0.3 tok/s), and auto-loading it beside the "
+                            f"{len(self.models)} resident model(s) on this box risks an out-of-"
+                            f"memory that drops them mid-serve — refusing. Load it explicitly to "
+                            f"force it, free the box, or use a node with more VRAM.", terminal=True)
                 load_warnings = assess["warnings"]
                 for _w in load_warnings:
                     log_activity(f"{friendly}: ⚠ {_w}")
