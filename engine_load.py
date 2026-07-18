@@ -167,6 +167,16 @@ class EngineLoadMixin:
             if _cdir and (_is_diffusers_dir(_cdir) or _is_kokoro_dir(_cdir)
                           or os.path.isdir(os.path.join(_cdir, "ace_step_transformer"))):
                 return   # #t2i/#t2a/#tts: image/audio checkpoints have no LLM shard cache to compile
+            # #embedding: an encoder / sentence-embedding checkpoint (nomic-embed, BERT, …) has no
+            # 'model.embed_tokens.weight' — an int4 shard compile ALWAYS fails (KeyError) and, because
+            # such models are typically persist/no_unload, RE-FIRES on every auto-load / re-adopt,
+            # spamming /compile_shards 400s in the error log. Mirror model_store's is_embedding
+            # classification on the on-disk config and skip (no LLM shard cache to build). Gotcha
+            # documented long ago for the manual precompile sweep — this closes the auto-load path too.
+            if _cdir:
+                _esp = await asyncio.to_thread(_spec_from_config, _cdir, friendly)
+                if _esp is not None and getattr(_esp, "is_embedding", False):
+                    return
             _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
             if _cdir and not (_cst.get(quant) or {}).get("ok"):
                 log_activity(f"{_ollama_name(friendly)}: no {quant} shard cache — building it now so this "
