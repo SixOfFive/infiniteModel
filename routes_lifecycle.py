@@ -555,7 +555,8 @@ def register(app):
                              "recovering": [fr for fr, _c, _q, _k in recover]})
 
     @app.post("/update")
-    async def update_endpoint(request: Request, workers: int = 0, force: bool = False) -> JSONResponse:
+    async def update_endpoint(request: Request, workers: int = 0, force: bool = False,
+                              hitless: int = 0) -> JSONResponse:
         # FORCED UPDATE (dashboard 'Update' button / deploy API): pull the latest code from GitHub
         # and restart NOW — do NOT wait for idle. Mitigates the auto-load race: set engine.updating
         # so no request reloads a model mid-swap, UNLOAD all models, tell every worker to FREE its
@@ -574,6 +575,37 @@ def register(app):
                                            + ", ".join(_steps) + ") — updating now would orphan its "
                                            "result; retry after it completes or pass force=1",
                                  "rendering": len(_renders)}, status_code=409)
+        # #hitless-update: pull the latest code and bounce the CONTROLLER ONLY, KEEPING every
+        # resident model. Workers are left entirely alone, so they keep their loaded shards
+        # (#adopt) and the relaunched controller re-ADOPTS them on the NEW code — no unload, no
+        # re-stream, no re-quantize. This is the deploy path for CONTROLLER-side changes
+        # (dashboard / routes / status / placement / serving / graphs / …). It is NOT for worker
+        # code: a worker only runs new client.py/worker_*.py after a restart, which wipes its
+        # shards — use a plain /update (or /restart?workers=1) for those. Same in-progress guard
+        # as /restart: a controller bounce aborts an in-flight load/compile/render, so refuse
+        # unless force=1. (Everything below this branch is the destructive full-unload path.)
+        if hitless:
+            if (engine.loadings or engine.compiling or _renders) and not force:
+                return JSONResponse({"ok": False, "status": "load_in_progress",
+                                     "reason": "a model load/compile/render is in progress; a "
+                                               "hitless update bounces the controller and would "
+                                               "abort it — pass force=1 to update anyway",
+                                     "loading": [c.get("model") for c in engine.loadings.values()],
+                                     "compiling": [c.get("model") for c in engine.compiling.values()],
+                                     "rendering": len(_renders)}, status_code=409)
+            engine.updating = True           # block auto-load during the brief swap (reset on relaunch)
+            kept = list(engine.models.keys())
+            msg = (f"HITLESS UPDATE by {who}: keeping {kept or 'no'} resident model(s), workers "
+                   f"untouched -> swap controller code + controller-only restart (#adopt re-adopts)")
+            log_activity(msg); print(f"[update] {msg}")
+            async def _go_hitless():
+                await asyncio.sleep(1.0)     # let this HTTP response flush
+                with contextlib.suppress(Exception):   # applies changed files; exits(42) if any changed
+                    await asyncio.to_thread(_self_update_check, "server.py", (lambda: True), True)
+                os._exit(42)                 # nothing to swap (or already swapped) -> plain relaunch
+            asyncio.create_task(_go_hitless())
+            return JSONResponse({"ok": True, "updating": True, "hitless": True, "kept": kept,
+                                 "requested_by": who})
         engine.updating = True               # block auto-load immediately (anti-reload-race)
         names = list(engine.models.keys())
         with contextlib.suppress(Exception):     # best-effort graceful unload (don't block on a
