@@ -245,6 +245,18 @@ The response and the dashboard toast list both sets (`recovering: [...]` vs the 
   pushes an **immediate update command to every worker** (files stage now; `/update?workers=1`
   has each worker stage the new files *before* its relaunch so it comes back on fresh code), then
   the controller swaps its own code and restarts. Deploys never wait on the 15-minute poll.
+- **Hitless deploy — `POST /update?hitless=1`** (added 2026-07-18): pull the latest code and
+  adopt-restart the controller **without unloading any model**. Unlike a plain `/update` (which
+  full-unloads every model + frees worker RAM), `hitless=1` leaves the workers entirely untouched —
+  they keep their shards and the relaunched controller **re-adopts** them on the new code (see
+  Restart semantics above). It runs the same `_self_update_check(force=True)` fetch-apply of
+  `server.py` + all `EXTRA_UPDATE_FILES`, just without the destructive preamble. This is the
+  preferred path for **controller-side** changes (dashboard / routes / status / placement /
+  serving / graphs). It is **not** for worker code (`client.py` / `worker_*.py`): a worker only
+  runs new code after a restart that wipes its shards, so use a plain `/update` or **Restart all**
+  for those. Guarded like `/restart` (refuses mid load / compile / render unless `force=1`).
+  Bootstrapping the endpoint on a controller that predates it: let the idle poll stage the file
+  (same-VERSION → applied to disk, no auto-restart), then `/restart?workers=0` picks it up.
 - **Worker processes still do NOT restart on a plain `/update?workers=0`** — files land
   immediately, but the running processes keep executing the old code until a VERSION bump or a
   restart. After a deploy that changes worker-side modules, use `/update?workers=1` or
