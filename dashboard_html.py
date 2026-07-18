@@ -197,6 +197,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   .chip.q4:hover{background:var(--accent);color:#0a0e14}
   .row .meta{flex:1;font-size:12.5px;color:var(--muted);min-width:0}
   .row .meta .em{color:var(--text)}
+  /* #models-tps-graph: per-loaded-model tok/s traffic graph, its own line under the stats */
+  .row .meta .mspark{margin-top:7px;line-height:0}
+  .row .meta .mspark svg{max-width:100%;height:auto;vertical-align:middle}
   .row .acts{display:flex;align-items:center;gap:7px}
   .miniprog{height:4px;background:#0a0e14;border-radius:3px;margin-top:5px;max-width:280px;overflow:hidden}
   .miniprog > i{display:block;height:100%;background:var(--warn)}
@@ -289,6 +292,10 @@ const gb=v=>(v==null?'—':(Math.round(v*10)/10)+' GB');
 const pc=(a,b)=>b>0?Math.min(100,Math.round(100*a/b)):0;
 let LAST=null;
 let DETAIL_OPEN=null;   // #model-detail: model name whose detail modal is open (live-refreshed each poll)
+// #models-tps-graph: server-rendered per-model tok/s sparklines, cached so the 2s model
+// re-render never blanks them, refreshed from /status?graphs=1 only every ~10s (flicker-free,
+// mirrors the node bandwidth sparklines on the Bandwidth page).
+let modelSparkCache={}, lastMSparkT=0;
 
 async function api(path,opts){
   try{const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={ok:r.ok,raw:t}}
@@ -406,6 +413,20 @@ function renderModels(d,cl){
     html+=modelRow(m,s);
   }
   $('#models').innerHTML=html;
+  paintModelSparks(); refreshModelSparks();
+}
+// #models-tps-graph: refill the per-model tok/s graphs from cache after every model re-render
+// (the 2s poll rebuilds #models, blanking them), and refresh the cached SVGs from the server
+// at most every ~10s — a graph needs no 2s cadence, and this keeps them flicker-free.
+function paintModelSparks(){
+  document.querySelectorAll('#models .mspark').forEach(box=>{ const s=modelSparkCache[box.dataset.model]; box.innerHTML=s||''; });
+}
+function refreshModelSparks(){
+  const now=Date.now()/1000; if(now-lastMSparkT<10)return; lastMSparkT=now;
+  fetch('/status?graphs=1',{cache:'no-store'}).then(r=>r.json()).then(sd=>{
+    (sd.models||[]).forEach(m=>{ if(m.spark_tps) modelSparkCache[m.name]=m.spark_tps; });
+    paintModelSparks();
+  }).catch(()=>{});
 }
 function modelRow(m,s){
   const t2i=(m.capabilities||[]).includes('t2i');
@@ -451,7 +472,12 @@ function modelRow(m,s){
     if(m.cpu_frac>=0.5)parts.push('<span style="color:var(--hot)">'+Math.round(m.cpu_frac*100)+'% CPU</span>');
     if(m.active)parts.push(m.active+' active');
     const b4=int4Badge(m); if(b4)parts.push(b4);   // #int4-badge: loaded but no int4 cache yet
-    meta=parts.join(' · ');
+    // #models-tps-graph: tok/s traffic graph on its own line (server-rendered SVG dropped in
+    // from cache by paintModelSparks; hover a point for its time + rate, click to expand). LLMs
+    // only — media (tts/t2a) and embedding models have no decode rate, so no graph (mirrors the
+    // server, which attaches spark_tps only to non-media/non-embedding loaded models).
+    const tpsG=(!m.media && !m.is_embedding)?'<div class="mspark" data-model="'+esc(m.name)+'" title="decode throughput (tok/s) — hover a point for details, click to expand"></div>':'';
+    meta=parts.join(' · ')+tpsG;
     acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
   } else if(s.k==='loading'){
     const ld=s.ld||{}; const r=pc(ld.ready||0,ld.total||1);

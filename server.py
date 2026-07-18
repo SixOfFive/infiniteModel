@@ -2166,6 +2166,16 @@ def save_vram_history() -> None:
         print(f"[vram-hist] could not save history: {exc!r}")
 
 
+# --- Per-model decode-throughput (tok/s) graph history (#models-tps-graph) ---
+# Keyed by MODEL FRIENDLY name (not hostname) and kept IN MEMORY only: a model's tok/s
+# history is meaningful only while it is resident (mirrors the context history, which is
+# cleared on unload), so — unlike the net/ram/vram rings — it is NOT persisted to disk and
+# is pruned when a model unloads. Appended by the metrics sampler on the SAME cadence as the
+# node graphs (NET_HIST_SAMPLE_S), same ring cap. Stored compactly as [t_ms:int,
+# tok_s_tenths:int] (one decimal, kept as an int). Injected into graphs.py alongside the others.
+TPS_HISTORY: dict[str, deque] = {}     # friendly -> deque[(t_ms, tps_tenths)]
+
+
 # ---------------------------------------------------------------------------
 # Server-rendered monitoring graphs (SVG strings built by hand) — moved to graphs.py
 # ---------------------------------------------------------------------------
@@ -2197,7 +2207,7 @@ from graphs import (_svg_esc, _fmt_hms, _fmt_bps, _downsample,
                     _spark_svg, _detail_svg)   # noqa: E402,F401
 # Inject the history rings (defined above: NET_HISTORY/RAM_HISTORY/VRAM_HISTORY) — the SAME
 # dict objects the metrics sampler appends to, so the renderers in graphs.py read live data.
-graphs.set_history_sources(net=NET_HISTORY, ram=RAM_HISTORY, vram=VRAM_HISTORY)
+graphs.set_history_sources(net=NET_HISTORY, ram=RAM_HISTORY, vram=VRAM_HISTORY, tps=TPS_HISTORY)
 
 
 def net_account(node_id: Optional[str], *, to_node: int = 0, from_node: int = 0) -> None:
@@ -2279,6 +2289,25 @@ async def metrics_sampler() -> None:
                         vq = VRAM_HISTORY[node.hostname] = deque(maxlen=NET_HIST_MAX)
                     vq.append((t_ms, int(round(node.vram_used_gb * 10)),
                                int(round(node.vram_total_gb * 10))))
+            # #models-tps-graph: per-model decode throughput (tok/s), keyed by friendly. LLMs
+            # only — media (tts/t2i/t2a) and embedding models have no decode rate. Live rate
+            # while a gen is active, else 0 (matches status' tok_s, which zeroes at idle). The
+            # ring is pruned to resident LLMs below so it can't grow without bound.
+            _tps_live = set()
+            for _fr, _lm in list(engine.models.items()):
+                if (getattr(_lm, "is_tts", False) or getattr(_lm, "is_t2a", False)
+                        or getattr(_lm, "is_t2i", False)
+                        or getattr(getattr(_lm, "spec", None), "is_embedding", False)):
+                    continue
+                _tps_live.add(_fr)
+                _rate = getattr(_lm, "last_tok_s", 0.0) if getattr(_lm, "active", 0) > 0 else 0.0
+                tq = TPS_HISTORY.get(_fr)
+                if tq is None:
+                    tq = TPS_HISTORY[_fr] = deque(maxlen=NET_HIST_MAX)
+                tq.append((t_ms, int(round(max(0.0, _rate) * 10))))
+            for _fr in list(TPS_HISTORY):          # forget models that have unloaded
+                if _fr not in _tps_live:
+                    TPS_HISTORY.pop(_fr, None)
             if now - st["last_flush"] >= NET_HIST_FLUSH_S:
                 st["last_flush"] = now
                 await asyncio.to_thread(save_net_history)

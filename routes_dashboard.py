@@ -80,13 +80,20 @@ def register(app):
                 # GPU VRAM sparkline only for nodes that have a GPU
                 if nd.get("vram_total_gb", 0) > 0:
                     nd["spark_vram"] = _spark_svg(h, "vram")
+            # #models-tps-graph: per-loaded-LLM decode-throughput (tok/s) sparkline with
+            # per-point hover tooltips (keyed to the model's TPS_HISTORY by friendly). Media
+            # (tts/t2i/t2a) and embedding models have no decode rate, so they get none.
+            for m in st.get("models", []):
+                if m.get("loaded") and not m.get("media") and not m.get("is_embedding"):
+                    m["spark_tps"] = _spark_svg(m.get("internal_name") or m.get("name"), "tps")
         return JSONResponse(st)
 
     @app.get("/graph/{kind}/{host}")
     async def graph(kind: str, host: str) -> Response:
-        # Larger detail graph for a node, server-rendered (the mini sparkline's
-        # click-target). kind in {bw, ram, vram}; anything else is a 404.
-        if kind not in ("bw", "ram", "vram"):
+        # Larger detail graph, server-rendered (the mini sparkline's click-target). kind in
+        # {bw, ram, vram} keyed by hostname, or {tps} keyed by a loaded model's friendly name;
+        # anything else is a 404.
+        if kind not in ("bw", "ram", "vram", "tps"):
             return Response(content="unknown graph kind", status_code=404,
                             media_type="text/plain")
         return Response(content=_detail_svg(host, kind), media_type="image/svg+xml")

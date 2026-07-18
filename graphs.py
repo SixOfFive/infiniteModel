@@ -51,6 +51,7 @@ _GRAPH_DL = "#378add"     # download (controller -> node, = net_in)
 _GRAPH_UL = "#e0833b"     # upload (node -> controller, = net_out)
 _GRAPH_RAM = "#1d9e75"    # free RAM
 _GRAPH_VRAM = "#7f77dd"   # GPU VRAM used (purple — distinct from RAM green & bw)
+_GRAPH_TPS = "#17b0c4"    # per-model decode throughput tok/s (cyan — distinct from the above)
 _GRAPH_GRID = "#888"      # axis / gridlines (low-contrast on either theme)
 
 
@@ -98,12 +99,16 @@ def _spark_svg(host: str, kind: str) -> str:
     ("HH:MM:SS · value") plus one summary <title> on the whole svg. Wrapped in an <a>
     to the detail page. Always returns valid standalone SVG — an empty/short history
     renders a flat baseline."""
-    W, H, pad = 110, 30, 2
+    W, H, pad = (240, 44, 3) if kind == "tps" else (110, 30, 2)
     x0, x1, y0, y1 = pad, W - pad, pad, H - pad
     pts = (list(_HIST.get("ram", {}).get(host, ())) if kind == "ram"
            else list(_HIST.get("vram", {}).get(host, ())) if kind == "vram"
+           else list(_HIST.get("tps", {}).get(host, ())) if kind == "tps"
            else list(_HIST.get("net", {}).get(host, ())))
-    pts = _downsample(pts, W)   # cap to the pixel width (per-point markup ballooned /status; #dash-bw)
+    # tps: fewer, well-spaced points so per-point <title> hover targets are usable (loaded
+    # models are few, so keeping per-point circles here is cheap — unlike the fleet-wide bw
+    # sparklines that dropped them for payload size, #dash-bw). Others cap to the pixel width.
+    pts = _downsample(pts, 90 if kind == "tps" else W)
     inner = []
     summary = host
     n = len(pts)
@@ -136,6 +141,18 @@ def _spark_svg(host: str, kind: str) -> str:
         inner.append(f'<polyline points="{poly}" fill="none" '
                      f'stroke="{_GRAPH_VRAM}" stroke-width="1.4"/>')
         summary = f"{host} · used {used[-1]:.1f} / {total:.1f} GB"
+    elif kind == "tps":
+        val = [p[1] / 10.0 for p in pts]          # tenths -> tok/s
+        vmax = max(max(val), 1.0)
+        xy = [_xy(i, val[i], vmax) for i in range(n)]
+        poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in xy)
+        inner.append(f'<polyline points="{poly}" fill="none" '
+                     f'stroke="{_GRAPH_TPS}" stroke-width="1.5"/>')
+        for i in range(n):                        # transparent per-point hover targets (<title>)
+            tip = f"{_fmt_hms(pts[i][0])} · {val[i]:.1f} tok/s"
+            inner.append(f'<circle cx="{xy[i][0]:.1f}" cy="{xy[i][1]:.1f}" r="3.5" '
+                         f'fill="transparent"><title>{_svg_esc(tip)}</title></circle>')
+        summary = f"{host} · {val[-1]:.1f} tok/s"
     else:  # bw
         dl = [p[1] for p in pts]
         ul = [p[2] for p in pts]
@@ -167,10 +184,12 @@ def _detail_svg(host: str, kind: str) -> str:
     x0, x1, y0, y1 = ml, W - mr, mt, H - mb
     pts = (list(_HIST.get("ram", {}).get(host, ())) if kind == "ram"
            else list(_HIST.get("vram", {}).get(host, ())) if kind == "vram"
+           else list(_HIST.get("tps", {}).get(host, ())) if kind == "tps"
            else list(_HIST.get("net", {}).get(host, ())))
     n = len(pts)
     title = (f"{_svg_esc(host)} · free RAM (GB)" if kind == "ram"
              else f"{_svg_esc(host)} · GPU VRAM used (GB)" if kind == "vram"
+             else f"{_svg_esc(host)} · decode throughput (tok/s)" if kind == "tps"
              else f"{_svg_esc(host)} · traffic (↓ download / ↑ upload)")
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" '
              f'xmlns:xlink="http://www.w3.org/1999/xlink" '
@@ -195,6 +214,10 @@ def _detail_svg(host: str, kind: str) -> str:
         total = pts[-1][2] / 10.0
         vmax = max(total, max(used), 0.1)
         unit_fmt = lambda v: f"{v:.0f}"           # GB labels
+    elif kind == "tps":
+        val = [p[1] / 10.0 for p in pts]          # tenths -> tok/s
+        vmax = max(max(val), 1.0)
+        unit_fmt = lambda v: f"{v:.0f}"           # tok/s labels
     else:
         dl = [p[1] for p in pts]
         ul = [p[2] for p in pts]
@@ -241,6 +264,12 @@ def _detail_svg(host: str, kind: str) -> str:
         for i in range(n):
             tip = f"{_fmt_hms(pts[i][0])} · used {used[i]:.1f} / {pts[i][2]/10.0:.1f} GB"
             parts.append(f'<circle cx="{_px(i):.1f}" cy="{_py(used[i]):.1f}" r="3" '
+                         f'fill="transparent"><title>{_svg_esc(tip)}</title></circle>')
+    elif kind == "tps":
+        _poly(val, _GRAPH_TPS, 1.8)
+        for i in range(n):
+            tip = f"{_fmt_hms(pts[i][0])} · {val[i]:.1f} tok/s"
+            parts.append(f'<circle cx="{_px(i):.1f}" cy="{_py(val[i]):.1f}" r="3" '
                          f'fill="transparent"><title>{_svg_esc(tip)}</title></circle>')
     else:
         _poly(dl, _GRAPH_DL, 1.6)
