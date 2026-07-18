@@ -774,27 +774,57 @@ class EngineLoadMixin:
                         # than aborting a loadable model — never silently proceed unlogged.
                         log_activity(f"{friendly}: wanted to cap ctx {ctx} -> {cap} but that replan "
                                      f"failed ({rplan.error}); keeping ctx {ctx} (warnings stand)")
-                # #render-oom-guard: an AUTO-load whose weights MOSTLY spill to CPU (SEVERE, <0.3
-                # tok/s) on the controller's OWN box, while other models are resident there, is both
-                # useless AND the exact over-commit that OOM-kills the co-located worker — dropping
-                # every co-resident model (a live render among them) with it (the om3nbox
-                # coder:32b-crashes-the-render incident, 2026-07-17). Refuse THIS request (terminal
-                # 503 at_capacity) instead of crashing the box. Scoped to auto-loads: an explicit
-                # /load (auto=False), an idle box (no residents to endanger), or a non-co-located
-                # capacity node (e.g. the dell CPU worker) still gets the intentional CPU-spill.
+                # #render-oom-guard v2 (2026-07-18, user: "if it can't go to VRAM, send it to RAM —
+                # the system should still load the requested model"): an AUTO-load whose weights
+                # MOSTLY spill to CPU (cpu_weight_frac > 0.5) on the controller's OWN co-located box,
+                # beside resident model(s) there, used to be REFUSED outright — the om3nbox
+                # coder:32b-crashes-the-render incident (2026-07-17) showed a blind CPU spill
+                # OOM-killing the co-located worker and dropping a live render. But refusing also
+                # never loads the model. So DON'T blanket-refuse: LOAD IT INTO RAM when the
+                # co-located box has the physically-free RAM to hold the model beside the residents,
+                # and refuse ONLY when it genuinely wouldn't fit — a real OOM loads NOTHING and drops
+                # the render too (strictly worse). free_mem_gb is live (already down for residents +
+                # any active render); keep CONTROLLER_RAM_RESERVE_GB (the co-located controller needs
+                # it to stream+serve while the worker builds) + RAM_SAFETY_GB. UNIFIED-MEMORY-SAFE:
+                # on a Strix-Halo APU the "VRAM" slice is carved from the SAME pool as RAM, so the
+                # need is sized by the model's FULL footprint (weights + full-ctx KV) on each
+                # co-located node, not just the RAM-spilled part (discrete GPUs, RAM >> this, pass
+                # trivially). Empty _colo_need (spill lands only on a REMOTE capacity node, e.g. the
+                # dell CPU worker) falls through and loads as before; explicit /load (auto=False) and
+                # idle boxes never reach here.
                 if auto and self.models and assess.get("cpu_weight_frac", 0.0) > 0.5:
-                    _colo = any(
-                        (node_by_id.get(st.node_id) is not None
-                         and node_by_id[st.node_id].data_host in _LOCAL_IPS)
-                        for st in stages)
-                    if _colo:
+                    _ram_margin = CONTROLLER_RAM_RESERVE_GB + RAM_SAFETY_GB
+                    _colo_need: dict = {}          # node_id -> full footprint bytes on a co-located node
+                    for st in stages:
+                        nd = node_by_id.get(st.node_id)
+                        if nd is None or nd.data_host not in _LOCAL_IPS:
+                            continue
+                        b = st.num_layers * spec.per_layer_weight_bytes
+                        if st.has_embed:
+                            b += spec.embed_bytes
+                        if st.has_head:
+                            b += spec.head_bytes + spec.final_norm_bytes
+                        b += st.num_layers * spec.kv_bytes_per_layer(ctx)
+                        _colo_need[st.node_id] = _colo_need.get(st.node_id, 0) + b
+                    _over = [(node_by_id[_nid].hostname, _b / GB,
+                              max(0.0, node_by_id[_nid].free_mem_gb - _ram_margin))
+                             for _nid, _b in _colo_need.items()
+                             if _b / GB > node_by_id[_nid].free_mem_gb - _ram_margin]
+                    if _over:
+                        _h, _n, _a = _over[0]
                         raise CapacityError(
-                            f"'{friendly}' would run {assess['cpu_weight_frac']*100:.0f}% on CPU "
-                            f"here (~{assess.get('cpu_weight_gb', 0):.0f} GB of weights spilled to "
-                            f"RAM, <0.3 tok/s), and auto-loading it beside the "
-                            f"{len(self.models)} resident model(s) on this box risks an out-of-"
-                            f"memory that drops them mid-serve — refusing. Load it explicitly to "
-                            f"force it, free the box, or use a node with more VRAM.", terminal=True)
+                            f"'{friendly}' needs ~{_n:.0f} GB (weights+KV) on {_h} but only ~{_a:.0f} "
+                            f"GB is safely free there beside the {len(self.models)} resident model(s) "
+                            f"— loading it would risk an out-of-memory that drops them mid-serve (a "
+                            f"live render among them). Free the box, use a smaller quant, or load on "
+                            f"a node with more room.", terminal=True)
+                    if _colo_need:   # fits RAM beside the residents -> load it INTO RAM (slow, but loads)
+                        _h0 = next(iter(_colo_need))
+                        log_activity(
+                            f"{friendly}: {assess['cpu_weight_frac']*100:.0f}% of weights won't fit "
+                            f"VRAM here — loading ~{assess.get('cpu_weight_gb', 0):.0f} GB into RAM "
+                            f"beside {len(self.models)} resident model(s) "
+                            f"({node_by_id[_h0].free_mem_gb:.0f} GB free; slow CPU decode).")
                 load_warnings = assess["warnings"]
                 for _w in load_warnings:
                     log_activity(f"{friendly}: ⚠ {_w}")
