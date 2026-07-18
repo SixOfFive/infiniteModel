@@ -25,7 +25,7 @@ python3 -m venv .venv
 python -m pip install --upgrade pip -q
 
 echo "== pip: torch — CPU aarch64 wheel from the PyTorch CPU index =="
-pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
 
 echo "== pip: transformers stack (PyPI) =="
 pip install transformers==5.12.1 safetensors==0.8.0 huggingface_hub==1.19.0 numpy==2.4.6 psutil==7.2.2

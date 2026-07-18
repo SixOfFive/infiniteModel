@@ -34,7 +34,7 @@ to the controller; the worker needs the proot setup below.
 
 `client.py` is a glibc program that installs manylinux PyTorch wheels. Termux
 itself is **Bionic** libc and has no PyTorch package, so torch won't install
-there. A **proot Debian guest is glibc**, so `pip install torch==2.12.0`
+there. A **proot Debian guest is glibc**, so `pip install torch==2.13.0`
 (from the PyTorch **CPU** index) pulls the aarch64 CPU wheel straight from PyPI
 and everything just works. The client auto-detects "no CUDA → CPU"; no code
 changes are needed. proot is plain userspace — no root, no flashing.
@@ -173,7 +173,7 @@ RAM/`--os-reserve-gb` tuning. Contributions and bug reports welcome.
 |------|------|
 | `client.py`, `wire.py` | the worker — vendored copies of the fleet client (run CPU-only on Android) |
 | `config.json` | controller host/ports + the public self-update source (no secrets) |
-| `requirements-android.txt` | pinned deps (torch 2.12.0 CPU **aarch64**, transformers 5.12.1, …) |
+| `requirements-android.txt` | pinned deps (torch 2.13.0 CPU **aarch64**, transformers 5.12.1, …) |
 | `setup.sh` | run **inside** the proot guest — builds a venv + installs deps |
 | `start-client.sh` | run **inside** the proot guest — starts the worker → controller |
 | `termux-bootstrap.sh` | run in **Termux** — one-shot: install proot+Debian, deploy, setup, shortcut |
