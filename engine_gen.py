@@ -33,6 +33,12 @@ class EngineGenMixin:
         async with model.lock:
             if model.stage0_writer is None:
                 raise RuntimeError("embedding model not connected")
+            # usage bookkeeping: embeddings have no decode rate, so only these counters mark them as
+            # used — they feed the request-activity graph (#models-usage-graph), the LRU last_used,
+            # and the dashboard "requests served" count (all previously stuck at 0 for embedders,
+            # since only the text-generation path bumped active/req_total/last_used).
+            model.last_used = time.time()
+            model.active += 1
             loop = asyncio.get_event_loop()
             rid = self.next_req()
             ids_meta, ids_raw = _pack_tensor(input_ids)
@@ -46,8 +52,10 @@ class EngineGenMixin:
                 nbytes = await _write_frame(model.stage0_writer, hdr, ids_raw + mask_raw)
                 net_account(self._stage0_id(model), to_node=nbytes)   # controller -> node
                 vecs = await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
+                model.req_total += 1
                 return vecs.tolist()
             finally:
+                model.active = max(0, model.active - 1)
                 self.pending.pop(rid, None)
                 self.pending_model.pop(rid, None)
 

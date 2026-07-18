@@ -83,17 +83,24 @@ def register(app):
             # #models-tps-graph: per-loaded-LLM decode-throughput (tok/s) sparkline with
             # per-point hover tooltips (keyed to the model's TPS_HISTORY by friendly). Media
             # (tts/t2i/t2a) and embedding models have no decode rate, so they get none.
+            # #models-usage-graph: models with a decode rate get the tok/s sparkline; media
+            # (tts/t2i/t2a) + embedding models have none, so they get a "request activity" one.
             for m in st.get("models", []):
-                if m.get("loaded") and not m.get("media") and not m.get("is_embedding"):
-                    m["spark_tps"] = _spark_svg(m.get("internal_name") or m.get("name"), "tps")
+                if not m.get("loaded"):
+                    continue
+                _host = m.get("internal_name") or m.get("name")
+                if not m.get("media") and not m.get("is_embedding"):
+                    m["spark_tps"] = _spark_svg(_host, "tps")
+                else:
+                    m["spark_usage"] = _spark_svg(_host, "usage")
         return JSONResponse(st)
 
     @app.get("/graph/{kind}/{host}")
     async def graph(kind: str, host: str) -> Response:
         # Larger detail graph, server-rendered (the mini sparkline's click-target). kind in
-        # {bw, ram, vram} keyed by hostname, or {tps} keyed by a loaded model's friendly name;
-        # anything else is a 404.
-        if kind not in ("bw", "ram", "vram", "tps"):
+        # {bw, ram, vram} keyed by hostname, or {tps, usage} keyed by a loaded model's friendly
+        # name; anything else is a 404.
+        if kind not in ("bw", "ram", "vram", "tps", "usage"):
             return Response(content="unknown graph kind", status_code=404,
                             media_type="text/plain")
         return Response(content=_detail_svg(host, kind), media_type="image/svg+xml")

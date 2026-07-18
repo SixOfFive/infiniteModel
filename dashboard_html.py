@@ -424,7 +424,7 @@ function paintModelSparks(){
 function refreshModelSparks(){
   const now=Date.now()/1000; if(now-lastMSparkT<10)return; lastMSparkT=now;
   fetch('/status?graphs=1',{cache:'no-store'}).then(r=>r.json()).then(sd=>{
-    (sd.models||[]).forEach(m=>{ if(m.spark_tps) modelSparkCache[m.name]=m.spark_tps; });
+    (sd.models||[]).forEach(m=>{ const g=m.spark_tps||m.spark_usage; if(g) modelSparkCache[m.name]=g; });
     paintModelSparks();
   }).catch(()=>{});
 }
@@ -452,7 +452,8 @@ function modelRow(m,s){
     if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');   // t2i uses RAM too (CPU text encoder + VAE; whole DiT in offload)
     if(m.active>0)parts.push('<span style="color:var(--good)">● rendering'
       +(m.t2i_step?(' step '+m.t2i_step+'/'+(m.t2i_total||'?')):'')+'</span>');
-    meta=parts.join(' · ');
+    // #models-usage-graph: t2i has no tok/s — show a request-activity graph (renders over time)
+    meta=parts.join(' · ')+'<div class="mspark" data-model="'+esc(m.name)+'" title="render activity over time (in-flight / recent renders) — hover a point for details, click to expand"></div>';
     acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
   } else if(s.k==='loaded'){
     const parts=[];
@@ -472,12 +473,14 @@ function modelRow(m,s){
     if(m.cpu_frac>=0.5)parts.push('<span style="color:var(--hot)">'+Math.round(m.cpu_frac*100)+'% CPU</span>');
     if(m.active)parts.push(m.active+' active');
     const b4=int4Badge(m); if(b4)parts.push(b4);   // #int4-badge: loaded but no int4 cache yet
-    // #models-tps-graph: tok/s traffic graph on its own line (server-rendered SVG dropped in
-    // from cache by paintModelSparks; hover a point for its time + rate, click to expand). LLMs
-    // only — media (tts/t2a) and embedding models have no decode rate, so no graph (mirrors the
-    // server, which attaches spark_tps only to non-media/non-embedding loaded models).
-    const tpsG=(!m.media && !m.is_embedding)?'<div class="mspark" data-model="'+esc(m.name)+'" title="decode throughput (tok/s) — hover a point for details, click to expand"></div>':'';
-    meta=parts.join(' · ')+tpsG;
+    // #models-tps-graph + #models-usage-graph: a per-model graph on its own line (server-rendered
+    // SVG dropped in from cache by paintModelSparks; hover a point for details, click to expand).
+    // LLMs get decode throughput (tok/s); media (tts/t2a) + embedding models have no decode rate,
+    // so they get a "request activity" graph instead (mirrors the server: spark_tps vs spark_usage).
+    const graphG=(m.media||m.is_embedding)
+      ? '<div class="mspark" data-model="'+esc(m.name)+'" title="request activity over time (in-flight / recent requests) — hover a point for details, click to expand"></div>'
+      : '<div class="mspark" data-model="'+esc(m.name)+'" title="decode throughput (tok/s) — hover a point for details, click to expand"></div>';
+    meta=parts.join(' · ')+graphG;
     acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
   } else if(s.k==='loading'){
     const ld=s.ld||{}; const r=pc(ld.ready||0,ld.total||1);

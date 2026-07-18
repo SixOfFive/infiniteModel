@@ -2174,6 +2174,8 @@ def save_vram_history() -> None:
 # node graphs (NET_HIST_SAMPLE_S), same ring cap. Stored compactly as [t_ms:int,
 # tok_s_tenths:int] (one decimal, kept as an int). Injected into graphs.py alongside the others.
 TPS_HISTORY: dict[str, deque] = {}     # friendly -> deque[(t_ms, tps_tenths)]
+USAGE_HISTORY: dict[str, deque] = {}   # friendly -> deque[(t_ms, req_activity)] — media/embed (no tok/s)
+_USAGE_PREV_REQ: dict[str, int] = {}   # friendly -> last-sampled req_total, for the per-interval delta
 
 
 # ---------------------------------------------------------------------------
@@ -2207,7 +2209,7 @@ from graphs import (_svg_esc, _fmt_hms, _fmt_bps, _downsample,
                     _spark_svg, _detail_svg)   # noqa: E402,F401
 # Inject the history rings (defined above: NET_HISTORY/RAM_HISTORY/VRAM_HISTORY) — the SAME
 # dict objects the metrics sampler appends to, so the renderers in graphs.py read live data.
-graphs.set_history_sources(net=NET_HISTORY, ram=RAM_HISTORY, vram=VRAM_HISTORY, tps=TPS_HISTORY)
+graphs.set_history_sources(net=NET_HISTORY, ram=RAM_HISTORY, vram=VRAM_HISTORY, tps=TPS_HISTORY, usage=USAGE_HISTORY)
 
 
 def net_account(node_id: Optional[str], *, to_node: int = 0, from_node: int = 0) -> None:
@@ -2308,6 +2310,29 @@ async def metrics_sampler() -> None:
             for _fr in list(TPS_HISTORY):          # forget models that have unloaded
                 if _fr not in _tps_live:
                     TPS_HISTORY.pop(_fr, None)
+            # #models-usage-graph: media (tts/t2i/t2a) + embedding models have NO decode rate, so
+            # instead graph "request activity" = max(in-flight concurrency, requests COMPLETED this
+            # interval). active alone misses sub-2s embed requests; the req_total delta catches them
+            # (embed now bumps req_total). Same ring/cadence as tok/s; pruned to resident media/embed.
+            _use_live = set()
+            for _fr, _lm in list(engine.models.items()):
+                if not (getattr(_lm, "is_tts", False) or getattr(_lm, "is_t2a", False)
+                        or getattr(_lm, "is_t2i", False)
+                        or getattr(getattr(_lm, "spec", None), "is_embedding", False)):
+                    continue
+                _use_live.add(_fr)
+                _cur = int(getattr(_lm, "req_total", 0) or 0)
+                _delta = max(0, _cur - _USAGE_PREV_REQ.get(_fr, _cur))
+                _USAGE_PREV_REQ[_fr] = _cur
+                _usage = max(int(getattr(_lm, "active", 0) or 0), _delta)
+                uq = USAGE_HISTORY.get(_fr)
+                if uq is None:
+                    uq = USAGE_HISTORY[_fr] = deque(maxlen=NET_HIST_MAX)
+                uq.append((t_ms, _usage))
+            for _fr in list(USAGE_HISTORY):        # forget models that have unloaded
+                if _fr not in _use_live:
+                    USAGE_HISTORY.pop(_fr, None)
+                    _USAGE_PREV_REQ.pop(_fr, None)
             if now - st["last_flush"] >= NET_HIST_FLUSH_S:
                 st["last_flush"] = now
                 await asyncio.to_thread(save_net_history)
