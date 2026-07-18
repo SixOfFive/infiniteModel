@@ -245,7 +245,23 @@ def _flatten_tool_roles(chat):
     return out
 
 
-def _render_chat_ids(tok, chat, hf_tools):
+def _thinking_pref(body):
+    """OpenAI/Ollama 'should the model think?' control -> enable_thinking bool, or None
+    (= leave the chat template's own default). The Anthropic /v1/messages path has its own
+    mapping (serving_anthropic.py #qwen3-thinking); this covers the OpenAI + Ollama endpoints,
+    where the switch was previously UNREACHABLE (thinking:false / chat_template_kwargs were
+    silently ignored). Honors, in order: vLLM/OpenAI-compat chat_template_kwargs.enable_thinking,
+    Ollama `think`, then an explicit top-level `enable_thinking`."""
+    ctk = body.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and isinstance(ctk.get("enable_thinking"), bool):
+        return ctk["enable_thinking"]
+    for k in ("think", "enable_thinking"):
+        if isinstance(body.get(k), bool):
+            return body[k]
+    return None
+
+
+def _render_chat_ids(tok, chat, hf_tools, enable_thinking=None):
     """#tools: tokenize a chat, injecting tool definitions when present. `hf_tools` is the
     OpenAI/HF shape ([{type:function, function:{name,description,parameters}}]) that /api/chat and
     /v1/chat/completions already send, passed straight to apply_chat_template(tools=). With NO tools
@@ -253,9 +269,15 @@ def _render_chat_ids(tok, chat, hf_tools):
     native tools= -> text tool instruction + flattened tool turns (templates without tool support
     SILENTLY ignore tools= — probe tok.chat_template up front, don't wait for an exception) ->
     flatten-and-retry on any template exception (e.g. a template that rejects the 'tool' role) ->
-    a flat text join. So every model SEES the tools + results, whatever its template supports."""
+    a flat text join. So every model SEES the tools + results, whatever its template supports.
+    #qwen3-thinking: `enable_thinking` (from _thinking_pref) is threaded into apply_chat_template
+    ONLY when the template actually supports the switch, so non-Qwen3 templates are untouched;
+    absent (None) keeps the template's own default (byte-identical to the old render)."""
     _tmpl = getattr(tok, "chat_template", None) or ""
     _native = isinstance(_tmpl, str) and ("tools" in _tmpl or "tool_call" in _tmpl)
+    _ctk = {}
+    if enable_thinking is not None and isinstance(_tmpl, str) and "enable_thinking" in _tmpl:
+        _ctk["enable_thinking"] = bool(enable_thinking)
     if hf_tools and not _native:
         # template would silently drop tools= AND likely rejects tool turns: flatten + instruct
         chat = _merge_system(_flatten_tool_roles(chat), _tool_instruction(hf_tools))
@@ -264,8 +286,8 @@ def _render_chat_ids(tok, chat, hf_tools):
     try:
         if hf_tools:
             return _to_id_list(tok.apply_chat_template(chat, tools=hf_tools,
-                               add_generation_prompt=True, tokenize=True))
-        return _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True))
+                               add_generation_prompt=True, tokenize=True, **_ctk))
+        return _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True, **_ctk))
     except Exception as exc:
         print(f"[serve] chat-template failed ({type(exc).__name__}: {exc}); "
               f"flattening tool turns" + (" + tool instruction" if hf_tools else ""))
@@ -273,7 +295,7 @@ def _render_chat_ids(tok, chat, hf_tools):
         if hf_tools:
             chat2 = _merge_system(chat2, _tool_instruction(hf_tools))
         try:
-            return _to_id_list(tok.apply_chat_template(chat2, add_generation_prompt=True, tokenize=True))
+            return _to_id_list(tok.apply_chat_template(chat2, add_generation_prompt=True, tokenize=True, **_ctk))
         except Exception:
             flat = "\n\n".join(f"{m.get('role')}: {m.get('content', '')}" for m in chat2)
             return _to_id_list(tok(flat + "\n\nassistant:"))
@@ -477,7 +499,8 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
                 f"{_fname or 'most appropriate'} tool — no plain text, no explanation, even if a "
                 f"tool call seems unnecessary for this message. Use sensible defaults for any "
                 f"missing arguments.")
-        ids = _render_chat_ids(tok, messages, _tc)       # #tools: inject tool defs when the request sends them
+        ids = _render_chat_ids(tok, messages, _tc,        # #tools: inject tool defs when the request sends them
+                               enable_thinking=_thinking_pref(body))   # #qwen3-thinking: reachable on OpenAI/Ollama
     else:
         _jm = _json_mode_instruction(body)
         ids = _to_id_list(tok((prompt or "") + (("\n\n" + _jm) if _jm else "")))
