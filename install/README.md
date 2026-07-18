@@ -31,7 +31,7 @@ install\prepare.bat          (Windows)
 This downloads, for **both** Windows and Linux:
 - a standalone **CPython 3.13** runtime → `install/python/cpython-3.13-{windows,linux}.tar.gz`
 - the full **wheel closure** for the worker deps → `install/wheels/{win,linux}/*.whl`
-  (torch 2.12.0 **CPU**, transformers 5.12.1, safetensors 0.8.0,
+  (torch 2.13.0 **CPU**, transformers 5.12.1, safetensors 0.8.0,
   huggingface_hub 1.19.0, numpy 2.4.6, psutil 7.2.2 — pinned to the proven
   fleet versions).
 

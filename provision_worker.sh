@@ -38,8 +38,8 @@ if [ ! -x "$PY" ]; then
   python3 -m venv "$REPO/.venv"
 fi
 "$PY" -m pip install -q --upgrade pip
-echo "== pip: torch 2.12.0 (CPU wheel) =="
-"$PY" -m pip install -q torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
+echo "== pip: torch 2.13.0 (CPU wheel) =="
+"$PY" -m pip install -q torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
 echo "== pip: transformers/safetensors/hub/numpy/psutil =="
 "$PY" -m pip install -q "transformers==5.12.1" "safetensors==0.8.0" "huggingface_hub==1.19.0" "numpy==2.4.6" "psutil==7.2.2"
 echo "== pip: einops (required by some models' trust_remote_code, e.g. nomic-embed-text) =="

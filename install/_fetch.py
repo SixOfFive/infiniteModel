@@ -40,7 +40,7 @@ WHEELS = os.path.join(HERE, "wheels")
 PYVER = "3.13"
 ABI = "cp313"
 IMPL = "cp"
-TORCH = "torch==2.12.0"
+TORCH = "torch==2.13.0"
 TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
 REST = [
     "transformers==5.12.1",

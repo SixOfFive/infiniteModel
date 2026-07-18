@@ -60,7 +60,7 @@ if errorlevel 1 (
   echo.
   echo [warn] offline install incomplete - falling back to ONLINE install ...
   "%VPY%" -m pip install --upgrade pip
-  "%VPY%" -m pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
+  "%VPY%" -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
   "%VPY%" -m pip install transformers==5.12.1 safetensors==0.8.0 huggingface_hub==1.19.0 numpy==2.4.6 psutil==7.2.2
   if errorlevel 1 ( echo [ERROR] dependency install failed ^(offline AND online^) & goto :fail )
 )
