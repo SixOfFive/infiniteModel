@@ -174,8 +174,13 @@ class EngineLoadMixin:
             # classification on the on-disk config and skip (no LLM shard cache to build). Gotcha
             # documented long ago for the manual precompile sweep — this closes the auto-load path too.
             if _cdir:
+                # GENERIC across all embedding models: is_embedding matches any encoder /
+                # sentence-embedding arch (nomic_bert, bert, roberta, mpnet, bge/gte/e5, …), not just
+                # nomic. Belt-and-suspenders name check covers an oddly-arch'd embedder is_embedding
+                # might miss (skipping a precompile is harmless — the model still cold-loads).
                 _esp = await asyncio.to_thread(_spec_from_config, _cdir, friendly)
-                if _esp is not None and getattr(_esp, "is_embedding", False):
+                if ((_esp is not None and getattr(_esp, "is_embedding", False))
+                        or "embed" in str(friendly).lower()):
                     return
             _cst = await asyncio.to_thread(_sh.shard_cache_status, _cdir) if _cdir else {}
             if _cdir and not (_cst.get(quant) or {}).get("ok"):
@@ -395,9 +400,17 @@ class EngineLoadMixin:
             await asyncio.to_thread(validate_arch_supported, model_dir)
             # ctx<=0 => use the model's native training context (config.json).
             ctx_was_auto = ctx <= 0          # #76: only auto-cap an AUTO ctx, never an explicit one
+            _tctx = _train_ctx_from_dir(model_dir, spec)   # native training window (max_position_embeddings)
             if ctx <= 0:
-                ctx = _train_ctx_from_dir(model_dir, spec)
+                ctx = _tctx
                 print(f"[load] ctx=auto -> training context {ctx}")
+            elif _tctx > 0 and ctx > _tctx:
+                # #ctx-ceiling: NEVER reserve more KV than the model was trained for — a 4k window on a
+                # 2k-trained model (e.g. nomic) just wastes pool on context the model can't attend to.
+                # Clamp DOWN to the training context; applies to an explicit ctx AND autoload_ctx alike.
+                # One-directional: a SMALLER request is always honored unchanged.
+                print(f"[load] ctx {ctx} > training context {_tctx} -> clamped to {_tctx}")
+                ctx = _tctx
             # Idempotent re-load: a duplicate /load for an ALREADY-resident model at the SAME
             # ctx+quant — e.g. an accidental dashboard double-click — is a NO-OP that returns the
             # live copy, instead of evicting + re-streaming it (which showed up as a spurious
