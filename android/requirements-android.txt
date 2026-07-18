@@ -2,12 +2,12 @@
 # Debian/Ubuntu guest. Pinned to the proven fleet versions.
 #
 # IMPORTANT — torch must come from the PyTorch CPU index, NOT plain PyPI:
-#     pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
+#     pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
 # The DEFAULT PyPI aarch64 torch wheel is the CUDA/SBSA build (Jetson/GH200) and
 # drags in multi-GB nvidia-* packages that are useless on a tablet. The CPU
-# index serves torch-2.12.0+cpu-...-manylinux_2_28_aarch64.whl (CPU-only).
+# index serves torch-2.13.0+cpu-...-manylinux_2_28_aarch64.whl (CPU-only).
 # setup.sh does this split automatically; this file documents the pins.
-torch==2.12.0
+torch==2.13.0
 transformers==5.12.1
 safetensors==0.8.0
 huggingface_hub==1.19.0
