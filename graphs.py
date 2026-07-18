@@ -25,6 +25,7 @@ imports its symbols back via a convergence-bridge import.
 """
 from __future__ import annotations
 
+import json
 import time
 
 
@@ -253,36 +254,83 @@ def _detail_svg(host: str, kind: str) -> str:
         parts.append(f'<polyline points="{pl}" fill="none" '
                      f'stroke="{color}" stroke-width="{width}"/>')
 
+    # Per-point data for the snap-hover overlay below: x-pixel, the highlight-dot y, and the
+    # tooltip text. (The polyline is drawn per kind; the tooltip is one line, same content as the
+    # old per-point <title>.) bw pins the dot to whichever series is higher, matching the label.
+    hover: list = []
     if kind == "ram":
         _poly(free, _GRAPH_RAM, 1.8)
         for i in range(n):
-            tip = f"{_fmt_hms(pts[i][0])} · free {free[i]:.1f} / {pts[i][2]/10.0:.1f} GB"
-            parts.append(f'<circle cx="{_px(i):.1f}" cy="{_py(free[i]):.1f}" r="3" '
-                         f'fill="transparent"><title>{_svg_esc(tip)}</title></circle>')
+            hover.append({"x": round(_px(i), 1), "y": round(_py(free[i]), 1),
+                          "t": f"{_fmt_hms(pts[i][0])} · free {free[i]:.1f} / {pts[i][2]/10.0:.1f} GB"})
     elif kind == "vram":
         _poly(used, _GRAPH_VRAM, 1.8)
         for i in range(n):
-            tip = f"{_fmt_hms(pts[i][0])} · used {used[i]:.1f} / {pts[i][2]/10.0:.1f} GB"
-            parts.append(f'<circle cx="{_px(i):.1f}" cy="{_py(used[i]):.1f}" r="3" '
-                         f'fill="transparent"><title>{_svg_esc(tip)}</title></circle>')
+            hover.append({"x": round(_px(i), 1), "y": round(_py(used[i]), 1),
+                          "t": f"{_fmt_hms(pts[i][0])} · used {used[i]:.1f} / {pts[i][2]/10.0:.1f} GB"})
     elif kind == "tps":
         _poly(val, _GRAPH_TPS, 1.8)
         for i in range(n):
-            tip = f"{_fmt_hms(pts[i][0])} · {val[i]:.1f} tok/s"
-            parts.append(f'<circle cx="{_px(i):.1f}" cy="{_py(val[i]):.1f}" r="3" '
-                         f'fill="transparent"><title>{_svg_esc(tip)}</title></circle>')
+            hover.append({"x": round(_px(i), 1), "y": round(_py(val[i]), 1),
+                          "t": f"{_fmt_hms(pts[i][0])} · {val[i]:.1f} tok/s"})
     else:
         _poly(dl, _GRAPH_DL, 1.6)
         _poly(ul, _GRAPH_UL, 1.6)
         for i in range(n):
-            tip = f"{_fmt_hms(pts[i][0])} · ↓ {_fmt_bps(dl[i])} · ↑ {_fmt_bps(ul[i])}"
-            parts.append(f'<circle cx="{_px(i):.1f}" cy="{_py(max(dl[i], ul[i])):.1f}" '
-                         f'r="3" fill="transparent"><title>{_svg_esc(tip)}</title></circle>')
+            hover.append({"x": round(_px(i), 1), "y": round(_py(max(dl[i], ul[i])), 1),
+                          "t": f"{_fmt_hms(pts[i][0])} · ↓ {_fmt_bps(dl[i])} · ↑ {_fmt_bps(ul[i])}"})
         # legend
         parts.append(f'<rect x="{x1 - 150}" y="{mt - 14}" width="10" height="10" fill="{_GRAPH_DL}"/>'
                      f'<text x="{x1 - 136}" y="{mt - 5}" fill="{_GRAPH_GRID}">download</text>'
                      f'<rect x="{x1 - 70}" y="{mt - 14}" width="10" height="10" fill="{_GRAPH_UL}"/>'
                      f'<text x="{x1 - 56}" y="{mt - 5}" fill="{_GRAPH_GRID}">upload</text>')
+
+    # #snap-hover: SNAP the tooltip to the nearest plotted point — hover anywhere over the plot and
+    # a crosshair + highlight dot + floating label track the closest sample, instead of needing a
+    # pixel-perfect landing on a 3px point (the old per-point <title> circles). Runs because
+    # /graph/{kind}/{host} is served as a standalone SVG DOCUMENT (image/svg+xml), where <script>
+    # executes (an <img>-embedded SVG would not). No-JS degrades to a static, still-readable graph
+    # (axis labels + lines). Points are evenly spaced in x, so nearest-by-x is a direct index map.
+    # json.dumps(ensure_ascii) escapes the · / ↑ ↓ glyphs; we also neutralize < and ]]> so nothing
+    # can break out of the CDATA / SVG. Overlay nodes carry pointer-events=none so they never steal
+    # the root's mousemove.
+    _data = (json.dumps(hover, separators=(",", ":"))
+             .replace("<", "\\u003c").replace("]]>", "]]\\u003e"))
+    parts.append(
+        f'<line id="_cx" x1="0" y1="{y0}" x2="0" y2="{y1}" stroke="{_GRAPH_GRID}" '
+        f'stroke-width="1" opacity="0.55" visibility="hidden" pointer-events="none"/>'
+        f'<circle id="_cdot" r="4" fill="#fff" stroke="#333" stroke-width="1.4" '
+        f'visibility="hidden" pointer-events="none"/>'
+        f'<g id="_tt" visibility="hidden" pointer-events="none">'
+        f'<rect id="_ttbg" rx="4" ry="4" fill="#1b1f24" stroke="#555" stroke-width="0.7"/>'
+        f'<text id="_tttxt" x="6" y="15" fill="#f0f0f0" font-size="11">.</text></g>')
+    parts.append(
+        '<script type="text/javascript"><![CDATA['
+        'var D=' + _data + ',X0=' + str(x0) + ',X1=' + str(x1) + ',MT=' + str(mt) + ';'
+        'var s=document.documentElement,'
+        'cx=document.getElementById("_cx"),cd=document.getElementById("_cdot"),'
+        'tt=document.getElementById("_tt"),bg=document.getElementById("_ttbg"),'
+        'tx=document.getElementById("_tttxt");'
+        'function U(e){var p=s.createSVGPoint();p.x=e.clientX;p.y=e.clientY;'
+        'var m=s.getScreenCTM();if(!m)return null;return p.matrixTransform(m.inverse());}'
+        'function hide(){cx.setAttribute("visibility","hidden");'
+        'cd.setAttribute("visibility","hidden");tt.setAttribute("visibility","hidden");}'
+        'function show(i){var p=D[i];'
+        'cx.setAttribute("x1",p.x);cx.setAttribute("x2",p.x);cx.setAttribute("visibility","visible");'
+        'cd.setAttribute("cx",p.x);cd.setAttribute("cy",p.y);cd.setAttribute("visibility","visible");'
+        'tx.textContent=p.t;var b=tx.getBBox();'
+        'bg.setAttribute("x",b.x-6);bg.setAttribute("y",b.y-4);'
+        'bg.setAttribute("width",b.width+12);bg.setAttribute("height",b.height+8);'
+        'var gx=p.x+12;if(gx+b.width+14>X1)gx=p.x-b.width-24;if(gx<2)gx=2;'
+        'var gy=p.y-b.height-14;if(gy<MT+2)gy=p.y+16;'
+        'tt.setAttribute("transform","translate("+gx+","+gy+")");'
+        'tt.setAttribute("visibility","visible");}'
+        'function mv(e){if(!D.length)return;var u=U(e);if(!u)return;'
+        'if(u.x<X0-6||u.x>X1+6){hide();return;}'
+        'var i=D.length<2?0:Math.round((u.x-X0)/(X1-X0)*(D.length-1));'
+        'if(i<0)i=0;else if(i>D.length-1)i=D.length-1;show(i);}'
+        's.addEventListener("mousemove",mv);s.addEventListener("mouseleave",hide);'
+        ']]></script>')
 
     parts.append('</svg>')
     return "".join(parts)
