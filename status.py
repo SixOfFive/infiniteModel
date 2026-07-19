@@ -211,6 +211,7 @@ def build_status() -> dict:
             "sampling_defaults": dict(getattr(lm, "sampling_defaults", None) or {}),
             "tp_size": getattr(lm, "tp_size", 1),            # #88: TP width (1 = pipeline)
             "is_tp": getattr(lm, "tp_size", 1) > 1,          # #88: card shows TP vs pipeline + reconfigure
+            "upgrade": getattr(lm, "upgrade", None) or None,  # #load-faster: {available,from,to,reason} or None
             "num_layers": lm.spec.num_layers, "params": _human_params(lm.spec),
             "size_gb": round(lm.spec.total_weight_bytes / GB, 2),
             "vram_used_gb": round(vram_used / GB, 2),
@@ -368,7 +369,7 @@ def build_status() -> dict:
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
                      "last_tok_s", "kv_pos", "fwd_prog_age_s", "active", "queued",
                      "is_embedding", "replica_idx",
-                     "tp_size", "is_tp", "num_layers", "params", "stages", "plan_basis",
+                     "tp_size", "is_tp", "upgrade", "num_layers", "params", "stages", "plan_basis",
                      "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
                      "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe",
                      "is_tts", "is_t2a", "media",   # #media-detail: media-model info block

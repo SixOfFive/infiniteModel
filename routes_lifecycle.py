@@ -359,6 +359,20 @@ def register(app):
                                  "loading": list(exc.args[0]) if exc.args else []}, status_code=409)
         return JSONResponse({"ok": True, "unloaded": names})
 
+    @app.post("/load_faster")
+    async def load_faster(model: str) -> JSONResponse:
+        # #load-faster: one-click "upgrade this resident model to a faster placement" (dashboard badge —
+        # only shown when engine._upgrade_for detected one). DRAINS the in-flight reply (up to ~2 min,
+        # then forces) then HITLESSLY re-places VRAM-first / fewest-nodes, preserving full config and
+        # rolling back to a working copy on failure (never left evicted). No confirm — the #juggler
+        # barrier makes it hitless (parked clients ride the swap). 409 if nothing faster fits right now.
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        res = await engine.load_faster(friendly)
+        return JSONResponse(res, status_code=(200 if res.get("ok") else 409))
+
     @app.post("/reconfigure")
     async def reconfigure(model: str, tp: int = 1, ctx: int = 0, quant: str = "keep",
                           mode: str = "auto", cpu_only: bool = False) -> JSONResponse:

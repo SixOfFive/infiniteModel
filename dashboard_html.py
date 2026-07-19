@@ -473,6 +473,7 @@ function modelRow(m,s){
     if(m.cpu_frac>=0.5)parts.push('<span style="color:var(--hot)">'+Math.round(m.cpu_frac*100)+'% CPU</span>');
     if(m.active)parts.push(m.active+' active');
     const b4=int4Badge(m); if(b4)parts.push(b4);   // #int4-badge: loaded but no int4 cache yet
+    const bUp=upgradeBadge(m); if(bUp)parts.push(bUp);   // #load-faster: a faster placement fits now
     // #models-tps-graph + #models-usage-graph: a per-model graph on its own line (server-rendered
     // SVG dropped in from cache by paintModelSparks; hover a point for details, click to expand).
     // LLMs get decode throughput (tok/s); media (tts/t2a) + embedding models have no decode rate,
@@ -565,6 +566,23 @@ function int4Badge(m){
     +'\n• once cached: int4 loads serve from cache instantly, no on-the-fly quantize'
     +'\n\nClick to compile now.';
   return ' <span class="chip q4" title="'+esc(tip)+'" onclick="compileShards(\''+esc(m.name)+'\',\'int4\')">⚡ int4</span>';
+}
+
+// #load-faster: one-click "upgrade to a faster placement". Shown ONLY when the backend
+// (engine._upgrade_for, throttled ~30s) detected a faster VRAM-first / fewer-node placement that fits
+// with currently-free VRAM (m.upgrade.available). Tooltip = from -> to + why. Click applies immediately
+// (NO confirm — the swap is hitless: in-flight clients pause and ride onto the fresh copy; a busy model
+// drains first, up to ~2 min, then forces).
+function upgradeBadge(m){
+  const u=m.upgrade; if(!u||!u.available)return '';
+  const tip='Load '+m.name+' faster'
+    +'\n• from: '+(u.from||'?')
+    +'\n• to: '+(u.to||'?')
+    +(u.reason?'\n• '+u.reason:'')
+    +'\n\nRe-places it VRAM-first using the room that just freed up. Hitless: any in-flight reply '
+    +'finishes first, then it swaps (a long generation is cut off after ~2 min). Click to apply.';
+  return ' <span class="chip" style="cursor:pointer;border-color:var(--good);color:var(--good)" title="'
+    +esc(tip)+'" onclick="upgradePlacement(\''+esc(m.name)+'\')">⬆ load faster</span>';
 }
 
 function renderNodes(d){
@@ -1240,6 +1258,7 @@ async function openHistory(name){
   $('#modal').innerHTML=head+'<div style="max-height:60vh;overflow:auto">'+blk+'</div>';
 }
 async function compileShards(name,quant){ closeOv(); toast('compiling '+quant+' cache for '+name+'…'); tick(); try{ await api('/compile_shards?model='+encodeURIComponent(name)+'&quant='+quant,{method:'POST'}); toast(quant+' cache for '+name+' done'); }catch(e){ toast(String(e.message||e),1);} tick(); }
+async function upgradePlacement(name){ closeOv(); toast('re-placing '+name+' faster…'); tick(); try{ const r=await api('/load_faster?model='+encodeURIComponent(name),{method:'POST'}); toast(name+' → '+((r&&r.to)||'faster placement')+(r&&r.forced?' (in-flight reply cut off)':'')); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function forget(name){ if(!confirm('Forget '+name+'? (keeps weight files)'))return; closeOv(); try{ await api('/forget?model='+encodeURIComponent(name),{method:'POST'}); toast('forgot '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function del(name){ if(!confirm('DELETE '+name+' and its weight files?'))return; closeOv(); toast('deleting '+name+'…'); try{ await api('/delete?model='+encodeURIComponent(name),{method:'POST'}); toast('deleted '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function reconf(name){ const tp=prompt('Reconfigure '+name+' — tp size (1=pipeline):','1'); if(tp==null)return;

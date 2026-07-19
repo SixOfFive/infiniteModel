@@ -2551,6 +2551,164 @@ class EngineLoadMixin:
                     gate.set()                              # wake every barrier waiter (ALWAYS)
                     self._promote_gates.pop(base, None)
 
+    # --- #load-faster: one-click "upgrade a resident model to a faster placement" (dashboard badge) ---
+    # Detection reuses the juggler's live-free-VRAM planner; the APPLY reuses the #juggler barrier so a
+    # click is HITLESS (parked clients ride the swap). Distinct from _maybe_juggle in TWO ways only:
+    # (a) it also flags multi-node->fewer-node consolidation (not just CPU-spill->VRAM), and (b) on click
+    # it WAITS for the in-flight reply to drain (then forces after a bound) instead of skipping busy
+    # models. Kept SELF-CONTAINED (its own atomic reload + rollback) so a bug here can never destabilize
+    # the auto juggler / wedge self-heal, which stay on the untouched reconfigure().
+    LOAD_FASTER_DRAIN_S = 120.0     # wait this long for the current reply to finish, then FORCE the swap
+
+    @staticmethod
+    def _placement_label(cpu_frac: float, nstages: int) -> str:
+        """Short human label for a placement, for the badge tooltip 'from X -> to Y'."""
+        if nstages <= 1 and cpu_frac <= 0.02:
+            return "single GPU (VRAM-resident)"
+        parts = [f"{nstages} node" + ("s" if nstages != 1 else "")]
+        if cpu_frac > 0.02:
+            parts.append(f"{cpu_frac * 100:.0f}% on CPU")
+        return ", ".join(parts)
+
+    def _plan_vram_first(self, m):
+        """Dry-run the fewest-nodes VRAM-first plan for resident model `m` against LIVE-free VRAM (+ this
+        model's own on-GPU bytes, reclaimed on reload) — the SAME basis as _juggle_would_fit_vram, so the
+        badge never promises a placement a real re-place can't reach. Returns (plan, cpu_weight_frac,
+        n_stages), or (None, 1.0, 99) if nothing plans."""
+        try:
+            spec = m.spec
+            own: dict = {}
+            for s in m.plan.stages:
+                own[s.node_id] = own.get(s.node_id, 0) + (getattr(s, "gpu_bytes", 0) or 0)
+            _, _res_vram = self._reserved_bytes()
+            mems = []
+            for n in registry.alive_sorted():
+                fv = max(0.0, self._node_live_free_vram_gb(
+                    n, own_bytes=own.get(n.node_id, 0), res_vram=_res_vram) - PLAN_VRAM_FLOOR_GB)
+                ram = n.eff_ram_gb - (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
+                mems.append(NodeMem(n.node_id, n.hostname, int((max(0.0, ram) + fv) * GB), int(fv * GB)))
+            p = plan_pipeline(spec, mems, m.ctx, consolidate=True, prefer_vram=True)
+            if not p.ok:
+                return None, 1.0, 99
+            assess = _assess_placement(spec, m.ctx, mems, p.stages, cpu_only=False)
+            return p, (assess.get("cpu_weight_frac", 0.0) or 0.0), len(p.stages)
+        except Exception:
+            return None, 1.0, 99
+
+    def _upgrade_for(self, m):
+        """An {available, from, to, reason} upgrade suggestion for resident model `m`, or None. An
+        upgrade exists when the fewest-nodes VRAM-first plan achievable with CURRENTLY-free fleet VRAM is
+        strictly better than the current placement — LESS CPU spill or FEWER nodes. Text models only
+        (media/embedding aren't served through the generate() barrier and never spill by mistake)."""
+        if (getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False)
+                or getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False)
+                or getattr(m, "is_tts", False)):
+            return None
+        cur_cpu = self._model_cpu_frac(m)
+        cur_n = len(m.plan.stages)
+        if cur_cpu <= 0.02 and cur_n <= 1:
+            return None                                   # already single-GPU + VRAM-resident: optimal
+        p, new_cpu, new_n = self._plan_vram_first(m)
+        if p is None:
+            return None
+        less_cpu = new_cpu < cur_cpu - 0.02 and new_n <= cur_n
+        fewer_nodes = new_n < cur_n and new_cpu <= cur_cpu + 0.02
+        if not (less_cpu or fewer_nodes):
+            return None
+        why = []
+        if less_cpu:
+            why.append("more of it now fits in VRAM (less CPU spill)")
+        if fewer_nodes:
+            why.append(f"{cur_n}→{new_n} node{'s' if new_n != 1 else ''} (fewer network hops)")
+        return {"available": True, "from": self._placement_label(cur_cpu, cur_n),
+                "to": self._placement_label(new_cpu, new_n), "reason": "; ".join(why)}
+
+    async def refresh_upgrades(self, min_interval: float = 30.0) -> None:
+        """Throttled: recompute each resident text model's `.upgrade` at most every ~min_interval s
+        (called from the /status route, polled ~2s). A cheap dry-run planner per loaded LLM. Never raises."""
+        now_t = time.time()
+        if now_t - getattr(self, "_upgrade_scan_ts", 0.0) < min_interval:
+            return
+        self._upgrade_scan_ts = now_t
+        for m in list(self.models.values()):
+            try:
+                m.upgrade = self._upgrade_for(m)
+            except Exception:
+                m.upgrade = None
+
+    async def load_faster(self, friendly: str) -> dict:
+        """#load-faster APPLY: DRAIN the in-flight reply (wait up to LOAD_FASTER_DRAIN_S, then FORCE),
+        then hitlessly re-place the model VRAM-first / fewest-nodes, PRESERVING its full config
+        (ctx/quant/tp/kv_quant/kv_offload/sampling defaults), rolling back to a working copy if the faster
+        layout fails. Reuses the #juggler barrier so parked clients ride the swap (connection pauses, no
+        reconnect). Serialized under _juggle_lock. `friendly` must already be resolved. Text models only."""
+        m = self.models.get(friendly)
+        if m is None:
+            return {"ok": False, "error": f"'{friendly}' is not resident"}
+        if (getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False)
+                or getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False)
+                or getattr(m, "is_tts", False)):
+            return {"ok": False, "error": "load-faster applies to text models only"}
+        base = m.base or friendly
+        async with self._juggle_lock:
+            m = self.models.get(friendly)
+            if m is None:
+                return {"ok": False, "error": "model is no longer resident"}
+            up = self._upgrade_for(m)
+            if up is None:
+                return {"ok": False, "error": "no faster placement is available right now"}
+            # snapshot FULL config so the swap is config-neutral (bare reconfigure would silently drop
+            # kv_quant / kv_offload / sampling defaults); a kv_quant of 'none' maps to load()'s '' default.
+            _kvq = getattr(m, "kv_quant", "none") or "none"
+            snap = dict(ctx=m.ctx, quant=(m.quant or "none"), tp=getattr(m, "tp_size", 1),
+                        kv_quant=(_kvq if _kvq != "none" else ""),
+                        kv_offload=bool(getattr(m, "kv_offload", False)),
+                        default_temp=getattr(m, "default_temperature", None),
+                        default_min_p=getattr(m, "default_min_p", None),
+                        moe_offload=bool(getattr(m, "moe_offload", False)))
+            cpu0, n0 = self._model_cpu_frac(m), len(m.plan.stages)
+            gate = asyncio.Event()                          # present+clear = barrier engaged (holds new reqs)
+            self._promote_gates[base] = gate
+            self.reconfiguring = {"model": _ollama_name(friendly), "from": up["from"], "to": up["to"]}
+            try:
+                deadline = time.time() + self.LOAD_FASTER_DRAIN_S     # DRAIN the in-flight reply, then FORCE
+                forced = False
+                while any((r.active or 0) > 0 or (r.queued or 0) > 0 for r in self.replicas_of(base)):
+                    if time.time() >= deadline:
+                        forced = True
+                        break
+                    await asyncio.sleep(0.5)
+                log_activity(f"load-faster: re-placing {friendly} VRAM-first ({up['from']} -> {up['to']})"
+                             + (" [forced: dropping an in-flight generation]" if forced else "") + " — hitless")
+                try:
+                    await self.load(friendly, snap["ctx"], consolidate=True, prefer_vram=True,
+                                    quant=snap["quant"], tp=snap["tp"], cpu_only=False, force=True,
+                                    kv_quant=snap["kv_quant"], kv_offload=snap["kv_offload"],
+                                    default_temp=snap["default_temp"], default_min_p=snap["default_min_p"],
+                                    moe_offload=snap["moe_offload"])
+                except Exception as exc:
+                    log_activity(f"load-faster: {friendly} faster placement FAILED ({exc!r}) — rolling back")
+                    try:
+                        await self.load(friendly, snap["ctx"], quant=snap["quant"], tp=snap["tp"],
+                                        force=True, kv_quant=snap["kv_quant"], kv_offload=snap["kv_offload"],
+                                        default_temp=snap["default_temp"],
+                                        default_min_p=snap["default_min_p"], moe_offload=snap["moe_offload"])
+                    except Exception as exc2:
+                        log_activity(f"load-faster: {friendly} ROLLBACK ALSO FAILED ({exc2!r}) — NOT resident")
+                        return {"ok": False, "error": f"upgrade failed AND rollback failed: {exc} || {exc2}"}
+                    return {"ok": False, "error": f"upgrade failed, rolled back to a working copy: {exc}"}
+                newm = self.models.get(friendly)
+                if newm is not None:
+                    newm.upgrade = self._upgrade_for(newm)      # refresh the badge state immediately
+                cpu1, n1 = (self._model_cpu_frac(newm), len(newm.plan.stages)) if newm else (1.0, 0)
+                log_activity(f"load-faster: {friendly} now {self._placement_label(cpu1, n1)}")
+                return {"ok": True, "model": _ollama_name(friendly), "forced": forced,
+                        "from": self._placement_label(cpu0, n0), "to": self._placement_label(cpu1, n1)}
+            finally:
+                gate.set()
+                self._promote_gates.pop(base, None)
+                self.reconfiguring = None
+
     async def _await_free_refresh(self, timeout: float = 12.0) -> None:
         """After unloading, wait for workers to gc and report FRESH free RAM (via the next
         heartbeat) so the planner budgets against true free memory, not RAM the old model

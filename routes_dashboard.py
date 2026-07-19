@@ -71,6 +71,9 @@ def register(app):
         # graphs=1 attaches a server-rendered SVG sparkline per node (bandwidth + RAM)
         # so the dashboard can drop them straight into the DOM. Off by default to keep
         # /status lean for non-dashboard consumers (the Ollama-compat clients, scripts).
+        # #load-faster: refresh each resident text model's placement-upgrade suggestion (self-throttled
+        # to ~30s inside refresh_upgrades, so this ~2s poll stays cheap). Sets lm.upgrade -> _loaded_dict.
+        await engine.refresh_upgrades()
         st = build_status()
         if graphs:
             for nd in st.get("nodes", []):
