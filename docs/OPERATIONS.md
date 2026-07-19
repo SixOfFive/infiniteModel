@@ -55,11 +55,26 @@ hybrid model left that way is permanently slow. The juggler fixes that automatic
   remembers a promotion that could only reach a partial fit and won't retry until the fleet
   actually frees more VRAM.
 
-### Placement is static after load
+### Load faster — one-click placement upgrade
 
-A model's GPU/RAM split never drifts while loaded. If a model "moved to RAM at some point," that
-was a **re-load** (restart, redeploy, eviction, or an auto-load that raced a busy fleet) — check
-`autoload_mode` (below) and the juggler.
+The dashboard shows a **⬆ load faster** badge under a loaded text model whenever a strictly faster
+placement is achievable with currently-free fleet VRAM — a CPU-spilled/hybrid model that would now
+fit VRAM-resident, or a multi-node split that would now consolidate onto fewer nodes. Hover shows
+*from → to*. One click (no confirm) **drains the in-flight reply** (waits ~2 min for the current
+generation, then forces), then re-places the model VRAM-first through the same hitless juggler
+barrier (clients pause and ride onto the fresh copy, no reconnect), preserving full config and
+rolling back to a working copy on failure. It complements the juggler, which only auto-promotes
+*idle* hybrids — so the badge's value is **busy** models (drain-then-swap) and **node
+consolidation**. Endpoint: `POST /load_faster?model=<name>` (returns `409` when nothing faster fits
+right now). Detection reuses the juggler's live-free-VRAM fit-check and is throttled to ~30 s, so it
+never promises a placement a real re-place can't reach.
+
+### Placement is static after load (unless you ask)
+
+A model's GPU/RAM split never *drifts* on its own while loaded. It changes only on a **re-load**
+(restart, redeploy, eviction, or an auto-load that raced a busy fleet), an automatic **juggler**
+promotion, or a manual **load-faster** click (both above). If a model "moved to RAM at some point"
+you didn't trigger, check `autoload_mode` (below) and the juggler.
 
 ### Shard-cache ops
 
@@ -166,7 +181,9 @@ All runtime knobs persist across restarts and are settable from the dashboard se
 
 Per-load knobs (query params on `/load`): `quant` (`none|int8|int4|int2` — **omitted ⇒ the
 `autoload_quant` default, normally int4**, NOT bf16; pass `quant=none` explicitly for bf16; int2
-requires its pre-compiled calibrated cache, see Shard-cache ops), `ctx`, `mode`
+requires its pre-compiled calibrated cache, see Shard-cache ops), `ctx` (**clamped down to the
+model's training context `max_position_embeddings` — a load never over-reserves KV for context the
+model can't attend to; a smaller value is honored as-is**), `mode`
 (`auto|single|gpu-spread|all-gpu|distribute|spread|proportional`), `node` (pin to one node),
 `tp` (tensor-parallel width), `replicas`, `kv_offload=1` (KV cache in system RAM — frees the VRAM
 KV reserve for layers; CUDA only, force-disabled on ROCm), `kv_quant` (`turbo2|turbo3|turbo4`),

@@ -715,6 +715,33 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   fit-check, and the anti-churn measure. The guard now actually clears when VRAM frees, so a freed
   GPU triggers relocation on the next sweep.
 
+- **#load-faster — one-click "load faster" placement upgrade (2026-07-19).** Under each loaded text
+  model the dashboard shows a **⬆ load faster** badge whenever a strictly faster placement is
+  achievable with currently-free fleet VRAM — a CPU-spilled/hybrid model that would now fit
+  VRAM-resident, or a multi-node pipeline split that would now consolidate onto fewer nodes. Hover
+  shows *from → to*; one click (no confirm) **drains the in-flight reply** (waits ~2 min for the
+  current generation to finish, then forces), then re-places the model VRAM-first through the same
+  hitless #juggler barrier (parked clients pause and ride onto the fresh copy — no reconnect),
+  preserving full config (ctx/quant/tp/kv_quant/kv_offload/sampling defaults) and rolling back to a
+  working copy if the faster layout no longer fits. Detection (`engine._upgrade_for`, throttled ~30 s
+  off `/status`) reuses the juggler's live-free-VRAM fit-check, so the badge never promises a placement
+  a real re-place can't reach. Complements the auto-juggler (which only promotes *idle* hybrids): the
+  badge's value is **busy** models (drain-then-swap) and **node consolidation**. Kept self-contained
+  (its own atomic reload + rollback) so it can't destabilize the auto-juggler / wedge self-heal.
+  `POST /load_faster?model=<name>`.
+- **Serving & placement correctness (2026-07-18/19).** Three fixes, deployed hitlessly to both
+  controllers: (1) **Qwen3 `enable_thinking` is now reachable on the OpenAI/Ollama endpoints** — it
+  was silently ignored there (only the Anthropic `/v1/messages` path mapped it, and only the
+  `/no_think` prompt soft-switch worked); `serving.py` now honors `chat_template_kwargs.enable_thinking`
+  (vLLM), Ollama `think`, or top-level `enable_thinking`, threaded into the template only when it
+  supports the switch (default unchanged). (2) **Cache-on-first-load precompile now skips embedding
+  models** — `_precompile_int4` excluded media checkpoints but not encoders, so every auto-load /
+  re-adopt of a persist embedding (nomic-embed) self-POSTed an int4 `/compile_shards` that always
+  failed `KeyError 'model.embed_tokens.weight'`, spamming recurring 400s; it now classifies the
+  on-disk config and skips. (3) **A load never over-reserves context** — an explicit or `autoload_ctx`
+  value is clamped **down** to the model's training context (`max_position_embeddings`), so a
+  2k-trained model (e.g. nomic) never gets a 4k KV window; a smaller request is honored unchanged.
+
 ## Public release
 - Central `config.json` (all hosts/ports + the self-update source; no addresses baked into code);
   credentials and internal-only artifacts scrubbed for open source.
