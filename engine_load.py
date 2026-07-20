@@ -369,7 +369,7 @@ class EngineLoadMixin:
                 if _d and os.path.isdir(os.path.join(_d, "ace_step_transformer")):
                     return await self._load_t2a_locked(friendly, _tgt, reg_key or friendly,
                                                        quant, replica_idx=replica_idx,
-                                                       offload=t2i_offload)
+                                                       offload=t2i_offload, cpu_only=cpu_only)
                 # #tts-serve: a Kokoro speech checkpoint (kokoro-v1_0.pth + voices/, no
                 # safetensors, no model_index.json) loads via the single-node speech path.
                 if _d and _is_kokoro_dir(_d):
@@ -1565,17 +1565,25 @@ class EngineLoadMixin:
 
     async def _load_t2a_locked(self, friendly: str, target_id: str, reg_key: str,
                                quant: str = "none", replica_idx: int = 0,
-                               offload: bool = False) -> LoadedModel:
+                               offload: bool = False,
+                               cpu_only: bool = False) -> LoadedModel:
         """#t2a-serve (M1): load an ACE-Step music checkpoint WHOLE onto ONE controller-
         CO-LOCATED GPU worker — the audio sibling of _load_t2i_locked. bf16-only for M1
         (edge-int4 is M2). offload=True keeps ACE-Step's components in RAM and hops the whole
         ~6.6 GB DiT to the GPU per render (low resident VRAM, ~8 GB transient, never evicts);
-        offload=False keeps the ~8.3 GB pipeline GPU-resident (faster). v1 co-location
-        constraint (shared FS: model dir read + WAV path back). MUST hold self.lock."""
+        offload=False keeps the ~8.3 GB pipeline GPU-resident (faster). #t2a-cpu: cpu_only=True
+        runs the WHOLE pipeline on CPU (device='cpu', RAM-resident, no GPU) — EXPERIMENTAL and
+        very slow (diffusion on CPU), opt-in via /load?cpu_only=1; it forces offload off (a
+        GPU-hop concept) and never falls back to GPU. v1 co-location constraint for the
+        co-located fast path (shared FS: model dir read + WAV path back). MUST hold self.lock."""
         model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
         if quant and quant not in ("none", ""):
             log_activity(f"{_ollama_name(friendly)}: {quant} is not a t2a tier (M1 bf16-only) — using bf16")
         quant = "none"
+        if cpu_only:
+            offload = False   # #t2a-cpu: CPU compute is RAM-resident; offload is a GPU-hop concept
+            log_activity(f"{_ollama_name(friendly)}: CPU-only t2a requested — EXPERIMENTAL and very "
+                         f"slow (diffusion on CPU), no GPU/offload fallback")
         dit_b = await asyncio.to_thread(_tree_weight_bytes,
                                         os.path.join(model_dir, "ace_step_transformer"))
         all_b = await asyncio.to_thread(_tree_weight_bytes, model_dir)
@@ -1618,7 +1626,7 @@ class EngineLoadMixin:
             # advertised the acestep runtime (can_t2a) — the checkpoint streams to it via
             # snapshot_download and the WAV returns as base64 over the link, so no shared FS.
             cand = [n for n in registry.alive_sorted()
-                    if n.can_infer and n.vram_total_gb > 0
+                    if n.can_infer and (cpu_only or n.vram_total_gb > 0)
                     and (_is_colo(n) or getattr(n, "can_t2a", False))]
             # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
             _res_ram_b, _res_vram_b = self._reserved_bytes(exclude_key=reg_key)
@@ -1632,6 +1640,13 @@ class EngineLoadMixin:
             # would otherwise fail the load with no failover.
             for n in sorted(cand, key=lambda _n: (bool(getattr(_n, "can_t2a", False)),
                                                    _is_colo(_n), _t2a_free(_n)), reverse=True):
+                if cpu_only:
+                    # #t2a-cpu: budget against RAM only (VRAM ignored) — whole pipeline + margin in RAM.
+                    if ((n.free_mem_gb or 0) - _res_ram_b.get(n.node_id, 0) / GB) \
+                            >= all_b / GB + _MARGIN_GB:
+                        node = n
+                        break
+                    continue
                 free = _t2a_free(n)
                 if offload:
                     # never evicts (its point): needs only the transient VRAM + RAM for the weights
@@ -1646,6 +1661,17 @@ class EngineLoadMixin:
                     break
             if node is not None:
                 break
+            if cpu_only:
+                # #t2a-cpu: no GPU/offload fallback — a worker either has the RAM + acestep or we fail.
+                if not _refreshed:
+                    _refreshed = True
+                    await self._await_free_refresh()
+                    continue
+                raise RuntimeError(
+                    f"no worker has ~{all_b / GB + _MARGIN_GB:.1f} GB free RAM plus the acestep "
+                    f"runtime for CPU-only t2a "
+                    f"({'no capable worker connected' if not cand else 'all workers too full'})"
+                    " — CPU-only music is EXPERIMENTAL and extremely slow; the normal path is a GPU")
             victim = (self._lru_evictable()
                       if (not offload and bool(ENGINE_CONFIG.get("auto_unload", True))) else None)
             if victim is None:
@@ -1681,13 +1707,17 @@ class EngineLoadMixin:
                         "target": target_id, "total": 1, "ready": 0,
                         "stages_total": 1, "stages_ready": 0,
                         "basis": f"t2a: single-node ({node.hostname}, "
-                                 f"{'bf16 OFFLOAD (components in RAM)' if offload else 'bf16 GPU-resident'})",
+                                 + ("bf16 CPU (experimental, slow)" if cpu_only
+                                    else "bf16 OFFLOAD (components in RAM)" if offload
+                                    else "bf16 GPU-resident") + ")",
                         "warnings": [], "node_ids": [node.node_id],
                         "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
         self._reservations[reg_key] = {node.node_id: {
-            "ram": int((all_b + 4 * GB) if offload else 2 * GB),
-            "vram": int((_T2A_OFFLOAD_VRAM_GB if offload else _need_gb()) * GB)}}
+            "ram": int(all_b + _MARGIN_GB * GB) if cpu_only
+                   else int((all_b + 4 * GB) if offload else 2 * GB),
+            "vram": 0 if cpu_only
+                    else int((_T2A_OFFLOAD_VRAM_GB if offload else _need_gb()) * GB)}}
         link = self.links.get(node.node_id)
         if link is None:
             self.loadings.pop(reg_key, None)
@@ -1699,7 +1729,7 @@ class EngineLoadMixin:
                          "t2a_offload": bool(offload),
                          "controller_http_port": ARGS.http_port,
                          "next_host": None, "next_port": ARGS.data_port,
-                         "device": "cuda"})
+                         "device": "cpu" if cpu_only else "cuda"})
         try:
             # generous: an offload load reads the ~8.3 GB pipeline into RAM then builds
             r = await asyncio.wait_for(fut, timeout=max(GEN_TIMEOUT_S, 1200.0))
@@ -1726,9 +1756,10 @@ class EngineLoadMixin:
                          quant="none", stage0_writer=stage0_writer, last_used=now,
                          stage0_dial=_dial, last_send_ts=now)
         lm.base, lm.replica_idx = friendly, replica_idx
-        lm.plan_basis = "t2a: single-node"
+        lm.plan_basis = "t2a: single-node" + (" (CPU)" if cpu_only else "")
         lm.is_t2a = True
         lm.t2a_offload = bool(offload)
+        lm.t2a_cpu = bool(cpu_only)   # #t2a-cpu: render path gives a CPU pipeline a larger timeout
         lm.media = r.get("media") if isinstance(r, dict) else None   # #media-detail (may be None)
         self.models[reg_key] = lm
         self.loadings.pop(reg_key, None)
@@ -1917,9 +1948,13 @@ class EngineLoadMixin:
                                  "prompt": str(prompt or ""), "lyrics": str(lyrics or ""),
                                  "duration": _dur, "steps": int(steps),
                                  "guidance": float(guidance), "seed": seed})
-                # GPU render is ~2x realtime (M0); CPU/offload much slower — scale by clip length.
+                # GPU render is ~2x realtime (M0); offload slower; #t2a-cpu diffusion-on-CPU is
+                # DRAMATICALLY slower — give a CPU-resident model a much larger upper bound so a
+                # legitimately slow render isn't cut off (it's only a hang ceiling, costs nothing).
+                _t2a_cpu = bool(getattr(lm, "t2a_cpu", False))
                 r = await asyncio.wait_for(
-                    fut, timeout=max(GEN_TIMEOUT_S, 120.0 + _dur * 20.0))
+                    fut, timeout=max(GEN_TIMEOUT_S,
+                                     (600.0 + _dur * 120.0) if _t2a_cpu else (120.0 + _dur * 20.0)))
             finally:
                 lm.active = 0
                 lm.t2a_req = None
