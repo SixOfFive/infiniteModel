@@ -1585,9 +1585,23 @@ class EngineLoadMixin:
                          meas_layer_w=max(1, dit_b // 24), meas_embed=0, meas_head=0,
                          meas_norm=0, meas_params=max(1, all_b // 2))
         _T2A_OFFLOAD_VRAM_GB = 8.0   # M0 whole-DiT-hop peak 6.67 GB + decode/activation margin
-        _MARGIN_GB = 2.5             # ~8.3 GB resident + activation/decode headroom
+        # #t2a-render-peak: size a GPU-RESIDENT placement to the diffusion RENDER peak, not the
+        # load footprint. ACE-Step's whole pipeline RESTS at ~8.3 GB, but a render climbs ~3+ GB
+        # higher (denoising activations + audio latents). An 11.55 GB card (RTX 3060) passed the
+        # old load-sized gate (all_b + 2.5 ≈ 10.8 GB), loaded fine, then CUDA-OOM'd MID-GENERATION
+        # at ~11.4 GB used — 32 MiB short (beast pool, 2026-07-20). Require the render peak (a FLOOR
+        # the 3060 can't clear, or all_b+margin for a larger t2a model) so a marginal card is
+        # rejected at PLACEMENT — it then picks a bigger card, evicts an idle LRU model, or fails
+        # clean — instead of dying partway through a render the user is waiting on. A too-small card
+        # is still reachable via OFFLOAD mode (DiT-hop only, ~8 GB peak), which the loop falls back
+        # to when no card clears the resident floor and nothing is evictable.
+        _MARGIN_GB = 4.5             # ~8.3 GB resident + ~3 GB render activation peak + safety
+        _T2A_RENDER_FLOOR_GB = 12.5  # min FREE VRAM for any ace-step GPU-resident render (observed
+                                     # peak ~11.4 GB + safety) — excludes the 11.55 GB 3060 whatever
+                                     # all_b measures
         def _need_gb() -> float:
-            return _T2A_OFFLOAD_VRAM_GB if offload else (all_b / GB + _MARGIN_GB)
+            return _T2A_OFFLOAD_VRAM_GB if offload else max(all_b / GB + _MARGIN_GB,
+                                                            _T2A_RENDER_FLOOR_GB)
         await self.ensure_data_listener()
         if reg_key in self.models:
             await self._unload_model_locked(reg_key, "reload (t2a)")
