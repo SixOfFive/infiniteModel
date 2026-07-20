@@ -99,6 +99,16 @@ class T2APipeline:
             cpu_offload=self.offload,
             overlapped_decode=False,
         )
+        # #t2a-cpu: ACE-Step has NO cpu-force flag — __init__ sets self.device = cuda:0
+        # whenever torch.cuda.is_available(), and load_checkpoint() moves EVERY component
+        # (ace_step_transformer / music_dcae / text_encoder_model) with .to(self.device).
+        # So on a GPU box it ignores our device='cpu' and loads onto the GPU (OOMing if the
+        # card is full). Override the pipeline's device to CPU BEFORE load_checkpoint so the
+        # whole model lands in RAM. cpu_offload is already False for a cpu_only load (the
+        # controller never asks for offload+cpu), so there is no GPU hop at render time.
+        if str(self.device).startswith("cpu"):
+            import torch as _torch
+            self.pipe.device = _torch.device("cpu")
         # Eager-load so `loaded` reflects reality and the first request isn't a cold load;
         # get_checkpoint_path uses model_dir as-is (has the 4 component subfolders).
         self.pipe.load_checkpoint(model_dir)
