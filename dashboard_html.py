@@ -197,8 +197,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   .chip.q4:hover{background:var(--accent);color:#0a0e14}
   .row .meta{flex:1;font-size:12.5px;color:var(--muted);min-width:0}
   .row .meta .em{color:var(--text)}
-  /* #models-tps-graph: per-loaded-model tok/s traffic graph, its own line under the stats */
-  .row .meta .mspark{margin-top:7px;line-height:0}
+  /* #models-tps-graph: per-loaded-model tok/s traffic graph, its own line under the stats.
+     RIGHT-aligned: .meta is flex:1 so its LEFT edge starts wherever that model's name (.nm)
+     ends — a left-aligned fixed-width spark therefore staggers row to row. .meta's RIGHT edge
+     is common to every row (bounded by .acts), so aligning right lines the graphs up. */
+  .row .meta .mspark{margin-top:7px;line-height:0;text-align:right}
   .row .meta .mspark svg{max-width:100%;height:auto;vertical-align:middle}
   .row .acts{display:flex;align-items:center;gap:7px}
   .miniprog{height:4px;background:#0a0e14;border-radius:3px;margin-top:5px;max-width:280px;overflow:hidden}
