@@ -1,12 +1,14 @@
 """media_encode.py: the controller's media/speech encode family (code-split Inc 11).
 
-RELOCATED VERBATIM from server.py — every function/method body below is BYTE-IDENTICAL to its
-server.py original; only this header (and the EngineSpeechMixin class wrapper) is new. Members:
+RELOCATED VERBATIM from server.py — originally every function/method body was BYTE-IDENTICAL
+to its server.py original; only this header (and the EngineSpeechMixin class wrapper) was new.
+(Since diverged: the #speech-idle-evict group below — audit #27 — touched _load_speech_components
+and split generate_speech into a pin wrapper + _generate_speech_inner.) Members:
 _encode_images, _encode_audio_gemma4, _encode_audio, the #P6 speech-out group (_SPEECH_CACHE /
 _SPEECH_MAT / _ensure_spk_dict / _materialize_from_prefix / SPEECH_DEVICE /
-_load_speech_components), and Engine.generate_speech as EngineSpeechMixin (composed into
-``class Engine(..., EngineSpeechMixin)`` in server.py; self.capture_thinker resolves via MRO
-from EngineGenMixin).
+_load_speech_components + the #speech-idle-evict reaper), and Engine.generate_speech as
+EngineSpeechMixin (composed into ``class Engine(..., EngineSpeechMixin)`` in server.py;
+self.capture_thinker resolves via MRO from EngineGenMixin).
 
 THIS MODULE IS THE CANONICAL HOME OF ``ENCODING`` — the >0-while-encoding idle-gate counter the
 self-updater reads. All FOUR mutators (`global ENCODING` in _encode_images / _encode_audio /
@@ -26,8 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import os
 import shutil
+import threading
 import time
 
 # Canonical idle-gate (relocated from server.py; see the module docstring).
@@ -425,6 +429,119 @@ def _encode_audio(target_id: str, audios: list, sampling_rate: int = 16000) -> d
 _SPEECH_CACHE: dict = {}    # target_id -> dict(model, talker, token2wav, embed, speaker_map, dev)
 _SPEECH_MAT: dict = {}      # target_id -> {component: [(name, shape, how)]}
 
+# #speech-idle-evict (audit #27): _SPEECH_CACHE pinned the ~14-18 GB fp32 talker+token2wav+embed
+# head in controller RAM FOREVER — one speech request permanently cost beast the RAM the
+# render-oom-guard / t2a-offload paths arbitrate over. The trio below + the lazy daemon thread
+# give it the same idle discipline models get: no speech use for > the window -> drop the head
+# (it lazy-rebuilds on the next request; heavy, ~minutes, an accepted trade for the RAM).
+_SPEECH_LAST_USE: dict = {}     # target_id -> time.monotonic() of last cache touch (reaper input)
+_SPEECH_INFLIGHT: dict = {}     # target_id -> live generate_speech count (reaper skip; covers the
+#                                 thinker-capture phase where ENCODING is 0 but the head is in use)
+_SPEECH_LOCK = threading.Lock()        # guards the two dicts above (reaper thread vs. servers)
+_SPEECH_BUILD_LOCK = threading.Lock()  # serializes the heavy build (evict -> 2 cold requests race)
+_SPEECH_REAPER_ON = False              # lazy one-shot; rebound only here (no outside reader)
+
+
+def _speech_idle_window_s() -> float:
+    """#speech-idle-evict window (seconds). Knob: ENGINE_CONFIG['speech_idle_unload_m'] —
+    minutes of NO speech use before the cached head is dropped (engine_config.json; hand-set —
+    /config has no dedicated param yet). Absent -> follow the model sweep's idle_unload_m, so
+    turning idle-unload on reaps this cache too with the SAME window; <= 0 (the -1 'forever'
+    sentinel included, same as every idle_unload_m consumer) -> keep forever (old behavior,
+    and still the default default since idle_unload_m defaults to 0)."""
+    try:
+        cfg = ENGINE_CONFIG            # injected by state.bind(); NameError pre-bind/standalone
+    except NameError:
+        return 0.0
+    v = cfg.get("speech_idle_unload_m")
+    if v in (None, ""):
+        v = cfg.get("idle_unload_m", 0)
+    try:
+        m = float(v or 0)
+    except (TypeError, ValueError):
+        m = 0.0
+    return m * 60.0 if m > 0 else 0.0
+
+
+def _speech_touch(target_id: str) -> None:
+    """Restart a cached head's idle clock (cache hit / fresh build / request end)."""
+    with _SPEECH_LOCK:
+        _SPEECH_LAST_USE[target_id] = time.monotonic()
+
+
+def _speech_pin(target_id: str) -> None:
+    """Pin a head for one in-flight speech request (generate_speech wrapper)."""
+    with _SPEECH_LOCK:
+        _SPEECH_INFLIGHT[target_id] = _SPEECH_INFLIGHT.get(target_id, 0) + 1
+
+
+def _speech_unpin(target_id: str) -> None:
+    with _SPEECH_LOCK:
+        n = _SPEECH_INFLIGHT.get(target_id, 0) - 1
+        if n > 0:
+            _SPEECH_INFLIGHT[target_id] = n
+        else:
+            _SPEECH_INFLIGHT.pop(target_id, None)
+        # idle counts from request END — a minutes-long talker/vocoder tail must not look idle
+        _SPEECH_LAST_USE[target_id] = time.monotonic()
+
+
+def _speech_evict_idle() -> list:
+    """One reaper pass: drop every cached speech head idle past the window; returns the evicted
+    target_ids. Skips: window off, ANY encode in flight (ENCODING > 0 covers the build and the
+    talker/vocoder phases — coarse but safe), and per-target pinned requests. Eviction is
+    .pop() IN PLACE: _SPEECH_MAT is from-imported by server.py/routes_diag, so a rebind would
+    silently decouple those readers (state.py SAFETY NOTE)."""
+    window = _speech_idle_window_s()
+    if window <= 0 or ENCODING > 0 or not _SPEECH_CACHE:
+        return []
+    now = time.monotonic()
+    evicted = []
+    with _SPEECH_LOCK:
+        for tid in list(_SPEECH_CACHE.keys()):
+            if _SPEECH_INFLIGHT.get(tid, 0) > 0:
+                continue
+            if now - _SPEECH_LAST_USE.get(tid, now) <= window:
+                continue
+            _SPEECH_CACHE.pop(tid, None)
+            _SPEECH_MAT.pop(tid, None)
+            _SPEECH_LAST_USE.pop(tid, None)
+            evicted.append(tid)
+    if evicted:
+        gc.collect()                   # the multi-GB fp32 head: hand the pages back NOW
+        if SPEECH_DEVICE not in ("cpu", ""):
+            with contextlib.suppress(Exception):
+                import torch
+                torch.cuda.empty_cache()
+        for tid in evicted:
+            msg = (f"speech idle-evict {tid}: no speech use for > {window / 60.0:g} min — "
+                   f"dropped the cached talker+token2wav+embed head from controller RAM "
+                   f"(lazy-rebuilds on the next speech request)")
+            try:
+                log_activity(msg)      # injected by state.bind(); print-fallback standalone
+            except NameError:
+                print(f"[speech] {msg}")
+    return evicted
+
+
+def _ensure_speech_reaper() -> None:
+    """Start the single daemon evict thread lazily on first cache insert. A thread, not a hook
+    into server.py's _idle_unload_loop: that sweep walks engine.models (worker shards) and lives
+    in a file this leaf must not reach back into; a private thread keeps the whole feature in
+    ENCODING's canonical home and needs no event loop. Called under _SPEECH_BUILD_LOCK, so the
+    one-shot flag needs no extra guard."""
+    global _SPEECH_REAPER_ON
+    if _SPEECH_REAPER_ON:
+        return
+    _SPEECH_REAPER_ON = True
+
+    def _loop():
+        while True:
+            time.sleep(60.0)
+            with contextlib.suppress(Exception):   # the reaper must never die
+                _speech_evict_idle()
+    threading.Thread(target=_loop, name="speech-idle-evict", daemon=True).start()
+
 
 def _ensure_spk_dict(target_id: str) -> str:
     """spk_dict.pt (speaker conditioning) is NOT a *.safetensors/*.json, so _controller_model_dir
@@ -479,10 +596,21 @@ def _load_speech_components(target_id: str) -> dict:
     distributed (we only pull its embed matrix for the assembly)."""
     cached = _SPEECH_CACHE.get(target_id)
     if cached is not None:
+        _speech_touch(target_id)   # #speech-idle-evict: every hit restarts the idle clock
         return cached
     import torch, glob
     import torch.nn as nn
     global ENCODING
+    # #speech-idle-evict: serialize the minutes-long multi-GB build. After an eviction, two
+    # concurrent cold speech requests would otherwise BOTH build (a 2x controller-RAM spike);
+    # the lock loser re-checks the cache and returns the winner's head. Blocking is safe —
+    # every caller reaches here via asyncio.to_thread, never on the event loop.
+    _SPEECH_BUILD_LOCK.acquire()
+    cached = _SPEECH_CACHE.get(target_id)
+    if cached is not None:
+        _SPEECH_BUILD_LOCK.release()
+        _speech_touch(target_id)
+        return cached
     ENCODING += 1   # heavy one-time build; hold the self-update idle gate
     try:
         from transformers import AutoConfig
@@ -532,9 +660,14 @@ def _load_speech_components(target_id: str) -> dict:
                     break
         if ew is None:
             raise RuntimeError("thinker.model.embed_tokens.weight not found")
-        embed = nn.Embedding(ew.shape[0], ew.shape[1])
+        # #speech-idle-evict (audit #27b): store the embed matrix bf16, NOT fp32 — the checkpoint
+        # is bf16 on disk and the SOLE consumer (generate_speech's emb()) casts every lookup to
+        # f32 anyway, so this halves the ~2.2 GB copy losslessly. A lookup is a dtype-safe gather
+        # even on CPU; do NOT extend bf16 to talker/token2wav — those COMPUTE on CPU and must
+        # stay fp32 (unreliable bf16 CPU ops; the zero-filled-filter/silent-audio history above).
+        embed = nn.Embedding(ew.shape[0], ew.shape[1], dtype=torch.bfloat16)
         with torch.no_grad():
-            embed.weight.copy_(ew.float())
+            embed.weight.copy_(ew.to(torch.bfloat16))
         embed = embed.to(dev).eval()
         spk_path = _ensure_spk_dict(target_id)
         speaker_map = torch.load(spk_path, weights_only=True)
@@ -542,11 +675,14 @@ def _load_speech_components(target_id: str) -> dict:
                "speaker_map": speaker_map, "dev": dev,
                "n_talker": nt, "n_token2wav": nw, "n_embed": 1}
         _SPEECH_CACHE[target_id] = res
+        _speech_touch(target_id)       # #speech-idle-evict: fresh build = fresh idle clock
+        _ensure_speech_reaper()        # lazy: the evict thread exists only once a head is cached
         _vlog(f"[speech] READY {target_id}: talker={nt} token2wav={nw} embed={list(ew.shape)} on "
               f"{dev}; speakers={list(speaker_map.keys())}; total {time.time()-t0:.1f}s")
         return res
     finally:
         ENCODING -= 1
+        _SPEECH_BUILD_LOCK.release()
 
 class EngineSpeechMixin:
     # Relocated Engine method (code-split Inc 11): BODY BYTE-IDENTICAL to the server.py
@@ -555,6 +691,23 @@ class EngineSpeechMixin:
     # THIS module's canonical idle-gate counter (the whole point of the move).
     async def generate_speech(self, friendly, prompt_ids, max_new=256, speaker="Chelsie",
                               talker_max_new=2048):
+        """#speech-idle-evict pin wrapper around the (unchanged) Phase-3 body below: hold the
+        per-target in-flight count for the WHOLE request. ENCODING covers the component build
+        and the talker/vocoder tail, but sits at 0 during the distributed thinker capture —
+        without the pin the reaper could evict the head mid-request there (memory-safe, the
+        local refs keep the tensors alive, but the next request would pay a pointless
+        minutes-long rebuild). Unpin also restamps last-use, so idle counts from request END."""
+        target = self.models[friendly].target_id
+        _speech_pin(target)
+        try:
+            return await self._generate_speech_inner(
+                friendly, prompt_ids, max_new=max_new, speaker=speaker,
+                talker_max_new=talker_max_new)
+        finally:
+            _speech_unpin(target)
+
+    async def _generate_speech_inner(self, friendly, prompt_ids, max_new=256, speaker="Chelsie",
+                                     talker_max_new=2048):
         """#P6 speech-out Phase 3: distributed Thinker (captured hidden states) -> Talker (codec
         tokens) -> token2wav (waveform). Faithful to Qwen2.5-Omni's generate() talker assembly
         (modeling_qwen2_5_omni.py): builds thinker_reply_part = last-layer-hidden + token-embed

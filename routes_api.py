@@ -57,6 +57,32 @@ def register(app):
         return JSONResponse({"id": _ollama_name(friendly), "object": "model",
                              "created": int(START_TIME), "owned_by": "infinitemodel"})
 
+    def _media_load_error(exc: Exception, model: str, media: str) -> JSONResponse:
+        """#at-capacity (b4a2db0, audit #32) for the MEDIA routes (t2i / tts / speech / t2a) —
+        the SAME typed ladder _serve/_serve_embed use (serving.py:#cold-contract), in the OpenAI
+        error envelope these routes already speak:
+          ValueError (registered but not loaded; auto-load off/updating) -> 404 model_not_found
+            (the old blanket except->404 told clients a CAPACITY-failed model doesn't exist —
+            a terminal signal; the furnace acestep OOM routing surfaced exactly that);
+          CapacityError.terminal (auto-unload off / all residents pinned) -> 503 code=at_capacity
+            with NO Retry-After (a retry can never succeed until an operator frees something);
+          anything else (capacity-busy / node / OOM load refusal) -> retryable 503 + Retry-After.
+        Every refused load is log_activity'd — the #render-oom-guard 503s used to be INVISIBLE
+        in telemetry (documented gap): the guard itself logs nothing on refuse, so this line is
+        the only fleet-side record that a media auto-load was turned away."""
+        if isinstance(exc, ValueError):
+            return JSONResponse({"error": {"message": str(exc), "type": "invalid_request_error",
+                                           "code": "model_not_found"}}, status_code=404)
+        _term = isinstance(exc, CapacityError) and getattr(exc, "terminal", False)
+        log_activity(f"{media} {model}: auto-load failed — {exc!r}"
+                     + (" [at_capacity TERMINAL]" if _term else ""))
+        _err = {"message": f"{media} model load failed: {exc}",
+                "type": ("server_error" if _term else "model_loading")}
+        if _term:
+            _err["code"] = "at_capacity"
+        return JSONResponse({"error": _err}, status_code=503,
+                            headers=({} if _term else {"Retry-After": "3"}))
+
     @app.post("/v1/images/generations")   # OpenAI Images API (#t2i-serve, task #37)
     async def v1_images_generations(req: Request) -> JSONResponse:
         """Text-to-image via the OpenAI images shape: {model?, prompt, size?, n?,
@@ -103,10 +129,13 @@ def register(app):
         n = max(1, min(4, int(body.get("n") or 1)))
         if friendly not in engine.models:
             try:
-                await engine.ensure_loaded(friendly, 0)
+                # auto_load=True: make the docstring's "auto-loads like the chat endpoints" TRUE
+                # — without it ensure_loaded (default False) could only ever raise the ValueError
+                # this route then mislabeled as an untyped-503 "load failed" (audit #32 NUANCE:
+                # the inversion opposite to the 404-on-capacity one).
+                await engine.ensure_loaded(friendly, 0, auto_load=True)
             except Exception as exc:
-                return JSONResponse({"error": {"message": f"image model load failed: {exc}",
-                                               "type": "server_error"}}, status_code=503)
+                return _media_load_error(exc, friendly, "t2i")
         data, meta = [], {}
         try:
             for i in range(n):
@@ -427,7 +456,9 @@ def register(app):
                     try:
                         await engine.ensure_loaded(_kf, 0, auto_load=True)
                     except Exception as exc:
-                        return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
+                        # #at-capacity (audit #32): was except->404 — a Kokoro auto-load refused
+                        # for RAM/VRAM told the client the model doesn't exist. Typed ladder now.
+                        return _media_load_error(exc, _kf, "tts")
                     try:
                         _speed = float(body.get("speed") or 1.0)
                     except Exception:
@@ -463,7 +494,9 @@ def register(app):
                 lm = await engine.ensure_loaded(friendly, ctx, auto_load=True)
                 tok = lm.tokenizer
             except Exception as exc:
-                return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
+                # #at-capacity (audit #32, 4th site): the Omni speech auto-load had the same
+                # blanket except->404 — capacity refusals masqueraded as model-not-found.
+                return _media_load_error(exc, friendly, "speech")
             # resolve voice -> our speaker (load speech components to know available speakers)
             try:
                 sc = await asyncio.to_thread(_load_speech_components, lm.target_id)
@@ -538,7 +571,11 @@ def register(app):
             try:
                 await engine.ensure_loaded(friendly, 0, auto_load=True)
             except Exception as exc:
-                return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
+                # #at-capacity (audit #32): THE observed failure — a t2a request routed to a
+                # can_t2a node it couldn't fit (furnace acestep OOM) came back 404 "not found",
+                # making retrying clients give up on a model that exists. Typed ladder now, and
+                # the refusal finally lands in log_activity (render-oom-guard telemetry gap).
+                return _media_load_error(exc, friendly, "t2a")
             audio_bytes, meta = await engine.t2a_generate(
                 friendly, prompt, lyrics=(body.get("lyrics") or ""),
                 duration=_f("duration", 30.0), steps=_i("steps", 60),
