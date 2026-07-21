@@ -225,6 +225,54 @@ def _node_tp_bw(node, is_gpu: bool) -> float:
     return {5: 70.0, 4: 45.0, 3: 25.0}.get(gen, 35.0)   # rough dual-channel desktop GB/s
 
 
+# --- #unified-mem (audit #17): APU shared-pool detection + plannable-budget clamp ------------
+# amdgpu sizes the GTT pool at ~1/2 of system RAM, so an APU's mem_get_info "VRAM total" lands
+# near 0.5x host RAM (om3nbox gfx1151: ~60/128 ≈ 0.47; steamdeck Van Gogh: ~8/16 ≈ 0.5). 0.35
+# leaves slack for BIOS carve-outs / smaller GTT limits while staying far above any discrete
+# card on this fleet (beast 4070TiS 16/128 ≈ 0.13).
+UNIFIED_MEM_VRAM_RATIO = 0.35
+
+
+def is_unified_mem_node(device_name: str, vram_total_gb: float, total_mem_gb: float,
+                        explicit=None) -> bool:
+    """True when a node's reported "VRAM" is a GTT slice CARVED FROM THE SAME physical RAM
+    psutil reports (APUs: om3nbox's Strix Halo gfx1151, the steamdeck's Van Gogh). A planner
+    that sums free RAM + free VRAM on such a node double-counts the one pool (an idle om3nbox
+    reads ~165 GB "usable" on a 128 GB box) and over-commits into a cgroup OOM-kill mid-load.
+
+    `explicit` is a worker-reported flag and WINS when present (bool, either way); no worker
+    ships one yet (heartbeat has no unified_mem field), so detection falls to an HONEST
+    HEURISTIC over registration data the controller already has:
+      AMD device name ("amd"/"radeon"/"gfx" — an NVIDIA name never matches, so every CUDA
+      node is exempt by construction) AND vram_total >= UNIFIED_MEM_VRAM_RATIO x host RAM
+      (the GTT-pool signature above; a discrete card's VRAM sits far below it).
+    KNOWN LIMIT, stated honestly: a big discrete Radeon beside little RAM (e.g. a 24 GB
+    7900XTX on a 32 GB box) would false-positive — none exists on this fleet today, and the
+    failure mode is UNDER-budgeting that node (conservative), never an OOM."""
+    if explicit is not None:
+        return bool(explicit)
+    if not vram_total_gb or not total_mem_gb or vram_total_gb <= 0 or total_mem_gb <= 0:
+        return False
+    dn = (device_name or "").lower()
+    if not ("amd" in dn or "radeon" in dn or "gfx" in dn):
+        return False
+    return vram_total_gb >= UNIFIED_MEM_VRAM_RATIO * total_mem_gb
+
+
+def clamp_unified_usable_gb(usable_gb: float, free_mem_gb: float,
+                            vram_reusable_gb: float = 0.0, reserve_gb: float = 0.0) -> float:
+    """Clamp a unified-memory node's plannable budget (RAM share + "VRAM" share summed by the
+    caller) to the LIVE physically-free bytes of the ONE pool: psutil free (GTT-pinned pages
+    already depress it — which is exactly why the clamp keys off the LIVE figure, not a static
+    total-minus-reserves) + reusable bytes held by the worker process (its vacant torch
+    allocator pool, #vram-reusable — invisible to psutil-free yet a new load allocates from
+    it; a re-place also passes its own reclaimable shard bytes here) - the same reserves the
+    caller already charged its RAM/VRAM budgets. Pure + monotonic: never RAISES a budget
+    (min against the caller's figure) and never returns < 0."""
+    phys_free_gb = free_mem_gb + max(0.0, vram_reusable_gb) - max(0.0, reserve_gb)
+    return max(0.0, min(usable_gb, phys_free_gb))
+
+
 @dataclass
 class StageAssign:
     node_id: str

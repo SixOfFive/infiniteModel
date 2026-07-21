@@ -6,6 +6,19 @@ across all mixins by MRO. Controller-only leaf module; in EXTRA_UPDATE_FILES.
 """
 from __future__ import annotations
 
+# #cache-reserve (audit #16): co-located controller RAM reserve for a CACHE-SERVED load.
+# CONTROLLER_RAM_RESERVE_GB (server.py, default 20, #78) is sized for streaming the FULL bf16
+# from the controller's disk (the 426 GB minimax serve) — but a load served from a VERIFIED
+# pre-quantized _shards/ cache reads only the small pre-packed units (~0.27x bf16 for int4,
+# e.g. ~18 GB vs ~70 GB for a 30B MoE), so charging the full reserve wastes 12-14 GB of
+# plannable RAM on the controller boxes for the COMMON path (autoload_quant=int4 +
+# #cache-on-first-load). Reserve a floor (controller process + serve buffers + OS-cache
+# headroom) scaled by the ACTUAL cache read volume — big int4 caches can still be 50+ GB of
+# reads. Defined here (not env) because these only tune the cache-served DISCOUNT; the bf16
+# reserve stays env-tunable in server.py, and env=0 still disables both (min() below).
+CACHE_CTRL_RESERVE_FLOOR_GB = 6.0    # never reserve less than this on a cache-served load
+CACHE_CTRL_RESERVE_READ_FRAC = 0.10  # + scale: 10% of the cache read volume past the floor
+
 
 class EngineLoadMixin:
 
@@ -608,6 +621,43 @@ class EngineLoadMixin:
                     except Exception as _dg_exc:
                         log_activity(f"{_ollama_name(friendly)}: draft-gpu reserve failed ({_dg_exc!r}) "
                                      f"— planning without it")
+            # #cache-reserve (audit #16) + #shard-cache Inc 2: decide ONCE, BEFORE placement,
+            # whether this load SERVES FROM a complete pre-quantized shard cache. The decision
+            # used to live after plan_pipeline (only dispatch needed it), so the planner could
+            # not know and charged the co-located controller box the FULL bf16-stream reserve on
+            # EVERY load. Hoisting is ~free (_shard_cache_ok memoizes on manifest mtime+size;
+            # quant/model_dir are known here) and also spares the eviction-retry loop the
+            # re-checks. Conservative default: any doubt (no cache, check error, quant is
+            # none/int8) keeps the full bf16 reserve. Re-verified at dispatch (vanish guard).
+            _cache_quant = ""
+            _cache_read_gb = 0.0
+            if quant in ("int4", "int2"):
+                try:
+                    if model_dir and await asyncio.to_thread(_shard_cache_ok, model_dir, quant):
+                        _cache_quant = quant
+
+                        def _cache_tree_bytes(_d=os.path.join(model_dir, "_shards", quant)):
+                            _t = 0
+                            for _r, _ds, _fs in os.walk(_d):
+                                for _f in _fs:
+                                    with contextlib.suppress(OSError):
+                                        _t += os.path.getsize(os.path.join(_r, _f))
+                            return _t
+                        _cache_read_gb = (await asyncio.to_thread(_cache_tree_bytes)) / GB
+                        log_activity(f"{friendly}: serving from {quant} shard cache "
+                                     f"(~{_cache_read_gb:.1f} GB pre-packed; skip bf16 stream "
+                                     f"+ per-layer re-quant)")
+                except Exception as _ce:
+                    log_activity(f"{friendly}: shard-cache check failed ({_ce!r}) -> bf16 stream")
+                    _cache_quant, _cache_read_gb = "", 0.0
+            # Cache-served: the controller reads/serves ~0.27x the bf16 volume, so a small
+            # floor + a slice of the actual read volume protects its process/serve buffers.
+            # min() = never MORE than the configured bf16 reserve (env 0 still disables both).
+            _ctrl_reserve_gb = CONTROLLER_RAM_RESERVE_GB
+            if _cache_quant:
+                _ctrl_reserve_gb = min(CONTROLLER_RAM_RESERVE_GB,
+                                       max(CACHE_CTRL_RESERVE_FLOOR_GB,
+                                           _cache_read_gb * CACHE_CTRL_RESERVE_READ_FRAC))
             # Plan over CAPABLE nodes, each sized by memory LEFT after resident models (so a 2nd
             # model can share a node's spare RAM/VRAM). If a node fails the load (missing deps)
             # mark it incapable and replan; if it won't fit even sharing, evict LRU and retry.
@@ -689,16 +739,31 @@ class EngineLoadMixin:
                     if quant == "int4":   # #62: per-expert streaming caps the transient (chunk + small
                         node_reserve_gb = min(node_reserve_gb, STREAM_EXPERT_RESERVE_GB)   # layer blob)
                     # #78: the controller's CO-LOCATED worker (same box) must leave RAM for the controller
-                    # to read+serve the full bf16 stream (OS cache + serving buffers) WHILE this worker
+                    # to read+serve the bf16 stream (OS cache + serving buffers) WHILE this worker
                     # builds its shard — else the box over-commits and the worker OOM-drops mid-load (the
                     # beast minimax crash). data_host in _LOCAL_IPS == same machine as the controller.
+                    # #cache-reserve (audit #16): _ctrl_reserve_gb (hoisted above the loop) is the FULL
+                    # bf16 reserve only when this load actually streams bf16; a cache-served load reads
+                    # ~0.27x, so it charges the small cache-scaled reserve instead — freeing 12-14 GB of
+                    # plannable RAM on beast/om3nbox for the common int4-cache path.
                     if n.data_host in _LOCAL_IPS:
-                        node_reserve_gb += CONTROLLER_RAM_RESERVE_GB
+                        node_reserve_gb += _ctrl_reserve_gb
                     ram_for_resident = (n.eff_ram_gb - node_reserve_gb
                                         - _res_ram.get(n.node_id, 0) / GB)   # #parallel-load reserve
                     if ram_for_resident <= 0:
                         continue   # too small for even one layer's build transient -> skip
                     usable = ram_for_resident + free_vram   # resident RAM budget (+ VRAM after residents/floor)
+                    # #unified-mem (audit #17): on an APU (om3nbox gfx1151, steamdeck) the line
+                    # above double-counts — free GTT bytes ARE free-RAM bytes — so clamp to the
+                    # LIVE physically-free pool minus the same reserves charged above (transient +
+                    # controller reserve in node_reserve_gb, the VRAM floor, the co-located draft
+                    # slice, both in-flight reservation ledgers — one pool, so the RAM and VRAM
+                    # claims both come out of it). No-op on discrete-GPU/CPU nodes.
+                    usable, free_vram = self._unified_mem_clamp(
+                        n, usable, free_vram,
+                        node_reserve_gb + PLAN_VRAM_FLOOR_GB
+                        + (draft_reserve_gb if n.data_host in _LOCAL_IPS else 0.0)
+                        + (_res_ram.get(n.node_id, 0) + _res_vram.get(n.node_id, 0)) / GB)
                     if usable <= 0:
                         continue
                     node_by_id[n.node_id] = n
@@ -874,24 +939,43 @@ class EngineLoadMixin:
                                 # the streaming phase (the visible bulk of a load) is what the
                                 # Connections panel attributes to the client
                                 "requested_by": _card0.get("requested_by", "")}
-                # #shard-cache Inc 2 (serve-from-cache): if a VERIFIED int4 cache exists, tell every
-                # worker to fetch PRE-PACKED int4 layers (cache=int4) instead of streaming the full
-                # bf16 + re-quantizing — the big win for MoE/large loads (e.g. ~18 GB cache vs ~70 GB
-                # bf16 stream). int4 + pipeline only: TP slices weights non-contiguously (its own
-                # dispatch path, never reaches here) so it can't use the whole-layer cache. The
-                # controller falls back to bf16 PER UNIT if any cache file is missing, and an old
-                # worker that ignores the `cache` key just streams bf16 — both safe.
-                _cache_quant = ""
+                # #shard-cache Inc 2 (serve-from-cache): a VERIFIED cache makes every worker fetch
+                # PRE-PACKED int4/int2 layers (cache=int4) instead of streaming the full bf16 +
+                # re-quantizing — the big win for MoE/large loads (~18 GB cache vs ~70 GB bf16).
+                # int4 + pipeline only: TP slices weights non-contiguously (its own dispatch path,
+                # never reaches here). The controller falls back to bf16 PER UNIT if a cache file
+                # is missing, and an old worker that ignores the `cache` key streams bf16 — safe.
+                # #cache-reserve (audit #16): the decision itself (_cache_quant) is HOISTED above
+                # the placement loop now — the co-located controller RAM reserve is sized by it.
+                # RE-VERIFY here at dispatch (memoized on manifest mtime+size, ~free): a cache
+                # that VANISHED since planning must NOT be streamed against the small cache-sized
+                # reserve — the per-unit bf16 fallback would re-create the exact #78 over-commit
+                # the reserve exists to prevent (narrow race, but the failure is an OOM-dropped
+                # worker). Instead: restore the full bf16 reserve and REPLAN (the attempt loop
+                # already re-enters cleanly from here). A cache that APPEARED since planning
+                # (a concurrent /compile_shards finished) is adopted as-is — the plan reserved
+                # MORE than needed, which is safe.
                 if quant in ("int4", "int2"):
+                    _now_cached = ""
                     try:
-                        _cdir = await asyncio.to_thread(_controller_model_dir, target_id)
-                        if _cdir and await asyncio.to_thread(_shard_cache_ok, _cdir, quant):
-                            _cache_quant = quant
-                            log_activity(f"{friendly}: serving from {quant} shard cache "
-                                         f"(skip bf16 stream + per-layer re-quant)")
+                        if model_dir and await asyncio.to_thread(_shard_cache_ok, model_dir, quant):
+                            _now_cached = quant
                     except Exception as _ce:
-                        log_activity(f"{friendly}: shard-cache check failed ({_ce!r}) -> bf16 stream")
-                        _cache_quant = ""
+                        log_activity(f"{friendly}: shard-cache re-check failed ({_ce!r}) "
+                                     f"-> bf16 stream")
+                    if _cache_quant and not _now_cached:
+                        log_activity(f"{friendly}: ⚠ {quant} shard cache vanished after planning — "
+                                     f"replanning with the full bf16 controller reserve "
+                                     f"({CONTROLLER_RAM_RESERVE_GB:.0f} GB, was "
+                                     f"{_ctrl_reserve_gb:.0f} GB cache-sized)")
+                        _cache_quant, _cache_read_gb = "", 0.0
+                        _ctrl_reserve_gb = CONTROLLER_RAM_RESERVE_GB
+                        continue
+                    if _now_cached and not _cache_quant:
+                        log_activity(f"{friendly}: {quant} shard cache appeared after planning — "
+                                     f"serving pre-packed (plan already reserved the larger "
+                                     f"bf16 figure; safe)")
+                    _cache_quant = _now_cached
                     # #38: int2 WITHOUT a valid calibrated cache must FAIL LOUD, never fall back.
                     # The bf16-stream fallback (correct for int4 — cold quant == cache by
                     # construction) would silently serve load-time RTN int2 = token salad. int2
@@ -1021,6 +1105,15 @@ class EngineLoadMixin:
                 # so sizing on the shrunken int4 footprint timed out the 426 GB minimax int4 build
                 # (#100). 35 MB/s floor + 5 min + a per-GB quantize allowance; clamp [15 min, 4 h].
                 read_bytes = total_bf16_bytes or getattr(spec, "total_weight_bytes", 0) or 0
+                # #cache-reserve (audit #16): a CACHE-SERVED load reads the pre-packed units, not
+                # the full bf16 — #100's "budget PRE-quant bytes" rule is about a plain int4 load
+                # (which really does stream bf16 then quantize); a VERIFIED cache does neither.
+                # Size on the cache read volume x2 (headroom for scattered per-unit bf16
+                # fallbacks if individual cache files go missing mid-load), never above the bf16
+                # figure; the [15 min, 4 h] clamp below still applies. Tighter timeout = a wedged
+                # cache-served load fails in minutes, not hours (no capacity effect either way).
+                if _cache_quant and _cache_read_gb > 0:
+                    read_bytes = min(read_bytes, int(_cache_read_gb * 2 * GB))
                 _quant_secs = (read_bytes / GB) * (4.0 if quant in ("int4", "int8") else 0.0)
                 load_timeout = int(read_bytes / (35 * 1024 * 1024)) + 300 + int(_quant_secs)
                 load_timeout = max(900, min(load_timeout, 4 * 3600))
@@ -1369,8 +1462,13 @@ class EngineLoadMixin:
             # co-located = same box as the controller: hostname match (the robust signal —
             # a standalone worker may register its LAN IP, e.g. om3nbox's 192.168.x) or a
             # loopback/this-box data endpoint.
+            # #media-node-optout (audit #28): skip a node whose NODE_CONFIG has BOTH tiers
+            # disabled (fully opted out) — same rule as the t2a filter (see _load_t2a_locked
+            # for the furnace incident that motivated it). t2i is co-located-only today, so
+            # this is precautionary here; it becomes load-bearing the day t2i goes remote.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and n.vram_total_gb > 0
+                    and (n.ram_enabled or n.vram_enabled)
                     and (n.hostname == _ctrl_host
                          or str(n.data_host).startswith(("127.", "::1"))
                          or str(n.data_host) in _LOCAL_IPS)]
@@ -1631,8 +1729,18 @@ class EngineLoadMixin:
             # #media-anywhere: serve on the co-located GPU OR any REMOTE GPU whose worker
             # advertised the acestep runtime (can_t2a) — the checkpoint streams to it via
             # snapshot_download and the WAV returns as base64 over the link, so no shared FS.
+            # #media-node-optout (audit #28): honor the dashboard's per-node tier toggles like
+            # the LLM planner does (its usable<=0 skip flows from eff_ram/eff_vram) — a node
+            # with BOTH tiers disabled in NODE_CONFIG is fully opted out and must not receive
+            # renders. This filter used to key off RAW vram_total_gb + can_t2a only, and the
+            # can_t2a-first sort below made the om3nbox pool's ONLY acestep node ALWAYS win —
+            # so music kept routing to furnace (RTX 5090, user-declared OFF-LIMITS, both tiers
+            # off) and OOM'd it. A SINGLE disabled tier still admits the node (tier toggles are
+            # placement knobs — RAM off = "GPU-only" still means the GPU is usable); only the
+            # both-off state excludes. Default (no NODE_CONFIG entry) is both-on -> unchanged.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and (cpu_only or n.vram_total_gb > 0)
+                    and (n.ram_enabled or n.vram_enabled)
                     and (_is_colo(n) or getattr(n, "can_t2a", False))]
             # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
             _res_ram_b, _res_vram_b = self._reserved_bytes(exclude_key=reg_key)
@@ -2454,6 +2562,39 @@ class EngineLoadMixin:
                    + own_bytes / GB
                    - rv / GB)
 
+    def _unified_mem_clamp(self, n, usable_gb: float, free_vram_gb: float,
+                           reserve_gb: float, own_gb: float = 0.0):
+        """#unified-mem (audit #17): on an APU whose "VRAM" is GTT carved from the SAME physical
+        RAM as the heartbeat's free_mem (om3nbox Strix Halo gfx1151; steamdeck Van Gogh), a
+        budget built as ram_share + vram_share sums the one pool TWICE — an idle om3nbox reads
+        ~165 GB "usable" on a 128 GB box, and a near-ceiling plan then over-commits into a
+        cgroup OOM-kill mid-load (worker drop -> #99 replan churn, or a dropped live render —
+        the very incident #render-oom-guard v2 patches for ONE path; this clamps the PLANNER,
+        covering explicit /load, <=0.5-CPU hybrids and first-load-on-idle-box too). Clamp the
+        summed budget to LIVE physically-free bytes: psutil free (GTT-pinned pages already
+        depress it) + `own_gb` reclaimable bytes (a re-place frees its own shard) — the vacant
+        allocator pool (#vram-reusable) is added inside the pure helper — minus `reserve_gb`
+        (whatever the caller charged its RAM/VRAM budgets: controller/transient reserves,
+        PLAN_VRAM_FLOOR, in-flight reservations) and the same adaptive RAM safety eff_ram_gb
+        keeps. Returns (usable_gb, free_vram_gb); the GPU share is re-capped at the clamped
+        total — one pool, so neither share may exceed it. Detection heuristic + its honest
+        limits live in placement.is_unified_mem_node. Guarded imports: a stale placement.py
+        (per-file CDN lag, see #cdn-lag-deploy) keeps the OLD unclamped behavior instead of
+        crashing every load; discrete-GPU (CUDA) nodes never match, so this is inert for them."""
+        try:
+            import placement as _pl
+        except Exception:
+            return usable_gb, free_vram_gb
+        _ufn = getattr(_pl, "is_unified_mem_node", None)
+        if _ufn is None or not _ufn(n.device_name, n.vram_total_gb, n.total_mem_gb,
+                                    explicit=getattr(n, "unified_mem", None)):
+            return usable_gb, free_vram_gb
+        usable_gb = _pl.clamp_unified_usable_gb(
+            usable_gb, n.free_mem_gb,
+            getattr(n, "vram_reusable_gb", 0.0) + max(0.0, own_gb),
+            max(0.0, reserve_gb) + min(RAM_SAFETY_GB, n.free_mem_gb * 0.4))
+        return usable_gb, min(free_vram_gb, usable_gb)
+
     async def _juggle_would_fit_vram(self, m) -> bool:
         """Dry-run the VRAM-first planner for `m` against the LIVE free VRAM PLUS this model's own
         on-GPU bytes (which a reload reclaims), and return True only when every weight lands on GPU.
@@ -2474,8 +2615,15 @@ class EngineLoadMixin:
                 fv = max(0.0, self._node_live_free_vram_gb(
                     n, own_bytes=own.get(n.node_id, 0), res_vram=_res_vram) - PLAN_VRAM_FLOOR_GB)
                 ram = n.eff_ram_gb - (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
-                mems.append(NodeMem(n.node_id, n.hostname,
-                                    int((max(0.0, ram) + fv) * GB), int(fv * GB)))
+                # #unified-mem (audit #17): same shared-pool clamp as the load planner's mems
+                # loop — a dry-run built on RAM+GTT double-counted bytes promises a promotion
+                # the real re-place can then OOM on. own_gb: this model's reclaimable shard.
+                tot, fv = self._unified_mem_clamp(
+                    n, max(0.0, ram) + fv, fv,
+                    (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
+                    + PLAN_VRAM_FLOOR_GB + _res_vram.get(n.node_id, 0) / GB,
+                    own_gb=own.get(n.node_id, 0) / GB)
+                mems.append(NodeMem(n.node_id, n.hostname, int(tot * GB), int(fv * GB)))
             p = plan_pipeline(spec, mems, m.ctx, consolidate=True, prefer_vram=True)
             if not p.ok:
                 return False
@@ -2641,7 +2789,14 @@ class EngineLoadMixin:
                 fv = max(0.0, self._node_live_free_vram_gb(
                     n, own_bytes=own.get(n.node_id, 0), res_vram=_res_vram) - PLAN_VRAM_FLOOR_GB)
                 ram = n.eff_ram_gb - (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
-                mems.append(NodeMem(n.node_id, n.hostname, int((max(0.0, ram) + fv) * GB), int(fv * GB)))
+                # #unified-mem (audit #17): shared-pool clamp — see _juggle_would_fit_vram; keeps
+                # the upgrade badge from promising a placement built on double-counted bytes.
+                tot, fv = self._unified_mem_clamp(
+                    n, max(0.0, ram) + fv, fv,
+                    (CONTROLLER_RAM_RESERVE_GB if n.data_host in _LOCAL_IPS else 0.0)
+                    + PLAN_VRAM_FLOOR_GB + _res_vram.get(n.node_id, 0) / GB,
+                    own_gb=own.get(n.node_id, 0) / GB)
+                mems.append(NodeMem(n.node_id, n.hostname, int(tot * GB), int(fv * GB)))
             p = plan_pipeline(spec, mems, m.ctx, consolidate=True, prefer_vram=True)
             if not p.ok:
                 return None, 1.0, 99
