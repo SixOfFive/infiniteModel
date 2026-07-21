@@ -296,8 +296,8 @@ secrets are stored in the source.
 InfiniteModel is explicitly a *heterogeneous* engine: the planner, the quantization kernels, and the
 transport all behave differently depending on the silicon they land on. A platform isn't really
 supported until it's been run, profiled, and had its sharp edges filed off. Essentially everything
-that works today — NVIDIA CUDA, AMD ROCm on Strix Halo, x86 CPU workers, aarch64/Android, older
-compute-capability cards — exists because I had one on a desk to test against.
+that works today — NVIDIA CUDA, AMD ROCm on Strix Halo, x86 CPU workers, aarch64/Android, down to
+Pascal-era Quadros — exists because I had one on a desk to test against.
 
 What I don't have is the high end: datacenter accelerators, big multi-GPU boxes, high-core-count
 servers, or fast interconnects. That's also where this project has the most headroom — more pooled
