@@ -165,10 +165,19 @@ def _unpack_tensor(meta, raw):
 #   - old controller + new worker: registry.add whitelist-parses the register dict (reg.get per
 #     known key), so the extra 'caps' key is simply ignored;
 #   - new controller + old worker: no 'caps' field -> empty set -> every gated feature stays off.
-WIRE_CAPS = ("ntensor",)
+# 'ntdiet' (#logits-diet): this build's worker_net/shard_forward understand the nt_mode/nt_clip/
+# nt_k request-header directive and can reply with reduced head frames (NT_TOKEN_IDS or
+# NT_TOPK_VALS+NT_TOPK_IDX) instead of the full-vocab logits row. Distinct from 'ntensor' because
+# a 14ae638-era node advertises 'ntensor' yet ignores nt_mode (it would reply full NT_LOGITS) and
+# an intermediate of that vintage rebuilds the next-hop header WITHOUT the nt_* keys — the
+# controller only requests the diet when EVERY chain node advertises 'ntdiet', and still accepts
+# a full-logits reply as the downgrade path (per-file self-update convergence can split wire.py
+# from worker_net.py/shard_forward.py on one box).
+WIRE_CAPS = ("ntensor", "ntdiet")
 
-# #ntensor-manifest tensor kinds (u8 on the wire). 0/1 are live (this stage); 2-4 are RESERVED
-# for the logits-diet (next stage): argmax token ids / top-K values / top-K indices.
+# #ntensor-manifest tensor kinds (u8 on the wire). 0/1 = full tensors; 2-4 carry the #logits-diet
+# reduced head replies: 2 = greedy argmax token ids (int64, [q]); 3/4 = top-K candidate values
+# (model dtype) + their token ids (int64), both [K], for controller-side sampling.
 NT_LOGITS = 0
 NT_HIDDEN = 1
 NT_TOKEN_IDS = 2

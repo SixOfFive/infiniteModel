@@ -57,8 +57,11 @@ class EngineLifecycleMixin:
                             # ride hdr['tensors'] positionally. Reconstruct the LEGACY result
                             # shape by kind so _send's callers stay format-agnostic: logits
                             # alone -> tensor; logits+hidden -> (logits, hidden) tuple; any
-                            # other combination (kinds 2-4, the logits-diet next stage) ->
-                            # the raw [(kind, tensor), ...] list for kind-aware consumers.
+                            # other combination -> the raw [(kind, tensor), ...] list for
+                            # kind-aware consumers — LIVE since #logits-diet: NT_TOKEN_IDS
+                            # (greedy/spec argmax ids) and NT_TOPK_VALS+NT_TOPK_IDX (sampled
+                            # top-K candidates) arrive here and are consumed in engine_gen's
+                            # _decode_plain/_decode_spec, which detect the list reply type.
                             parts = _unpack_ntensor(hdr.get("tensors") or [], raw)
                             _by = dict(parts)
                             if set(_by) == {NT_LOGITS}:

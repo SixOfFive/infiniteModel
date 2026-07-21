@@ -84,9 +84,14 @@ class WorkerNetMixin:
 
     def _run_stage(self, model_id, x, cache_start, reset, all_logits, inject=None,
                    position_ids=None, capture_hidden=False, capture_pre_norm=False,
-                   bidir_spans=None):
+                   bidir_spans=None, nt=None):
         # TP rank 0 drives the group: broadcast this forward's input to the peers (who run
         # their sharded forward in lockstep), then run ours, all-reducing via the mesh hooks.
+        # #logits-diet: nt is NOT in the broadcast tuple — the controller excludes TP models
+        # from the diet outright (engine_gen gates on tp_size==1), so nt is always None here on
+        # a TP rank 0. Rank 0's post-all-reduce head reduction would be a purely LOCAL op (no
+        # collective), so wiring it through is LIKELY safe, but that's unvalidated on a live
+        # mesh — stage 1 excludes TP rather than assume.
         if self._tp is not None and self._tp.rank == 0 and model_id == self._tp_model_id:
             import pickle
             # #tp-mesh-keepalive: hold the mesh lock across the WHOLE forward (broadcast + every
@@ -103,6 +108,13 @@ class WorkerNetMixin:
                 return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
                                                      position_ids, capture_hidden, capture_pre_norm,
                                                      bidir_spans)
+        if nt is not None:
+            # #logits-diet: pass the reduction directive ONLY when set — and the caller only sets
+            # it when the shard advertised _nt_capable (new shard_forward.py), so a stale
+            # forward() signature is never handed an unknown argument mid self-update convergence.
+            return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
+                                                 position_ids, capture_hidden, capture_pre_norm,
+                                                 bidir_spans, nt)
         return self.shards[model_id].forward(x, cache_start, reset, all_logits, inject,
                                              position_ids, capture_hidden, capture_pre_norm,
                                              bidir_spans)
@@ -237,6 +249,30 @@ class WorkerNetMixin:
                     # the legacy format, which the controller always still accepts — so a stale
                     # gate is harmless in both directions.
                     ntensor_req = bool(hdr.get("ntensor", False))
+                    # #logits-diet: per-request reduced head reply, riding the ids header hop-by-
+                    # hop exactly like capture_hidden. nt_mode='argmax' -> the head returns ONLY
+                    # the greedy token id(s) (NT_TOKEN_IDS int64 [q] — one per position, so a
+                    # spec-verify all_logits frame collapses (K+1) full rows to (K+1) ints);
+                    # nt_mode='topk' -> the top-nt_k candidate (values, ids) pair
+                    # (NT_TOPK_VALS/NT_TOPK_IDX) for controller-side sampling. nt_clip = the
+                    # controller's tokenizer length: candidates come from row[:clip] (ids past
+                    # the tokenizer must never win — the legacy #21 tail mask, applied FIRST);
+                    # 0 = unclipped (the spec-verify raw-argmax semantics). Only meaningful with
+                    # the manifest reply, and gated on the shard actually supporting it
+                    # (_nt_capable: a stale shard_forward.py during per-file self-update
+                    # convergence doesn't — the head then replies full NT_LOGITS, which the
+                    # controller ALWAYS still accepts as the downgrade path). capture frames
+                    # keep full logits (speech/MTP consume the row + hidden).
+                    nt = None
+                    _ntm = hdr.get("nt_mode")
+                    if (ntensor_req and _ntm in ("argmax", "topk") and shard.has_head
+                            and _pack_ntensor is not None
+                            and not capture_hidden and not capture_pre_norm
+                            and getattr(shard, "_nt_capable", False)):
+                        nt = {"mode": _ntm, "clip": int(hdr.get("nt_clip") or 0),
+                              "k": int(hdr.get("nt_k") or 0)}
+                        if _ntm == "topk" and nt["k"] <= 0:
+                            nt = None   # k<=0 = diet off for sampled decode -> full row
                     # #prefill-progress: hand the frame's req_id to the shard so its per-layer
                     # progress heartbeat is ATTRIBUTED to this request (shard_forward copies it to
                     # _fwd_cur_rid once it OWNS _fwd_lock, so an orphaned forward keeps its own
@@ -244,19 +280,26 @@ class WorkerNetMixin:
                     shard._fwd_next_rid = hdr.get("req_id")
                     out = await asyncio.to_thread(self._run_stage, model_id, x, cache_start,
                                                   reset, all_logits, inject, position_ids,
-                                                  capture_hidden, capture_pre_norm, bidir_spans)
+                                                  capture_hidden, capture_pre_norm, bidir_spans,
+                                                  nt)
                     kind = "logits" if shard.has_head else "hidden"
                     if ntensor_req and shard.has_head and _pack_ntensor is not None:
                         # #ntensor-manifest: head stage, controller requested the manifest frame.
                         # raw = [count:u8][count x (kind:u8, nbytes:u32 BE)][payloads...]; the
                         # per-tensor dtype/shape metas ride the JSON header ('tensors', positional
                         # — the same self-describing meta as every legacy frame). Kinds live in
-                        # wire.py: 0=logits, 1=hidden; 2=token_ids / 3=topk_vals / 4=topk_idx are
-                        # RESERVED for the logits-diet (next stage). _pack_ntensor is None only
-                        # when wire.py is stale (self-update convergence) — then this worker never
-                        # advertised 'ntensor' and the flag can't legitimately be set; falling
-                        # through keeps the legacy format either way.
-                        if (capture_hidden or capture_pre_norm) and isinstance(out, tuple):
+                        # wire.py: 0=logits, 1=hidden; 2/3/4 carry the #logits-diet reduced
+                        # replies (token ids / top-K values / top-K ids). _pack_ntensor is None
+                        # only when wire.py is stale (self-update convergence) — then this worker
+                        # never advertised 'ntensor' and the flag can't legitimately be set;
+                        # falling through keeps the legacy format either way.
+                        if nt is not None and nt["mode"] == "topk":
+                            # #logits-diet: (values, ids) candidate pair from _diet_topk
+                            _parts = [(NT_TOPK_VALS, out[0]), (NT_TOPK_IDX, out[1])]
+                        elif nt is not None:
+                            # #logits-diet argmax mode: int64 greedy id(s) only, ~8(q) bytes
+                            _parts = [(NT_TOKEN_IDS, out)]
+                        elif (capture_hidden or capture_pre_norm) and isinstance(out, tuple):
                             _parts = [(NT_LOGITS, out[0]), (NT_HIDDEN, out[1])]
                         else:
                             _parts = [(NT_LOGITS, out)]
@@ -300,6 +343,13 @@ class WorkerNetMixin:
                             ohdr["capture_pre_norm"] = True
                         if ntensor_req and not shard.has_head:   # #ntensor-manifest: reach the head
                             ohdr["ntensor"] = True
+                            # #logits-diet: the reduction directive must ride hop-by-hop too —
+                            # this parser rebuilds the next-hop header, so an unforwarded key
+                            # would die at the first intermediate stage and the head would fall
+                            # back to a full-logits reply (safe, but no diet).
+                            for _dk in ("nt_mode", "nt_clip", "nt_k"):
+                                if hdr.get(_dk) is not None:
+                                    ohdr[_dk] = hdr[_dk]
                         _tx = await self._send_next(model_id, ohdr, oraw)
                         _net_peer(self.next_peer.get(model_id, "?"), tx=_tx)   # to next stage / controller
                 except Exception as exc:  # stage failed -> tell the controller, fast

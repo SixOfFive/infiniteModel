@@ -22,6 +22,20 @@ def _bidir_spans_from_positions(positions):
     return [(s, e) for s, e in spans]
 
 
+def _wire_topk_k() -> int:
+    """#logits-diet: K for the top-K sampled-decode wire mode — the head ships only the top-K
+    (values, ids) candidates instead of the full-vocab row. INFINITEMODEL_TOPK_WIRE (controller
+    env), default 4096; 0 = full row = diet OFF for sampled requests (greedy/spec argmax mode is
+    unaffected — it is bit-exact and has no truncation to opt out of). Top-4096 covers >>0.9999
+    of the softmax mass on realistic peaked LM rows (spot-checked in scratch_logits_diet_test.py;
+    a pathologically FLAT distribution is the case 0 exists for)."""
+    import os
+    try:
+        return max(0, int(os.environ.get("INFINITEMODEL_TOPK_WIRE", "4096")))
+    except Exception:
+        return 4096
+
+
 class EngineGenMixin:
 
     async def embed(self, friendly: str, input_ids, attention_mask) -> list:
@@ -213,10 +227,32 @@ class EngineGenMixin:
         ids = getattr(model, "stage_node_ids", None) or []
         return bool(ids) and all("ntensor" in registry.node_caps(nid) for nid in ids)
 
+    def _wire_diet_ok(self, model) -> bool:
+        """#logits-diet: may _send ask `model`'s head for a REDUCED reply (argmax token ids /
+        top-K candidates) instead of the full-vocab logits row? Requires the full
+        #ntensor-manifest gate PLUS:
+        - every chain node advertising 'ntdiet' (#wire-caps): a 14ae638-era node advertises
+          'ntensor' but its worker_net ignores nt_mode (harmless — it replies full logits — but
+          pointless), and an intermediate of that vintage DROPS the nt_* keys when it rebuilds
+          the next-hop header, so all-or-nothing on the newer cap is the honest gate;
+        - tp_size == 1: the TP positional broadcast does not carry the directive to peer ranks.
+          Rank 0's post-all-reduce head reduction is a purely local op and LIKELY safe, but
+          that's unvalidated on a live mesh — stage 1 EXCLUDES TP models rather than assume.
+        Even when this returns True the reply may still be a full row (a node whose wire.py
+        outran its worker_net/shard_forward during per-file self-update convergence advertises
+        the cap but can't compute the reduction) — every caller detects the reply type and
+        falls back to the legacy row path, so the diet can only ever degrade to status quo."""
+        if not self._wire_ntensor_ok(model):
+            return False
+        if int(getattr(model, "tp_size", 1) or 1) != 1:
+            return False
+        ids = getattr(model, "stage_node_ids", None) or []
+        return bool(ids) and all("ntdiet" in registry.node_caps(nid) for nid in ids)
+
     async def _send(self, model: LoadedModel, x, cache_position: int, reset: bool,
                     all_logits: bool = False, mm=None, position_ids=None,
                     capture_hidden: bool = False, capture_pre_norm: bool = False,
-                    ntensor: bool = False):
+                    ntensor: bool = False, nt_mode=None, nt_clip: int = 0, nt_k: int = 0):
         """Push one frame (token ids) through `model`'s pipeline and return last-stage
         logits — last position only, or every position when all_logits=True (verify).
         mm = (positions, embeds_tensor) (#22 inc 3): on a prefill (reset), a companion
@@ -226,10 +262,29 @@ class EngineGenMixin:
         return frame instead of the legacy one/two-tensor format — downgraded here to the
         legacy format unless the whole chain advertised the cap (#wire-caps), so callers can
         pass it unconditionally. The reply is dispatched by ITS OWN header in _on_data, so
-        even a stale gate (old worker ignoring the flag) degrades cleanly."""
+        even a stale gate (old worker ignoring the flag) degrades cleanly.
+        nt_mode (#logits-diet) asks the head for a REDUCED reply riding that manifest:
+        'argmax' -> greedy token id(s) only (NT_TOKEN_IDS, int64 — bit-exact vs the legacy
+        mask+argmax; with all_logits, one id per position, so a spec-verify round returns
+        (K+1) ints instead of (K+1) full rows); 'topk' -> the top-nt_k candidate (values,
+        ids) pair for controller-side sampling. nt_clip = tokenizer length (candidates from
+        row[:clip]; 0 = raw-row semantics, the _decode_spec convention). Downgraded here
+        unless the whole chain advertised 'ntdiet' AND tp_size==1 (_wire_diet_ok) and never
+        combined with a capture rider, so callers pass it unconditionally and detect the
+        reply TYPE: a [(kind, tensor), ...] list = diet reply; a plain tensor = full row."""
+        # #logits-diet: downgrade the reduced-reply request unless the chain fully supports it.
+        # Callers always handle a full-row reply, so a downgrade is a silent no-op, not an error.
+        if nt_mode is not None and (capture_hidden or capture_pre_norm
+                                    or not self._wire_diet_ok(model)):
+            nt_mode = None
+        if nt_mode == "topk" and int(nt_k or 0) <= 0:
+            nt_mode = None   # INFINITEMODEL_TOPK_WIRE=0 -> full row for sampled decode
+        if nt_mode is not None:
+            ntensor = True   # the reduced reply rides the #ntensor-manifest frame
         # #wire-caps: never request the manifest from a chain that hasn't advertised it.
         if ntensor and not self._wire_ntensor_ok(model):
             ntensor = False
+            nt_mode = None
         if model.stage0_writer is None:
             await self._freshen_stage0(model, force=True)   # rebuild from saved dial if dropped
         if model.stage0_writer is None:
@@ -277,6 +332,12 @@ class EngineGenMixin:
                 # on #wire-caps above; old workers whitelist-read the header via hdr.get and
                 # ignore this key harmlessly — their legacy reply is always still accepted)
                 hdr["ntensor"] = True
+                if nt_mode is not None:   # #logits-diet: the reduction directive (gated above;
+                    # intermediate stages re-propagate these keys hop-by-hop like capture_hidden)
+                    hdr["nt_mode"] = nt_mode
+                    hdr["nt_clip"] = int(nt_clip or 0)
+                    if nt_mode == "topk":
+                        hdr["nt_k"] = int(nt_k)
             nb = await _write_frame(w, hdr, raw)
             net_account(self._stage0_id(model), to_node=nb)  # controller -> stage0
 
@@ -589,35 +650,75 @@ class EngineGenMixin:
             return
         prefill_pos = mrope[0] if mrope else None
         base = mrope[1] if mrope else None
-        logits = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
-                                  mm=mm, position_ids=prefill_pos)
-        cur = len(prompt_ids)
-        model.kv_pos = cur          # KV depth so far (prompt); climbs per decode token
-        produced = 0
         # #21: this model's lm_head can be WIDER than its text tokenizer (a multimodal
         # head carries vision/audio placeholder ids the text tokenizer can't decode).
         # Selecting one of those ids crashed detokenization ("list index out of
         # range") and showed up as empty/failed generation. Mask logits beyond the
         # tokenizer's decodable range so we only ever emit a real text token.
+        # (Computed BEFORE the prefill so the #logits-diet directive can carry it as nt_clip —
+        # the head applies row[:ntok] FIRST, the exact worker-side twin of this mask.)
         try:
             ntok = len(model.tokenizer)
         except Exception:
             ntok = 0
+        # #logits-diet: pick the per-request reduced-reply mode ONCE. Penalties need
+        # arbitrary-id access to the full row (_penalized indexes any history id), so they keep
+        # the legacy full-row wire. Greedy is exactly argmax(row[:ntok]) -> ship ids only
+        # (bit-exact). Sampled -> top-K candidates (K=INFINITEMODEL_TOPK_WIRE, 0=off); the
+        # controller then runs the SAME _sample over the K candidates and maps the draw through
+        # the candidate ids (min_p keeps identical survivor sets — probability RATIOS are
+        # renormalization-invariant; top_p/multinomial renormalize over K, dropping only the
+        # beyond-K tail mass — the documented, negligible-at-4096 truncation). _send downgrades
+        # to the legacy row unless the whole chain advertises 'ntdiet' (and on TP), so every
+        # consumer below also handles a plain-tensor reply.
+        _nt_mode, _nt_k = None, 0
+        if not _pen:
+            if not temperature or temperature <= 0:
+                _nt_mode = "argmax"
+            else:
+                _nt_k = _wire_topk_k()
+                if _nt_k > 0:
+                    _nt_mode = "topk"
+        res = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
+                               mm=mm, position_ids=prefill_pos,
+                               nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
+        cur = len(prompt_ids)
+        model.kv_pos = cur          # KV depth so far (prompt); climbs per decode token
+        produced = 0
         while produced < max_new:
             if model.friendly not in self.models or model.stage0_writer is None:
                 raise RuntimeError("pipeline went down mid-generation")
-            row = logits[0, -1]
-            if ntok and ntok < int(row.shape[-1]):
-                row = row.clone()
-                row[ntok:] = float("-inf")
-            if _pen:   # #runtime-knobs: repetition penalties reshape the logits pre-sampling
-                row = self._penalized(row, prompt_ids, _hist, _sp)
-            tok_id = self._sample(row, temperature, top_p, min_p, top_k=_top_k, gen=_gen)
+            tok_id = None
+            if isinstance(res, list):
+                # #logits-diet reduced reply: [(kind, tensor), ...] straight off the manifest
+                # (engine_lifecycle passes non-legacy kind sets through verbatim).
+                _by = {int(_k): _t for _k, _t in res}
+                if NT_TOKEN_IDS in _by:            # argmax mode: the head already picked it
+                    tok_id = int(_by[NT_TOKEN_IDS].reshape(-1)[-1])
+                elif NT_TOPK_VALS in _by and NT_TOPK_IDX in _by:
+                    # topk mode: run the REAL sampler over the K candidate logits (fp32-converted
+                    # inside _sample exactly like the full row was), then map the drawn position
+                    # through the candidate ids. The head clipped to ntok first, so every
+                    # candidate is a decodable text token (#21) — no re-mask needed.
+                    _cv = _by[NT_TOPK_VALS].reshape(-1)
+                    _cpos = self._sample(_cv, temperature, top_p, min_p, top_k=_top_k, gen=_gen)
+                    tok_id = int(_by[NT_TOPK_IDX].reshape(-1)[_cpos])
+                else:   # unusable kind set — can't happen from our own workers; fail loud
+                    raise RuntimeError(f"#logits-diet reply with unusable kinds {sorted(_by)}")
+            if tok_id is None:      # legacy full-row reply (diet off / downgraded chain)
+                row = res[0, -1]
+                if ntok and ntok < int(row.shape[-1]):
+                    row = row.clone()
+                    row[ntok:] = float("-inf")
+                if _pen:   # #runtime-knobs: repetition penalties reshape the logits pre-sampling
+                    row = self._penalized(row, prompt_ids, _hist, _sp)
+                tok_id = self._sample(row, temperature, top_p, min_p, top_k=_top_k, gen=_gen)
             _hist.append(tok_id)
             if produced == 0:
                 with contextlib.suppress(Exception):
+                    _hv = int(res.shape[-1]) if hasattr(res, "shape") else f"diet:{_nt_mode}"
                     print(f"[gen] {model.friendly}: first token id={tok_id} "
-                          f"head_vocab={int(logits.shape[-1])} len(tok)={ntok} "
+                          f"head_vocab={_hv} len(tok)={ntok} "
                           f"eos={tok_id in model.eos_ids}")
             produced += 1
             if tok_id in model.eos_ids:
@@ -628,8 +729,9 @@ class EngineGenMixin:
                 break
             # mRoPE decode position = base + step (same on t/h/w); else 1D (worker uses arange).
             dpos = [[base + produced - 1]] * 3 if base is not None else None
-            logits = await self._send(model, torch.tensor([[tok_id]], dtype=torch.long), cur,
-                                      False, position_ids=dpos)
+            res = await self._send(model, torch.tensor([[tok_id]], dtype=torch.long), cur,
+                                   False, position_ids=dpos,
+                                   nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
             cur += 1
             model.kv_pos = cur
         yield None, "length"
@@ -710,7 +812,13 @@ class EngineGenMixin:
         # target KV) and rides at the FRONT of the next round's verify sequence, so its logits
         # come from the same traversal that verifies the drafts. Bit-exact vs plain greedy:
         # every emitted token is still the target's argmax over the full prefix.
-        a0 = (await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True))[0, -1]
+        # #logits-diet: spec is greedy-BY-CONSTRUCTION and argmaxes the RAW row (no ntok mask —
+        # the pre-existing plain-vs-spec inconsistency, deliberately PRESERVED: nt_clip=0 keeps
+        # the head's argmax bit-exact with the legacy int(row.argmax()) below). A downgraded
+        # chain replies the full row instead; both shapes are handled at every consumer.
+        _r0 = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
+                               nt_mode="argmax", nt_clip=0)
+        a0 = None if isinstance(_r0, list) else _r0[0, -1]
         cur = len(prompt_ids)              # target KV holds exactly tokens[0:cur]
         d_logits = await asyncio.to_thread(self._draft_prefill, model, prompt_ids)
         produced = 0
@@ -723,7 +831,8 @@ class EngineGenMixin:
                       f"{produced / rounds:.2f} tok/round)")
 
         # the prefill's own greedy token comes free — emit it and carry it as pending
-        pending = int(a0.argmax())
+        pending = (int(dict(_r0)[NT_TOKEN_IDS].reshape(-1)[-1]) if a0 is None   # #logits-diet
+                   else int(a0.argmax()))
         produced += 1
         if pending in eos:
             yield None, "stop"
@@ -744,10 +853,18 @@ class EngineGenMixin:
                 drafts.append(dt)
                 dl = await asyncio.to_thread(self._draft_step, model, dt, cur + 1 + i)
             # 2. ONE pipeline traversal verifies pending + all K drafts
+            # #logits-diet: argmax mode + all_logits -> the head returns (K+1) int64 ids instead
+            # of (K+1) full-vocab rows (~2.7 MB/round at K=8 on Qwen -> ~72 bytes). nt_clip=0
+            # preserves this path's RAW-row argmax semantics; a downgraded chain still returns
+            # the full [1,K+1,V] tensor and takes the legacy branch below — bit-identical tg
+            # either way, so acceptance (and thus emitted tokens) never depends on the wire mode.
             V = await self._send(model, torch.tensor([[pending] + drafts], dtype=torch.long),
-                                 cur, False, all_logits=True)
+                                 cur, False, all_logits=True, nt_mode="argmax", nt_clip=0)
             # 3. target's greedy tokens for positions cur+1 .. cur+K+1
-            tg = [int(V[0, i].argmax()) for i in range(K + 1)]
+            if isinstance(V, list):   # #logits-diet reduced reply
+                tg = [int(t) for t in dict(V)[NT_TOKEN_IDS].reshape(-1).tolist()]
+            else:
+                tg = [int(V[0, i].argmax()) for i in range(K + 1)]
             # 4. accept the matched draft prefix + one target token (correction/bonus)
             m = 0
             while m < K and tg[m] == drafts[m]:

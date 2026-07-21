@@ -20,6 +20,50 @@ class _ForwardSuperseded(RuntimeError):
 _PREALLOC_KV_CLS = None   # #kv-prealloc: classes built ONCE on first use (transformers import deferred)
 
 
+# --- #logits-diet: reduced head replies (worker-side halves of the wire diet) --------------------
+# The head stage historically shipped the FULL-vocab logits row ([1,1,V] model dtype, ~300 KB for
+# Qwen / ~512 KB for Gemma) to the controller EVERY decode token, and (K+1) full rows per
+# spec-verify round — while the controller consumed only an argmax (greedy/verify) or a sampled
+# token from the top of the distribution. These helpers reduce the row ON ITS COMPUTE DEVICE, so
+# only ids / top-K candidates cross D2H and the wire. Requested per frame via the nt_mode /
+# nt_clip / nt_k header keys (worker_net), replied as NT_TOKEN_IDS / NT_TOPK_VALS+NT_TOPK_IDX
+# manifest tensors (wire.py #ntensor-manifest), cap-gated end to end ('ntdiet', #wire-caps).
+
+def _diet_argmax(logits, clip):
+    """#logits-diet argmax mode: greedy token id(s) [q] (int64, CPU) from head logits [1,q,V]
+    (any device/dtype). clip>0 restricts candidates to the first `clip` vocab entries — EXACTLY
+    the controller's legacy `row[ntok:] = -inf` mask + argmax (#21): slicing preserves index
+    order and a -inf tail can never win, so the results are BIT-EXACT equivalents, ties included
+    (torch.argmax returns the FIRST maximal index on a slice just as it does on the masked full
+    row; proven in scratch_logits_diet_test.py incl. tie and beyond-clip-max rows). clip<=0 or
+    >= V = unclipped — the _decode_spec verify semantics, which argmaxes the RAW row (that
+    pre-existing plain-vs-spec inconsistency is deliberately PRESERVED, not fixed here; the
+    controller chooses per path by sending nt_clip=ntok or 0). Model-dtype comparison equals the
+    controller's fp32-after-.float() comparison because bf16/fp16 -> fp32 is value-preserving
+    (injective), so ordering and ties are unchanged."""
+    rows = logits[0]                                     # [q, V]
+    if clip and 0 < int(clip) < int(rows.shape[-1]):
+        rows = rows[:, :int(clip)]
+    return rows.argmax(dim=-1).to("cpu")                 # int64 [q]
+
+
+def _diet_topk(logits, clip, k):
+    """#logits-diet topk mode: (values, token ids) of the top-k candidates of the LAST position's
+    row — the only position sampled decode consumes (the controller never requests topk with
+    all_logits). clip applied FIRST (ids at/past the tokenizer length must never be candidates —
+    mirrors the controller's legacy tail mask, so idx entries are always valid token ids), then
+    torch.topk over the clipped row. Values keep the MODEL dtype (the controller fp32-converts
+    before softmax exactly as it did the full row); ids are int64. k >= the clipped width
+    degrades to a full sorted row (still a valid reply). Both outputs land on CPU for packing."""
+    import torch
+    row = logits[0, -1]                                  # [V]
+    if clip and 0 < int(clip) < int(row.shape[-1]):
+        row = row[:int(clip)]
+    kk = min(int(k), int(row.shape[-1]))
+    vals, idx = torch.topk(row, kk)
+    return vals.to("cpu"), idx.to("cpu")
+
+
 def _prealloc_kv_cache_cls():
     """#kv-prealloc: build (once, lazily) the preallocated-KV cache classes against the INSTALLED
     transformers' DynamicCache/DynamicLayer (validated on 5.12.1). Stock DynamicLayer.update appends
@@ -151,10 +195,16 @@ def _prealloc_kv_cache_cls():
 
 class ShardForwardMixin:
 
+    # #logits-diet: worker_net gates the nt directive on THIS attribute (getattr, default False)
+    # so a stale shard_forward.py during per-file self-update convergence — whose forward() has
+    # no `nt` parameter — is never handed one (the head then replies full logits, which the
+    # controller always still accepts as the downgrade path).
+    _nt_capable = True
+
     def forward(self, x, cache_start: int = 0, reset: bool = True,
                 all_logits: bool = False, inject=None, position_ids=None,
                 capture_hidden: bool = False, capture_pre_norm: bool = False,
-                bidir_spans=None):
+                bidir_spans=None, nt=None):
         # #fwd-serialize: serialize forwards on this shard so a still-running ORPHANED forward (from a
         # reclaimed/disconnected gen — the worker thread can't be cancelled) can't concurrently mutate
         # the shared self.kv underneath a fresh forward, which desyncs the KV length from the causal
@@ -194,7 +244,7 @@ class ShardForwardMixin:
         try:
             return self._forward_impl(x, cache_start, reset, all_logits, inject,
                                       position_ids, capture_hidden, capture_pre_norm,
-                                      bidir_spans)
+                                      bidir_spans, nt)
         finally:
             lock.release()
 
@@ -268,7 +318,7 @@ class ShardForwardMixin:
     def _forward_impl(self, x, cache_start: int = 0, reset: bool = True,
                       all_logits: bool = False, inject=None, position_ids=None,
                       capture_hidden: bool = False, capture_pre_norm: bool = False,
-                      bidir_spans=None):
+                      bidir_spans=None, nt=None):
         """Run this stage's layers with an incremental KV cache (M2e). Always called holding
         self._fwd_lock (see forward()).
         x = token ids (first stage) or hidden states (mid stage), covering the
@@ -277,7 +327,11 @@ class ShardForwardMixin:
         inject = (positions, embeds) splices multimodal embeds into stage-0's embed
         output (#22 inc 3); None for the normal text path.
         Returns hidden states, or — on the last stage — logits for just the last
-        position, or for ALL positions when all_logits=True (speculative verify)."""
+        position, or for ALL positions when all_logits=True (speculative verify).
+        nt (#logits-diet, head stage only) = {'mode': 'argmax'|'topk', 'clip': int, 'k': int}:
+        reduce the head logits ON DEVICE and return int64 token ids ([q], argmax mode) or a
+        (top-K values, top-K ids) pair (topk mode) instead of the full-vocab row — worker_net
+        only passes it for plain logits frames (never with capture_hidden/capture_pre_norm)."""
         torch = self.torch
         # #kv-reset-on-seqstart: ALWAYS rebuild the cache when this frame starts a new sequence
         # (cache_start == 0), not only when the controller flags reset. A cancelled / gen-stall-
@@ -339,7 +393,7 @@ class ShardForwardMixin:
         with torch.inference_mode():
             if self.uniform_device is not None:
                 return self._forward_uniform(x, cache_start, all_logits, inject, position_ids,
-                                             capture_hidden, capture_pre_norm, bidir_spans)
+                                             capture_hidden, capture_pre_norm, bidir_spans, nt)
             # #gemma4-bidir: OR image-span bidirectional attention into the PREFILL masks when the
             # text config asks for it (use_bidirectional_attention='vision') and the controller
             # sent the image runs. Prefill-only: a decoded token is text (block id -1) -> no effect.
@@ -485,6 +539,15 @@ class ShardForwardMixin:
                 # + each decoded token); logits only for the sampled position(s).
                 nh = self.norm(h)
                 sel = nh if all_logits else nh[:, -1:, :]   # verify needs every position
+                if nt is not None and not capture_hidden and not capture_pre_norm:
+                    # #logits-diet: reduce ON DEVICE — only the ids / top-K candidates cross D2H
+                    # and the wire, never the [1,q,V] row. Softcap first (monotonic, so argmax is
+                    # unchanged, but topk VALUES feed controller-side sampling and must match the
+                    # legacy row exactly — #gemma4).
+                    ld = self._softcap_logits(self.head(sel))
+                    if nt.get("mode") == "topk":
+                        return _diet_topk(ld, nt.get("clip", 0), nt.get("k", 0))
+                    return _diet_argmax(ld, nt.get("clip", 0))
                 logits = self._softcap_logits(self.head(sel)).to(self.cpu)   # #gemma4 final logit softcap
                 if capture_pre_norm:
                     # #91 MTP: return the PRE-final-norm trunk hidden (what the checkpoint's MTP
@@ -499,7 +562,7 @@ class ShardForwardMixin:
 
     def _forward_uniform(self, x, cache_start: int, all_logits: bool, inject=None,
                          position_ids=None, capture_hidden: bool = False,
-                         capture_pre_norm: bool = False, bidir_spans=None):
+                         capture_pre_norm: bool = False, bidir_spans=None, nt=None):
         """Single-device fast-path router. #cudagraph (opt-in, default OFF): for a graph-eligible
         single-node standard-attention model, a plain single-token decode is served by a captured
         CUDA graph via the COPY-HANDOFF path — prefill (and everything else) stays on the eager
@@ -507,13 +570,22 @@ class ShardForwardMixin:
         if self._graph_enabled() and inject is None and position_ids is None and bidir_spans is None:
             r = self._maybe_graph_decode(x, cache_start, all_logits, capture_hidden, capture_pre_norm)
             if r is not None:
+                if nt is not None:
+                    # #logits-diet on the captured-graph path: the replay already returned the
+                    # full [1,1,V] row on CPU (the capture/replay machinery is untouched — its
+                    # output tensors are baked). Reduce that row the SAME way; here the win is
+                    # the wire + controller CPU, not D2H. Values/ids identical to the eager
+                    # reduction because the helpers are device/dtype-agnostic.
+                    if nt.get("mode") == "topk":
+                        return _diet_topk(r, nt.get("clip", 0), nt.get("k", 0))
+                    return _diet_argmax(r, nt.get("clip", 0))
                 return r
         return self._forward_uniform_eager(x, cache_start, all_logits, inject, position_ids,
-                                           capture_hidden, capture_pre_norm, bidir_spans)
+                                           capture_hidden, capture_pre_norm, bidir_spans, nt)
 
     def _forward_uniform_eager(self, x, cache_start: int, all_logits: bool, inject=None,
                                position_ids=None, capture_hidden: bool = False,
-                               capture_pre_norm: bool = False, bidir_spans=None):
+                               capture_pre_norm: bool = False, bidir_spans=None, nt=None):
         """The eager single-device path (DynamicCache). Bit-identical to the pre-cudagraph behavior —
         everything (embed, layers, norm/head, rotary) lives on self.uniform_device; single-token
         decode uses no mask (the lone query attends every cached key). Also serves as the cuda-graph
@@ -637,6 +709,12 @@ class ShardForwardMixin:
         if self.has_head:
             nh = self.norm(h)
             sel = nh if all_logits else nh[:, -1:, :]
+            if nt is not None and not capture_hidden and not capture_pre_norm:
+                # #logits-diet: reduce ON DEVICE (see the general path) — ids / top-K only.
+                ld = self._softcap_logits(self.head(sel))
+                if nt.get("mode") == "topk":
+                    return _diet_topk(ld, nt.get("clip", 0), nt.get("k", 0))
+                return _diet_argmax(ld, nt.get("clip", 0))
             logits = self._softcap_logits(self.head(sel)).to(self.cpu)   # #gemma4 final logit softcap
             if capture_pre_norm:   # #91 MTP: PRE-final-norm trunk hidden (see general path)
                 hsel = h if all_logits else h[:, -1:, :]
