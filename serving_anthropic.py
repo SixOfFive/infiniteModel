@@ -314,24 +314,23 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         if rec is not None:
             with contextlib.suppress(Exception):
                 rec["task"] = asyncio.current_task()
-        produced: list[int] = []
+        det = IncrementalDetok(tok)   # #inc-detok: O(tail)/token, byte-identical to full re-decode
         prev = ""
         try:
           async for tid, reason in engine.generate(friendly, ids, max_new,
                                                    temperature, top_p, False, rec=rec, mm=mm,
                                                    mrope=mrope, min_p=min_p, sampling=sampling):
             if tid is not None:
-                produced.append(tid)
-                state["tokens"] = len(produced)
+                text = det.push(tid)
+                state["tokens"] = det.n
                 METRICS["tokens"] += 1
-                text = _decode_visible(tok, produced)
                 if text.endswith("�"):
                     continue
                 piece, prev = text[len(prev):], text
                 if piece:
                     yield piece, None
             if reason:
-                text = _decode_visible(tok, produced)
+                text = det.current()
                 if text.endswith("�"):               # incomplete multi-byte at gen end -> drop partial
                     text = text.rstrip("�")           # (#detok-tail)
                 yield text[len(prev):], reason

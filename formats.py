@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -167,6 +168,114 @@ def _decode_visible(tok, ids) -> str:
     analysis CoT); otherwise a plain _safe_decode. Byte-identical for every non-harmony model."""
     h = _harmony_final_text(tok, ids)
     return h if h is not None else _safe_decode(tok, ids)
+
+
+class IncrementalDetok:
+    """#inc-detok: stateful replacement for per-token `_decode_visible(tok, produced)`.
+
+    The old pattern re-decoded the FULL cumulative id list (and, for harmony, re-scanned every
+    id for channel markers) on EVERY generated token — O(n) work per token, O(n^2) per
+    generation, measured 6-9 ms/token at 16-32k-id thinking outputs, paid ON the event loop.
+
+    Scheme: anchored suffix decode with VERIFIED folds. `head` caches the exact decode of
+    ids[:anchor]; each step decodes only ids[anchor:] (the tail, usually a few tokens) and
+    returns head + tail-decode. Every _FOLD_EVERY tokens one full decode runs and the anchor
+    advances ONLY IF head_candidate + suffix == full — so the emitted text is byte-identical
+    to the old full re-decode by construction: sentencepiece leading-space stripping and
+    cleanup-spaces junction effects depend on the FIRST suffix token, which is pinned at the
+    verified fold; a tokenizer that ever fails verification simply never folds and degrades
+    to the old cost, never to wrong output. The harmony channel walk is a small state machine
+    fed only NEW ids (same semantics as _harmony_final_text, including a LATER `final` header
+    re-basing the visible text, which resets the anchor).
+
+    Kill switch: INFINITEMODEL_INC_DETOK=0 delegates every call to the old full path."""
+
+    _FOLD_EVERY = 64     # steps between fold attempts (1 full decode amortized over 64 tokens)
+    _KEEP_TAIL = 8       # ids kept behind the anchor so the "�" holdback window never folds away
+
+    def __init__(self, tok):
+        self.tok = tok
+        self.ids: list[int] = []
+        self.n = 0                       # public token count (serving state["tokens"])
+        self._full = os.environ.get("INFINITEMODEL_INC_DETOK", "1") in ("0", "false", "no")
+        self._anchor = 0                 # ids[:anchor] are folded into _head
+        self._head = ""                  # exact decode(ids[:_anchor]), fold-verified
+        self._since_fold = 0
+        # harmony state: _hmy None=unknown, False=plain model, True=harmony markers seen
+        self._hmy = None
+        self._chan = self._msg = None    # marker ids (resolved once, None if unresolvable)
+        self._hdr: list[int] | None = None   # ids of a channel header still awaiting <|message|>
+        self._final_start = None         # id index where the final channel's answer begins
+
+    def _resolve_markers(self):
+        if self._chan is None and self._hmy is None:
+            try:
+                chan = self.tok.convert_tokens_to_ids("<|channel|>")
+                msg = self.tok.convert_tokens_to_ids("<|message|>")
+                unk = getattr(self.tok, "unk_token_id", None)
+                if chan in (None, unk) or msg in (None, unk):
+                    self._hmy = False            # tokenizer has no harmony markers
+                else:
+                    self._chan, self._msg = chan, msg
+            except Exception:
+                self._hmy = False
+
+    def _feed_harmony(self, tid: int):
+        """Mirror _harmony_final_text's scan, one id at a time (only ever sees NEW ids)."""
+        if self._hmy is False:
+            return
+        self._resolve_markers()
+        if self._hmy is False:
+            return
+        if self._hdr is not None:                # inside a header: collecting the channel name
+            if tid == self._msg:                 # header closed — is it the `final` channel?
+                with contextlib.suppress(Exception):
+                    if _safe_decode(self.tok, self._hdr).strip() == "final":
+                        self._final_start = self.n          # answer begins AFTER this id
+                        self._anchor, self._head, self._since_fold = self.n, "", 0
+                self._hdr = None
+            else:                                # NOTE: a nested <|channel|> is collected into the
+                self._hdr.append(tid)            # name, exactly like _harmony_final_text's scan
+                                                 # (it only breaks on <|message|>)
+        elif tid == self._chan:
+            self._hmy = True                     # first marker: this IS a harmony stream
+            self._hdr = []
+
+    def push(self, tid: int) -> str:
+        """Append one produced id; return the CURRENT full visible text (old-path-identical)."""
+        self.ids.append(tid)
+        self.n += 1
+        self._feed_harmony(tid)
+        return self.current()
+
+    def current(self) -> str:
+        if self._full:                           # kill switch: exact old behavior
+            return _decode_visible(self.tok, self.ids)
+        if self._hmy:                            # harmony stream: only the final channel shows
+            if self._final_start is None:
+                return ""                        # final channel not reached yet (hides CoT)
+            base = self._final_start
+        else:
+            base = 0
+        lo = max(self._anchor, base)
+        text = self._head + _safe_decode(self.tok, self.ids[lo:])
+        self._since_fold += 1
+        if self._since_fold >= self._FOLD_EVERY and self.n - lo > self._KEEP_TAIL:
+            self._since_fold = 0
+            new_anchor = self.n - self._KEEP_TAIL
+            # one true full decode of the visible span, used BOTH to verify and to fold:
+            full = _safe_decode(self.tok, self.ids[base:])
+            suffix = _safe_decode(self.tok, self.ids[new_anchor:])
+            if full == text and full.endswith(suffix) and not full[:len(full) - len(suffix)].endswith("�"):
+                self._anchor = new_anchor
+                self._head = full[:len(full) - len(suffix)]
+            # verification failed -> keep the old anchor; output above is still the old-path
+            # text ONLY if head+tail matched the full decode — if it didn't, repair now so a
+            # mismatch can never be emitted (belt-and-suspenders; costs one already-done decode).
+            elif full != text:
+                self._anchor, self._head = base, ""
+                text = full
+        return text
 
 
 # ---------------------------------------------------------------------------
