@@ -143,6 +143,19 @@ from wire import (_pack_tensor, _unpack_tensor, _set_keepalive, _tp_hetsplit,   
                   install_log_tee, drain_new_logs, _fuse_moe_experts,
                   load_config, repo_raw_url)
 
+# #wire-caps + #ntensor-manifest: manifest-frame helpers + capability constants (canonical home:
+# wire.py, shared with the controller). GUARDED so a per-file self-update convergence window
+# (this client.py newer than wire.py) still BOOTS the worker: with a stale wire.py the worker
+# advertises no caps (build_registration reads wire.WIRE_CAPS off the module -> absent) and
+# _pack_ntensor stays None, so worker_net's manifest branch is dead and every return frame keeps
+# the legacy byte-identical format until the next self-update completes wire.py too.
+try:
+    from wire import (WIRE_CAPS, NT_LOGITS, NT_HIDDEN, NT_TOKEN_IDS,   # noqa: F401
+                      NT_TOPK_VALS, NT_TOPK_IDX, _pack_ntensor, _unpack_ntensor)
+except ImportError:   # stale wire.py — run capability-less until it converges
+    WIRE_CAPS, _pack_ntensor, _unpack_ntensor = (), None, None
+    NT_LOGITS, NT_HIDDEN, NT_TOKEN_IDS, NT_TOPK_VALS, NT_TOPK_IDX = 0, 1, 2, 3, 4
+
 
 async def _read_frame(reader: asyncio.StreamReader) -> tuple[dict, bytes, int]:
     hdr_len = int.from_bytes(await reader.readexactly(4), "big")

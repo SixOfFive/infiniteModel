@@ -199,14 +199,37 @@ class EngineGenMixin:
                   f"{model.stage0_dial[0]}:{model.stage0_dial[1]} "
                   f"({'write failed' if force else 'idle'})", flush=True)
 
+    def _wire_ntensor_ok(self, model) -> bool:
+        """#wire-caps: may the controller request the #ntensor-manifest return frame from
+        `model`'s chain? True only when EVERY stage node advertised the 'ntensor' cap at
+        registration (registry.node_caps) — an old INTERMEDIATE worker rebuilds the next-hop
+        header and would silently DROP the flag, and an old HEAD ignores it, so all-or-nothing
+        is the only correct gate — AND this controller's own wire.py provides the unpacker
+        (_unpack_ntensor is None during a per-file self-update convergence window; the
+        controller counts as a wire peer too). Re-evaluated per _send, so a replan/adoption
+        that swaps nodes is picked up automatically."""
+        if globals().get("_unpack_ntensor") is None:
+            return False
+        ids = getattr(model, "stage_node_ids", None) or []
+        return bool(ids) and all("ntensor" in registry.node_caps(nid) for nid in ids)
+
     async def _send(self, model: LoadedModel, x, cache_position: int, reset: bool,
                     all_logits: bool = False, mm=None, position_ids=None,
-                    capture_hidden: bool = False, capture_pre_norm: bool = False):
+                    capture_hidden: bool = False, capture_pre_norm: bool = False,
+                    ntensor: bool = False):
         """Push one frame (token ids) through `model`'s pipeline and return last-stage
         logits — last position only, or every position when all_logits=True (verify).
         mm = (positions, embeds_tensor) (#22 inc 3): on a prefill (reset), a companion
         'mm' frame is sent FIRST with the same req_id so stage 0 splices those embeds into
-        its embed output at `positions` before running the layers."""
+        its embed output at `positions` before running the layers.
+        ntensor=True (#ntensor-manifest) asks the head stage for the N-tensor manifest
+        return frame instead of the legacy one/two-tensor format — downgraded here to the
+        legacy format unless the whole chain advertised the cap (#wire-caps), so callers can
+        pass it unconditionally. The reply is dispatched by ITS OWN header in _on_data, so
+        even a stale gate (old worker ignoring the flag) degrades cleanly."""
+        # #wire-caps: never request the manifest from a chain that hasn't advertised it.
+        if ntensor and not self._wire_ntensor_ok(model):
+            ntensor = False
         if model.stage0_writer is None:
             await self._freshen_stage0(model, force=True)   # rebuild from saved dial if dropped
         if model.stage0_writer is None:
@@ -250,6 +273,10 @@ class EngineGenMixin:
                 hdr["capture_hidden"] = True
             if capture_pre_norm:   # #91 MTP: ask the head stage for the PRE-final-norm trunk hidden
                 hdr["capture_pre_norm"] = True
+            if ntensor:   # #ntensor-manifest: ask the head for the manifest return frame (gated
+                # on #wire-caps above; old workers whitelist-read the header via hdr.get and
+                # ignore this key harmlessly — their legacy reply is always still accepted)
+                hdr["ntensor"] = True
             nb = await _write_frame(w, hdr, raw)
             net_account(self._stage0_id(model), to_node=nb)  # controller -> stage0
 

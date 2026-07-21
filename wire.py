@@ -155,6 +155,80 @@ def _unpack_tensor(meta, raw):
     return torch.from_numpy(arr).view(dt).reshape(shape)
 
 
+# --- #wire-caps + #ntensor-manifest (wire capability negotiation + N-tensor return frame) --------
+# WIRE_CAPS: the wire-protocol capabilities THIS build's wire code provides. The worker advertises
+# them in its register hello ('caps': [...]; worker_hw.build_registration reads this via getattr,
+# so a node still carrying an OLD wire.py during per-file self-update convergence advertises
+# nothing). The controller records them on the Node (registry.add) and exposes them via
+# registry.node_caps(node_id) -> frozenset; a gated wire feature turns on for a model only when
+# EVERY node in that model's chain advertises it. Mixed-version safety, by construction:
+#   - old controller + new worker: registry.add whitelist-parses the register dict (reg.get per
+#     known key), so the extra 'caps' key is simply ignored;
+#   - new controller + old worker: no 'caps' field -> empty set -> every gated feature stays off.
+WIRE_CAPS = ("ntensor",)
+
+# #ntensor-manifest tensor kinds (u8 on the wire). 0/1 are live (this stage); 2-4 are RESERVED
+# for the logits-diet (next stage): argmax token ids / top-K values / top-K indices.
+NT_LOGITS = 0
+NT_HIDDEN = 1
+NT_TOKEN_IDS = 2
+NT_TOPK_VALS = 3
+NT_TOPK_IDX = 4
+
+
+def _pack_ntensor(parts):
+    """#ntensor-manifest: [(kind:int, tensor), ...] -> (tmeta list, raw bytes). The raw payload
+    is a compact binary manifest followed by the tensor payloads, back to back:
+
+        u8 count | count x (u8 kind, u32 nbytes big-endian) | count payloads (concatenated)
+
+    dtype/shape can't ride the fixed-width binary manifest, so they ride the frame's JSON header
+    instead (hdr['tensors'] = the returned tmeta, POSITIONALLY aligned with the manifest
+    entries) — the same self-describing JSON meta every legacy frame already uses. Tensor bytes
+    are _pack_tensor's storage reinterpret, so any dtype round-trips losslessly. The frame is
+    sent ONLY when the controller asked for it (request-header 'ntensor' flag) AND the worker
+    advertised the 'ntensor' cap — the legacy one/two-tensor formats remain the default and are
+    byte-identical to before."""
+    import struct
+    metas, blobs = [], []
+    head = struct.pack(">B", len(parts))
+    for kind, t in parts:
+        meta, raw = _pack_tensor(t)
+        metas.append(meta)
+        blobs.append(raw)
+        head += struct.pack(">BI", int(kind), len(raw))
+    return metas, head + b"".join(blobs)
+
+
+def _unpack_ntensor(tmeta, raw):
+    """#ntensor-manifest: inverse of _pack_ntensor -> [(kind:int, tensor), ...] in manifest
+    order. `tmeta` is the frame header's 'tensors' list (dtype/shape per entry, positional).
+    Validates count and byte-span consistency so a malformed/short frame RAISES — the
+    controller's _on_data turns that into the request future's exception, exactly like a
+    legacy short frame."""
+    import struct
+    if not raw:
+        raise ValueError("ntensor frame: empty payload")
+    count = raw[0]
+    if count != len(tmeta or []):
+        raise ValueError(f"ntensor frame: manifest count {count} != header metas "
+                         f"{len(tmeta or [])}")
+    off = 1 + 5 * count                      # payloads start right after the manifest entries
+    if len(raw) < off:
+        raise ValueError("ntensor frame: truncated manifest")
+    out, pos = [], 1
+    for i in range(count):
+        kind, nb = struct.unpack_from(">BI", raw, pos)
+        pos += 5
+        if off + nb > len(raw):
+            raise ValueError(f"ntensor frame: tensor {i} spans past payload end")
+        out.append((int(kind), _unpack_tensor(tmeta[i], raw[off:off + nb])))
+        off += nb
+    if off != len(raw):
+        raise ValueError(f"ntensor frame: {len(raw) - off} trailing bytes after last tensor")
+    return out
+
+
 # --- Process log ring (#logs API) ---------------------------------------------------------------
 # A bounded in-memory ring of recent stdout/stderr lines so a process's live log is exposable over
 # HTTP: the controller serves its own via GET /logs, and each worker relays new lines on its

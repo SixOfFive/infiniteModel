@@ -47,7 +47,27 @@ class EngineLifecycleMixin:
                     continue
                 if fut and not fut.done():
                     try:
-                        if hdr.get("hid_meta") is not None:
+                        if hdr.get("kind") == "ntensor":
+                            # #ntensor-manifest: N-tensor manifest return frame — arrives ONLY
+                            # when this controller requested it (request-header 'ntensor' flag,
+                            # cap-gated in engine_gen), so _unpack_ntensor is present by
+                            # construction (a freak mismatch raises -> the except below fails
+                            # the future, same as any malformed frame). raw = [count:u8]
+                            # [count x (kind:u8, nbytes:u32 BE)][payloads]; dtype/shape metas
+                            # ride hdr['tensors'] positionally. Reconstruct the LEGACY result
+                            # shape by kind so _send's callers stay format-agnostic: logits
+                            # alone -> tensor; logits+hidden -> (logits, hidden) tuple; any
+                            # other combination (kinds 2-4, the logits-diet next stage) ->
+                            # the raw [(kind, tensor), ...] list for kind-aware consumers.
+                            parts = _unpack_ntensor(hdr.get("tensors") or [], raw)
+                            _by = dict(parts)
+                            if set(_by) == {NT_LOGITS}:
+                                fut.set_result(_by[NT_LOGITS])
+                            elif set(_by) == {NT_LOGITS, NT_HIDDEN}:
+                                fut.set_result((_by[NT_LOGITS], _by[NT_HIDDEN]))
+                            else:
+                                fut.set_result(parts)
+                        elif hdr.get("hid_meta") is not None:
                             # #P6 speech: two-tensor result frame = logits ++ post-norm hidden.
                             ln = int(hdr["logits_nbytes"])
                             logits = _unpack_tensor(hdr, raw[:ln])

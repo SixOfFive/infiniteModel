@@ -493,6 +493,17 @@ def build_registration(args: argparse.Namespace) -> dict:
             return False
     reg["can_t2a"] = _has("acestep")
     reg["can_t2i"] = _has("diffusers")
+    # #wire-caps: advertise this build's wire-protocol capability set (e.g. ["ntensor"]) so the
+    # controller can gate new wire formats per node (registry.node_caps). Read via getattr off
+    # the wire MODULE — an old wire.py (per-file self-update convergence window) has no
+    # WIRE_CAPS, so the worker advertises nothing and stays on the legacy wire format
+    # end-to-end. Old controllers whitelist-parse registration (registry.add reads known keys
+    # via reg.get) and ignore the extra key by construction.
+    try:
+        import wire as _wire_mod
+        reg["caps"] = sorted(str(c) for c in getattr(_wire_mod, "WIRE_CAPS", ()))
+    except Exception:
+        reg["caps"] = []
     return reg
 
 

@@ -230,6 +230,13 @@ class WorkerNetMixin:
                     # #91 MTP: capture_pre_norm rides the same chain as capture_hidden but the head
                     # returns the PRE-final-norm trunk hidden (what the MTP head consumes).
                     capture_pre_norm = bool(hdr.get("capture_pre_norm", False))
+                    # #ntensor-manifest: the controller OPTED IN to the N-tensor manifest return
+                    # frame for this request (it only sets the flag when every node in the chain
+                    # advertised the 'ntensor' cap — #wire-caps). Old workers ignore this unknown
+                    # header key by construction (this parser reads keys via hdr.get) and reply in
+                    # the legacy format, which the controller always still accepts — so a stale
+                    # gate is harmless in both directions.
+                    ntensor_req = bool(hdr.get("ntensor", False))
                     # #prefill-progress: hand the frame's req_id to the shard so its per-layer
                     # progress heartbeat is ATTRIBUTED to this request (shard_forward copies it to
                     # _fwd_cur_rid once it OWNS _fwd_lock, so an orphaned forward keeps its own
@@ -239,7 +246,31 @@ class WorkerNetMixin:
                                                   reset, all_logits, inject, position_ids,
                                                   capture_hidden, capture_pre_norm, bidir_spans)
                     kind = "logits" if shard.has_head else "hidden"
-                    if (capture_hidden or capture_pre_norm) and shard.has_head and isinstance(out, tuple):
+                    if ntensor_req and shard.has_head and _pack_ntensor is not None:
+                        # #ntensor-manifest: head stage, controller requested the manifest frame.
+                        # raw = [count:u8][count x (kind:u8, nbytes:u32 BE)][payloads...]; the
+                        # per-tensor dtype/shape metas ride the JSON header ('tensors', positional
+                        # — the same self-describing meta as every legacy frame). Kinds live in
+                        # wire.py: 0=logits, 1=hidden; 2=token_ids / 3=topk_vals / 4=topk_idx are
+                        # RESERVED for the logits-diet (next stage). _pack_ntensor is None only
+                        # when wire.py is stale (self-update convergence) — then this worker never
+                        # advertised 'ntensor' and the flag can't legitimately be set; falling
+                        # through keeps the legacy format either way.
+                        if (capture_hidden or capture_pre_norm) and isinstance(out, tuple):
+                            _parts = [(NT_LOGITS, out[0]), (NT_HIDDEN, out[1])]
+                        else:
+                            _parts = [(NT_LOGITS, out)]
+                        tmeta, oraw = _pack_ntensor(_parts)
+                        ohdr = {"req_id": hdr.get("req_id"), "model_id": model_id,
+                                "kind": "ntensor", "cache_position": cache_start,
+                                "reset": reset, "all_logits": all_logits, "tensors": tmeta}
+                        if position_ids is not None:
+                            ohdr["position_ids"] = position_ids
+                        if bidir_spans is not None:
+                            ohdr["bidir_spans"] = bidir_spans
+                        _tx = await self._send_next(model_id, ohdr, oraw)
+                        _net_peer(self.next_peer.get(model_id, "?"), tx=_tx)
+                    elif (capture_hidden or capture_pre_norm) and shard.has_head and isinstance(out, tuple):
                         logits_t, hidden_t = out
                         lmeta, lraw = _pack_tensor(logits_t)
                         hmeta, hraw = _pack_tensor(hidden_t)
@@ -267,6 +298,8 @@ class WorkerNetMixin:
                             ohdr["capture_hidden"] = True
                         if capture_pre_norm and not shard.has_head:   # #91 MTP
                             ohdr["capture_pre_norm"] = True
+                        if ntensor_req and not shard.has_head:   # #ntensor-manifest: reach the head
+                            ohdr["ntensor"] = True
                         _tx = await self._send_next(model_id, ohdr, oraw)
                         _net_peer(self.next_peer.get(model_id, "?"), tx=_tx)   # to next stage / controller
                 except Exception as exc:  # stage failed -> tell the controller, fast

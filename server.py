@@ -516,6 +516,11 @@ class Node:
     # GPU, not just the co-located one. False for workers that never reported it (pre-feature).
     can_t2a: bool = False
     can_t2i: bool = False
+    # #wire-caps: wire-protocol capability set the worker advertised at registration (e.g.
+    # {"ntensor"}). EMPTY for old workers that sent no 'caps' field — every capability-gated
+    # wire feature then stays OFF for any chain through this node (mixed fleets degrade to the
+    # legacy wire format). Read via registry.node_caps(node_id).
+    caps: frozenset = frozenset()
     # GPU memory (worker-reported; the controller can't see a worker's VRAM).
     # Non-zero only when the worker runs on a GPU (--device gpu/cpu+gpu).
     vram_total_gb: float = 0.0
@@ -629,6 +634,7 @@ class Node:
             "age_s": round(self.age, 1), "alive": self.alive,
             "can_infer": self.can_infer, "incapable_reason": self.incapable_reason,
             "can_t2a": self.can_t2a, "can_t2i": self.can_t2i,
+            "caps": sorted(self.caps),   # #wire-caps: advertised wire capabilities (/status)
             "vram_total_gb": round(self.vram_total_gb, 2),
             "vram_used_gb": round(self.vram_used_gb, 2),
             "vram_reusable_gb": round(self.vram_reusable_gb, 2),   # #vram-reusable: vacant pool
@@ -673,6 +679,9 @@ class Registry:
                 cores=int(reg.get("cores", 0)),
                 can_t2a=bool(reg.get("can_t2a", False)),
                 can_t2i=bool(reg.get("can_t2i", False)),
+                # #wire-caps: record the worker's advertised wire capabilities. Absent/unknown
+                # field (old worker) -> empty frozenset -> every gated wire feature stays off.
+                caps=frozenset(str(c) for c in (reg.get("caps") or [])),
             )
             self._nodes[node_id] = node
             # NOTE: a node JOINING is just added capacity — it must NOT force resident models
@@ -680,6 +689,15 @@ class Registry:
             # nodes are simply available for the NEXT load. Only node loss reloads, and only
             # the models that used the lost node (via invalidate_model on remove/reap).
             return node
+
+    def node_caps(self, node_id: str) -> frozenset:
+        """#wire-caps: the wire-capability set node_id advertised at registration. UNKNOWN
+        node id, or an old worker that sent no 'caps' field -> EMPTY frozenset, i.e. every
+        capability-gated wire feature off — the safe mixed-fleet default. Sync + lock-free
+        (same read pattern as the existing registry._nodes.get(nid) callers): registration
+        replaces whole Node objects, never mutates caps in place."""
+        n = self._nodes.get(node_id)
+        return getattr(n, "caps", frozenset()) if n is not None else frozenset()
 
     async def find_stale_dupes(self, fresh: Node) -> list[Node]:
         """Prior node entries that are the SAME physical worker as the just-registered `fresh`
@@ -1381,6 +1399,18 @@ def run_self_test_plan(os_reserve_gb: float, gb_list: list[float], ctxs: list[in
 # git clone, so a plain import is safe.
 from wire import (_pack_tensor, _unpack_tensor, _set_keepalive, _tp_hetsplit,   # noqa: F401
                   install_log_tee, tail_logs)
+
+# #wire-caps + #ntensor-manifest: manifest-frame helpers + capability constants (canonical home:
+# wire.py, shared with the workers). GUARDED so a controller mid per-file self-update (this
+# server.py newer than wire.py) still boots: with _unpack_ntensor = None the engine never
+# REQUESTS the manifest frame (engine_gen._wire_ntensor_ok gates on it), so every return frame
+# stays in the legacy format the old wire code fully handles.
+try:
+    from wire import (WIRE_CAPS, NT_LOGITS, NT_HIDDEN, NT_TOKEN_IDS,   # noqa: F401
+                      NT_TOPK_VALS, NT_TOPK_IDX, _pack_ntensor, _unpack_ntensor)
+except ImportError:   # stale wire.py — run capability-less until it converges
+    WIRE_CAPS, _pack_ntensor, _unpack_ntensor = (), None, None
+    NT_LOGITS, NT_HIDDEN, NT_TOKEN_IDS, NT_TOPK_VALS, NT_TOPK_IDX = 0, 1, 2, 3, 4
 
 
 # code-split Inc 2: the CONTROL PLANE (frame IO, ControlLink, the resilient TCP listener,
