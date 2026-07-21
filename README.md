@@ -289,6 +289,32 @@ Point existing tooling at `http://<controller>:21434`.
 Self-update pulls module sources from the public GitHub repo's raw endpoint — **no token needed**. No
 secrets are stored in the source.
 
+## Hardware donations & testing
+
+**I'm happy to test donated hardware and build proper support for it — especially high-end gear.**
+
+InfiniteModel is explicitly a *heterogeneous* engine: the planner, the quantization kernels, and the
+transport all behave differently depending on the silicon they land on. A platform isn't really
+supported until it's been run, profiled, and had its sharp edges filed off. Essentially everything
+that works today — NVIDIA CUDA, AMD ROCm on Strix Halo, x86 CPU workers, aarch64/Android, older
+compute-capability cards — exists because I had one on a desk to test against.
+
+What I don't have is the high end: datacenter accelerators, big multi-GPU boxes, high-core-count
+servers, or fast interconnects. That's also where this project has the most headroom — more pooled
+VRAM means bigger models, and a faster fabric between stages directly attacks the main cost of
+pipeline parallelism.
+
+If you have hardware sitting idle and would like it supported:
+
+- I'll do the actual implementation work to make it a first-class worker — placement, kernels,
+  quantization tiers, whatever the platform needs — not just confirm that it boots.
+- I'll write up the results publicly in this repo, **including if it turns out to be a poor fit**.
+  An honest "this hardware isn't worth it for this workload" is a useful result too.
+- **Loans are as welcome as donations**, and short-term remote access to a box is genuinely useful
+  on its own if you'd rather not ship anything.
+
+Open an issue if you'd like to talk about it.
+
 ## Acknowledgments
 
 Inspired in spirit by [exo](https://github.com/exo-explore/exo) and the broader idea of pooling the
