@@ -85,6 +85,12 @@ if triton is not None:
 # QuantLinear4 at placement, self-checked vs the naive dequant, naive fallback on any mismatch /
 # unsupported device. Off-switch: IM_FUSED_INT4=0.
 _FUSED_INT4 = (os.environ.get("IM_FUSED_INT4", "1") != "0")
+# #large-m-naive: the fused Triton quant linears' M>1 kernels are DECODE-tuned (fixed BM=16
+# tl.dot tiles, no autotune) — at prefill row counts they can lose to "dequant the weight ONCE
+# + one BLAS GEMM" (the naive path, remat amortized over the whole chunk). Which side wins is
+# shape/arch-dependent, so it is MEASURED per shape at prepare time (_bench_large_m_naive) and
+# forward falls through above the benched threshold. Off-switch: IM_LARGE_M_NAIVE=0.
+_LARGE_M_NAIVE = (os.environ.get("IM_LARGE_M_NAIVE", "1") != "0")
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +457,10 @@ def _quant4_linear_cls():
                         if rel < 0.05:
                             self._fused = (self.qweight, sz, op, in_pad)   # kernel reads qweight; keep it
                             print(f"[int4] triton w4a16 kernel active on {dev}", flush=True)
+                            # #large-m-naive: fused is now proven for correctness; bench whether
+                            # prefill-shaped M should fall through to dequant-once+BLAS instead
+                            # of the decode-tuned _k (threshold 0 = never; cached per shape).
+                            self._naive_m_min = _bench_large_m_naive(self, "int4")
                         else:
                             print(f"[int4] triton w4a16 self-check rel={rel:.3f} on {dev} -> naive", flush=True)
                     except Exception as exc:
@@ -501,6 +511,20 @@ def _quant4_linear_cls():
                     if rel < 0.05:
                         self._fused = (mat2, sz, op, in_pad)
                         self.qweight = None        # packed mat2 is now authoritative; free the source
+                        # #sz-free: scale/zero live on ONLY inside the fused sz tensor now (the
+                        # [ng,out,2] bf16 repack above) — the originals are dead weight, ~6% of
+                        # qweight bytes held TWICE (~0.4-0.5 GB on a 14 GB dense-int4 shard set).
+                        # Safe to drop: with qweight None both _dequant callers are unreachable
+                        # (forward's naive tail is gated behind the fused branch + the
+                        # #large-m-naive gate requires qweight; prepare_fused re-entry is
+                        # _fused_tried/qweight-None guarded), and a None buffer is already the
+                        # shipped qweight=None pattern — nn.Module buffers()/state_dict()/_apply
+                        # skip None entries and the teardown sweeps None-guard (worker_load
+                        # _release_shard_vram, worker_t2i offload, client [int4-vram] census).
+                        # ROCm never gets here (early return above) — its sz TUPLE aliases these
+                        # live buffers and the Triton kernel reads them every call: keep BOTH.
+                        self.scale = None
+                        self.zero = None
                     else:
                         print(f"[int4] fused self-check rel={rel:.3f} on {dev} -> naive path",
                               flush=True)
@@ -509,6 +533,14 @@ def _quant4_linear_cls():
 
             def forward(self, x):
                 fz = getattr(self, "_fused", None)
+                # #large-m-naive: prefill-shaped calls (rows >= the threshold MEASURED at prepare
+                # time) skip the decode-tuned fused Triton kernel and take the naive tail below —
+                # dequant ONCE + one BLAS GEMM, i.e. the self-check's own reference numerics.
+                # Triton-only by construction: needs the retained qweight (tinygemm frees it and
+                # never sets a threshold), and decode M=1 can never reach the threshold.
+                _nm = getattr(self, "_naive_m_min", 0)
+                if fz is not None and _nm and self.qweight is not None and _rows(x) >= _nm:
+                    fz = None
                 if fz is not None:
                     # fused-dequant int4 GEMM (2D only): flatten, bf16 activations, restore shape.
                     mat2, sz, op, in_pad = fz
@@ -692,6 +724,75 @@ def _w4a16_triton_op_locked():
         _W4A16_OP = None
     _W4A16_TRIED = True      # #triton-race: only AFTER _W4A16_OP is final (see _W4A16_BUILD_LOCK)
     return _W4A16_OP
+
+
+# #large-m-naive: measured large-M dispatch decisions, keyed (tag, N, in_pad, group) so 40
+# layers of the same shape pay ONE bench (the _pad_choice precedent). Value = smallest benched
+# row count where the naive path wins (forward falls through at rows >= it); 0 = keep fused.
+_LARGE_M_CHOICE: dict = {}
+_LARGE_M_BENCH_ROWS = (64, 256, 2048)   # 2048 = the INFINITEMODEL_PREFILL_CHUNK default
+
+
+def _bench_large_m_naive(mod, tag: str) -> int:
+    """#large-m-naive: pick the fused-vs-naive dispatch threshold for PREFILL-shaped calls on a
+    fused TRITON quant linear (the paths that RETAIN qweight, so the naive fall-through costs no
+    extra residency — never the tinygemm path, which frees qweight/scale/zero).
+
+    Why: the M>1 tl.dot kernels are decode-tuned (fixed BM=16/BN=128 tiles, no autotune) — a
+    2048-row prefill chunk revisits and RE-DEQUANTS every weight tile cdiv(M,16) times, while the
+    naive path dequants the weight ONCE per call and hands one bf16 GEMM to hipBLAS/cuBLAS,
+    amortizing the remat over the whole chunk. Which side wins is shape/arch-dependent (the
+    APU's BLAS may itself be below peak), so — like the MoE pad-vs-unpadded #dram-dealias bench —
+    the choice is MEASURED on the production tensors/op at prepare time, never guessed. Returns
+    the smallest benched row count where dequant-once+GEMM beats the fused kernel by >=13%
+    (crossover is monotonic in M: naive amortizes a fixed remat, fused revisit cost grows with
+    M — so rows between bench points inherit the decision conservatively), or 0 = keep fused
+    everywhere. Decode is untouched either way (M=1 has its own autotuned split-K GEMV, and the
+    threshold can never be < the smallest bench row). Numerics: the fall-through IS the
+    self-check's reference path (_dequant + F.linear), so no new self-check is needed. Any
+    bench failure -> 0 (keep fused, uncached so a transient hiccup doesn't pin the shape).
+    Off-switch: IM_LARGE_M_NAIVE=0."""
+    if not _LARGE_M_NAIVE:
+        return 0
+    try:
+        import torch
+        import torch.nn.functional as F
+        qw, szt, op, in_pad = mod._fused
+        key = (tag, qw.shape[0], in_pad, mod.group_size)
+        hit = _LARGE_M_CHOICE.get(key)
+        if hit is not None:
+            return hit
+        dev = qw.device
+
+        def _ms(fn, iters=2):
+            fn()                                  # warmup (Triton JIT / allocator steady-state)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t0) / iters * 1e3
+
+        thr = 0
+        log = []
+        for M in _LARGE_M_BENCH_ROWS:
+            xt = torch.randn(M, mod.in_features, device=dev, dtype=torch.bfloat16)
+            xk = xt if in_pad == mod.in_features else F.pad(xt, (0, in_pad - mod.in_features))
+            xk = xk.contiguous()
+            t_f = _ms(lambda: op(xk, qw, mod.group_size, szt))
+            t_n = _ms(lambda: F.linear(xt, mod._dequant(torch.bfloat16)))
+            log.append(f"M={M} fused={t_f:.2f}ms naive={t_n:.2f}ms")
+            if t_n < t_f * 0.87:                  # same >=13%-win margin as the de-alias bench
+                thr = M
+                break                             # monotonic: larger M favors naive even more
+        _LARGE_M_CHOICE[key] = thr
+        _builtins.print(f"[{tag}] large-M dispatch [N={qw.shape[0]},Kpad={in_pad}]: "
+                        f"{'; '.join(log)} -> "
+                        f"{f'naive at rows>={thr}' if thr else 'fused for all M'}", flush=True)
+        return thr
+    except Exception as exc:                      # never let a bench hiccup break placement
+        _builtins.print(f"[{tag}] large-M bench skipped ({exc!r})", flush=True)
+        return 0
 
 
 _W4A16_MOE_OP = None
