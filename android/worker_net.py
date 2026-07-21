@@ -140,12 +140,17 @@ class WorkerNetMixin:
                     with contextlib.suppress(Exception):
                         await self._send_next(model_id, hdr, b"")   # reconnect-safe (reach the controller)
                     continue
-                if hdr.get("kind") == "crop":  # speculative-decode KV rollback
+                if hdr.get("kind") == "crop":  # spec-decode KV rollback / #prefix-kv resume
                     if shard is not None:
                         shard.crop(int(hdr.get("cache_position", 0)))
-                    with contextlib.suppress(Exception):  # propagate down the chain
-                        if nxt is not None:
-                            await _write_frame(nxt, hdr, b"")
+                    with contextlib.suppress(Exception):  # propagate down the chain, via
+                        # _send_next (reconnect-once) so the crop rides the SAME (possibly
+                        # freshly re-dialed) socket the following data frames will use — the
+                        # old raw next_writers write was silently LOST when the hop had
+                        # idle-died, and the very next forward then crashed downstream on a
+                        # mask/KV length mismatch (#prefix-kv makes crop frames routine on
+                        # long-idle chains, not just mid-generation spec rounds).
+                        await self._send_next(model_id, hdr, b"")
                     continue
                 if hdr.get("kind") == "mm":   # #22 inc 3: stage multimodal embeds for the
                     # next prefill of this (model_id, req_id). Stage-0 only; NOT forwarded down.
@@ -199,6 +204,19 @@ class WorkerNetMixin:
                 if reset:   # #stage0-stale-reconnect: new generation -> drop a stale (idle) next hop
                     self._freshen_next(model_id)   # so this prefill's forward rides a fresh socket
                     # (#pipefill: only chunk 0 carries reset=True, so a chunk burst freshens once)
+                else:
+                    # #prefix-kv: a prefix-resume suffix prefill arrives reset=False (crop +
+                    # append at cache_position=L) yet typically follows a LONG idle gap (the
+                    # multi-turn agent shape) — exactly the silently-half-open window
+                    # _freshen_next exists for. Freshen on any MULTI-TOKEN frame too: q>1 only
+                    # ever means prefill-shaped work (suffix chunks, spec verify — mid-gen
+                    # frames find the socket warm and no-op on the STAGE_STALE_S check inside);
+                    # q==1 decode steps keep the never-freshen contract ([1,q] ids and [1,q,H]
+                    # hidden frames both carry q at shape[1]).
+                    with contextlib.suppress(Exception):
+                        _shp = hdr.get("shape") or ()
+                        if len(_shp) >= 2 and int(_shp[1]) > 1:
+                            self._freshen_next(model_id)
                 try:
                     if shard is None:
                         raise RuntimeError(f"no shard for model_id={model_id!r} on this node")

@@ -57,6 +57,25 @@ def _pipefill_conf() -> int:
     return max(256, n) if n > 0 else 0
 
 
+def _prefix_kv_min() -> int:
+    """#prefix-kv: minimum shared-prefix length (tokens) worth a crop+resume, or 0 = feature
+    disabled. Two controller envs, read per request like the other knobs here:
+    INFINITEMODEL_PREFIX_KV — '0'/'off'/'false'/'no' -> hard opt-out (default ON; the
+    _prefix_kv_ok gates already require the modern 'pipefill' worker caps, so a mixed/stale
+    fleet self-gates to the classic full prefill);
+    INFINITEMODEL_PREFIX_MIN — the reuse threshold, default 1024 tokens; clamped >=16 so a
+    typo can never make every tiny retry crop a live cache for a negligible win."""
+    import os
+    v = os.environ.get("INFINITEMODEL_PREFIX_KV", "").strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return 0
+    try:
+        n = int(os.environ.get("INFINITEMODEL_PREFIX_MIN", "1024"))
+    except ValueError:
+        return 1024
+    return max(16, n)
+
+
 class EngineGenMixin:
 
     async def embed(self, friendly: str, input_ids, attention_mask) -> list:
@@ -336,10 +355,108 @@ class EngineGenMixin:
             return 0
         return cstep
 
+    def _prefix_kv_ok(self, model) -> bool:
+        """#prefix-kv master gate: may a new request RESUME this replica's resident KV (crop to
+        the shared prefix + suffix-only prefill) instead of re-prefilling from position 0? All
+        binding audit caveats, all conservative — any doubt keeps the classic full prefill:
+        - tp_size == 1: the TP positional broadcast path was never validated for crop+resume
+          (and TP peers don't see crop frames at all);
+        - kv_offload off: the worker's OffloadedCache fallback can silently drop/rebuild
+          self.kv mid-request, so a controller-side record of its contents can't be trusted;
+        - kv_quant == none (#172): TurboQuantCache.crop exists, but a cross-request resume over
+          the quantized-prefix + bf16-residual-window split is unvalidated — excluded;
+        - every chain node advertises 'pipefill' (#wire-caps all-or-nothing): those workers run
+          the reviewed sequential-inbound contract the suffix chunk burst leans on (reuses that
+          machinery — no new cap);
+        - _pipefill_arch_ok: excludes hybrid Gated-DeltaNet (a crop cannot roll back linear-
+          attention recurrent state — documented not bit-exact), Gemma4 per-type sliding KV (a
+          sliding layer has already DISCARDED early tokens, so cropping below the window edge is
+          unrecoverable), omni and qwen2_5_vl mrope (absolute 3D-position layouts were never
+          built for a split/resumed prompt)."""
+        if int(getattr(model, "tp_size", 1) or 1) != 1:
+            return False
+        if getattr(model, "kv_offload", False):
+            return False
+        if (getattr(model, "kv_quant", "none") or "none") != "none":
+            return False
+        ids = getattr(model, "stage_node_ids", None) or []
+        if not ids or not all("pipefill" in registry.node_caps(nid) for nid in ids):
+            return False
+        return self._pipefill_arch_ok(model)
+
+    async def _prefill_reuse(self, model: LoadedModel, prompt_ids: list, mm=None,
+                             position_ids=None, nt_mode=None, nt_clip: int = 0, nt_k: int = 0):
+        """#prefix-kv: prefill dispatcher with CROSS-REQUEST prefix reuse (audit finding 29).
+
+        THE DEFECT this fixes: every request re-prefilled its ENTIRE prompt from position 0,
+        yet multi-turn agent workloads (Claude Code via /v1/messages, agent loops, quorum
+        re-asks) send prompt_N = prompt_{N-1} + answer_{N-1} + new turn — the shared tens-of-
+        thousands-of-token prefix was recomputed every turn (tens of seconds to minutes of
+        TTFT, worst on the bandwidth-bound Strix box) while the SAME tokens' KV sat resident
+        on every stage (workers keep self.kv between generations; nothing frees it at gen end).
+
+        MECHANISM (single-cache resume — THE one live cache per replica; no KV slots yet): the
+        decode paths publish model.kv_ids = exactly the ids whose KV is in the shards (prompt +
+        SENT decode tokens; spec-decode crop-aware). On the next text-only request for this
+        replica (serialized by model.lock, so the read is race-free) compute the longest common
+        prefix LCP(new, cached); when it clears INFINITEMODEL_PREFIX_MIN and every _prefix_kv_ok
+        gate: crop every stage to L (the production spec-rollback frame — in-order on every hop,
+        so it lands before the suffix) and prefill ONLY new_ids[L:] as a reset=False frame /
+        chunk burst at cache_position=L via _send_prefill(base=L) — the proven spec-verify shape
+        (#pipefill chunks it cross-stage when long; the shard's intra-stage #prefill-chunk loop
+        caps mask memory either way, since it triggers on q>1 regardless of reset). POSITION
+        INTEGRITY: RoPE positions for the suffix continue at L because every shard forward path
+        computes them from the cache offset — arange(cache_start, cache_start+q) in both
+        _forward_impl and _forward_uniform_eager — never from 0. EDGE: new prompt fully inside
+        the cache (an identical retry) -> crop to len(new)-1 and prefill the last token, so
+        there is always >=1 suffix token to forward (the head must produce next-token logits).
+        Any gate/miss -> the classic full prefill, byte-identical to before.
+
+        REPLY CONTRACT: identical to _send_prefill's — the head's logits (or #logits-diet
+        reduced form) for the FINAL prompt position, all either call site consumes.
+        RECORD CONTRACT: model.kv_ids is nulled (here via _crop/_send_prefill) BEFORE any KV
+        mutation and re-published only by the CALLER after this returns — a failure anywhere
+        leaves it None, so the next request safely full-prefills."""
+        import torch
+        cached = getattr(model, "kv_ids", None)
+        L = 0
+        _min = _prefix_kv_min()
+        if (cached and _min and mm is None and position_ids is None
+                and model.stage0_writer is not None      # a silent no-op _crop would desync KV
+                and self._prefix_kv_ok(model)):
+            q = len(prompt_ids)
+            n = min(len(cached), q)
+            if n >= _min:
+                if cached[:n] == prompt_ids[:n]:   # C-speed fast path: pure extension / retry —
+                    lcp = n                        # the every-turn agent shape (no Python loop)
+                else:
+                    lcp = 0
+                    while lcp < n and cached[lcp] == prompt_ids[lcp]:
+                        lcp += 1
+                if lcp >= _min:
+                    L = min(lcp, q - 1)   # EDGE: leave >=1 suffix token on an identical retry
+        if L <= 0:
+            return await self._send_prefill(model, torch.tensor([prompt_ids], dtype=torch.long),
+                                            mm=mm, position_ids=position_ids,
+                                            nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k)
+        # -- resume: crop every stage to the shared prefix, prefill only the suffix -------------
+        await self._crop(model, L)      # nulls model.kv_ids; in-order ahead of the suffix frames
+        res = await self._send_prefill(model,
+                                       torch.tensor([prompt_ids[L:]], dtype=torch.long),
+                                       base=L, nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k)
+        # #prefix-kv observability: without this line a reuse is invisible in telemetry (the
+        # render-oom-guard lesson) — one activity line per HIT, with the tokens saved.
+        with contextlib.suppress(Exception):
+            log_activity(f"{model.friendly}: #prefix-kv HIT — reused {L} cached prefix tokens, "
+                         f"prefilled {len(prompt_ids) - L} of {len(prompt_ids)} "
+                         f"({100 * L // max(1, len(prompt_ids))}% of the prompt skipped)")
+        return res
+
     async def _send(self, model: LoadedModel, x, cache_position: int, reset: bool,
                     all_logits: bool = False, mm=None, position_ids=None,
                     capture_hidden: bool = False, capture_pre_norm: bool = False,
-                    ntensor: bool = False, nt_mode=None, nt_clip: int = 0, nt_k: int = 0):
+                    ntensor: bool = False, nt_mode=None, nt_clip: int = 0, nt_k: int = 0,
+                    prefill_wait: bool = False):
         """Push one frame (token ids) through `model`'s pipeline and return last-stage
         logits — last position only, or every position when all_logits=True (verify).
         mm = (positions, embeds_tensor) (#22 inc 3): on a prefill (reset), a companion
@@ -358,7 +475,12 @@ class EngineGenMixin:
         row[:clip]; 0 = raw-row semantics, the _decode_spec convention). Downgraded here
         unless the whole chain advertised 'ntdiet' AND tp_size==1 (_wire_diet_ok) and never
         combined with a capture rider, so callers pass it unconditionally and detect the
-        reply TYPE: a [(kind, tensor), ...] list = diet reply; a plain tensor = full row."""
+        reply TYPE: a [(kind, tensor), ...] list = diet reply; a plain tensor = full row.
+        prefill_wait=True (#prefix-kv) gives a reset=False frame the reset branch's progress-
+        aware patience — a long SUFFIX prefill at a cache offset is prefill-shaped work, not a
+        decode step, so it must not die at the classic single GEN_TIMEOUT budget under GPU
+        contention (the #endpoint-weather class). Default False keeps every existing
+        decode/verify call site byte-identical."""
         # #logits-diet: downgrade the reduced-reply request unless the chain fully supports it.
         # Callers always handle a full-row reply, so a downgrade is a silent no-op, not an error.
         if nt_mode is not None and (capture_hidden or capture_pre_norm
@@ -372,6 +494,13 @@ class EngineGenMixin:
         if ntensor and not self._wire_ntensor_ok(model):
             ntensor = False
             nt_mode = None
+        # #prefix-kv: a reset frame rebuilds every stage's KV from position 0 — whatever ids the
+        # cross-request record claimed are gone the moment this dispatches. Null FIRST (before
+        # any await can fail) so EVERY reset path (decode prefills, capture_thinker, MTP,
+        # routes_diag/routes_shards qcheck probes) invalidates centrally; the decode paths that
+        # KNOW the post-prefill contents re-publish after their prefill returns.
+        if reset:
+            model.kv_ids = None
         if model.stage0_writer is None:
             await self._freshen_stage0(model, force=True)   # rebuild from saved dial if dropped
         if model.stage0_writer is None:
@@ -438,7 +567,7 @@ class EngineGenMixin:
                 await self._freshen_stage0(model, force=True)
                 await _flush(model.stage0_writer)
             model.last_send_ts = time.time()
-            if not reset:   # decode/verify step: classic single-budget wait
+            if not reset and not prefill_wait:   # decode/verify step: classic single-budget wait
                 return await asyncio.wait_for(fut, timeout=GEN_TIMEOUT_S)
             # #endpoint-weather: a PREFILL is ONE frame/future for the whole prompt, so under GPU
             # contention a healthy prefill can legitimately outlast GEN_TIMEOUT_S — and dying here
@@ -469,7 +598,7 @@ class EngineGenMixin:
             self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
 
     async def _send_prefill(self, model: LoadedModel, x, mm=None, position_ids=None,
-                            nt_mode=None, nt_clip: int = 0, nt_k: int = 0):
+                            nt_mode=None, nt_clip: int = 0, nt_k: int = 0, base: int = 0):
         """#pipefill: prefill dispatcher. Eligible prompts (see _pipefill_chunk) are streamed
         through the pipeline as a BURST of chunk frames so the stages overlap; everything else
         falls through to the classic one-shot _send prefill, byte-identical to before.
@@ -514,12 +643,21 @@ class EngineGenMixin:
         the same hard ceiling backstop. Cancellation (client drop / gen-stall reclaim /
         _ForwardSuperseded upstream) unwinds through the finally: every chunk rid is scrubbed
         from pending, so orphaned worker forwards report progress nobody credits (exactly the
-        one-shot orphan contract) and their late replies/errors are ignored by _on_data."""
+        one-shot orphan contract) and their late replies/errors are ignored by _on_data.
+
+        base>0 (#prefix-kv): `x` is a SUFFIX starting at absolute cache_position `base` —
+        every frame goes out reset=False at base+off (the production spec-verify shape; the
+        caller has already cropped every stage's KV to exactly `base`, in-order on the same
+        sockets). base==0 keeps every path above byte-identical."""
         q = int(x.shape[1])
+        # #prefix-kv: ANY prefill (full at 0 or suffix at base) mutates the shard KV — the
+        # cross-request record is stale from here until the owning decode path re-publishes it.
+        model.kv_ids = None
         cstep = self._pipefill_chunk(model, q, mm, position_ids)
         if not cstep:
-            return await self._send(model, x, 0, True, mm=mm, position_ids=position_ids,
-                                    nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k)
+            return await self._send(model, x, base, base == 0, mm=mm, position_ids=position_ids,
+                                    nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k,
+                                    prefill_wait=base > 0)
         # -- chunked pipelined path ------------------------------------------------------------
         # #logits-diet gating for the LAST chunk mirrors _send's own downgrade ladder, so the
         # final reply keeps the exact same wire mode the one-shot prefill would have used.
@@ -538,8 +676,11 @@ class EngineGenMixin:
 
         async def _write_chunk(rid: int, off: int, cl: int, last: bool) -> None:
             meta, raw = _pack_tensor(x[:, off:off + cl])
+            # #prefix-kv: base offsets every chunk; reset only at ABSOLUTE position 0 (a suffix
+            # burst must append to the cropped resident KV, never rebuild it).
             hdr = {"req_id": rid, "model_id": model.target_id, "kind": "ids",
-                   "cache_position": off, "reset": off == 0, "all_logits": False, **meta}
+                   "cache_position": base + off, "reset": base + off == 0,
+                   "all_logits": False, **meta}
             if last:
                 if nt_mode is not None:   # the caller's reply directive rides the FINAL chunk
                     hdr["ntensor"] = True
@@ -580,6 +721,8 @@ class EngineGenMixin:
                         # for a burst) -> KV append order would be undefined. Freshen for the
                         # NEXT request and fail THIS one; the retry's chunk 0 (reset=True,
                         # position 0) rebuilds every stage's cache, so nothing stale survives.
+                        # (#prefix-kv suffix bursts too: this failure nulled model.kv_ids via
+                        # the dispatcher, so the retry is a FULL reset prefill, never a resume.)
                         with contextlib.suppress(Exception):
                             await self._freshen_stage0(model, force=True)
                         raise
@@ -635,9 +778,13 @@ class EngineGenMixin:
                         _f.exception()
 
     async def _crop(self, model: LoadedModel, length: int) -> None:
-        """Tell every stage of `model` to truncate its KV cache to `length` (spec rollback).
-        Fire-and-forget: in-order delivery on each stage's connection guarantees the
-        crop is applied before the next frame the controller sends afterwards."""
+        """Tell every stage of `model` to truncate its KV cache to `length` (spec rollback,
+        #prefix-kv resume). Fire-and-forget: in-order delivery on each stage's connection
+        guarantees the crop is applied before the next frame the controller sends afterwards."""
+        # #prefix-kv: KV contents change under this frame — invalidate the cross-request record;
+        # the callers that know the exact post-crop ids (spec decode's round loop, the prefix
+        # resume's owner) re-publish afterwards, everyone else safely full-prefills next.
+        model.kv_ids = None
         if model.stage0_writer is not None:
             nbytes = await _write_frame(model.stage0_writer,
                                         {"model_id": model.target_id, "kind": "crop",
@@ -932,13 +1079,29 @@ class EngineGenMixin:
                 _nt_k = _wire_topk_k()
                 if _nt_k > 0:
                     _nt_mode = "topk"
-        # #pipefill: long multi-stage text prefills stream as a chunk burst (stages overlap);
-        # everything else takes _send_prefill's one-shot fallback — same reply either way.
-        res = await self._send_prefill(model, torch.tensor([prompt_ids], dtype=torch.long),
-                                       mm=mm, position_ids=prefill_pos,
-                                       nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
+        # #pipefill: long multi-stage text prefills stream as a chunk burst (stages overlap).
+        # #prefix-kv: when the LAST generation's KV (still resident on every stage) shares a
+        # long prefix with this prompt, _prefill_reuse crops to the shared prefix and prefills
+        # ONLY the suffix; everything else takes the classic full prefill — same reply shape.
+        res = await self._prefill_reuse(model, prompt_ids, mm=mm, position_ids=prefill_pos,
+                                        nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
         cur = len(prompt_ids)
         model.kv_pos = cur          # KV depth so far (prompt); climbs per decode token
+        # #prefix-kv: publish the cross-request record — exactly the ids now in every stage's
+        # KV (the prefill round-tripped: the head's reply proves every stage appended; on a
+        # resume, prefix[:L] + suffix == prompt_ids again). Appended IN PLACE after each
+        # successful decode send below, so the record tracks SENT tokens only — the final
+        # emitted token (length stop) and the eos are sampled but never sent (the audit's
+        # off-by-one caveat). Any send failure nulls it; the next request then full-prefills.
+        # mm (vision/audio) prompts publish NOTHING: the shard KV rows at spliced positions
+        # were computed from IMAGE/AUDIO embeds, not from the placeholder token ids, so a
+        # prompt_ids record would violate the contract ('exactly the ids whose KV is in the
+        # shards') — a later TEXT-ONLY prompt whose id-LCP crossed a splice start would
+        # silently reuse image-embed KV as text KV. The read gate requires mm is None anyway,
+        # so a vision follow-up turn could never resume regardless; full-id publishing on mm
+        # requests buys nothing. (_kv still appends in-loop below — harmless, unpublished.)
+        _kv = list(prompt_ids)
+        model.kv_ids = _kv if mm is None else None
         produced = 0
         while produced < max_new:
             if model.friendly not in self.models or model.stage0_writer is None:
@@ -984,11 +1147,19 @@ class EngineGenMixin:
                 break
             # mRoPE decode position = base + step (same on t/h/w); else 1D (worker uses arange).
             dpos = [[base + produced - 1]] * 3 if base is not None else None
-            res = await self._send(model, torch.tensor([[tok_id]], dtype=torch.long), cur,
-                                   False, position_ids=dpos,
-                                   nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
+            try:
+                res = await self._send(model, torch.tensor([[tok_id]], dtype=torch.long), cur,
+                                       False, position_ids=dpos,
+                                       nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
+            except BaseException:
+                # #prefix-kv: append state unknown mid-send (incl. CancelledError from a client
+                # drop / gen-stall reclaim / _ForwardSuperseded landing in this await) -> the
+                # record is invalid; null it so the next request full-prefills.
+                model.kv_ids = None
+                raise
             cur += 1
             model.kv_pos = cur
+            _kv.append(tok_id)   # #prefix-kv: tok_id's KV landed on every stage (reply received)
         yield None, "length"
 
     async def capture_thinker(self, friendly, prompt_ids, max_new, temperature=0.0,
@@ -1075,10 +1246,15 @@ class EngineGenMixin:
         # chain replies the full row instead; both shapes are handled at every consumer.
         # #pipefill: spec's prefill is a plain text prefill (verify frames are untouched), so it
         # rides the same chunk-burst dispatcher; the last chunk's reply keeps nt argmax/nt_clip=0.
-        _r0 = await self._send_prefill(model, torch.tensor([prompt_ids], dtype=torch.long),
-                                       nt_mode="argmax", nt_clip=0)
+        # #prefix-kv: and the same cross-request prefix resume (spec is text-only by construction).
+        _r0 = await self._prefill_reuse(model, prompt_ids, nt_mode="argmax", nt_clip=0)
         a0 = None if isinstance(_r0, list) else _r0[0, -1]
         cur = len(prompt_ids)              # target KV holds exactly tokens[0:cur]
+        # #prefix-kv: publish the record (== tokens[0:cur], the invariant above). Each round
+        # extends + re-publishes it after the crop (which nulls it); a verify/crop failure
+        # leaves it None so the next request full-prefills.
+        _kv = list(prompt_ids)
+        model.kv_ids = _kv
         d_logits = await asyncio.to_thread(self._draft_prefill, model, prompt_ids)
         produced = 0
         rounds = drafted = matched = 0
@@ -1117,8 +1293,14 @@ class EngineGenMixin:
             # preserves this path's RAW-row argmax semantics; a downgraded chain still returns
             # the full [1,K+1,V] tensor and takes the legacy branch below — bit-identical tg
             # either way, so acceptance (and thus emitted tokens) never depends on the wire mode.
-            V = await self._send(model, torch.tensor([[pending] + drafts], dtype=torch.long),
-                                 cur, False, all_logits=True, nt_mode="argmax", nt_clip=0)
+            try:
+                V = await self._send(model, torch.tensor([[pending] + drafts], dtype=torch.long),
+                                     cur, False, all_logits=True, nt_mode="argmax", nt_clip=0)
+            except BaseException:
+                # #prefix-kv: the K+1 appends may have landed on SOME stages only — record
+                # invalid; null it so the next request full-prefills (binding audit caveat).
+                model.kv_ids = None
+                raise
             # 3. target's greedy tokens for positions cur+1 .. cur+K+1
             if isinstance(V, list):   # #logits-diet reduced reply
                 tg = [int(t) for t in dict(V)[NT_TOKEN_IDS].reshape(-1).tolist()]
@@ -1133,7 +1315,13 @@ class EngineGenMixin:
             drafted += K
             matched += m
             # 5. roll target KV back: keep pending + the m accepted drafts, drop the rest
-            await self._crop(model, cur + 1 + m)
+            await self._crop(model, cur + 1 + m)   # (nulls the #prefix-kv record)
+            # #prefix-kv: the shard KV now holds _kv + [pending] + drafts[:m] (the matched
+            # prefix == tg[:m]) — extend + re-publish so the record mirrors the cache exactly.
+            # The bonus/correction token tg[m] is emitted but NOT in the KV (it rides the next
+            # round's verify as `pending`), so it is deliberately not recorded.
+            _kv.extend([pending] + drafts[:m])
+            model.kv_ids = _kv
             # 6. emit
             for t in accepted:
                 produced += 1

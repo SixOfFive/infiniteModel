@@ -592,6 +592,8 @@ async def gen_stall_watchdog() -> None:
             m.last_tok_s = 0.0
             m.last_token_ts = now
             m.fwd_progress_ts = 0.0   # #prefill-progress: stale stamps must not shield the NEXT gen
+            m.kv_ids = None   # #prefix-kv: a reclaimed gen may have half-appended KV (orphaned
+            #                   forwards can still land) — never let the next request resume it
             # #recovery: a mid-pipeline hop death never delivers an error frame upstream (the data
             # chain is one-way), so the orphaned generate() is blocked in _send's wait_for(fut,
             # GEN_TIMEOUT). Fail this model's leaked controller-side pending futures NOW so _send
