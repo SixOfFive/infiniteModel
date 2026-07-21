@@ -416,6 +416,30 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   that fits GPU (low `cpu_weight_frac`); media loads take a separate path entirely and are never
   gated. The useless <0.3 tok/s auto-placement it blocks was never worth serving anyway; load such a
   model explicitly to force it. (Adversarially reviewed end-to-end before ship.)
+- **ACE-Step defaults to RAM-offload — 0 resident VRAM (#t2a-offload-default, 2026-07-20).** A t2a
+  load previously defaulted to **GPU-resident** bf16 (holding ~10 GB VRAM) and only offloaded once the
+  card was already full (#t2a-offload-fallback below); on a card with room, music sat on precious VRAM
+  the LLMs wanted. Offload is now the **standing default on every controller**: components stay
+  resident in RAM and the ~6.6 GB DiT hops to the GPU only for each render — **0 GB resident VRAM**,
+  ~8 GB transient during a render, cannot OOM a card on load, never evicts a co-resident model, and
+  renders still run on the GPU at full speed. GPU-resident became opt-*out* via a new persisted knob,
+  `POST /config?t2a_offload_default=0`. Controller-only (the worker already honoured `t2a_offload` in
+  the load message), so it deployed hitlessly to both controllers.
+- **CPU-only t2a: plumbed, measured, documented as non-viable (#t2a-cpu, 2026-07-20).** Added opt-in
+  `POST /load?model=<ace-step>&cpu_only=1` — the whole pipeline in RAM with `device='cpu'`, budgeted
+  against RAM only, no GPU/offload fallback, basis `t2a: single-node (CPU)` — plus the worker-side
+  override that makes it real: ACE-Step has **no cpu-force flag** (its `__init__` grabs `cuda:0`
+  whenever a GPU is visible and `load_checkpoint()` moves every component with `.to(self.device)`), so
+  `worker_t2a.py` now overrides `pipe.device` **before** `load_checkpoint()`. Without that, a
+  `cpu_only` load silently loaded onto the GPU and OOM'd a full card. Result: it **loads** cleanly on
+  CPU (~4 s, 0 GB GPU) but **does not render** — on a 32-core box a short clip sat at ~8–14 % CPU with
+  **zero** diffusion steps for 10+ minutes. Kept opt-in and documented as a diagnostic curiosity, not
+  a serving mode. Also documents the trap that **`cpu_frac=1.0` does not mean "running on the CPU"**:
+  offload and cpu_only report identical `vram_used=0 / cpu_frac=1.0` (the stat describes where the
+  *weights* sit, not where the *compute* runs) — only the basis string or the render time separates
+  them. `docs/T2A.md` additionally now carries the full rationale for **why t2a is CUDA-only and not
+  implemented on ROCm** (no `torchaudio` matching the ROCm torch ABI, MIOpen-JIT-unreliable diffusion
+  kernels on gfx1151, and no CPU fallback to retreat to), cross-linked from `docs/ROCM.md`.
 - **t2a/music auto-falls-back to RAM offload instead of failing (#t2a-offload-fallback,
   2026-07-17).** An ACE-Step music auto-load (`/v1/audio/music`) that couldn't get its ~10 GB of
   GPU-resident VRAM — because the co-located card was full of **un-evictable** residents (a pinned

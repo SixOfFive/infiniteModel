@@ -85,12 +85,29 @@ Then restart that worker (`systemctl restart im-worker`, or the controller's per
 `POST /restart_node?node=<host>`). On reconnect it advertises `can_t2a=True` and becomes a valid
 music-placement target. Verify with `/status` → the node's `can_t2a` flag.
 
-> **ROCm boxes (Strix Halo / gfx1151) — not recommended for t2a.** Serving ACE-Step on the iGPU
-> hits two walls: there is **no torchaudio wheel matching the ROCm / nightly-torch ABI** (a
-> `pip install torchaudio` clashes), and gfx1151 diffusion is MIOpen-JIT-unreliable (the Kokoro TTS
-> leaf already falls back to CPU there). Serve music from a **remote CUDA GPU in the same pool**
-> instead — that is exactly what `#media-anywhere` is for (e.g. the om3nbox pool renders on furnace's
-> RTX 5090, never the ROCm iGPU, whose worker is left `can_t2a=False` on purpose).
+### Why ACE-Step is **not** implemented on ROCm (AMD)
+
+t2a is deliberately **CUDA-only**. A ROCm box (Strix Halo / gfx1151) is left `can_t2a=False` **on
+purpose**, so the placement planner never routes music to it. Three independent walls, any one of
+which is disqualifying:
+
+1. **No `torchaudio` wheel matching the ROCm torch ABI.** ACE-Step hard-depends on `torchaudio` for
+   audio I/O, but AMD's arch-specific builds (TheRock gfx1151 wheels, and ROCm nightlies generally)
+   ship `torch` with **no matching `torchaudio`**. Installing one from PyPI or the CUDA index pulls a
+   build compiled against a different torch ABI, which breaks the venv — *including the LLM stack the
+   box is actually there to serve*. There is no supported combination.
+2. **MIOpen-JIT unreliability on the diffusion kernels.** ACE-Step's DiT + DCAE decoder lean on
+   conv/attention paths that JIT through MIOpen on RDNA. On gfx1151 those are flaky-to-broken — the
+   same wall that already forces the **Kokoro TTS** leaf to fall back to CPU on that box. A render is
+   dozens of diffusion steps deep, so a mid-render MIOpen failure wastes minutes of work.
+3. **There is no CPU fallback to retreat to.** ACE-Step's diffusion does not run usably on CPU (see
+   *CPU-only* below — measured: zero diffusion steps in 10+ minutes). So on a ROCm box there is no
+   working path *at all*: not the iGPU, not the CPU.
+
+**What to do instead:** serve music from a **CUDA GPU** — co-located, or anywhere in the pool via
+`#media-anywhere`. That is exactly why the remote path exists: a ROCm-only controller keeps
+`can_t2a=False` locally and renders on a CUDA worker elsewhere in its pool. If a pool has **no** CUDA
+acestep worker, it cannot serve t2a at all — that is a hardware gap, not a config one.
 
 ## Install gotchas & troubleshooting
 
@@ -153,10 +170,36 @@ Real walls hit bringing this up on beast, amdcomp, and furnace, with their fixes
 - **Auto-load:** a `POST /v1/audio/music` for a registered-but-cold ace-step model loads it on
   demand (like chat/images/speech).
 - **Dashboard / API:** the Load button, or `POST /load?model=ace-step`. `force=1` as usual.
-- **Resident vs offload:** GPU-resident bf16 needs ~10 GB VRAM (fastest). If the chosen box can't
-  spare that, pass `t2i_offload=1` (or let the auto-fallback take it): the components live in RAM and
-  the ~6.6 GB DiT hops to the GPU per render — ~8 GB transient VRAM + ~12 GB RAM, and it never
-  evicts a co-resident model. int4 is **not** a t2a tier in M1 (bf16 only).
+- **Offload is the DEFAULT (`#t2a-offload-default`).** ACE-Step loads with its components **resident
+  in RAM**, hopping the ~6.6 GB DiT onto the GPU only for the duration of each render: **0 GB
+  resident VRAM**, ~8 GB *transient* VRAM during a render, ~12 GB RAM. So it cannot OOM a card on
+  load, never evicts a co-resident model, and leaves VRAM free for LLMs — while renders still run on
+  the GPU at full speed (seconds, not minutes). This is the standing default on every controller.
+- **GPU-resident** (bf16, holds ~10 GB VRAM, marginally faster — no per-render weight hop) is now
+  opt-**out**: `POST /config?t2a_offload_default=0` (persisted). Only worth it on a card with VRAM to
+  spare.
+- Offload still needs ~8 GB **free** VRAM at render time for the hop. A genuinely full card returns a
+  clean `503` for that render — it never OOMs, and it never holds VRAM at rest.
+- int4 is **not** a t2a tier in M1 (bf16 only).
+
+### CPU-only (`cpu_only=1`) — plumbed, but ACE-Step does not render on CPU
+
+`POST /load?model=ace-step&cpu_only=1` places the whole pipeline in RAM with `device='cpu'` and no
+GPU at all (basis `t2a: single-node (CPU)`). The path works end-to-end — it loads cleanly in ~4 s,
+0 GB GPU, no OOM — but **ACE-Step's diffusion does not actually execute on CPU**: measured on a
+32-core box, a short render sat at ~8–14 % CPU with **zero diffusion steps** for 10+ minutes and
+never produced audio. Treat CPU-only as a diagnostic curiosity, **not** a serving mode.
+
+ACE-Step also has no cpu-force flag of its own — its `__init__` sets `self.device = cuda:0` whenever
+`torch.cuda.is_available()`, and `load_checkpoint()` moves every component with `.to(self.device)`.
+So `worker_t2a.py` must override `pipe.device` **before** `load_checkpoint()` for the request to be
+honoured at all; otherwise a `cpu_only` load silently grabs the GPU (and OOMs if it's full).
+
+> **Gotcha — `cpu_frac=1.0` does NOT mean "running on the CPU."** Both **offload** and **cpu_only**
+> report `vram_used=0` and `cpu_frac=1.0`, because that stat describes **where the weights sit, not
+> where the compute runs**. Offload renders on the GPU in seconds; true CPU never finishes. Tell them
+> apart by the **basis string** — `t2a: single-node` (+ load line `…, offload`) vs
+> `t2a: single-node (CPU)` (+ load line `…, 0.00 GB GPU, resident`) — or simply by render time.
 
 ## The API — `POST /v1/audio/music`
 

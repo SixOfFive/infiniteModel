@@ -205,6 +205,14 @@ surface, and the dashboard.
   tax outweighs the bandwidth savings at diffusion's large batch shapes) — int4 is the
   *capacity* recipe for fitting the DiT, not a speed win. Use bf16 (or the offload mode) when
   it fits. See [T2I.md](T2I.md).
+- **Text-to-music (ACE-Step / t2a) is NOT supported on ROCm — by design.** A ROCm worker is left
+  `can_t2a=False` on purpose so the planner never routes music to it. Three walls: ACE-Step
+  hard-depends on `torchaudio`, and the ROCm/TheRock builds ship **no `torchaudio` matching that
+  torch ABI** (installing one from PyPI/CUDA breaks the venv, LLM stack included); its DiT + DCAE
+  kernels JIT through **MIOpen**, which is flaky-to-broken on gfx1151 (the same wall that pushes
+  **Kokoro TTS** to CPU here); and there is **no CPU fallback** — ACE-Step's diffusion does not run
+  usably on CPU. Serve music from a **CUDA** GPU instead, locally or anywhere in the pool via
+  `#media-anywhere`. Full rationale in [T2A.md](T2A.md).
 - **CUDA-graph decode is broken on TheRock rocm7.13** — capture/replay run but replay computes
   wrong logits; the first-decode self-check auto-disables it (serving stays eager and correct).
   Leave `INFINITEMODEL_CUDA_GRAPH` unset on ROCm; details in
