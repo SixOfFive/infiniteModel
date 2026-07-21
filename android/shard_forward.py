@@ -17,6 +17,138 @@ class _ForwardSuperseded(RuntimeError):
     controller ignores it. #fwd-cancel."""
 
 
+_PREALLOC_KV_CLS = None   # #kv-prealloc: classes built ONCE on first use (transformers import deferred)
+
+
+def _prealloc_kv_cache_cls():
+    """#kv-prealloc: build (once, lazily) the preallocated-KV cache classes against the INSTALLED
+    transformers' DynamicCache/DynamicLayer (validated on 5.12.1). Stock DynamicLayer.update appends
+    via ``torch.cat([self.keys, key_states], dim=-2)`` — reallocating and copying the ENTIRE
+    per-layer cache EVERY token on EVERY layer (O(cache) memcpy: at 16k ctx on a 14B that is
+    multiple GB of pure copy traffic per decoded token) while transiently holding 2x one layer's KV
+    during each cat (the allocator churn expandable_segments papers over). The layer below
+    preallocates capacity in _CHUNK-token buffers, DOUBLES on overflow (amortized O(1) total copy)
+    and writes new K/V by index (copy_ into the spare tail); ``self.keys``/``self.values`` are then
+    re-narrowed to ``[..., :len, :]`` VIEWS over the buffer, so every external reader — #cudagraph's
+    _copy_dynamic_to_static (reads layers[i].keys/.values), spec-decode crop(), get_seq_length()'s
+    keys.shape[-2] — sees exactly stock-DynamicLayer shapes. Values are BIT-IDENTICAL to the cat
+    path (A/B validated incl. crop + regrow), and the views keep last-dim contiguity so SDPA
+    consumes them directly. Memory: capacity is at least _CHUNK (so short sequences hold a 1024-token
+    buffer regardless of live length) and otherwise the next doubling >= live length, CLAMPED to the
+    model's max_position_embeddings when known (_MAX_CAP, injected per model by _make_prealloc_kv).
+    The clamp is what keeps growth inside the plan's budget: placement funds KV at exactly full ctx
+    per layer (gpu_kv_bytes), and unclamped doubling past a ctx that is not a power-of-2 multiple of
+    _CHUNK (Qwen3's 40960) would regrow EVERY owned layer to ~1.6x the funded reserve the moment a
+    sequence crossed 32768 — OOMing tightly packed coexistence-budgeted GPUs mid-decode. With the
+    clamp, steady-state capacity never exceeds max(live length, funded full-ctx); the only overshoot
+    is the regrow-migration transient (old + new buffer, ONE layer at a time) — still cheaper than
+    the cat path's per-token 2x-one-layer transient."""
+    global _PREALLOC_KV_CLS
+    if _PREALLOC_KV_CLS is not None:
+        return _PREALLOC_KV_CLS
+    from transformers import DynamicCache
+    from transformers.cache_utils import DynamicLayer
+
+    class _PreallocKVLayer(DynamicLayer):
+        """#kv-prealloc: index-write K/V layer (see _prealloc_kv_cache_cls). Invariant: self.keys /
+        self.values are ALWAYS ``self._kbuf/_vbuf[:, :, :self._len, :]`` views (or the stock empty
+        tensor pre-first-write), so anything written through stock DynamicLayer semantics keeps
+        working; torch-free (buffers come from key_states.new_empty — right device/dtype for free)."""
+
+        _CHUNK = 1024    # first allocation, tokens; doubles thereafter (1024 -> 2048 -> 4096 ...)
+        _MAX_CAP = 0     # capacity clamp, tokens (= model max_position_embeddings; 0 = no clamp).
+                         # Set on a per-model DERIVED class by _make_prealloc_kv — never mutated
+                         # here, so the shared base class stays clamp-free for other models.
+
+        def __init__(self, config=None):
+            super().__init__()
+            self._kbuf = self._vbuf = None   # capacity buffers [b,h,cap,d]; cap >= _len
+            self._len = 0                    # live token count (== keys.shape[-2])
+
+        def lazy_initialization(self, key_states, value_states):
+            super().lazy_initialization(key_states, value_states)   # dtype/device + empty keys/values
+            self._kbuf = self._vbuf = None
+            self._len = 0
+
+        def update(self, key_states, value_states, *args, **kwargs):
+            if not self.is_initialized:
+                self.lazy_initialization(key_states, value_states)
+            q = int(key_states.shape[-2])
+            end = self._len + q
+            cap = 0 if self._kbuf is None else int(self._kbuf.shape[-2])
+            if end > cap:
+                ncap = max(cap, self._CHUNK)
+                while ncap < end:                        # doubling -> amortized O(1) copies total
+                    ncap *= 2
+                if self._MAX_CAP:
+                    # Clamp to the model's ctx: placement funds KV at exactly full ctx per layer,
+                    # so doubling past a non-power-of-2-multiple ctx (Qwen3's 40960) must not
+                    # overshoot the funded reserve. max(end, ...) keeps ncap >= end, so a sequence
+                    # somehow beyond ctx still fits (exact-size growth) instead of crashing here.
+                    ncap = min(ncap, max(end, self._MAX_CAP))
+                b, h, _, d = key_states.shape
+                nk = key_states.new_empty((b, h, ncap, d))
+                nv = value_states.new_empty((b, h, ncap, d))
+                if self._len:                            # migrate the live prefix into the bigger buffer
+                    nk[:, :, :self._len, :].copy_(self._kbuf[:, :, :self._len, :])
+                    nv[:, :, :self._len, :].copy_(self._vbuf[:, :, :self._len, :])
+                self._kbuf, self._vbuf = nk, nv
+            self._kbuf[:, :, self._len:end, :].copy_(key_states)
+            self._vbuf[:, :, self._len:end, :].copy_(value_states)
+            self._len = end
+            self.keys = self._kbuf[:, :, :end, :]
+            self.values = self._vbuf[:, :, :end, :]
+            return self.keys, self.values
+
+        def crop(self, max_length):
+            # spec-decode rollback: NARROW the views back — the buffer keeps its capacity, so the
+            # re-decode after a rejected draft re-fills the SAME slots (no realloc, no copy; stock
+            # semantics incl. negative max_length = drop that many tail tokens).
+            if max_length < 0:
+                max_length = self._len - abs(max_length)
+            if not self.is_initialized or self._kbuf is None or self._len <= max_length:
+                return
+            self._len = max_length = max(0, int(max_length))
+            self.keys = self._kbuf[:, :, :max_length, :]
+            self.values = self._vbuf[:, :, :max_length, :]
+
+        def _adopt(self):
+            # A base-class op (beam/batch reshuffle — UNUSED by the shard path, which drives layers
+            # directly) reassigned self.keys/.values to fresh tensors. Re-adopt them as exact-fit
+            # buffers so the index-write invariant can't silently desync if one is ever invoked.
+            if self.is_initialized and self.keys is not None and self.keys.numel():
+                self._kbuf, self._vbuf = self.keys.contiguous(), self.values.contiguous()
+                self._len = int(self._kbuf.shape[-2])
+                self.keys, self.values = self._kbuf, self._vbuf
+
+        def reorder_cache(self, beam_idx):
+            super().reorder_cache(beam_idx)
+            self._adopt()
+
+        def batch_repeat_interleave(self, repeats):
+            super().batch_repeat_interleave(repeats)
+            self._adopt()
+
+        def batch_select_indices(self, indices):
+            super().batch_select_indices(indices)
+            self._adopt()
+
+    class _PreallocKVCache(DynamicCache):
+        """#kv-prealloc: a plain DynamicCache whose lazily-replicated layers are _PreallocKVLayer.
+        Built with NO config so DynamicCache takes its lazy layer_class_to_replicate path (mirrors
+        kv_quant's _TurboQuantCache) — this cache is gated to the plain standard-attention branch,
+        exactly the case that takes that path. crop()/get_seq_length()/layers stay stock Cache
+        behavior over our layers; a mid/tail stage's untouched placeholder layers (created by
+        Cache.update's replicate-to-layer_idx loop) never initialize, same as stock."""
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.layer_class_to_replicate = _PreallocKVLayer
+
+    _PREALLOC_KV_CLS = _PreallocKVCache
+    return _PREALLOC_KV_CLS
+
+
 class ShardForwardMixin:
 
     def forward(self, x, cache_start: int = 0, reset: bool = True,
@@ -97,6 +229,42 @@ class ShardForwardMixin:
             print(f"[kv_quant] '{name}' unavailable ({exc!r}) -> plain bf16 KV", flush=True)
             return DynamicCache()
 
+    def _make_prealloc_kv(self):
+        """#kv-prealloc: KV cache for the PLAIN standard-attention branch — preallocated,
+        capacity-doubling, index-write append instead of stock DynamicLayer's per-token torch.cat
+        (O(cache) memcpy per layer per token; see _prealloc_kv_cache_cls for the full why).
+        Injects the model's max_position_embeddings as a capacity clamp (_MAX_CAP) on a freshly
+        DERIVED layer class — never on the shared base — so doubling can't overshoot the funded
+        full-ctx KV reserve (the cfg read is best-effort: no ctx found just means no clamp).
+        Correctness-first: ANY failure (transformers API drift) and the opt-out env
+        INFINITEMODEL_KV_PREALLOC=0 fall back to a stock DynamicCache so generation never breaks.
+        Hybrid / #172 kv_quant / #kv-offload branches keep their stock caches — their layers carry
+        state (conv/recurrent, quantized reps, CPU-resident K/V) a prealloc buffer can't represent."""
+        import os
+        from transformers import DynamicCache
+        try:
+            if os.environ.get("INFINITEMODEL_KV_PREALLOC", "1").strip().lower() in ("0", "off", "false"):
+                return DynamicCache()
+            kv = _prealloc_kv_cache_cls()()
+            mx = 0
+            try:
+                tc = self.cfg
+                if hasattr(tc, "get_text_config"):
+                    try:
+                        tc = tc.get_text_config(decoder=True)
+                    except TypeError:   # older get_text_config signature without `decoder`
+                        tc = tc.get_text_config()
+                mx = int(getattr(tc, "max_position_embeddings", 0) or 0)
+            except Exception:
+                mx = 0
+            if mx > 0:
+                base = kv.layer_class_to_replicate
+                kv.layer_class_to_replicate = type(base.__name__, (base,), {"_MAX_CAP": mx})
+            return kv
+        except Exception as exc:
+            print(f"[kv_prealloc] unavailable ({exc!r}) -> plain DynamicCache", flush=True)
+            return DynamicCache()
+
     def _forward_impl(self, x, cache_start: int = 0, reset: bool = True,
                       all_logits: bool = False, inject=None, position_ids=None,
                       capture_hidden: bool = False, capture_pre_norm: bool = False,
@@ -156,7 +324,9 @@ class ShardForwardMixin:
                 if self.kv is None:
                     self.kv = DynamicCache()
             else:
-                self.kv = DynamicCache()
+                # #kv-prealloc: amortized-O(1) per-token append (chunked, capacity-doubling
+                # index-write buffers) — bit-identical values, .keys/.values stay narrowed views.
+                self.kv = self._make_prealloc_kv()
             # #cudagraph: a new sequence invalidates the graph's StaticCache mirror (it must be
             # re-synced from this fresh DynamicCache at the next decode). Cheap, idempotent.
             self._gkv_pos = 0
