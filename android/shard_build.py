@@ -110,6 +110,7 @@ class ShardBuildMixin:
             self.placement = "cpu" + ("" if not want_gpu else " (no CUDA → CPU)")
             self.gpu_bytes = 0
             self.gpu_kv_bytes = 0
+            self._dedup_tied_head()   # #tied-dedup: CPU stage too — the tied vocab copy costs RAM
             self._finalize_placement()
             return
 
@@ -257,6 +258,11 @@ class ShardBuildMixin:
                     if any(b.device.type != "cpu" for b in _br.buffers()):
                         raise RuntimeError(
                             f"moe_offload: layer {i} expert buffers not all on CPU after split")
+        # #tied-dedup: a tie_word_embeddings stage holding BOTH embed and head carries the vocab
+        # matrix TWICE (every build path ships lm_head as a physical copy — see the helper). Alias
+        # it away HERE: after every module .to() above and after _materialize_cpu_layers, but
+        # before the gpu_bytes sum below (which subtracts the shared matrix once via _tied_dup).
+        _tied_dup = self._dedup_tied_head()
         # bytes actually resident on the GPU (controller sums these for size_vram). DEVICE-ACCURATE
         # (_mod_gpu_bytes) so a split layer counts only its GPU mixer, not its CPU experts.
         gb = 0
@@ -266,6 +272,8 @@ class ShardBuildMixin:
             gb += self._mod_gpu_bytes(lyr)
         if self.has_head:
             gb += self._mod_gpu_bytes(self.norm) + self._mod_gpu_bytes(self.head)
+            if _tied_dup and self.head_device.type == "cuda":
+                gb -= _tied_dup   # #tied-dedup: head.weight IS embed.weight — already counted above
         self.gpu_bytes = gb
         # #int4-vram-probe: int4 weights have been seen resident ~bf16-sized on gfx1151/ROCm (devstral
         # 13.5 GB int4 cache -> 43.9 GB VRAM). Free any transient build/dequant buffers the caching
@@ -327,6 +335,56 @@ class ShardBuildMixin:
                 if p.device.type == "cpu":
                     p.data = p.data.clone()         # heap copy -> drops this param's mmap view
         self.cpu_materialized = True
+
+    def _dedup_tied_head(self) -> int:
+        """#tied-dedup: when config.tie_word_embeddings and THIS stage holds both embed and head,
+        every build path materializes lm_head.weight as a physical COPY of embed_tokens.weight
+        (~2 GB for a Gemma-class vocab): the controller clones it into the served blob/stream
+        (safetensors save_file rejects shared storage, and the wire has no aliasing), and the
+        local from_hf path clones in _assemble_sd. After placement the copy is pure waste — point
+        the head Linear's Parameter at the embedding's; the clone refcount-frees. MUST run after
+        final placement (sharing a Parameter earlier would let a hybrid split's later head.to()
+        drag embed off its device — nn.Module._apply mutates the SHARED param) and after
+        _materialize_cpu_layers (its per-param clone would silently un-share the pair). Guards
+        keep it conservative: bf16 Parameter on BOTH ends only (int8's QuantLinear head, a TP
+        reduced-dim head, or any future quantized head fails the attr/shape check -> keep the
+        copy), same device+dtype, and a 2-row content spot-check so a checkpoint that ships a
+        DIFFERENT lm_head despite the flag never gets silently-wrong logits. Dedups
+        loaded_bytes/loaded_params in place (both build paths counted the matrix twice —
+        data_ptr-distinct at count time); the caller corrects gpu_bytes. Returns bytes freed
+        (0 = kept the copy)."""
+        if not (self.has_embed and self.has_head) or getattr(self, "quant", "") == "int8":
+            return 0
+        if not bool(getattr(self.cfg, "tie_word_embeddings", False)):
+            return 0
+        emb, head = self.embed, self.head
+        if emb is None or head is None:
+            return 0
+        torch = self.torch
+        ew = getattr(emb, "weight", None)
+        hw = getattr(head, "weight", None)
+        if not (isinstance(ew, torch.nn.Parameter) and isinstance(hw, torch.nn.Parameter)):
+            return 0
+        if getattr(ew, "is_meta", False) or getattr(hw, "is_meta", False):
+            return 0
+        if hw.data_ptr() == ew.data_ptr():
+            return 0                                 # already shared -> nothing to free/discount
+        if hw.shape != ew.shape or hw.dtype != ew.dtype or hw.device != ew.device:
+            return 0
+        try:                                         # 2-row spot-check (cheap even on CUDA)
+            if not (torch.equal(hw[0], ew[0]) and torch.equal(hw[-1], ew[-1])):
+                return 0
+        except Exception:
+            return 0                                 # can't verify equality -> keep the copy
+        freed = hw.numel() * hw.element_size()
+        head._parameters["weight"] = ew              # alias: the old clone refcount-frees now
+        if getattr(self, "loaded_bytes", 0):
+            self.loaded_bytes = max(0, self.loaded_bytes - freed)
+        if getattr(self, "loaded_params", 0):
+            self.loaded_params = max(0, self.loaded_params - ew.numel())
+        print(f"[load] #tied-dedup: lm_head shares embed_tokens storage "
+              f"({freed / GB:.2f} GB freed on {ew.device})", flush=True)
+        return freed
 
     @classmethod
     def from_blob(cls, config_dict: dict, blob: bytes, layer_start: int, layer_end: int,
@@ -758,14 +816,21 @@ class ShardBuildMixin:
                 return max(1, min(_STREAM_PREFETCH_MAX, int(a * 0.35 / slot)))
             K = _bound_K()
             _balloon_release_one()   # free this shard's chunk before it installs (consume the reservation)
-            _do_install(src0, jobs[0][0], jobs[0][1]); del src0; gc.collect()
+            # #gc-gen0: the per-unit collect here is cycle HYGIENE, not the freeing mechanism —
+            # blobs/tensors are refcount-freed by `del` — but a FULL gc walks the entire (growing)
+            # resident model graph: measured 53-70 ms/call with ZERO garbage on a fast CPU, 100-300 ms
+            # on dell/steamdeck, x ~92 units for a big stage = 5-20 s of pure overhead. Gen-0 per unit
+            # (~free) + a full pass every 8 units + one at stream end (in the finally) bounds cyclic
+            # stragglers instead. OOM-recovery full collects (balloon MemoryError) stay untouched.
+            _do_install(src0, jobs[0][0], jobs[0][1]); del src0; gc.collect(0)
             nxt = 1
             for _ in range(min(K, len(jobs) - nxt)):          # prime the window
                 inflight[nxt] = ex.submit(_fetch_job, jobs[nxt]); nxt += 1
             for idx in range(1, len(jobs)):
                 src = inflight.pop(idx).result()              # wait this slice's fetch (in order)
                 _balloon_release_one()   # free this shard's chunk before it installs (consume the reservation)
-                _do_install(src, jobs[idx][0], jobs[idx][1]); del src; gc.collect()
+                _do_install(src, jobs[idx][0], jobs[idx][1]); del src
+                gc.collect() if idx % 8 == 0 else gc.collect(0)   # #gc-gen0: full sweep every 8 units only
                 # Re-clamp the prefetch window to CURRENT free RAM each layer (#61): the resident
                 # int4 shard GROWS as the load proceeds, so a K sized when the node was empty can
                 # over-commit it 50+ layers later (the planner reserves ~1 layer's transient, not K
@@ -783,6 +848,7 @@ class ShardBuildMixin:
                     _r = _f.result(timeout=0)
                     if isinstance(_r, str):
                         os.remove(_r)
+            gc.collect()   # #gc-gen0: the ONE full end-of-stream sweep (also covers the error path)
         if not _trust:                       # native: rotary built on meta -> rebuild for real inv_freq.
             rot = model.model.rotary_emb
             model.model.rotary_emb = type(rot)(self.cfg)

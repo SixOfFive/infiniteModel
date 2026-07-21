@@ -959,6 +959,11 @@ def _assemble_sd(tensors: dict, start: int, end: int, has_embed: bool,
     if has_head:
         sd["model.norm.weight"] = tensors["model.norm.weight"]
         if tied:
+            # #tied-dedup: the clone is DELIBERATE — load_state_dict(assign=True) with ONE tensor
+            # for both keys would share a Parameter across embed+head BEFORE placement, and a
+            # hybrid split's later head.to()/embed.to() (nn.Module._apply mutates the shared param)
+            # would drag the other module off its device. The duplicate is aliased away AFTER
+            # placement in ShardBuildMixin._dedup_tied_head (same-device stages only).
             sd["lm_head.weight"] = tensors["model.embed_tokens.weight"].clone()
         else:
             sd["lm_head.weight"] = tensors["lm_head.weight"]
