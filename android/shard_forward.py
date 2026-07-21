@@ -342,6 +342,14 @@ class ShardForwardMixin:
         # attention mask (q vs cache_start+q) would mismatch ("expanded size N must match M").
         # Treating position 0 as an unconditional fresh start makes stale KV impossible to reuse —
         # cache_start==0 is ONLY ever a sequence start (decode/verify always send cache_start>0).
+        # #pipefill leans on exactly this contract: a chunked pipelined prefill's chunk 0 arrives
+        # reset=True at position 0 (fresh cache on every stage — including after an ABORTED prior
+        # burst, whose stale trailing chunks may have errored or appended garbage here: the next
+        # sequence start wipes it), and chunks 1..C-1 arrive reset=False at their absolute
+        # cache_position, appending in order (worker_net's sequential loop + in-order TCP). Each
+        # chunk's masks below are built from cache_start, which is chunk-position-correct by the
+        # same construction the intra-stage #prefill-chunk loop validated (cs_off = its absolute
+        # start; a q>1 reset=False frame is the spec-verify shape, exercised in production).
         if reset or self.kv is None or cache_start == 0:
             from transformers import DynamicCache
             # Hybrid arch: a config-typed cache pre-creates the right per-layer slot

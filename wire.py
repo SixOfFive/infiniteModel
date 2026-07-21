@@ -173,7 +173,18 @@ def _unpack_tensor(meta, raw):
 # controller only requests the diet when EVERY chain node advertises 'ntdiet', and still accepts
 # a full-logits reply as the downgrade path (per-file self-update convergence can split wire.py
 # from worker_net.py/shard_forward.py on one box).
-WIRE_CAPS = ("ntensor", "ntdiet")
+# 'pipefill' (#pipefill): this build's worker loop (worker_net._data_inbound) + shard
+# (shard_forward) are VALIDATED for chunked pipelined prefill — the controller streaming one
+# prompt as SEVERAL back-to-back ids frames (chunk 0 reset=True at cache_position 0, chunks
+# 1..C-1 reset=False at increasing cache_position, each with its OWN req_id) so downstream
+# stages compute chunk i while upstream stages compute chunk i+1. No NEW header keys ride the
+# frames (reset/cache_position are day-one fields, and the multi-token reset=False forward is
+# the production spec-verify path), so the cap is a VINTAGE marker, not a format switch: the
+# controller only streams a chunk burst when EVERY chain node is of a build whose inbound loop
+# / KV-reset / mask semantics were audited for multi-frame prefill bursts (#wire-caps
+# all-or-nothing, same doctrine as 'ntdiet'). A chain with any older node keeps the one-shot
+# single-frame prefill, byte-identical to before.
+WIRE_CAPS = ("ntensor", "ntdiet", "pipefill")
 
 # #ntensor-manifest tensor kinds (u8 on the wire). 0/1 = full tensors; 2-4 carry the #logits-diet
 # reduced head replies: 2 = greedy argmax token ids (int64, [q]); 3/4 = top-K candidate values

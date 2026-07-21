@@ -192,8 +192,22 @@ class WorkerNetMixin:
                 cache_start = int(hdr.get("cache_position", 0))
                 reset = bool(hdr.get("reset", True))
                 all_logits = bool(hdr.get("all_logits", False))
+                # #pipefill CONTRACT (cap-gated controller-side; advertised via wire.WIRE_CAPS):
+                # a prefill may arrive as SEVERAL back-to-back ids/hidden frames — chunk 0
+                # reset=True at cache_position 0, chunks 1..C-1 reset=False at increasing
+                # cache_position, each with its OWN req_id. NOTHING here special-cases that:
+                # the correctness rests on two properties this loop must KEEP —
+                #   1. strictly SEQUENTIAL processing per connection (each forward is awaited
+                #      before the next frame is read), which with in-order TCP guarantees the
+                #      per-stage KV appends chunks in prompt order;
+                #   2. the multi-token reset=False forward at a cache offset (the production
+                #      spec-verify shape) staying supported by _run_stage/shard.forward.
+                # If you ever make this loop CONCURRENT per frame, you must re-gate #pipefill.
+                # The cross-stage overlap falls out for free: _send_next ships chunk i's output
+                # downstream, then this loop reads chunk i+1 while the next stage computes i.
                 if reset:   # #stage0-stale-reconnect: new generation -> drop a stale (idle) next hop
                     self._freshen_next(model_id)   # so this prefill's forward rides a fresh socket
+                    # (#pipefill: only chunk 0 carries reset=True, so a chunk burst freshens once)
                 try:
                     if shard is None:
                         raise RuntimeError(f"no shard for model_id={model_id!r} on this node")

@@ -36,6 +36,27 @@ def _wire_topk_k() -> int:
         return 4096
 
 
+def _pipefill_conf() -> int:
+    """#pipefill: chunk length (tokens) for the cross-stage pipelined prefill, or 0 = disabled.
+    INFINITEMODEL_PIPEFILL (controller env, read per request like INFINITEMODEL_TOPK_WIRE):
+    '0'/'off'/'false' -> opt-out (classic one-shot prefill everywhere); a positive int -> the
+    chunk length; unset/anything else -> 2048. The default deliberately MATCHES
+    INFINITEMODEL_PREFILL_CHUNK's default so each pipefill frame runs exactly one already-
+    validated intra-stage chunk pass (shard_forward #prefill-chunk builds the identical
+    [cl, cache_start+cl] mask for both) — the per-chunk compute and numerics are the SAME ops
+    the intra-stage loop was validated with, just driven from the controller. Clamped to >=256
+    so a typo can never flood the data plane with hundreds of tiny frames."""
+    import os
+    v = os.environ.get("INFINITEMODEL_PIPEFILL", "").strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return 0
+    try:
+        n = int(v)
+    except ValueError:
+        return 2048
+    return max(256, n) if n > 0 else 0
+
+
 class EngineGenMixin:
 
     async def embed(self, friendly: str, input_ids, attention_mask) -> list:
@@ -249,6 +270,72 @@ class EngineGenMixin:
         ids = getattr(model, "stage_node_ids", None) or []
         return bool(ids) and all("ntdiet" in registry.node_caps(nid) for nid in ids)
 
+    def _pipefill_arch_ok(self, model) -> bool:
+        """#pipefill: is this model's ARCHITECTURE safe for cross-stage chunked prefill? Must
+        mirror shard_forward's own intra-stage do_chunk exclusion list (the audit-binding set):
+        _per_type (Gemma4 sliding/full split), _hybrid (Gated-DeltaNet linear attention — a
+        chunked pass diverges from one-shot, the same reason _has_mtp gates hybrid off), _omni
+        and _mrope3d (Omni/Qwen2.5-VL: the shard feeds the rotary 3D positions even for plain
+        text; the intra-stage loop excludes them, so the cross-stage split does too);
+        bidir_spans is request-scoped and covered by the mm-is-None gate in _pipefill_chunk.
+        Detected from the checkpoint's LOCAL config.json (a loaded model's weights streamed
+        from THIS controller's models/ dir, so the read is zero-network by construction — the
+        path is computed directly rather than via _controller_model_dir, whose populate path
+        could touch the network). CONSERVATIVE + honest: any sniff failure, and ANY
+        layer_types presence (that field is how both hybrid AND Gemma4's per-type rotary
+        announce themselves; a hypothetical all-full_attention layer_types model is gated off
+        too rather than guessing at its rotary), means False -> one-shot prefill. Cached on
+        the LoadedModel (immutable per load)."""
+        ok = getattr(model, "_pipefill_arch", None)
+        if ok is not None:
+            return ok
+        ok = False
+        try:
+            with open(os.path.join(MODELS_DIR, _safe_name(model.target_id), "config.json"),
+                      encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            tc = cfg.get("text_config", cfg)
+            _mt = str(cfg.get("model_type") or tc.get("model_type") or "").lower()
+            ok = (not (tc.get("layer_types") or [])                    # hybrid / per-type
+                  and cfg.get("thinker_config") is None                # _omni (multimodal.py:is_omni)
+                  and _mt not in ("qwen2_5_vl", "qwen2_5_vl_text"))    # _mrope3d (client.py twin)
+        except Exception:
+            ok = False
+        model._pipefill_arch = ok
+        return ok
+
+    def _pipefill_chunk(self, model, q: int, mm, position_ids) -> int:
+        """#pipefill master gate: chunk length (tokens) for a chunked PIPELINED prefill of a
+        q-token prompt, or 0 = keep the classic one-shot single-frame prefill. All gates are
+        conservative — any doubt keeps the pre-pipefill behavior byte-identical:
+        - INFINITEMODEL_PIPEFILL opt-out / chunk length (_pipefill_conf; 0 = off);
+        - q must EXCEED one chunk (a short prompt's single frame is already optimal);
+        - text-only this stage: mm embeds (splice + #gemma4-bidir spans key off ONE prefill
+          frame's req_id/positions) and explicit mrope position_ids are EXCLUDED — the mm
+          companion pairing and absolute-position layout were not built for a split prompt;
+        - pipeline only (tp_size == 1): the TP rank-0 broadcast path is per-forward and
+          unvalidated for chunk bursts;
+        - MULTI-stage only (>=2 stages): on a single stage there is nothing to overlap — the
+          intra-stage #prefill-chunk loop already covers mask memory, and chunking the WIRE
+          would only add per-frame overhead (single-stage placements keep the untouched path);
+        - every chain node advertises the 'pipefill' wire cap (#wire-caps all-or-nothing);
+        - the architecture is chunk-safe (_pipefill_arch_ok, mirrors shard do_chunk)."""
+        cstep = _pipefill_conf()
+        if not cstep or q <= cstep:
+            return 0
+        if mm is not None or position_ids is not None:
+            return 0
+        if int(getattr(model, "tp_size", 1) or 1) != 1:
+            return 0
+        ids = getattr(model, "stage_node_ids", None) or []
+        if len(ids) < 2:
+            return 0
+        if not all("pipefill" in registry.node_caps(nid) for nid in ids):
+            return 0
+        if not self._pipefill_arch_ok(model):
+            return 0
+        return cstep
+
     async def _send(self, model: LoadedModel, x, cache_position: int, reset: bool,
                     all_logits: bool = False, mm=None, position_ids=None,
                     capture_hidden: bool = False, capture_pre_norm: bool = False,
@@ -380,6 +467,172 @@ class EngineGenMixin:
             self.pending.pop(rid, None)  # never leak the future
             self.pending_model.pop(rid, None)
             self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
+
+    async def _send_prefill(self, model: LoadedModel, x, mm=None, position_ids=None,
+                            nt_mode=None, nt_clip: int = 0, nt_k: int = 0):
+        """#pipefill: prefill dispatcher. Eligible prompts (see _pipefill_chunk) are streamed
+        through the pipeline as a BURST of chunk frames so the stages overlap; everything else
+        falls through to the classic one-shot _send prefill, byte-identical to before.
+
+        THE DEFECT this fixes: a one-shot prefill runs the S stages strictly SEQUENTIALLY —
+        stage 0 computes the WHOLE prompt (internally chunked by INFINITEMODEL_PREFILL_CHUNK
+        for mask memory, but shipped as ONE hidden block), only then does stage 1 start, etc.
+        TTFT = sum of per-stage prefill times + full per-hop transfer times (the #endpoint-
+        weather comment in _send documents healthy prefills outlasting GEN_TIMEOUT under
+        contention for exactly this reason).
+
+        MECHANISM — controller-orchestrated chunk streaming, chosen over a worker-forwarded
+        redesign because it reuses the MOST production-proven machinery and needs ZERO new
+        wire format: the prompt is split into ~2048-token chunks and written back-to-back to
+        stage 0 as ordinary ids frames — chunk 0 reset=True at cache_position 0 (rebuilds
+        every stage's KV via the existing #kv-reset-on-seqstart contract), chunks 1..C-1
+        reset=False at their absolute cache_position, each with its OWN req_id/future. The
+        multi-token reset=False forward at a cache offset is EXACTLY the spec-decode verify
+        path (_decode_spec sends [pending]+drafts at cur, reset=False) which is exercised in
+        production, so no worker forward change is required; per-stage KV chunks append in
+        order because TCP is in-order and the worker inbound loop (worker_net._data_inbound)
+        is strictly sequential per connection. The pipelining falls out of the EXISTING
+        worker behavior: stage k's loop finishes chunk i, _send_next ships its hidden block,
+        and reads chunk i+1 — while stage k+1 computes chunk i. Cap-gated ('pipefill',
+        #wire-caps all-or-nothing) so a chain with any pre-audit node keeps one-shot.
+
+        REPLY CONTRACT: identical to `await _send(model, x, 0, True, ...)` — the returned
+        value is the LAST chunk's head reply (logits [1,1,V] for the final prompt position,
+        or its #logits-diet reduced form), which is what both prefill call sites consume.
+        Intermediate chunks' head replies are pipeline exhaust: with all_logits=False each is
+        one logits row, requested in #logits-diet argmax form (8 bytes) when the chain
+        supports it, awaited only for ERROR propagation and then discarded.
+
+        FAILURE CONTRACT (audit caveats 3+4): ALL chunk futures are awaited via a fail-fast
+        gather — hop_error/stage_error/watchdog fail ONLY their own rid, so awaiting just the
+        last future would hang ~GEN_TIMEOUT when an intermediate chunk dies. The whole burst
+        (including the FINAL chunk, which plain _send would give only the classic reset=False
+        single budget) waits under _send's #endpoint-weather progress-aware patience: keep
+        waiting while per-layer forward progress (model.fwd_progress_ts, heartbeat-fed and
+        credited only to still-pending rids — every chunk rid stays pending until its reply)
+        is advancing, bail once the classic budget is spent AND progress has gone quiet, with
+        the same hard ceiling backstop. Cancellation (client drop / gen-stall reclaim /
+        _ForwardSuperseded upstream) unwinds through the finally: every chunk rid is scrubbed
+        from pending, so orphaned worker forwards report progress nobody credits (exactly the
+        one-shot orphan contract) and their late replies/errors are ignored by _on_data."""
+        q = int(x.shape[1])
+        cstep = self._pipefill_chunk(model, q, mm, position_ids)
+        if not cstep:
+            return await self._send(model, x, 0, True, mm=mm, position_ids=position_ids,
+                                    nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k)
+        # -- chunked pipelined path ------------------------------------------------------------
+        # #logits-diet gating for the LAST chunk mirrors _send's own downgrade ladder, so the
+        # final reply keeps the exact same wire mode the one-shot prefill would have used.
+        if nt_mode is not None and not self._wire_diet_ok(model):
+            nt_mode = None
+        if nt_mode == "topk" and int(nt_k or 0) <= 0:
+            nt_mode = None
+        _diet_mid = self._wire_diet_ok(model)   # shrink DISCARDED intermediate replies to ~8 B
+        if model.stage0_writer is None:
+            await self._freshen_stage0(model, force=True)
+        if model.stage0_writer is None:
+            raise RuntimeError("pipeline not connected")
+        loop = asyncio.get_event_loop()
+        rids: list = []
+        futs: list = []
+
+        async def _write_chunk(rid: int, off: int, cl: int, last: bool) -> None:
+            meta, raw = _pack_tensor(x[:, off:off + cl])
+            hdr = {"req_id": rid, "model_id": model.target_id, "kind": "ids",
+                   "cache_position": off, "reset": off == 0, "all_logits": False, **meta}
+            if last:
+                if nt_mode is not None:   # the caller's reply directive rides the FINAL chunk
+                    hdr["ntensor"] = True
+                    hdr["nt_mode"] = nt_mode
+                    hdr["nt_clip"] = int(nt_clip or 0)
+                    if nt_mode == "topk":
+                        hdr["nt_k"] = int(nt_k)
+            elif _diet_mid:
+                # Intermediate replies are discarded — ask for the argmax id (8 bytes) instead
+                # of a ~300 KB full-vocab row purely to keep exhaust off the last hop's wire.
+                hdr["ntensor"] = True
+                hdr["nt_mode"] = "argmax"
+                hdr["nt_clip"] = 0
+            nb = await _write_frame(model.stage0_writer, hdr, raw)
+            net_account(self._stage0_id(model), to_node=nb)   # controller -> stage0
+
+        allf = None
+        try:
+            off = 0
+            first = True
+            while off < q:
+                cl = min(cstep, q - off)
+                rid = self.next_req()
+                fut = loop.create_future()
+                self.pending[rid] = fut
+                self.pending_model[rid] = model.target_id
+                self.pending_friendly[rid] = model.friendly   # #5 replica-precise recovery
+                rids.append(rid)
+                futs.append(fut)
+                try:
+                    await _write_chunk(rid, off, cl, off + cl >= q)
+                except (ConnectionError, OSError, asyncio.IncompleteReadError):
+                    if not first:
+                        # Mid-burst write failure: earlier chunks may already sit in the OLD
+                        # socket's stream, and a resend on a FRESH socket would let TWO worker
+                        # inbound loops interleave this prefill's frames (the one-frame
+                        # in-flight window that makes _send's resend-once safe does not hold
+                        # for a burst) -> KV append order would be undefined. Freshen for the
+                        # NEXT request and fail THIS one; the retry's chunk 0 (reset=True,
+                        # position 0) rebuilds every stage's cache, so nothing stale survives.
+                        with contextlib.suppress(Exception):
+                            await self._freshen_stage0(model, force=True)
+                        raise
+                    # First frame failed: nothing of this prefill reached the old stream ->
+                    # mirror _send's reconnect-once-and-resend (worker keys frames by model_id
+                    # and has processed nothing on the new socket, so the same rid is clean).
+                    await self._freshen_stage0(model, force=True)
+                    await _write_chunk(rid, off, cl, off + cl >= q)
+                first = False
+                off += cl
+            model.last_send_ts = time.time()
+            # Fail-fast gather over ALL chunk futures + the #endpoint-weather progress-aware
+            # patience from _send's reset branch (see FAILURE CONTRACT above).
+            allf = asyncio.gather(*futs)
+            _PROG_QUIET_S = 120.0
+            _PREFILL_HARD_S = max(3600.0, GEN_TIMEOUT_S)
+            _t0 = time.time()
+            while True:
+                _left = _PREFILL_HARD_S - (time.time() - _t0)
+                if _left <= 0:
+                    raise TimeoutError(
+                        f"pipefill prefill exceeded the {int(_PREFILL_HARD_S)}s hard ceiling")
+                try:
+                    res = await asyncio.wait_for(asyncio.shield(allf), timeout=min(30.0, _left))
+                    return res[-1]
+                except asyncio.TimeoutError:
+                    if allf.done():       # raced the timeout: result/exception landed — take it
+                        return allf.result()[-1]
+                    _fp = max(getattr(model, "fwd_progress_ts", 0.0) or 0.0, model.last_send_ts)
+                    if ((time.time() - _t0) >= GEN_TIMEOUT_S
+                            and (time.time() - _fp) > _PROG_QUIET_S):
+                        raise
+        finally:
+            # Do NOT cancel a still-pending gather here: cancelling a future that is (or was
+            # just) wrapped in asyncio.shield makes the loop log "CancelledError exception in
+            # shielded future" on every abort path (watchdog reclaim / client drop). Scrubbing
+            # the rids from pending below already guarantees no chunk future can EVER resolve
+            # after this point (_on_data / hop_error / the watchdog all key off pending), so
+            # the un-awaited gather + its pending children just get GC'd — a pending future
+            # never warns; only an unretrieved EXCEPTION does, and those are retrieved here.
+            if allf is not None and allf.done() and not allf.cancelled():
+                with contextlib.suppress(Exception):
+                    allf.exception()
+            for _rid in rids:   # never leak a chunk future (same contract as _send's finally)
+                self.pending.pop(_rid, None)
+                self.pending_model.pop(_rid, None)
+                self.pending_friendly.pop(_rid, None)
+            for _f in futs:
+                # Retrieve any SECOND chunk failure so a near-simultaneous double fault (gather
+                # surfaced the first) can't log "exception was never retrieved" at GC.
+                if _f.done() and not _f.cancelled():
+                    with contextlib.suppress(Exception):
+                        _f.exception()
 
     async def _crop(self, model: LoadedModel, length: int) -> None:
         """Tell every stage of `model` to truncate its KV cache to `length` (spec rollback).
@@ -679,9 +932,11 @@ class EngineGenMixin:
                 _nt_k = _wire_topk_k()
                 if _nt_k > 0:
                     _nt_mode = "topk"
-        res = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
-                               mm=mm, position_ids=prefill_pos,
-                               nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
+        # #pipefill: long multi-stage text prefills stream as a chunk burst (stages overlap);
+        # everything else takes _send_prefill's one-shot fallback — same reply either way.
+        res = await self._send_prefill(model, torch.tensor([prompt_ids], dtype=torch.long),
+                                       mm=mm, position_ids=prefill_pos,
+                                       nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
         cur = len(prompt_ids)
         model.kv_pos = cur          # KV depth so far (prompt); climbs per decode token
         produced = 0
@@ -748,6 +1003,8 @@ class EngineGenMixin:
         model = self.models[friendly]
         prefill_pos = mrope[0] if mrope else None
         base = mrope[1] if mrope else None
+        # #pipefill: deliberately NOT chunked — capture_hidden needs the post-norm hidden for
+        # EVERY prompt position in one reply; a chunk burst would return only the last chunk's.
         logits, prefill_hidden = await self._send(
             model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
             mm=mm, position_ids=prefill_pos, capture_hidden=True)
@@ -816,8 +1073,10 @@ class EngineGenMixin:
         # the pre-existing plain-vs-spec inconsistency, deliberately PRESERVED: nt_clip=0 keeps
         # the head's argmax bit-exact with the legacy int(row.argmax()) below). A downgraded
         # chain replies the full row instead; both shapes are handled at every consumer.
-        _r0 = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
-                               nt_mode="argmax", nt_clip=0)
+        # #pipefill: spec's prefill is a plain text prefill (verify frames are untouched), so it
+        # rides the same chunk-burst dispatcher; the last chunk's reply keeps nt argmax/nt_clip=0.
+        _r0 = await self._send_prefill(model, torch.tensor([prompt_ids], dtype=torch.long),
+                                       nt_mode="argmax", nt_clip=0)
         a0 = None if isinstance(_r0, list) else _r0[0, -1]
         cur = len(prompt_ids)              # target KV holds exactly tokens[0:cur]
         d_logits = await asyncio.to_thread(self._draft_prefill, model, prompt_ids)
@@ -995,6 +1254,9 @@ class EngineGenMixin:
 
         from transformers import DynamicCache
         # Prefill the MAIN model: per-position logits + PRE-norm hidden for the whole prompt.
+        # #pipefill: deliberately NOT chunked — all_logits + capture_pre_norm need EVERY prompt
+        # position in one reply; a chunk burst returns only the final chunk's. (#91 is gated
+        # off anyway; this keeps the validated path intact for any future revival.)
         ml, h_pre = await self._send(model, torch.tensor([prompt_ids], dtype=torch.long), 0, True,
                                      all_logits=True, capture_pre_norm=True)
         P = len(prompt_ids)

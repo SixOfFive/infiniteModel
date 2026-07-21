@@ -96,6 +96,9 @@ class EngineLifecycleMixin:
             # served, then doom only those STILL pending after REQUEUE_GRACE_S. A reconnect delivers
             # within the head stage's compute (well under the grace) -> future resolves -> skipped;
             # a genuinely dead head still fails fast (grace << gen-stall watchdog / GEN_TIMEOUT).
+            # (#pipefill: a chunked prefill has SEVERAL pending rids for one prompt — they all
+            # land in this snapshot and ride the same progress-aware grace below; dooming any
+            # one of them fails the burst's fail-fast gather in _send_prefill immediately.)
             at_close = [rid for rid, f in self.pending.items()
                         if not f.done() and self.pending_model.get(rid) in served]
             with contextlib.suppress(Exception):
