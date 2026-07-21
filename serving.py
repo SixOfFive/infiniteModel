@@ -499,11 +499,15 @@ async def _prepare(model: str, prompt: Optional[str], messages, body: dict):
                 f"{_fname or 'most appropriate'} tool — no plain text, no explanation, even if a "
                 f"tool call seems unnecessary for this message. Use sensible defaults for any "
                 f"missing arguments.")
-        ids = _render_chat_ids(tok, messages, _tc,        # #tools: inject tool defs when the request sends them
-                               enable_thinking=_thinking_pref(body))   # #qwen3-thinking: reachable on OpenAI/Ollama
+        # #off-loop-tokenize: template render (Jinja) + encode of a large chat is 100-500ms of
+        # CPU that previously STALLED the whole event loop (heartbeats, other streams, dashboard).
+        # Fast-tokenizer encode is Rust &self (concurrent-safe); the win is loop liveness.
+        ids = await asyncio.to_thread(_render_chat_ids, tok, messages, _tc,   # #tools
+                                      enable_thinking=_thinking_pref(body))   # #qwen3-thinking
     else:
         _jm = _json_mode_instruction(body)
-        ids = _to_id_list(tok((prompt or "") + (("\n\n" + _jm) if _jm else "")))
+        ids = await asyncio.to_thread(
+            lambda: _to_id_list(tok((prompt or "") + (("\n\n" + _jm) if _jm else ""))))
     # #vl-vision: OpenAI/Ollama image support — extract images from the messages and splice their
     # embeds (was previously only wired into /v1/messages). No-op for text requests / generate mode.
     mm = mrope = None

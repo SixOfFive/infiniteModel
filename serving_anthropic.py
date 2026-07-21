@@ -163,8 +163,12 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
     if images and do_audio:
         print(f"[v1/messages] both audio + image present -> audio path; {len(images)} "
               f"image(s) dropped (mixed AV not yet supported)")
-    ids = _render_ids(_anthropic_messages_to_chat(body.get("system"), body.get("messages"),
-                                                  keep_images=do_vision, keep_audio=do_audio))
+    # #off-loop-tokenize: the Claude Code path carries 50-200KB conversations — flatten +
+    # Jinja render + encode ran 100-500ms ON the event loop. Same pattern as routes_api's
+    # speech-component load; fast-tokenizer encode is Rust &self (concurrent-safe).
+    ids = await asyncio.to_thread(lambda: _render_ids(
+        _anthropic_messages_to_chat(body.get("system"), body.get("messages"),
+                                    keep_images=do_vision, keep_audio=do_audio)))
     # #22 inc 5c: AUDIO path (Qwen2.5-Omni). Encode clip(s), expand each single <|AUDIO|> into
     # its token-count run, splice the embeds, and use sequential TMRoPE positions.
     if do_audio:
@@ -207,8 +211,9 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         except Exception as exc:
             print(f"[v1/messages] audio encode failed ({type(exc).__name__}: {exc}); text-only")
         if mm is None:
-            ids = _render_ids(_anthropic_messages_to_chat(body.get("system"),
-                              body.get("messages"), keep_images=False, keep_audio=False))
+            ids = await asyncio.to_thread(lambda: _render_ids(   # #off-loop-tokenize
+                _anthropic_messages_to_chat(body.get("system"),
+                                            body.get("messages"), keep_images=False, keep_audio=False)))
             print("[v1/messages] audio unavailable -> rebuilt text-only prompt "
                   f"({len(ids)} tokens)")
     # #22 inc 3b: VISION path (only when no audio splice happened). Encode the image(s),
@@ -265,8 +270,9 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         # <|image_pad|> placeholders leak into the prefill (they'd embed as bare placeholder
         # tokens and degrade output). Only the success branch above keeps the expanded ids.
         if mm is None:
-            ids = _render_ids(_anthropic_messages_to_chat(body.get("system"),
-                              body.get("messages"), keep_images=False))
+            ids = await asyncio.to_thread(lambda: _render_ids(   # #off-loop-tokenize
+                _anthropic_messages_to_chat(body.get("system"),
+                                            body.get("messages"), keep_images=False)))
             print("[v1/messages] vision unavailable -> rebuilt text-only prompt "
                   f"({len(ids)} tokens)")
     # Reasoning models (Qwen3) whose template OPENS <think> in the prompt make the model
@@ -569,13 +575,17 @@ async def _count_tokens_anthropic(body: dict):
     resident = engine.models.get(friendly)
     if resident is not None:
         tok = resident.tokenizer
-        with contextlib.suppress(Exception):
-            if hf_tools:
-                enc = tok.apply_chat_template(chat, tools=hf_tools,
-                                              add_generation_prompt=True, tokenize=True)
-            else:
-                enc = tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True)
-            n = len(_to_id_list(enc))
+
+        def _count():   # #off-loop-tokenize: count_tokens renders the SAME large chat
+            with contextlib.suppress(Exception):
+                if hf_tools:
+                    enc = tok.apply_chat_template(chat, tools=hf_tools,
+                                                  add_generation_prompt=True, tokenize=True)
+                else:
+                    enc = tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True)
+                return len(_to_id_list(enc))
+            return None
+        n = await asyncio.to_thread(_count)
     if n is None:
         n = _estimate_tokens(chat)
     return JSONResponse({"input_tokens": n})

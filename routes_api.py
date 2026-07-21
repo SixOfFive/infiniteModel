@@ -511,8 +511,9 @@ def register(app):
             chat = [{"role": "system", "content": sys_prompt},
                     {"role": "user", "content": "Read the following text aloud exactly as "
                      f"written, and say nothing else:\n\n{text}"}]
-            ids = _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True,
-                                                      tokenize=True))
+            ids = await asyncio.to_thread(   # #off-loop-tokenize: keep the event loop live
+                lambda: _to_id_list(tok.apply_chat_template(chat, add_generation_prompt=True,
+                                                            tokenize=True)))
             # scale the text budget to the input length (verbatim ~ input length + margin)
             max_new = max(64, min(1024, int(len(_to_id_list(tok(text))) * 1.5) + 32))
             gen_ids, stop, wav, info = await engine.generate_speech(
