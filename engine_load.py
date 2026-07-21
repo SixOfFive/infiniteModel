@@ -367,9 +367,15 @@ class EngineLoadMixin:
                 # #t2a-serve: an ACE-Step music checkpoint (ace_step_transformer/ subfolder, no
                 # model_index.json) isn't a diffusers-pipeline dir — route it to the audio path.
                 if _d and os.path.isdir(os.path.join(_d, "ace_step_transformer")):
-                    return await self._load_t2a_locked(friendly, _tgt, reg_key or friendly,
-                                                       quant, replica_idx=replica_idx,
-                                                       offload=t2i_offload, cpu_only=cpu_only)
+                    # #t2a-offload-default: ACE-Step defaults to OFFLOAD (weights RAM-resident, the
+                    # DiT hops to the GPU per render) — it holds ZERO resident VRAM, can't OOM a card
+                    # on load, and leaves the GPU free for LLMs (VRAM is precious). Renders still run
+                    # on the GPU (~seconds), so speed is unaffected. Opt back into GPU-resident via
+                    # /config?t2a_offload_default=0; cpu_only forces its own (offload-off) path.
+                    return await self._load_t2a_locked(
+                        friendly, _tgt, reg_key or friendly, quant, replica_idx=replica_idx,
+                        offload=(t2i_offload or bool(ENGINE_CONFIG.get("t2a_offload_default", True))),
+                        cpu_only=cpu_only)
                 # #tts-serve: a Kokoro speech checkpoint (kokoro-v1_0.pth + voices/, no
                 # safetensors, no model_index.json) loads via the single-node speech path.
                 if _d and _is_kokoro_dir(_d):

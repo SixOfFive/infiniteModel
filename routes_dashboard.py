@@ -299,6 +299,7 @@ def register(app):
                          autoload_ctx: Optional[int] = None,
                          autoload_mode: Optional[str] = None,
                          vram_weights_first: Optional[bool] = None,
+                         t2a_offload_default: Optional[bool] = None,
                          gen_stall_s: Optional[float] = None,
                          gen_stall_decode_s: Optional[float] = None,
                          idle_unload_m: Optional[float] = None,
@@ -370,6 +371,8 @@ def register(app):
                 ENGINE_CONFIG["autoload_mode"] = _am
         if vram_weights_first is not None:               # #vram-weights-first: pack weights into free VRAM
             ENGINE_CONFIG["vram_weights_first"] = bool(vram_weights_first)
+        if t2a_offload_default is not None:               # #t2a-offload-default: ACE-Step -> RAM-resident (0 VRAM at rest)
+            ENGINE_CONFIG["t2a_offload_default"] = bool(t2a_offload_default)
         if gen_stall_s is not None:                       # #gen-stall-watchdog: wedged-gen reclaim threshold (0=off)
             ENGINE_CONFIG["gen_stall_s"] = max(0.0, float(gen_stall_s))
         if gen_stall_decode_s is not None:                # #active-decode-stall: tighter post-first-token stall (0=off)
