@@ -7,6 +7,10 @@ traffic to the rest of the fleet (node <-> all) plus the controller and a fleet 
 Each node spans TWO rows: a stats line topped by a GREEN download sparkline, and a RED
 upload sparkline beneath it.
 
+  VER        - that node's client build (client_version). The controller row shows the SERVER
+               build instead — a different version stream, so it is never flagged. A node whose
+               build differs from the fleet majority is highlighted YELLOW (version skew is what
+               stops a stale worker from registering)
   DOWN / UP  - current in / out rate (DOWN green, UP red)
   FROM→…→NEXT- the node's place in the ROUND TRIP, INFERRED from the loaded models' pipeline
                placement: where its data comes FROM and goes NEXT (from→node→next). The train
@@ -24,6 +28,11 @@ upload sparkline beneath it.
 MAX and XFER cover ONLY the window currently shown (the last ~N seconds of bars), not traffic
 before that. NEXT is an INFERENCE from placement, not a measured per-edge rate (the controller
 doesn't expose per-peer bytes over /status).
+
+Whatever vertical space is LEFT under the footers becomes a live WORKER LOG tail -- the recent
+output of this tablet's own worker, read from its detached tmux pane ('wrk') via capture-pane.
+That is a local read-only peek at a pane we already own; it sends nothing to the fleet. If the
+node rows fill the screen there is no room left and the log is simply omitted.
 
 Native Termux (no proot/torch); pure /status consumer -- touches nothing in the fleet client.
   python traffic_panel.py [controller_ip] [poll_seconds]
@@ -49,6 +58,11 @@ CTRL       = "controller"                           # controller's row name + bo
 
 GRN, RED, DIM, MAG, BOLD, RST = (
     "\033[32m", "\033[31m", "\033[2m", "\033[35m", "\033[1m", "\033[0m")
+YEL = "\033[33m"                                    # version skew (node build != fleet majority)
+
+WRK_SESSION = "wrk"                                 # tmux session the worker runs in (see ~/.bashrc)
+WLOG_TTL    = 3.0                                   # s between capture-pane calls (poll is 2s)
+_wlog       = [0.0, []]                             # (last capture ts, cached lines)
 
 hin  = defaultdict(lambda: deque(maxlen=HIST))     # download (in) rate samples per row
 hout = defaultdict(lambda: deque(maxlen=HIST))     # upload  (out) rate samples per row
@@ -145,6 +159,39 @@ def tablet_load():
             return float(f.read().split()[0])
     except Exception:
         return None
+
+
+def worker_log(maxlines):
+    """Last `maxlines` non-blank lines of THIS tablet's worker output.
+
+    The worker runs detached as `tmux new-session -d -s wrk 'proot-distro login debian -- ...
+    start-client.sh'`, so its stdout/stderr live in that pane rather than a file — `capture-pane
+    -p` prints it plain (escape sequences already stripped, since we don't pass -e). Read-only,
+    and local: it peeks at a pane this user already owns and sends nothing to the fleet.
+    Result is cached for WLOG_TTL so a 2s render loop doesn't fork tmux every single frame."""
+    now = time.time()
+    if _wlog[1] and now - _wlog[0] < WLOG_TTL:
+        return _wlog[1][-maxlines:]
+    try:
+        import subprocess
+        r = subprocess.run(["tmux", "capture-pane", "-p", "-t", WRK_SESSION, "-S", "-200"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+        if r.returncode == 0:
+            txt = r.stdout.decode("utf-8", "replace")
+            out = []
+            for ln in txt.splitlines():
+                ln = "".join(c for c in ln if c >= " " or c == "\t").rstrip()
+                if ln:
+                    out.append(ln)
+            lines = out or ["(worker started, no output yet)"]
+        else:                                          # no such session => worker isn't running
+            lines = [f"(no worker session '{WRK_SESSION}' — start it with: startworker)"]
+    except FileNotFoundError:
+        lines = ["(tmux not installed)"]
+    except Exception as e:
+        lines = [f"(worker log unavailable: {e})"]
+    _wlog[0], _wlog[1] = now, lines
+    return lines[-maxlines:]
 
 
 _cver_cache = [None]                               # cached VERSION read from the guest's client.py
@@ -296,29 +343,34 @@ def resid_label(v):
     return f"{nm}m {nl}L {g}G"
 
 
-# Columns: NODE DOWN UP ROUTE RESIDENT MAX XFER. DOWN is idx 1 (green), UP idx 2 (red).
-COLW = ((10, "<"), (9, ">"), (9, ">"), (20, "<"), (12, "<"), (9, ">"), (9, ">"))
+# Columns: NODE VER DOWN UP ROUTE RESIDENT MAX XFER. Indices are named because inserting VER
+# shifted DOWN/UP -- the sparkline width shrinks by VER's width, which is the intended trade.
+COLW = ((10, "<"), (10, "<"), (9, ">"), (9, ">"), (20, "<"), (12, "<"), (9, ">"), (9, ">"))
+COL_VER, COL_DOWN, COL_UP = 1, 2, 3
 PREFIX_W = 1 + sum(w for w, _ in COLW) + (len(COLW) - 1)    # leading sp + cells + single-space gaps
 
 
-def fmt_prefix(vals, base="", color=False):
+def fmt_prefix(vals, base="", color=False, ver_warn=False):
     """The fixed-width column block (no sparkline). DOWN/UP get colored when `color`, each
-    returning to `base` after so a base-colored row (controller/total) stays intact."""
+    returning to `base` after so a base-colored row (controller/total) stays intact. VER renders
+    dim, or YELLOW when this node's build is off the fleet majority (`ver_warn`)."""
     cells = [f"{v:{a}{w}}" for v, (w, a) in zip(vals, COLW)]
     if color:
-        cells[1] = f"{GRN}{cells[1]}{RST}{base}"
-        cells[2] = f"{RED}{cells[2]}{RST}{base}"
+        cells[COL_DOWN] = f"{GRN}{cells[COL_DOWN]}{RST}{base}"
+        cells[COL_UP] = f"{RED}{cells[COL_UP]}{RST}{base}"
+        vc = YEL if ver_warn else DIM
+        cells[COL_VER] = f"{vc}{cells[COL_VER]}{RST}{base}"
     return (base + " " + " ".join(cells)) if base else (" " + " ".join(cells))
 
 
-def node_lines(name, i, o, nxt, resid, peak, winx, base, color, cols, sw):
+def node_lines(name, ver, i, o, nxt, resid, peak, winx, base, color, cols, sw, ver_warn=False):
     """Two stacked rows for one node: stats + green download spark, then the red upload spark
     aligned beneath. Colored rows fit by construction; plain rows are sliced to `cols`."""
-    vals = (name, human(i), human(o), nxt, resid, human(peak), human_bytes(winx))
+    vals = (name, ver, human(i), human(o), nxt, resid, human(peak), human_bytes(winx))
     if color:
         dn = f"{GRN}↓{spark(hin[name], sw, peak)}{RST}"
         up = f"{RED}↑{spark(hout[name], sw, peak)}{RST}"
-        l1 = fmt_prefix(vals, base=base, color=True) + "  " + dn + RST
+        l1 = fmt_prefix(vals, base=base, color=True, ver_warn=ver_warn) + "  " + dn + RST
         l2 = base + " " * PREFIX_W + "  " + up + RST
         return [l1, l2]
     pre = fmt_prefix(vals, color=False)
@@ -394,6 +446,7 @@ def render():
         down, up, mesh = build_edges(st)               # forward + reverse node edges (round trip)
         res, fleet_models = build_resident(st)
         cur = {}                                       # name -> (in, out) this poll
+        vers = {}                                      # name -> client build, for the VER column
         ti = to = 0.0
         for n in st.get("nodes", []):
             name = (n.get("hostname") or "?")[:12]
@@ -401,8 +454,17 @@ def render():
             o = float(n.get("net_out_bps") or 0)
             track(name, i, o)
             cur[name] = (i, o)
+            vers[name] = (n.get("client_version") or "?")[:10]
             ti += i
             to += o
+        # Fleet-majority client build; anything else is skew and gets flagged yellow. Compared
+        # among NODES only — the controller runs a separate server build (never flagged).
+        tally = defaultdict(int)
+        for v in vers.values():
+            if v and v != "?":
+                tally[v] += 1
+        fleet_ver = max(tally, key=tally.get) if tally else ""
+        srv_ver = ((st.get("controller") or {}).get("version") or "?")[:10]
         m = st.get("metrics", {})
         ci = float(m.get("ctrl_in_bps") or 0)
         co = float(m.get("ctrl_out_bps") or 0)
@@ -413,31 +475,42 @@ def render():
         node_names = [nm for nm in cur if nm not in ("controller", "__total__")]
         node_names.sort(key=lambda nm: stat[nm][1], reverse=True)   # busiest-in-window first
 
-        out.append(DIM + fmt_prefix(("NODE", "DOWN", "UP", "FROM→…→NEXT", "RESIDENT", "MAX", "XFER"))
-                   + "  ↓ download / ↑ upload" + RST)
+        hdr = (fmt_prefix(("NODE", "VER", "DOWN", "UP", "FROM→…→NEXT", "RESIDENT", "MAX", "XFER"))
+               + "  ↓ download / ↑ upload")          # plain (color=False) -> safe to slice
+        out.append(DIM + hdr[:cols] + RST)
         budget = max(1, (lines - 9) // 2)              # 2 rows/node; reserve header/ctrl/total/legend/tablet/models
         shown = node_names[:budget]
         for name in shown:
             i, o = cur[name]
             peak, winx = stat[name]
-            out.extend(node_lines(name, i, o, route_label(name, up, down, mesh),
-                                  resid_label(res.get(name)), peak, winx, "", color, cols, sw))
+            out.extend(node_lines(name, vers.get(name, "?"), i, o,
+                                  route_label(name, up, down, mesh),
+                                  resid_label(res.get(name)), peak, winx, "", color, cols, sw,
+                                  ver_warn=bool(fleet_ver) and vers.get(name) != fleet_ver))
         if len(node_names) > len(shown):
             out.append(f"{DIM}   …{len(node_names) - len(shown)} more node(s){RST}")
 
         cpeak, cwinx = stat["controller"]
-        out.extend(node_lines("controller", ci, co, route_label("controller", up, down, mesh),
+        out.extend(node_lines("controller", srv_ver, ci, co,   # SERVER build, not a client build
+                              route_label("controller", up, down, mesh),
                               "", cpeak, cwinx, MAG, color, cols, sw))
         tpeak, twinx = stat["__total__"]
         fleet_gb = sum(v[2] for v in res.values())
         fleet_layers = sum(v[1] for v in res.values())
         tresid = resid_label((fleet_models, fleet_layers, fleet_gb))
-        out.append(BOLD + fmt_prefix((f"TOTAL {len(node_names)}", human(ti), human(to), "",
-                                      tresid, human(tpeak), human_bytes(twinx)),
+        out.append(BOLD + fmt_prefix((f"TOTAL {len(node_names)}", fleet_ver, human(ti), human(to),
+                                      "", tresid, human(tpeak), human_bytes(twinx)),
                                      base=BOLD, color=color) + RST)
-        out.append(f"  {GRN}██{RST} download  {RED}██{RST} upload   "
-                   f"{DIM}↓green=download ↑red=upload (scaled to MAX) · "
-                   f"FROM→node→NEXT: 'home'=controller (drop-off → home){RST}")
+        # Legend: colored swatches (fixed plain width) + a tail truncated by PLAIN length, so the
+        # line can never wrap and break the static layout no matter how narrow the terminal is.
+        nskew = sum(1 for nm in node_names if fleet_ver and vers.get(nm) != fleet_ver)
+        lead_plain = "  ██ download  ██ upload   "
+        lead = f"  {GRN}██{RST} download  {RED}██{RST} upload   "
+        tail_p = (f"↓green ↑red (scaled to MAX) · FROM→node→NEXT: 'home'=controller · "
+                  f"VER=client build, controller row=server {srv_ver} · "
+                  + (f"{nskew} node(s) OFF-BUILD" if nskew else "all nodes on-build"))
+        tail_p = tail_p[:max(0, cols - len(lead_plain))]
+        out.append(lead + (YEL if nskew else DIM) + tail_p + RST)
         # This tablet's own load (the panel process runs here, so /proc is the tablet's).
         cpu_pct, cpu_s = tablet_cpu()
         if cpu_pct is not None:
@@ -468,6 +541,15 @@ def render():
             mtxt = mtxt[:avail - 1] + "…"
         out.append(f"  {BOLD}MODELS{RST} {mtxt}")
         log_csv(time.time(), [(nm, *cur[nm]) for nm in node_names] + [("controller", ci, co)])
+
+    # Whatever vertical room is LEFT becomes a live tail of this tablet's worker log. Sits outside
+    # the else, so when /status is unreachable (short `out`, lots of room) the log still renders --
+    # which is exactly when you want to see what the worker is saying.
+    room = lines - len(out) - 1                        # -1 for the section header itself
+    if room >= 2:
+        out.append(f"  {BOLD}WORKER LOG{RST} {DIM}· this tablet · tmux '{WRK_SESSION}'{RST}")
+        for ln in worker_log(room):
+            out.append(f"  {DIM}{ln[:max(8, cols - 3)]}{RST}")
 
     sys.stdout.write("\033[H")
     sys.stdout.write("\033[K\n".join(out[:lines]))
