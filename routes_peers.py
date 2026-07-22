@@ -298,7 +298,7 @@ def register(app):
         return JSONResponse({"ok": True, "node": node, "config": cfg})
 
     @app.post("/peer_handoff")
-    async def peer_handoff(node: str, to: str, port: int = 0) -> JSONResponse:
+    async def peer_handoff(node: str, to: str, port: int = 0, force: int = 0) -> JSONResponse:
         """Transfer a node — WITH its resident shards — to a peer controller. No reload.
 
         The worker keeps the weights in VRAM, reassigns their owner, drops this session and
@@ -318,6 +318,16 @@ def register(app):
         if not host_nids:
             return JSONResponse({"ok": False, "error": f"no live node named {node!r}"},
                                 status_code=404)
+        # Handing over the controller's OWN co-located worker gives a remote controller this box's
+        # GPU. Legitimate eventually, but far too easy to do by accident (auto-placement often lands
+        # on the controller host), so it needs an explicit force=1.
+        if not force and any(getattr(registry._nodes[nid], "data_host", "") in _LOCAL_IPS
+                             for nid in host_nids):
+            return JSONResponse(
+                {"ok": False, "node": node,
+                 "error": f"{node} is this controller's own co-located worker — handing it to a "
+                          f"peer gives that controller this box's hardware. Pass force=1 if that "
+                          f"is really what you want."}, status_code=409)
         moving, split = [], []
         for fr, m in list(engine.models.items()):
             ids = set(m.stage_node_ids or [])
@@ -338,8 +348,10 @@ def register(app):
         if link is None:
             return JSONResponse({"ok": False, "error": f"no control link for {node}"},
                                 status_code=404)
+        # NB: (peer.get("info") or {}) — a peer record initialises "info": None, so the KEY exists
+        # and .get("info", {}) hands back None, not the default. That was a 500 on first live use.
         try:
-            ctrl_port = int(peer.get("info", {}).get("control_port")
+            ctrl_port = int((peer.get("info") or {}).get("control_port")
                             or peers._cfg()["control_port"])
         except (TypeError, ValueError):
             ctrl_port = int(peers._cfg()["control_port"])
