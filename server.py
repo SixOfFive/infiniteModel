@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c173"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c174"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -141,6 +141,7 @@ EXTRA_UPDATE_FILES: list[str] = ["worker_t2i.py",   # #t2i-serve: worker diffusi
                                  # m4c153 code-split: relocated build_app routes
                                  "routes_dashboard.py", "routes_lifecycle.py", "routes_api.py", "routes_diag.py",
                                  "routes_shards.py",   # code-split Inc 6: shard/pack/weights routes
+                                 "peers.py", "routes_peers.py",   # #federation: controller<->controller
                                  "serving.py", "status.py",   # m4c154/155 code-split: serving + status-building layers
                                  "serving_anthropic.py",   # code-split Inc 3: Anthropic Messages engine
                                  "downloads.py",   # code-split Inc 5: download/registry lifecycle
@@ -1861,7 +1862,8 @@ from media_encode import (_encode_images, _encode_audio, _load_speech_components
 # parse_args; build_app is called later), so FastAPI can resolve the route annotations at register time.
 # Controller-only leaf modules; in EXTRA_UPDATE_FILES; pull-once convergence bridge as elsewhere.
 for _crm in ("routes_dashboard", "routes_lifecycle", "routes_api", "routes_diag",
-             "routes_shards"):   # code-split Inc 6
+             "routes_shards",   # code-split Inc 6
+             "peers", "routes_peers"):   # #federation Phase 1
     try:
         __import__(_crm)
     except Exception:
@@ -1874,6 +1876,9 @@ import routes_lifecycle
 import routes_api
 import routes_diag
 import routes_shards
+import peers            # #federation Phase 1: controller<->controller discovery + gossip
+import routes_peers
+from routes_peers import register as routes_peers_register
 from routes_dashboard import register as routes_dashboard_register
 from routes_lifecycle import register as routes_lifecycle_register
 from routes_api import register as routes_api_register
@@ -2452,6 +2457,12 @@ def build_app() -> FastAPI:
             want = str(msg.get("cluster_id") or "")
             if mine and want and want != mine:
                 return                      # different fleet — stay silent
+            # #federation: the querier is a CONTROLLER announcing itself, not a worker looking for
+            # one. Record it as a peer, then answer normally — one datagram teaches both sides.
+            if msg.get("peer"):
+                with contextlib.suppress(Exception):
+                    peers.record_peer(addr[0], msg.get("http_port"), str(msg.get("name") or ""),
+                                      str(msg.get("version") or ""), want, source="udp")
             reply = {"im": wire.DISCOVERY_MAGIC, "r": 1,
                      "host": wire.local_ip_for(addr[0]) or _display_host(),
                      "control_port": ARGS.control_port, "http_port": ARGS.http_port,
@@ -2490,6 +2501,11 @@ def build_app() -> FastAPI:
         # Deliberately best-effort — a bind failure (port taken, container netns, hardened host)
         # must never stop the controller: static config.json addressing still works untouched.
         disc_tr = await _start_discovery_responder()
+        # #federation Phase 1: announce ourselves to sibling controllers and gossip their inventory.
+        # Purely additive — neither loop loads, unloads or places anything; a peer being visible
+        # never changes how this controller serves.
+        peer_announcer = asyncio.create_task(peers.announce_loop())
+        peer_gossiper = asyncio.create_task(peers.gossip_loop())
         serve = ctrl.task
         reaper = asyncio.create_task(reaper_loop())
         sampler = asyncio.create_task(metrics_sampler())
@@ -2647,7 +2663,8 @@ def build_app() -> FastAPI:
             # (each parked in readline()), so we drop those connections first and
             # time-box the wait — this is what makes Ctrl-C actually quit.
             print("\n[*] shutting down controller…")
-            for t in (serve, reaper, sampler, updater, idle_unloader, juggler_sweeper, persist_reloader):
+            for t in (serve, reaper, sampler, updater, idle_unloader, juggler_sweeper,
+                      persist_reloader, peer_announcer, peer_gossiper):
                 t.cancel()
             if disc_tr is not None:            # #discovery: stop answering broadcasts
                 with contextlib.suppress(Exception):
@@ -2706,6 +2723,7 @@ def build_app() -> FastAPI:
     routes_shards_register(app)   # code-split Inc 6: shard/pack/weights routes
     routes_api_register(app)
     routes_diag_register(app)
+    routes_peers_register(app)   # #federation Phase 1: /peer_info /peers /peer_add /peer_remove
     downloads_register(app)
 
     # code-split Inc 1: _serve_embed + /api/embed + /api/embeddings + /v1/embeddings
@@ -2765,7 +2783,7 @@ def main() -> None:
     state.publish(globals())
     state.bind(engine_load, engine_gen, engine_lifecycle, control_plane, media_encode,
                routes_dashboard, routes_lifecycle, routes_api, routes_diag, serving,
-               serving_anthropic, status, downloads, routes_shards)
+               serving_anthropic, status, downloads, routes_shards, routes_peers)
     print(f"InfiniteModel controller {VERSION}")
     if HF_TOKEN:
         print(f"[hf] auth token loaded (...{HF_TOKEN[-4:]}) — model pulls authenticated")
