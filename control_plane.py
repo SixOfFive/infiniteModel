@@ -260,6 +260,35 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             print(f"[+] {node.hostname} re-registered as {node.node_id} (was {stale.node_id}); "
                   f"recovered {n_rec} model(s) the restart invalidated")
 
+        # #restart-stale backstop: this worker just (re)registered — if the controller still
+        # holds resident models with a stage on this BOX that the worker's kept-model
+        # inventory does NOT carry, those shards are GONE (a worker restart wipes them; the
+        # inventory is refreshed on EVERY reconnect — client.py session()). The id-keyed
+        # cleanups can all miss that: every re-register mints a fresh node id (registry.add),
+        # the old socket can die silently half-open (no link-death event), and #77's
+        # find_stale_dupes needs the exact data endpoint to match — a dual-homed box that
+        # re-registered via another route slips it (the 2026-07-21 om3nbox class:
+        # /restart_node saw models_affected=[], then every request 500'd "no shard for
+        # model_id=..." until a manual /unload). Match by HOSTNAME (physical identity, the
+        # same assumption find_stale_dupes makes) and invalidate LOUDLY. invalidate_model
+        # pops the row from engine.models, so this fires exactly once per stale model — a
+        # reconnect storm can't turn it into an invalidation storm.
+        _held = {e.get("model_id") or (e.get("assign") or {}).get("model_id")
+                 for e in (msg.get("loaded") or []) if isinstance(e, dict)}
+        _host_l = (node.hostname or "").strip().lower()
+        for _fr, _lm in list(engine.models.items()):
+            _stgs = getattr(getattr(_lm, "plan", None), "stages", None) or []
+            if not any((getattr(_s, "hostname", "") or "").strip().lower() == _host_l
+                       for _s in _stgs):
+                continue
+            if _lm.target_id in _held:
+                continue   # worker still holds it (kept for adoption / healthy reconnect flap)
+            log_activity(f"#restart-stale: {node.hostname} re-registered ({node.node_id}) "
+                         f"WITHOUT its shard of {_ollama_name(_fr)} — controller state was "
+                         "stale; invalidating it now")
+            engine.invalidate_model(_fr, f"{node.hostname} re-registered without its shard "
+                                         "(worker restarted; stale controller state)")
+
         # #adopt: the register carried a kept-loaded-model inventory (this worker held its
         # shards across a controller restart) — rebuild those models' controller state from
         # the reported recipes instead of re-streaming them. Fire-and-forget: registration

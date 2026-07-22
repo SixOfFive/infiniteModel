@@ -491,8 +491,8 @@ def register(app):
         # #node-restart: restart ONE worker process (exit 42 -> its supervisor relaunches it) —
         # the per-node "fresh start" that clears whatever VRAM/RAM the process is holding,
         # without touching the controller or the rest of the fleet. Models with a stage on the
-        # node DROP (a worker restart wipes its shards); the existing link-death invalidation
-        # cleans up their controller state AND frees their surviving stages on OTHER nodes, so
+        # node DROP (a worker restart wipes its shards); the route invalidates them
+        # SYNCHRONOUSLY (#restart-stale) AND frees their surviving stages on OTHER nodes, so
         # an idle model costs nothing anywhere afterwards (it re-auto-loads on demand). A model
         # that is IN USE (serving/queued now, or used in the last 10 min) is RECOVERED: once
         # the invalidation lands, a background task re-loads it with its original ctx/quant/KV
@@ -511,12 +511,31 @@ def register(app):
             return JSONResponse({"ok": False, "error": f"no control link to {nd.hostname} "
                                  "(already down? it will relaunch on its own supervisor)"},
                                 status_code=409)
-        affected = [fr for fr, m in engine.models.items() if nd.node_id in m.stage_node_ids]
+        # #restart-stale: match models to the target node by PHYSICAL identity — current
+        # node_id OR stage hostname — never node_id alone. stage_node_ids is frozen at
+        # load/adopt time while every re-registration mints a fresh id (registry.add), so a
+        # worker that re-registered behind the controller's back (silent half-open old
+        # socket, a data_host flip defeating find_stale_dupes, or a mid-adopt/mid-load
+        # window) leaves resident models keyed under a node id that no longer exists
+        # ANYWHERE — and the old id-only scan here returned models_affected=[] while the
+        # model's only stage sat on the box (observed live 2026-07-21 om3nbox/qwen3-30b:
+        # the restart wiped the shard, the stale row kept dialing the relaunched worker,
+        # every request 500'd "no shard for model_id=..." until a manual /unload).
+        _host_l = (nd.hostname or "").strip().lower()
+
+        def _on_target(m) -> bool:
+            if nd.node_id in m.stage_node_ids:
+                return True
+            _stgs = getattr(getattr(m, "plan", None), "stages", None) or []
+            return any((getattr(s, "hostname", "") or "").strip().lower() == _host_l
+                       for s in _stgs)
+
+        affected = [fr for fr, m in engine.models.items() if _on_target(m)]
         # Snapshot the recovery set BEFORE the restart (invalidation wipes engine.models).
         recover: list[tuple] = []
         _now = time.time()
         for fr, m in engine.models.items():
-            if nd.node_id not in m.stage_node_ids:
+            if not _on_target(m):
                 continue
             in_use = (m.active > 0 or m.queued > 0
                       or (_now - (m.last_used or 0)) < 600)
@@ -543,11 +562,25 @@ def register(app):
                                 status_code=502)
         log_activity(f"NODE RESTART: {nd.hostname} ({nd.node_id}) requested by {who}"
                      + (f" — drops {', '.join(affected)}" if affected else ""))
+        # #restart-stale: SYNCHRONOUSLY invalidate every affected model NOW instead of
+        # trusting link-death detection to do it. The restart command is accepted (send
+        # succeeded), so these shards are fate-sealed — but the link-death scan is keyed by
+        # the DYING link's node id and misses a row whose stage ids are stale (above), and a
+        # fast supervisor relaunch can re-register before the old socket even errors. Missing
+        # the cleanup left the controller serving a wiped shard. invalidate_model is the
+        # standard teardown (fails the model's in-flight requests, frees surviving stages on
+        # OTHER nodes, records the drop for the dashboard); when link-death DOES fire later
+        # it finds the row already gone — a no-op, not a double-drop. In-use models are then
+        # re-placed by the recovery task below (the route's contract).
+        for fr in affected:
+            engine.invalidate_model(fr, f"node restart: {nd.hostname} ({nd.node_id}) — "
+                                        "its shards are wiped by the restart")
         if recover:
             async def _recover():
-                # Wait for the link-death invalidation to actually drop the models (the worker
-                # exits ~instantly; the dead socket surfaces within seconds) — reloading while
-                # the old copy is still registered would be treated as a live-model reload.
+                # #restart-stale: the route already invalidated the affected models
+                # synchronously, so this loop normally exits on its first tick — it stays as
+                # a belt (reloading while an old copy is somehow still registered would be
+                # treated as a live-model reload).
                 for _ in range(30):
                     await asyncio.sleep(1.0)
                     if all(fr not in engine.models for fr, _c, _q, _k in recover):
