@@ -536,15 +536,32 @@ def _broadcast_targets() -> list:
     return tgts
 
 
-def discover_controller(cluster_id: str = "", port: int = 0, timeout: float = 2.5,
-                        verbose: bool = True) -> dict:
-    """Broadcast a discovery query and return the chosen controller as
-    {host, control_port, http_port, cluster_id, name, version} — or {} if nothing answered.
+def discover_controllers(cluster_id: str = "", port: int = 0, timeout: float = 2.5,
+                         verbose: bool = True) -> list:
+    """EVERY controller that answers, not just the best one (#multi-controller).
 
-    Re-sends every ~0.5s for `timeout` seconds (one dropped datagram must not fail onboarding).
-    Ambiguity policy: a worker silently joining the WRONG fleet is far worse than a slow start, so
-    when several distinct controllers answer we prefer (1) an exact cluster_id match, then (2) a
-    controller on our own /24, and we always LOG every responder so a mis-join is visible."""
+    Same single broadcast as discover_controller — the candidates were always collected; this just
+    stops throwing the extras away. Ordered: exact cluster_id matches first, then same-/24, then
+    the rest, so a worker that connects to a bounded number still picks the most relevant."""
+    cands = _discover_candidates(cluster_id, port, timeout, verbose)
+    if not cands:
+        return []
+    want = str(cluster_id or load_config().get("cluster_id") or "")
+    mine = {ip.rsplit(".", 1)[0] for ip in _local_ipv4s()}
+
+    def rank(c):
+        return (0 if (want and c["cluster_id"] == want) else 1,
+                0 if c["host"].rsplit(".", 1)[0] in mine else 1)
+    return sorted(cands, key=rank)
+
+
+def _discover_candidates(cluster_id: str = "", port: int = 0, timeout: float = 2.5,
+                         verbose: bool = True) -> list:
+    """ONE broadcast round -> every distinct controller that replied.
+
+    Re-sends every ~0.5s for `timeout` seconds (a single dropped datagram must not fail onboarding).
+    Shared by discover_controller (picks one) and discover_controllers (keeps them all), so both
+    see exactly the same candidate set from the same wire behaviour."""
     import json
     import socket
     import time
@@ -597,11 +614,23 @@ def discover_controller(cluster_id: str = "", port: int = 0, timeout: float = 2.
             })
     finally:
         s.close()
-    if not found:
-        if verbose:
-            print("[discovery] no controller answered", flush=True)
+    if not found and verbose:
+        print("[discovery] no controller answered", flush=True)
+    return list(found.values())
+
+
+def discover_controller(cluster_id: str = "", port: int = 0, timeout: float = 2.5,
+                        verbose: bool = True) -> dict:
+    """Broadcast and return the ONE best controller — {} if nothing answered.
+
+    Ambiguity policy: a worker silently joining the WRONG fleet is far worse than a slow start, so
+    when several distinct controllers answer we prefer (1) an exact cluster_id match, then (2) a
+    controller on our own /24, and we always LOG every responder so a mis-join is visible."""
+    cfg = load_config()
+    want = str(cluster_id or cfg.get("cluster_id") or "")
+    cands = _discover_candidates(cluster_id, port, timeout, verbose)
+    if not cands:
         return {}
-    cands = list(found.values())
     if len(cands) > 1 and verbose:
         print(f"[discovery] ⚠ {len(cands)} controllers answered — set `cluster_id` on this worker "
               f"to pin it to one fleet:", flush=True)
