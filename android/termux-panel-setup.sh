@@ -39,7 +39,7 @@ _im_worker() {
   _im_shim
   termux-wake-lock >/dev/null 2>&1 || true
   tmux has-session -t wrk 2>/dev/null || \
-    tmux new-session -d -s wrk "proot-distro login debian -- bash -lc 'cd /root/android && bash start-client.sh --name tablet'"
+    tmux new-session -d -x 200 -y 50 -s wrk "proot-distro login debian -- bash -lc 'cd /root/android && bash start-client.sh --name tablet'"
 }
 # Bandwidth PANEL, detached (tmux 'im'), full-screen. Idempotent.
 _im_panel() {
@@ -81,7 +81,7 @@ ln -sf python3.13 /data/data/com.termux/files/usr/bin/python3.12 2>/dev/null
 termux-wake-lock >/dev/null 2>&1 || true
 sleep 25   # let Wi-Fi associate before the worker dials the controller
 tmux has-session -t wrk 2>/dev/null || \
-  tmux new-session -d -s wrk "proot-distro login debian -- bash -lc 'cd /root/android && bash start-client.sh --name tablet'"
+  tmux new-session -d -x 200 -y 50 -s wrk "proot-distro login debian -- bash -lc 'cd /root/android && bash start-client.sh --name tablet'"
 if ! tmux has-session -t im 2>/dev/null; then
   tmux new-session -d -s im "while true; do /data/data/com.termux/files/usr/bin/python3 /data/data/com.termux/files/home/.im/traffic_panel.py; sleep 2; done"
   tmux set-option -t im status off 2>/dev/null

@@ -27,7 +27,8 @@ graphed.
   MAX        - peak rate within the DISPLAYED sparkline window (the busier direction); both
                sparklines scale to it (full bar == this window's max)
   XFER       - bytes moved within the DISPLAYED window (the visible sparkline span) -- NOT
-               lifetime; rows sort busiest-first by this
+               lifetime. Rows are LISTED alphabetically; XFER no longer sets display order, it
+               only decides which nodes survive truncation when they outnumber the rows available
 
 MAX and XFER cover ONLY the window currently shown (the last ~N seconds of bars), not traffic
 before that. NEXT is an INFERENCE from placement, not a measured per-edge rate (the controller
@@ -163,6 +164,24 @@ def tablet_load():
             return float(f.read().split()[0])
     except Exception:
         return None
+
+
+def resize_worker_pane(cols, rows):
+    """Widen the worker's tmux window to match this panel.
+
+    The worker session is created DETACHED, and a detached tmux session gets the default 80x24 --
+    so the client's output hard-wraps at 80 columns, about 2/3 of the tablet's width, and the log
+    tail below looks narrow no matter how wide we draw it. Resizing the window fixes new output.
+    tmux does NOT reflow existing scrollback, so history stays wrapped as it was captured; the
+    full width appears as fresh lines arrive. Best-effort and silent (no tmux / old tmux / no
+    session are all fine)."""
+    try:
+        import subprocess
+        subprocess.run(["tmux", "resize-window", "-t", WRK_SESSION,
+                        "-x", str(max(40, cols)), "-y", str(max(24, rows))],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except Exception:
+        pass
 
 
 def worker_log(maxlines):
@@ -422,6 +441,7 @@ def render():
     if (cols, lines) != (_last_size[0], _last_size[1]):
         _last_size[0], _last_size[1] = cols, lines
         sys.stdout.write("\033[2J")                   # full clear on (re)size -> no stale artifacts
+        resize_worker_pane(cols, max(24, lines))      # keep the worker's pane as wide as we are
     sw = max(8, cols - (PREFIX_W + 4))                # bars width; +4 = "  " + arrow + 1 margin
     color = cols >= PREFIX_W + 12
     win_s = int(sw * POLL)
@@ -492,9 +512,9 @@ def render():
                     or bool(res.get(nm) and res[nm][0])
                     or (bool(fleet_ver) and vers.get(nm) != fleet_ver))
 
-        graph_names = [nm for nm in node_names if graphed(nm)]     # keeps busiest-first order
-        gset = set(graph_names)
-        idle_names = [nm for nm in node_names if nm not in gset]
+        graph_names = [nm for nm in node_names if graphed(nm)]     # still busiest-first HERE, so
+        gset = set(graph_names)                                    # truncation drops the quietest,
+        idle_names = sorted((nm for nm in node_names if nm not in gset), key=str.lower)
 
         idle_lines = []                                # built first: they cost the node budget rows
         if idle_names:
@@ -511,7 +531,9 @@ def render():
             idle_lines.append(line.rstrip())
 
         budget = max(1, (lines - 9 - len(idle_lines)) // 2)   # 2 rows/node; reserve fixed footers
-        shown = graph_names[:budget]
+        # ...but DISPLAY alphabetically. Picking by traffic and only then sorting keeps a busy node
+        # from being dropped just because its name sorts late.
+        shown = sorted(graph_names[:budget], key=str.lower)
         for name in shown:
             i, o = cur[name]
             peak, winx = stat[name]
@@ -532,9 +554,12 @@ def render():
         fleet_gb = sum(v[2] for v in res.values())
         fleet_layers = sum(v[1] for v in res.values())
         tresid = resid_label((fleet_models, fleet_layers, fleet_gb))
-        out.append(BOLD + fmt_prefix((f"TOTAL {len(node_names)}", fleet_ver, human(ti), human(to),
-                                      "", tresid, human(tpeak), human_bytes(twinx)),
-                                     base=BOLD, color=color) + RST)
+        tvals = (f"TOTAL {len(node_names)}", fleet_ver, human(ti), human(to),
+                 "", tresid, human(tpeak), human_bytes(twinx))
+        # Plain mode embeds no ANSI, so it can be sliced to fit a terminal narrower than PREFIX_W;
+        # colored mode fits by construction (color is only on when cols >= PREFIX_W + 12).
+        out.append(BOLD + (fmt_prefix(tvals, base=BOLD, color=True) if color
+                           else fmt_prefix(tvals)[:cols]) + RST)
         # Legend: colored swatches (fixed plain width) + a tail truncated by PLAIN length, so the
         # line can never wrap and break the static layout no matter how narrow the terminal is.
         # Skew notice goes FIRST in the tail: it is the actionable bit, so it must survive the
@@ -586,8 +611,8 @@ def render():
     room = lines - len(out) - 1                        # -1 for the section header itself
     if room >= 2:
         out.append(f"  {BOLD}WORKER LOG{RST} {DIM}· this tablet · tmux '{WRK_SESSION}'{RST}")
-        for ln in worker_log(room):
-            out.append(f"  {DIM}{ln[:max(8, cols - 3)]}{RST}")
+        for ln in worker_log(room):                    # 2-space indent + cols-2 == exactly full width
+            out.append(f"  {DIM}{ln[:max(8, cols - 2)]}{RST}")
 
     sys.stdout.write("\033[H")
     sys.stdout.write("\033[K\n".join(out[:lines]))
