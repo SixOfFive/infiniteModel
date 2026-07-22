@@ -525,8 +525,12 @@ function modelRow(m,s){
   } else { // notdl
     meta='<span class="err">not downloaded</span> · '+gb(m.size_gb); acts='<button class="btn sm" onclick="dl(\''+esc(m.name)+'\',\'start\')">Download</button>';
   }
+  // #unified-fleet: a model a PEER controller has resident shows here as loaded, because from a
+  // client's point of view it IS — a request for it is federated to the owner and answered. The
+  // chip names who actually holds the weights; Unload federates there too.
+  const fed=m.federated?'<span class="chip" title="Resident on controller '+esc(m.owner||'peer')+' ('+esc(m.owner_url||'')+'), not on this one. Requests for it are federated there and answered normally — one copy of the weights, either controller as the front door. Unload acts on the owning controller.">via '+esc(m.owner||'peer')+'</span>':'';
   return '<div class="row"><span class="dot" style="background:'+s.c+'"></span>'
-    +'<div class="nm" onclick="openDetail(\''+esc(m.name)+'\')"><b>'+esc(m.name)+'</b>'+arch+al+'</div>'
+    +'<div class="nm" onclick="openDetail(\''+esc(m.name)+'\')"><b>'+esc(m.name)+'</b>'+arch+fed+al+'</div>'
     +'<div class="meta">'+meta+'</div><div class="acts">'+acts
     +'<span class="btn sm ghost" title="details" onclick="openDetail(\''+esc(m.name)+'\')">⋯</span></div></div>';
 }
@@ -590,8 +594,12 @@ function upgradeBadge(m){
 }
 
 function renderNodes(d){
-  const ns=(d.nodes||[]).slice().sort((a,b)=>(b.has_gpu?1:0)-(a.has_gpu?1:0)||a.hostname.localeCompare(b.hostname));
-  $('#ncount').textContent=ns.length+' nodes';
+  // #unified-fleet: OUR nodes plus every node a peer controller owns, so this page shows the whole
+  // fleet from either controller. Peer nodes carry federated/owner and render read-only — the
+  // controller that owns a node is the only one that may restart it or place work on it.
+  const pns=(d.peer_nodes||[]);
+  const ns=(d.nodes||[]).concat(pns).slice().sort((a,b)=>(a.federated?1:0)-(b.federated?1:0)||(b.has_gpu?1:0)-(a.has_gpu?1:0)||String(a.hostname).localeCompare(String(b.hostname)));
+  $('#ncount').textContent=ns.length+' nodes'+(pns.length?' ('+pns.length+' via peers)':'');
   // fleet-consensus version = the most common client_version among nodes; a node that differs from it
   // is flagged (warn) so a worker that missed a restart/update stands out. When all match, nothing flags.
   const _vc={}; ns.forEach(n=>{ if(n.client_version) _vc[n.client_version]=(_vc[n.client_version]||0)+1; });
@@ -626,8 +634,12 @@ function renderNodes(d){
     // #node-restart: per-node fresh start — restarts just this worker process (supervisor
     // relaunches it; clears whatever VRAM/RAM it holds). Models with a stage here drop and
     // re-load on demand — the confirm says so. Hidden for offline nodes (nothing to signal).
-    const rbtn=n.alive?' <a class="nrst" title="Restart this worker process (fresh start: clears its VRAM/RAM; models on it drop and re-load on demand)" onclick="restartNode(\''+esc(n.hostname)+'\')">↻</a>':'';
-    return '<div class="node"><div class="nn">'+esc(n.hostname)+rbtn+' <small>'+esc(dev)+'</small>'+off+'</div>'
+    const rbtn=(n.alive&&!n.federated)?' <a class="nrst" title="Restart this worker process (fresh start: clears its VRAM/RAM; models on it drop and re-load on demand)" onclick="restartNode(\''+esc(n.hostname)+'\')">↻</a>':'';
+    // A peer's node is shown, not driven: no restart handle, and a chip naming the controller that
+    // owns it. Ownership is exclusive by design (two planners against one node double-book its
+    // memory), so this is a live view of the other half of the fleet, not a second set of controls.
+    const own=n.federated?' <span class="chip" title="Owned by controller '+esc(n.owner||'peer')+' at '+esc(n.owner_url||'')+'. It places and restarts work here; this controller can drive models on it by federating (Load sends the request there).">via '+esc(n.owner||'peer')+'</span>':'';
+    return '<div class="node"'+(n.federated?' style="opacity:.72"':'')+'><div class="nn">'+esc(n.hostname)+rbtn+own+' <small>'+esc(dev)+'</small>'+off+'</div>'
       +vram+memRow('RAM',(n.proc_rss_gb||0),ramUsed,(n.total_mem_gb||0))
       +'<div class="util">'+util+verCell+'</div></div>';
   }).join('');

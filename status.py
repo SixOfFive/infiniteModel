@@ -392,6 +392,36 @@ def build_status() -> dict:
                 for _k in _RUNTIME_KEYS:
                     if _k in _ld and _e.get(_k) is None:
                         _e[_k] = _ld[_k]
+    # #unified-fleet: fold in what our PEER controllers hold, so either controller renders the whole
+    # fleet. Peer rows are stamped federated/owner and are strictly additive — a model or node we
+    # drive ourselves is never replaced by a peer's view of it (peers.federated_* dedupe against us).
+    # Both lists are also published raw so non-dashboard consumers can tell the two apart.
+    _peer_nodes, _peer_models = [], []
+    try:
+        import peers as _peers
+        _peer_nodes = _peers.federated_nodes()
+        _peer_models = _peers.federated_models()
+    except Exception as _exc:   # noqa: BLE001 — federation is additive; /status must never 500 on it
+        print(f"[status] peer view unavailable ({_exc!r})", flush=True)
+    for _pm in _peer_models:
+        _nm = _pm.get("display_name") or _pm.get("friendly") or ""
+        # A peer's resident model presents as a LOADED card (it IS loaded — on the other controller's
+        # nodes) with ready=False: its weights are not on OUR disk, so our Load button would have to
+        # download them. Requests still work today via Phase 3 request federation.
+        _card = {"name": _nm, "internal_name": _pm.get("friendly") or _nm,
+                 "target": _pm.get("target") or "", "draft": "", "ready": False,
+                 "status": "peer", "loaded": True, "federated": True,
+                 "owner": _pm.get("owner"), "owner_url": _pm.get("owner_url"),
+                 "aliases": _pm.get("aliases") or [], "capabilities": []}
+        for _k in ("quant", "kv_quant", "ctx", "size_gb", "active", "queued", "num_layers",
+                   "params", "arch", "is_moe", "is_embedding", "is_tts", "is_t2a",
+                   "vram_used_gb", "tok_s", "ema_tok_s", "last_tok_s", "max_tok_s",
+                   "loaded_at_ts", "last_used_ts"):
+            if _pm.get(_k) is not None:
+                _card[_k] = _pm[_k]
+        if _pm.get("stages"):
+            _card["stages"] = [{"hostname": h} for h in _pm["stages"]]
+        model_cards.append(_card)
     return {
         "controller": {
             "hostname": platform.node(), "os": f"{platform.system()} {platform.release()}",
@@ -464,6 +494,12 @@ def build_status() -> dict:
         "clients": clients,      # #connections: per-client accounting + activity (dashboard panel)
         "models": model_cards,   # registry cards enriched with resident runtime (#model-detail)
         "nodes": [n.to_dict() for n in nodes],
+        # #unified-fleet: our PEERS' nodes/models, stamped with their owner. Kept in separate keys
+        # (not merged into "nodes") because everything downstream of "nodes" — the planner, the pool
+        # arithmetic, per-node actions — means "nodes THIS controller drives", and quietly widening
+        # that would let a peer's hardware into our capacity maths. The dashboard concatenates.
+        "peer_nodes": _peer_nodes,
+        "peer_models": _peer_models,
         "activity": list(ACTIVITY),   # newest-first controller activity (dashboard panel)
         "unloads": list(UNLOADS),     # newest-first "why a model left" events (dashboard panel)
         "errors": list(ERRORS),       # #error-log: newest-first HTTP 4xx/5xx responses (Logs UI)

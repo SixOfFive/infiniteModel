@@ -43,7 +43,7 @@ import urllib.request
 import state
 import wire
 
-PEER_POLL_S = 30.0          # how often we re-poll each peer's /peer_info
+PEER_POLL_S = 10.0          # how often we re-poll each peer's /peer_info
 PEER_ANNOUNCE_S = 60.0      # how often we re-broadcast our presence
 PEER_STALE_S = 180.0        # no successful contact for this long -> mark stale
 PEER_DROP_S = 900.0         # ... and this long -> forget entirely (a decommissioned controller)
@@ -163,43 +163,192 @@ def peers_public() -> list:
     return out
 
 
+# --- #unified-fleet: ONE fleet seen from either controller ------------------------------------------
+# Phases 1-5 made a peer's inventory *reachable* (borrow a model, keep off its nodes). This makes it
+# *visible in the ordinary UI*: every controller renders the whole fleet — its own nodes and models
+# plus its peers' — and can drive a load/unload anywhere by proxying to the owner. The physical
+# invariant is unchanged and non-negotiable: ONE controller drives any given shard (a shard has one
+# KV cache and per-controller req_id/slot counters would interleave). So "shared" means one physical
+# copy with two front doors, never two drivers.
+
+
+def healthy_peers() -> list:
+    return [p for p in PEERS.values() if peer_state(p) == "ok"]
+
+
+def peer_label(p: dict) -> str:
+    return str(p.get("name") or (p.get("info") or {}).get("name") or p.get("host") or "peer")
+
+
+def _stamp(row: dict, p: dict) -> dict:
+    """Mark a row as belonging to a peer, so the UI can never confuse it with something we drive."""
+    return {**row, "federated": True, "owner": peer_label(p),
+            "owner_key": peer_key(p["host"], p["http_port"]), "owner_url": peer_base(p)}
+
+
+def federated_nodes() -> list:
+    """Every node our healthy peers own, stamped with the owner. Deduped against OUR OWN nodes:
+    a node can only be driven by one controller, so if it is in our registry it is ours to show."""
+    mine = set()
+    registry = getattr(state, "registry", None)
+    try:
+        for n in (registry.alive_sorted() if registry else []):
+            mine.add(getattr(n, "hostname", ""))
+    except Exception:   # noqa: BLE001
+        pass
+    out, seen = [], set()
+    for p in healthy_peers():
+        for n in ((p.get("info") or {}).get("nodes") or []):
+            h = str(n.get("hostname") or "")
+            if not h or h in mine or h in seen:
+                continue
+            seen.add(h)
+            out.append(_stamp(n, p))
+    return out
+
+
+def federated_models() -> list:
+    """Every model our healthy peers have RESIDENT, stamped with the owner.
+
+    Excludes anything we hold ourselves (ours is the copy we can actually drive) so the caller can
+    concatenate without producing two rows for one model."""
+    engine = getattr(state, "engine", None)
+    mine = set()
+    try:
+        for fr, m in list((getattr(engine, "models", None) or {}).items()):
+            mine.add(str(fr).strip().lower())
+            for a in _model_aliases({"friendly": fr, "target": getattr(m, "target_id", "")}):
+                mine.add(a)
+    except Exception:   # noqa: BLE001
+        pass
+    out, seen = [], set()
+    for p in healthy_peers():
+        for m in ((p.get("info") or {}).get("models") or []):
+            names = _model_aliases(m)
+            if not names or (names & mine) or (names & seen):
+                continue
+            seen |= names
+            out.append(_stamp(m, p))
+    return out
+
+
+def find_peer(sel: str) -> dict | None:
+    """Resolve a peer by "host:port", bare host, or advertised name. None if we don't know it."""
+    s = str(sel or "").strip()
+    if not s:
+        return None
+    if s in PEERS:
+        return PEERS[s]
+    for p in PEERS.values():
+        if s == p.get("host") or s.lower() == peer_label(p).lower():
+            return p
+    return None
+
+
+def peer_for_model(name: str) -> dict | None:
+    """The healthy peer that has `name` resident (federated load/unload target)."""
+    return find_model_peer(name)[0]
+
+
+def http_post_json(url: str, timeout: float = 120.0) -> dict:
+    """POST with no body — the shape every controller op route takes (params in the query string)."""
+    req = urllib.request.Request(url, data=b"", method="POST",
+                                 headers={"User-Agent": "infinitemodel-peer/1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:          # a 4xx/5xx still carries the peer's JSON error
+        try:
+            return json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:                        # noqa: BLE001
+            return {"ok": False, "error": f"peer HTTP {e.code}"}
+
+
+async def kick(p: dict) -> None:
+    """Re-poll one peer NOW. Called right after we change something on it, so our view reflects the
+    change immediately instead of up to PEER_POLL_S later — that lag is what makes two controllers
+    feel out of sync even when they agree."""
+    try:
+        await poll_peer(p)
+    except Exception:   # noqa: BLE001
+        pass
+
+
 # --- what we serve to peers ----------------------------------------------------------------------
+
+def _model_runtime(friendly: str, m) -> dict:
+    """One resident model as a peer needs to SEE it — #unified-fleet.
+
+    Phase 1-5 sent 7 fields (just enough to decide "can I borrow this?"). A peer that must RENDER
+    the model in its own Models list needs what the local card carries: quant/ctx/footprint/speed/
+    placement. Everything here is already public at /status; nothing new is exposed."""
+    g = lambda a, d=None: getattr(m, a, d)
+    out = {
+        "friendly": friendly,
+        "display_name": str(g("display_name", "") or friendly),
+        "target": g("target_id", "") or g("target", ""),
+        "aliases": list(g("aliases", None) or []),
+        "quant": g("quant", "") or "none",
+        "kv_quant": g("kv_quant", "") or "none",
+        "ctx": int(g("ctx", 0) or 0),
+        "size_gb": round(float(g("size_gb", 0) or 0), 2),
+        "active": int(g("active", 0) or 0),
+        "queued": int(g("queued", 0) or 0),
+        "stages": model_hosts(m) or None,
+    }
+    # Runtime numbers are best-effort: a model mid-load may not have them yet, and a missing
+    # speed reading must never cost us the whole gossip payload.
+    for src, dst, cast in (("num_layers", "num_layers", int), ("params", "params", str),
+                           ("arch", "arch", str), ("is_moe", "is_moe", bool),
+                           ("is_embedding", "is_embedding", bool),
+                           ("is_tts", "is_tts", bool), ("is_t2a", "is_t2a", bool),
+                           ("loaded_at_ts", "loaded_at_ts", float),
+                           ("last_used", "last_used_ts", float)):
+        try:
+            v = g(src, None)
+            if v is not None:
+                out[dst] = cast(v)
+        except (TypeError, ValueError):
+            pass
+    try:                       # measured footprint + decode speed, same basis as our own card
+        out["vram_used_gb"] = round(sum(float(getattr(s, "gpu_bytes", 0) or 0)
+                                        for s in (getattr(g("plan"), "stages", None) or [])) / 1e9, 2)
+    except Exception:          # noqa: BLE001
+        pass
+    for a in ("tok_s", "ema_tok_s", "last_tok_s", "max_tok_s"):
+        try:
+            out[a] = round(float(g(a, 0) or 0), 2)
+        except (TypeError, ValueError):
+            pass
+    return out
+
 
 def self_info() -> dict:
     """Payload for GET /peer_info — our identity, our nodes and our resident models.
 
     Deliberately derived from live engine/registry state at call time (never cached) and stripped to
     what a peer needs: enough to display us, decide whether to borrow a model, and later negotiate
-    node ownership. No secrets, no request contents."""
+    node ownership. No secrets, no request contents.
+
+    #unified-fleet: nodes are sent as the FULL Node.to_dict() — the same rows /status publishes —
+    so a peer can render our fleet in its own Nodes grid instead of a 7-field stub. These are
+    hardware/telemetry facts (memory, utilisation, versions) that /status already serves openly."""
     ident = my_identity()
     models, nodes = [], []
     engine = getattr(state, "engine", None)
     registry = getattr(state, "registry", None)
     try:
         for friendly, m in list(getattr(engine, "models", {}).items()):
-            models.append({
-                "friendly": friendly,
-                "target": getattr(m, "target_id", "") or getattr(m, "target", ""),
-                "quant": getattr(m, "quant", "") or "none",
-                "ctx": int(getattr(m, "ctx", 0) or 0),
-                "size_gb": round(float(getattr(m, "size_gb", 0) or 0), 2),
-                "active": int(getattr(m, "active", 0) or 0),
-                "stages": model_hosts(m) or None,
-            })
+            models.append(_model_runtime(friendly, m))
     except Exception as exc:   # noqa: BLE001 — /peer_info must never 500 a peer's gossip round
         models = []
         print(f"[peers] self_info models unavailable ({exc!r})", flush=True)
     try:
         for n in (registry.alive_sorted() if registry else []):
-            nodes.append({
-                "hostname": getattr(n, "hostname", ""),
-                "device": getattr(n, "device_name", "") or getattr(n, "device", ""),
-                "vram_total_gb": round(float(getattr(n, "vram_total_gb", 0) or 0), 2),
-                "vram_used_gb": round(float(getattr(n, "vram_used_gb", 0) or 0), 2),
-                "free_mem_gb": round(float(getattr(n, "free_mem_gb", 0) or 0), 2),
-                "ram_enabled": bool(getattr(n, "ram_enabled", True)),
-                "vram_enabled": bool(getattr(n, "vram_enabled", True)),
-            })
+            try:
+                nodes.append(n.to_dict())
+            except Exception:   # noqa: BLE001 — one bad node must not blank the whole fleet
+                nodes.append({"hostname": getattr(n, "hostname", "")})
     except Exception as exc:   # noqa: BLE001
         nodes = []
         print(f"[peers] self_info nodes unavailable ({exc!r})", flush=True)

@@ -8,6 +8,57 @@ Inc 6). Controller-only leaf; in EXTRA_UPDATE_FILES.
 """
 from __future__ import annotations
 
+# stdlib, imported HERE rather than relied on from the injected server namespace: server.py's
+# `import urllib.request` sits inside a function, so `urllib` is not one of its module globals.
+import urllib.parse   # noqa: E402
+
+
+# --- #unified-fleet: drive a load/unload on a PEER controller ---------------------------------------
+# A controller can only place work on nodes it owns (ownership is exclusive — see peers.py Phase 5),
+# so on a controller with no nodes of its own the Load button used to be dead. Federating the
+# OPERATION fixes that without breaking exclusivity: the owning controller performs the real load on
+# its own nodes, and we then see the result through gossip and serve requests against it via Phase 3
+# request federation. One physical copy, two front doors — never two drivers.
+
+def _peers_mod():
+    """peers.py, or None. Imported lazily and failing OPEN: a controller running without the
+    federation leaf must behave exactly as it did before."""
+    try:
+        import peers
+        return peers
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _local_capacity() -> bool:
+    """True if we own at least one alive node that could actually take a shard."""
+    try:
+        return any(getattr(n, "can_infer", True) for n in registry.alive_sorted())
+    except Exception:   # noqa: BLE001
+        return False
+
+
+def _fed_target(peers, model: str, owner: str):
+    """(peer, reason) for the controller that should perform this op — (None, why-not) otherwise."""
+    if owner:
+        p = peers.find_peer(owner)
+        if p is None:
+            return (None, f"unknown controller '{owner}'")
+        if peers.peer_state(p) != "ok":
+            return (None, f"controller '{owner}' is {peers.peer_state(p)}")
+        return (p, "requested")
+    if _local_capacity():
+        return (None, "")          # we have nodes — this is our load to do
+    live = peers.healthy_peers()
+    if not live:
+        return (None, "")          # nothing to hand to; let the local path produce its own error
+    # Prefer a peer that already HAS the weights (no download), then the one with the most nodes.
+    p, _m = peers.find_model_peer(model)
+    if p is not None:
+        return (p, "already resident there")
+    best = max(live, key=lambda q: len(((q.get("info") or {}).get("nodes") or [])))
+    return (best, "we own no nodes; it does")
+
 
 def register(app):
 
@@ -21,8 +72,32 @@ def register(app):
                    temperature: str = "",
                    min_p: str = "", precompile: bool = True,
                    draft_gpu: bool = False, draft_margin_gb: str = "",
-                   t2i_offload: bool = False) -> JSONResponse:
+                   t2i_offload: bool = False, owner: str = "") -> JSONResponse:
         _req_ip = _client_ip(request)   # #connections: attribute this load to its requester
+        # #unified-fleet: hand the load to a peer controller when it — not us — owns the hardware.
+        # `owner=<name|host>` forces a specific controller; with no owner this fires ONLY when we
+        # own no usable nodes at all, so a controller with its own fleet is completely unaffected.
+        _pm = _peers_mod()
+        if _pm is not None and _pm.PEERS:
+            _peer, _why = _fed_target(_pm, model, owner)
+            if _peer is None and owner:
+                return JSONResponse({"ok": False, "error": _why}, status_code=404)
+            if _peer is not None:
+                _q = "&".join(kv for kv in str(request.url.query or "").split("&")
+                              if kv and not kv.startswith("owner="))
+                _lbl = _pm.peer_label(_peer)
+                log_activity(f"load {model}: federating to {_lbl} ({_why})")
+                try:
+                    _r = await asyncio.to_thread(
+                        _pm.http_post_json, f"{_pm.peer_base(_peer)}/load?{_q}", 900.0)
+                except Exception as _exc:      # noqa: BLE001 — peer unreachable: say so plainly
+                    log_activity(f"load {model}: {_lbl} unreachable — {_exc}")
+                    return JSONResponse({"ok": False, "federated_to": _lbl,
+                                         "error": f"peer controller {_lbl} unreachable: {_exc}"},
+                                        status_code=502)
+                await _pm.kick(_peer)          # reflect the new model in our view immediately
+                return JSONResponse({**_r, "federated_to": _lbl, "federated_reason": _why},
+                                    status_code=(200 if _r.get("ok") else 400))
         # force=1 (#stuck-load-override): if a load of this model is already IN FLIGHT, CANCEL it and
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
         # it. Also reloads an already-resident copy (skips the idempotent no-op). Without force, a
@@ -350,9 +425,35 @@ def register(app):
         return JSONResponse({"ok": True, "cancelled": cancelled})
 
     @app.post("/unload")
-    async def unload(model: str = "") -> JSONResponse:
+    async def unload(model: str = "", owner: str = "") -> JSONResponse:
         # No model -> unload everything; model=X -> evict just that one (keep the rest).
+        # #unified-fleet: a model WE don't hold but a peer does is unloaded ON that peer, so the
+        # Unload button works on every row the dashboard shows. Deliberately per-model only —
+        # blanket "unload everything" stays scoped to this controller's own models (reaching across
+        # and tearing down a peer's whole fleet from our Unload-all is never what was meant).
         if model:
+            _pm = _peers_mod()
+            _resolves_here = False
+            try:
+                _resolves_here = resolve_model_name(model) in engine.models
+            except Exception:   # noqa: BLE001 — unknown name here; a peer may still know it
+                pass
+            if _pm is not None and not _resolves_here:
+                _peer = _pm.find_peer(owner) if owner else _pm.peer_for_model(model)
+                if _peer is not None:
+                    _lbl = _pm.peer_label(_peer)
+                    log_activity(f"unload {model}: federating to {_lbl}")
+                    try:
+                        _r = await asyncio.to_thread(
+                            _pm.http_post_json,
+                            f"{_pm.peer_base(_peer)}/unload?model={urllib.parse.quote(model)}", 120.0)
+                    except Exception as _exc:   # noqa: BLE001
+                        return JSONResponse({"ok": False, "federated_to": _lbl,
+                                             "error": f"peer controller {_lbl} unreachable: {_exc}"},
+                                            status_code=502)
+                    await _pm.kick(_peer)
+                    return JSONResponse({**_r, "federated_to": _lbl},
+                                        status_code=(200 if _r.get("ok") else 400))
             try:
                 friendly = resolve_model_name(model)
             except ValueError as exc:
