@@ -20,6 +20,19 @@ CACHE_CTRL_RESERVE_FLOOR_GB = 6.0    # never reserve less than this on a cache-s
 CACHE_CTRL_RESERVE_READ_FRAC = 0.10  # + scale: 10% of the cache read volume past the floor
 
 
+def _peer_claimed_host(hostname: str) -> bool:
+    """#federation Phase 5: is a PEER controller already using this node?
+
+    Imported lazily and failure-tolerant on purpose: peers.py is a newer leaf, so a controller
+    mid per-file self-update (this engine_load.py newer than peers.py) must still plan normally.
+    ANY problem answers False = "not claimed" = behave exactly as before federation existed."""
+    try:
+        import peers
+        return peers.is_peer_claimed(hostname)
+    except Exception:      # noqa: BLE001 — never let federation break placement
+        return False
+
+
 class EngineLoadMixin:
 
     def _fit_ctx(self, spec, mems, ctx: int, consolidate: bool, prefer_vram: bool,
@@ -766,6 +779,14 @@ class EngineLoadMixin:
                         continue
                     if exclude_nodes and n.node_id in exclude_nodes:
                         continue   # a sibling replica already owns this node (disjoint placement)
+                    # #federation Phase 5: a PEER controller is already using this node. Two
+                    # controllers planning against the same node's memory is the double-booking that
+                    # OOMs it — each is blind to the other's reserved-but-unfaulted KV and in-flight
+                    # reservations. Ownership is therefore EXCLUSIVE: skip a node a healthy peer
+                    # claims, unless we hold a shard on it ourselves (then it is ours and the peer's
+                    # claim is stale). Off via /config?respect_peer_claims=0.
+                    if _peer_claimed_host(n.hostname):
+                        continue
                     if pin_host and n.hostname != pin_host:
                         continue   # #pin-device: user pinned this load to one node (dashboard placement)
                     # cpu_only: plan against RAM ONLY (VRAM=0) so the model never lands in

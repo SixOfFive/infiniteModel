@@ -204,7 +204,7 @@ def self_info() -> dict:
         nodes = []
         print(f"[peers] self_info nodes unavailable ({exc!r})", flush=True)
     return {"im": "infinitemodel-peer", "v": 1, **ident,
-            "models": models, "nodes": nodes, "t": time.time()}
+            "models": models, "nodes": nodes, "claims": my_claims(), "t": time.time()}
 
 
 # --- gossip --------------------------------------------------------------------------------------
@@ -337,6 +337,60 @@ def _announce_once(timeout: float = 2.0) -> int:
     finally:
         s.close()
     return seen
+
+
+# --- #federation Phase 5: exclusive node ownership -------------------------------------------------
+# Two controllers planning against ONE node's memory is the double-booking that OOMs it: each is
+# blind to the other's reserved-but-unfaulted KV and to its in-flight reservations, so both read the
+# same "free" bytes and both commit. Rather than teach two planners to share (which needs
+# worker-owned admission control — Phase 6), ownership is made EXCLUSIVE: a node in use by one
+# controller is simply invisible to the others. Lending is then just "stop using it here".
+
+
+def respect_peer_claims() -> bool:
+    cfg = getattr(state, "ENGINE_CONFIG", None) or {}
+    return bool(cfg.get("respect_peer_claims", True))
+
+
+def my_claims() -> list:
+    """Hostnames WE currently hold a shard on — advertised so peers keep off them."""
+    engine = getattr(state, "engine", None)
+    out = set()
+    try:
+        for m in list(getattr(engine, "models", {}).values()):
+            for n in getattr(m, "stage_nodes", []) or []:
+                h = getattr(n, "hostname", "")
+                if h:
+                    out.add(h)
+    except Exception:   # noqa: BLE001 — claims are advisory; never break a load computing them
+        pass
+    return sorted(out)
+
+
+def peer_claimed_hosts() -> dict:
+    """hostname -> peer name, for every node a HEALTHY peer says it is using.
+
+    Only "ok" peers count: a stale peer's claim is a guess, and honouring a guess would strand
+    capacity we could legitimately use."""
+    out = {}
+    if not respect_peer_claims():
+        return out
+    for p in PEERS.values():
+        if peer_state(p) != "ok":
+            continue
+        for h in ((p.get("info") or {}).get("claims") or []):
+            out.setdefault(str(h), p.get("name") or p.get("host") or "peer")
+    return out
+
+
+def is_peer_claimed(hostname: str) -> bool:
+    """True if a healthy peer is using `hostname` AND we are not. Ours always wins: if we hold a
+    shard there the peer's claim is stale, and stranding our own resident model would be worse."""
+    if not hostname:
+        return False
+    if hostname in set(my_claims()):
+        return False
+    return hostname in peer_claimed_hosts()
 
 
 # --- #federation Phase 4: pull a model's weights FROM a peer ---------------------------------------

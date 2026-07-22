@@ -1671,6 +1671,14 @@ CONTROLLERS_HTML = r"""<!doctype html>
   </div>
 </div>
 
+<div class="card">
+  <h2>Node ownership</h2>
+  <div class="sub">A node is used by <b>one</b> controller at a time — two controllers planning
+    against the same node's memory would double-book it and OOM the box. Lending a node just stops
+    using it here, which makes it available to whichever controller wants it.</div>
+  <div id="nodes"><div class="note">loading…</div></div>
+</div>
+
 <div class="card" id="pullcard" style="display:none">
   <h2>Model transfers</h2>
   <div class="sub">Copying weights from a peer controller — no HuggingFace round trip. Interrupted
@@ -1802,9 +1810,56 @@ async function pulls(){
   }catch(e){ /* transfers panel is best-effort */ }
 }
 
-refresh(false); pulls();
+function nodeRow(n){
+  let owner, act;
+  if(n.peer && !n.mine){
+    owner = '<span style="color:var(--warn)">in use by '+esc(n.peer)+'</span>';
+    act   = '<span class="note">not plannable here</span>';
+  }else if(n.mine){
+    owner = '<span style="color:var(--good)">in use by this controller</span>';
+    act   = '<button class="btn sm" onclick="lend('+JSON.stringify(n.hostname)+')">Lend</button>';
+  }else if(n.lent){
+    owner = '<span class="note">lent (disabled here)</span>';
+    act   = '<button class="btn sm" onclick="reclaim('+JSON.stringify(n.hostname)+')">Reclaim</button>';
+  }else{
+    owner = '<span class="note">free</span>';
+    act   = '<button class="btn sm" onclick="lend('+JSON.stringify(n.hostname)+')">Lend</button>';
+  }
+  return '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
+    +'<td class="num">'+gb(n.vram_total_gb)+'</td><td>'+owner+'</td>'
+    +'<td class="mono">'+(n.vram_enabled?'gpu':'')+(n.vram_enabled&&n.ram_enabled?'+':'')
+    +(n.ram_enabled?'cpu':'')+((!n.vram_enabled&&!n.ram_enabled)?'off':'')+'</td>'
+    +'<td>'+act+'</td></tr>';
+}
+
+async function nodes(){
+  try{
+    const r = await fetch('/peer_nodes'); const j = await r.json();
+    const rows = (j.nodes||[]).map(nodeRow).join('');
+    document.getElementById('nodes').innerHTML =
+      '<div class="scroll"><table><thead><tr><th>Node</th><th>Device</th><th>VRAM</th>'
+      +'<th>Owner</th><th>Tiers</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+      +(j.respect_peer_claims?'':'<div class="note" style="margin-top:8px">⚠ respect_peer_claims is OFF '
+        +'— this controller will plan onto peer-claimed nodes.</div>');
+  }catch(e){
+    document.getElementById('nodes').innerHTML='<div class="err">failed: '+esc(e.message||e)+'</div>';
+  }
+}
+
+async function lend(node){
+  if(!confirm('Stop using "'+node+'" on this controller so another can take it?\n\nModels with a shard there will be re-placed.')) return;
+  await fetch('/peer_lend?node='+encodeURIComponent(node), {method:'POST'});
+  nodes();
+}
+async function reclaim(node){
+  await fetch('/peer_reclaim?node='+encodeURIComponent(node), {method:'POST'});
+  nodes();
+}
+
+refresh(false); pulls(); nodes();
 setInterval(()=>refresh(false), 5000);
 setInterval(pulls, 2000);
+setInterval(nodes, 5000);
 </script>
 </body></html>
 """

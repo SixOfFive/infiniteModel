@@ -231,6 +231,63 @@ def register(app):
         return JSONResponse({"ok": True, "started": True, "target": target,
                              "peer": f"{host}:{p}", "dest": dest})
 
+    # --- #federation Phase 5: exclusive node ownership / lending ---------------------------------
+
+    @app.get("/peer_nodes")
+    async def peer_nodes() -> JSONResponse:
+        """Who owns what, across every controller we know about.
+
+        For each node WE can see: whether we are using it, whether a peer claims it, and whether it
+        is currently enabled here. This is the view the Controllers page renders to make lending a
+        one-click decision instead of guesswork."""
+        claimed = peers.peer_claimed_hosts()
+        mine = set(peers.my_claims())
+        rows = []
+        for n in registry.alive_sorted():
+            h = n.hostname
+            rows.append({
+                "hostname": h,
+                "device": getattr(n, "device_name", "") or getattr(n, "device", ""),
+                "vram_total_gb": round(float(getattr(n, "vram_total_gb", 0) or 0), 2),
+                "ram_enabled": bool(getattr(n, "ram_enabled", True)),
+                "vram_enabled": bool(getattr(n, "vram_enabled", True)),
+                "mine": h in mine,
+                "peer": claimed.get(h, ""),
+                "lent": (not getattr(n, "ram_enabled", True)
+                         and not getattr(n, "vram_enabled", True)),
+            })
+        return JSONResponse({"ok": True, "respect_peer_claims": peers.respect_peer_claims(),
+                             "my_claims": sorted(mine), "peer_claims": claimed, "nodes": rows})
+
+    @app.post("/peer_lend")
+    async def peer_lend(node: str) -> JSONResponse:
+        """Stop using a node here so another controller can take it.
+
+        Lending is deliberately just "disable both tiers locally" — it reuses the existing
+        /nodeconfig machinery, needs no agreement protocol, and cannot double-book: a node disabled
+        here is invisible to OUR planner, and the peer's planner only ever saw its own view anyway.
+        Resident models on that node are re-planned by the same tier-change path /nodeconfig uses."""
+        cfg = NODE_CONFIG.setdefault(node, {"ram": True, "vram": True})
+        cfg["ram"] = False
+        cfg["vram"] = False
+        save_node_config()
+        host_nids = {nid for nid, n in registry._nodes.items() if n.hostname == node}
+        for fr in [fr for fr, m in engine.models.items()
+                   if any(nid in m.stage_node_ids for nid in host_nids)]:
+            engine.invalidate_model(fr, f"lent {node} to a peer controller")
+        log_activity(f"federation: lent node {node} to a peer (both tiers disabled here)")
+        return JSONResponse({"ok": True, "node": node, "config": cfg})
+
+    @app.post("/peer_reclaim")
+    async def peer_reclaim(node: str) -> JSONResponse:
+        """Take a lent node back: re-enable both tiers here."""
+        cfg = NODE_CONFIG.setdefault(node, {"ram": True, "vram": True})
+        cfg["ram"] = True
+        cfg["vram"] = True
+        save_node_config()
+        log_activity(f"federation: reclaimed node {node} (both tiers re-enabled here)")
+        return JSONResponse({"ok": True, "node": node, "config": cfg})
+
     @app.get("/peer_pull_status")
     async def peer_pull_status() -> JSONResponse:
         return JSONResponse({"ok": True, "pulls": peers.pulls_public()})
