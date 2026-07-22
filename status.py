@@ -396,11 +396,12 @@ def build_status() -> dict:
     # fleet. Peer rows are stamped federated/owner and are strictly additive — a model or node we
     # drive ourselves is never replaced by a peer's view of it (peers.federated_* dedupe against us).
     # Both lists are also published raw so non-dashboard consumers can tell the two apart.
-    _peer_nodes, _peer_models = [], []
+    _peer_nodes, _peer_models, _peer_tot = [], [], {}
     try:
         import peers as _peers
         _peer_nodes = _peers.federated_nodes()
         _peer_models = _peers.federated_models()
+        _peer_tot = _peers.federated_totals()
     except Exception as _exc:   # noqa: BLE001 — federation is additive; /status must never 500 on it
         print(f"[status] peer view unavailable ({_exc!r})", flush=True)
     for _pm in _peer_models:
@@ -507,6 +508,27 @@ def build_status() -> dict:
         # that would let a peer's hardware into our capacity maths. The dashboard concatenates.
         "peer_nodes": _peer_nodes,
         "peer_models": _peer_models,
+        # WHOLE-FLEET rollup for the dashboard's summary tiles: ours + every healthy peer's. On a
+        # controller that owns no hardware, "pool" and "compute" are legitimately all zeros — they
+        # describe what THIS controller drives — so the tiles read 0 nodes / 0 GB / 0 tok/s while
+        # the page below them showed the whole fleet. This is the number a person means by "the
+        # fleet"; `via_peers` keeps it attributable rather than one blended figure. Consumers that
+        # want strictly-ours keep reading pool/compute/metrics, which are unchanged.
+        "fleet": {
+            "nodes": len(nodes) + int(_peer_tot.get("nodes") or 0),
+            "gpus": len(gpu_nodes) + int(_peer_tot.get("gpus") or 0),
+            "ram_total_gb": round(pool_ram_total + float(_peer_tot.get("ram_total_gb") or 0), 2),
+            "ram_free_gb": round(pool_ram_free + float(_peer_tot.get("ram_free_gb") or 0), 2),
+            "vram_total_gb": round(pool_vram_total + float(_peer_tot.get("vram_total_gb") or 0), 2),
+            "vram_free_gb": round(pool_vram_free + float(_peer_tot.get("vram_free_gb") or 0), 2),
+            "tokens_per_s": round(float(metrics.get("tokens_per_s") or 0)
+                                  + float(_peer_tot.get("tokens_per_s") or 0), 2),
+            "units_busy": round(units_busy + float(_peer_tot.get("units_busy") or 0), 2),
+            "units_total": int(units_total) + int(_peer_tot.get("units_total") or 0),
+            "via_peers": {"nodes": int(_peer_tot.get("nodes") or 0),
+                          "gpus": int(_peer_tot.get("gpus") or 0),
+                          "controllers": _peer_tot.get("controllers") or []},
+        },
         "activity": list(ACTIVITY),   # newest-first controller activity (dashboard panel)
         "unloads": list(UNLOADS),     # newest-first "why a model left" events (dashboard panel)
         "errors": list(ERRORS),       # #error-log: newest-first HTTP 4xx/5xx responses (Logs UI)

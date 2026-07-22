@@ -319,21 +319,31 @@ function render(){
   if(!(window._toastUntil>Date.now())) $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');  // don't clobber an active toast
   // fleet tiles
   const loaded=(d.models||[]).filter(m=>m.loaded).length, reg=(d.models||[]).length;
+  // #unified-fleet: the tiles describe THE FLEET, not just the slice this controller drives.
+  // d.pool/d.compute are deliberately own-hardware-only, so on a controller that owns nothing they
+  // are all zeros — the tiles read "0 nodes / 0 GB / 0 tok/s" above a page listing the whole fleet.
+  // d.fleet is ours + every healthy peer's; fall back to the local blocks on an older controller.
+  const F=d.fleet||null, vp=(F&&F.via_peers)||{};
+  const pool=F?F:p, cmp2=F?F:comp;
   // pool bars: PHYSICAL used (total - free) against PHYSICAL total, one base (#pool-base).
-  const vT=p.vram_total_gb||0, rT=p.ram_total_gb||0;
-  const vU=Math.max(0,vT-(p.vram_free_gb||0)), rU=Math.max(0,rT-(p.ram_free_gb||0));
+  const vT=pool.vram_total_gb||0, rT=pool.ram_total_gb||0;
+  const vU=Math.max(0,vT-(pool.vram_free_gb||0)), rU=Math.max(0,rT-(pool.ram_free_gb||0));
   // #pool-split: GREEN = what InfiniteModel itself uses (sum of loaded models' MEASURED VRAM/RAM),
   // BLUE = the rest of the physical usage = OTHER processes on the nodes. So any blue beyond the
   // green tells you something else is holding pool memory. Clamp iM's share to physical-used.
   const _lm=(d.models||[]).filter(m=>m.loaded);
   const vProg=Math.min(vU,_lm.reduce((s,m)=>s+(m.vram_used_gb||0),0));
   const rProg=Math.min(rU,_lm.reduce((s,m)=>s+(m.ram_used_gb||0),0));
+  const _viaN=vp.nodes||0;
+  const _busyPct=(cmp2.units_total>0)?(100*(cmp2.units_busy||0)/cmp2.units_total):(comp.overall_pct||0);
   $('#fleet').innerHTML=[
-    tile('Nodes', (p.nodes||0)+' <small>· '+(comp.gpus||0)+' GPU</small>'),
+    tile('Nodes', (pool.nodes||0)+' <small>· '+(cmp2.gpus||0)+' GPU'
+         +(_viaN?(' · '+_viaN+' via '+((vp.controllers||[]).join(', ')||'peers')):'')+'</small>'),
     tile('Loaded', loaded+' <small>/ '+reg+' registered</small>'),
     tile('GPU pool', fmt(vU)+'<small> / '+fmt(vT)+' GB</small>', poolbar(vProg,vU-vProg,vT,'InfiniteModel '+fmt(vProg)+' GB (green) · other processes '+fmt(vU-vProg)+' GB (blue) · '+fmt(vT-vU)+' GB free')),
     tile('RAM pool', fmt(rU)+'<small> / '+fmt(rT)+' GB</small>', poolbar(rProg,rU-rProg,rT,'InfiniteModel '+fmt(rProg)+' GB (green) · other processes '+fmt(rU-rProg)+' GB (blue) · '+fmt(rT-rU)+' GB free')),
-    tile('Throughput', ((d.metrics||{}).tokens_per_s||0).toFixed(1)+' <small>tok/s · '+Math.round(comp.overall_pct||0)+'% busy</small>'),
+    tile('Throughput', (F?(F.tokens_per_s||0):((d.metrics||{}).tokens_per_s||0)).toFixed(1)
+         +' <small>tok/s · '+Math.round(_busyPct)+'% busy</small>'),
   ].join('');
   renderModels(d,cl);
   renderNodes(d);

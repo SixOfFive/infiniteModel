@@ -270,6 +270,52 @@ def federated_models() -> list:
     return out
 
 
+def federated_totals() -> dict:
+    """The capacity + throughput our PEERS contribute, for the dashboard's fleet tiles.
+
+    Capacity is recomputed from the DEDUPED peer node rows (federated_nodes) using the same
+    arithmetic build_status applies to our own nodes — deliberately NOT summed from the peers'
+    `pool` blocks, which would double-count the instant two controllers disagree about who owns a
+    node. Throughput/busy DO come from each peer's own aggregate: a controller reports only traffic
+    it served, so those cannot double-count.
+
+    Everything is the peers' contribution ALONE; the caller adds ours. Keeping the two halves
+    separate is what lets the UI say "of which N via peers" instead of one unattributable number."""
+    nodes = federated_nodes()
+    t = {"controllers": [], "nodes": len(nodes), "gpus": 0,
+         "ram_total_gb": 0.0, "ram_free_gb": 0.0, "vram_total_gb": 0.0, "vram_free_gb": 0.0,
+         "tokens_per_s": 0.0, "units_busy": 0.0, "units_total": 0}
+    for n in nodes:
+        try:
+            if float(n.get("vram_total_gb") or 0) > 0:
+                t["gpus"] += 1
+            if n.get("ram_enabled", True):
+                t["ram_total_gb"] += float(n.get("total_mem_gb") or 0)
+                t["ram_free_gb"] += float(n.get("free_mem_gb") or 0)
+            if n.get("vram_enabled", True):
+                vt = float(n.get("vram_total_gb") or 0)
+                t["vram_total_gb"] += vt
+                t["vram_free_gb"] += max(0.0, vt - float(n.get("vram_used_gb") or 0))
+        except (TypeError, ValueError):
+            continue
+    for p in healthy_peers():
+        st = _rich(p)
+        if not st:
+            continue
+        t["controllers"].append(peer_label(p))
+        try:
+            t["tokens_per_s"] += float((st.get("metrics") or {}).get("tokens_per_s") or 0)
+            _c = st.get("compute") or {}
+            t["units_busy"] += float(_c.get("units_busy") or 0)
+            t["units_total"] += int(_c.get("units_total") or 0)
+        except (TypeError, ValueError):
+            pass
+    for k in ("ram_total_gb", "ram_free_gb", "vram_total_gb", "vram_free_gb", "tokens_per_s",
+              "units_busy"):
+        t[k] = round(t[k], 2)
+    return t
+
+
 def find_peer(sel: str) -> dict | None:
     """Resolve a peer by "host:port", bare host, or advertised name. None if we don't know it."""
     s = str(sel or "").strip()
