@@ -11,10 +11,96 @@ build_app() calls register(app) to attach them.
 """
 from __future__ import annotations
 
+import json as _json
+import urllib.error
+import urllib.request
+
 import peers
+
+# #federation Phase 3: POST endpoints whose body names a model. A request for a model WE do not have
+# resident, that a healthy peer DOES have resident, is proxied to that peer instead of cold-loading
+# a second copy of the same weights.
+FEDERATED_PATHS = frozenset({
+    "/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
+    "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/messages",
+})
+FEDERATE_TIMEOUT_S = 900.0
+
+
+def _local_has(name: str) -> bool:
+    """Is `name` resident HERE? Resolved through the engine's own name resolution so an alias or a
+    canonical target id is judged exactly the way the serving path would judge it."""
+    try:
+        fr = resolve_model_name(name)
+    except Exception:      # noqa: BLE001 — unknown name: not local, let federation try
+        return False
+    return fr in getattr(engine, "models", {})
+
+
+async def _proxy_to_peer(p: dict, path: str, body: bytes, ctype: str):
+    """Forward one request to a peer controller and stream its answer straight back.
+
+    Streams chunk-by-chunk so SSE / NDJSON token streams stay live rather than buffering to
+    completion. urllib (stdlib) in a worker thread — the controller takes no new dependency."""
+    url = peers.peer_base(p) + path
+
+    def _open():
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": ctype or "application/json",
+                     "Accept": "*/*", "X-InfiniteModel-Federated": "1"})
+        return urllib.request.urlopen(req, timeout=FEDERATE_TIMEOUT_S)
+
+    resp = await asyncio.to_thread(_open)
+
+    async def _gen():
+        try:
+            while True:
+                chunk = await asyncio.to_thread(resp.read, 8192)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            with contextlib.suppress(Exception):
+                resp.close()
+
+    return StreamingResponse(_gen(), status_code=getattr(resp, "status", 200),
+                             media_type=resp.headers.get("Content-Type", "application/json"))
 
 
 def register(app):
+
+    @app.middleware("http")
+    async def federate_middleware(request, call_next):
+        """Route a request for a model only a PEER has resident to that peer.
+
+        Guards, in order: federation enabled; a federated path; not already a federated hop (the
+        X-InfiniteModel-Federated header breaks any A->B->A loop); a model name in the body; NOT
+        resident locally; a healthy peer that has it. Anything unexpected falls through to normal
+        local handling — federation must never be able to break serving."""
+        if (request.method != "POST" or request.url.path not in FEDERATED_PATHS
+                or request.headers.get("X-InfiniteModel-Federated")
+                or not peers.federation_enabled() or not peers.PEERS):
+            return await call_next(request)
+        try:
+            body = await request.body()          # cached on the Request, so downstream re-reads work
+            name = (_json.loads(body or b"{}") or {}).get("model")
+        except Exception:                        # noqa: BLE001 — unparseable body: not ours to judge
+            return await call_next(request)
+        if not name or _local_has(name):
+            return await call_next(request)
+        p, m = peers.find_model_peer(name)
+        if not p:
+            return await call_next(request)
+        log_activity(f"{name}: not resident here — federating to {p.get('name') or p['host']} "
+                     f"({peers.peer_base(p)}), which has it loaded")
+        try:
+            return await _proxy_to_peer(p, request.url.path, body,
+                                        request.headers.get("Content-Type", "application/json"))
+        except Exception as exc:                 # noqa: BLE001 — peer died mid-flight: serve locally
+            p["error"] = f"federate: {type(exc).__name__}: {exc}"
+            log_activity(f"{name}: federation to {p['host']} failed ({exc!r}) — serving locally")
+            return await call_next(request)
 
     @app.get("/controllers", response_class=HTMLResponse)   # dashboard: Cross-controller page
     async def controllers_page() -> str:

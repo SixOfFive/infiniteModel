@@ -309,6 +309,7 @@ def register(app):
                          no_unload_off: Optional[str] = None,
                          juggler: Optional[bool] = None,
                          autostart_delay_s: Optional[float] = None,
+                         federate: Optional[bool] = None,
                          wedge_reload_n: Optional[int] = None) -> JSONResponse:
         if persist is not None:                          # #77: keep this model across restarts
             with contextlib.suppress(ValueError):
@@ -345,6 +346,8 @@ def register(app):
             ENGINE_CONFIG["juggler"] = bool(juggler)
         if autostart_delay_s is not None:                # #autostart-delay: client-connect grace before persist reload
             ENGINE_CONFIG["autostart_delay_s"] = max(0.0, float(autostart_delay_s))
+        if federate is not None:                         # #federation: use a peer's already-loaded model
+            ENGINE_CONFIG["federate"] = bool(federate)
         if wedge_reload_n is not None:                   # #wedge-quarantine: self-heal re-place after N wedges (0 = off)
             ENGINE_CONFIG["wedge_reload_n"] = max(0, int(wedge_reload_n))
         if max_loaded is not None:

@@ -208,6 +208,51 @@ def self_info() -> dict:
 
 # --- gossip --------------------------------------------------------------------------------------
 
+# --- #federation Phase 3: request federation -------------------------------------------------------
+
+def federation_enabled() -> bool:
+    """`federate` engine knob (default ON). Off = never route a request to a peer."""
+    cfg = getattr(state, "ENGINE_CONFIG", None) or {}
+    return bool(cfg.get("federate", True))
+
+
+def _model_aliases(m: dict) -> set:
+    """Every name a peer's model answers to, normalised for matching."""
+    out = set()
+    for v in (m.get("friendly"), m.get("target")):
+        if v:
+            out.add(str(v).strip().lower())
+    for v in (m.get("aliases") or []):
+        out.add(str(v).strip().lower())
+    return out
+
+
+def find_model_peer(name: str) -> tuple:
+    """(peer, model) for a HEALTHY peer that already has `name` RESIDENT, else (None, None).
+
+    Only "ok" peers are considered — a stale peer's inventory is a guess, and routing a live request
+    at a controller we cannot currently reach would turn a servable request into a timeout. Among
+    candidates we prefer the least busy (fewest active requests) so federation spreads rather than
+    piles onto one box."""
+    want = str(name or "").strip().lower()
+    if not want:
+        return (None, None)
+    best = (None, None, 1 << 30)
+    for p in PEERS.values():
+        if peer_state(p) != "ok":
+            continue
+        for m in ((p.get("info") or {}).get("models") or []):
+            if want in _model_aliases(m):
+                act = int(m.get("active") or 0)
+                if act < best[2]:
+                    best = (p, m, act)
+    return (best[0], best[1])
+
+
+def peer_base(p: dict) -> str:
+    return f"http://{p['host']}:{p['http_port']}"
+
+
 def _http_get_json(url: str, timeout: float = PEER_HTTP_TIMEOUT) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": "infinitemodel-peer/1"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
