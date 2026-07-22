@@ -16,6 +16,10 @@ import peers
 
 def register(app):
 
+    @app.get("/controllers", response_class=HTMLResponse)   # dashboard: Cross-controller page
+    async def controllers_page() -> str:
+        return CONTROLLERS_HTML
+
     @app.get("/peer_info")
     async def peer_info() -> JSONResponse:
         """Our identity + nodes + resident models, for a peer controller's gossip poll.

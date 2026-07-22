@@ -252,6 +252,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <a href="/config">Config</a>
     <a href="/logs-page">Logs</a>
     <a href="/bandwidth">Bandwidth</a>
+    <a href="/controllers">Controllers</a>
   </nav>
   <span class="grow"></span>
   <button class="btn pri" onclick="openAdd()">+ Add model</button>
@@ -1308,7 +1309,7 @@ CONFIG_HTML = r"""<!doctype html>
 <body><div class="wrap">
 <header>
   <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
-  <nav><a href="/">Models</a><a href="/chat">Chat</a><a class="on" href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a class="on" href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
 </header>
 
 <div class="card">
@@ -1431,7 +1432,7 @@ CHAT_HTML = r"""<!doctype html>
 <body><div class="wrap">
 <header>
   <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
-  <nav><a href="/">Models</a><a class="on" href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+  <nav><a href="/">Models</a><a class="on" href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
 </header>
 <div class="bar">
   <label class="hint">Model</label>
@@ -1537,7 +1538,7 @@ LOGS_HTML = r"""<!doctype html>
 <body><div class="wrap">
 <header>
   <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
-  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a class="on" href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a></nav>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a class="on" href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
   <span class="grow"></span>
   <span class="tog">source <select class="f" id="src" onchange="refresh()"></select></span>
   <button class="btn on" id="auto" onclick="toggleAuto()">auto ⟳</button>
@@ -1596,6 +1597,166 @@ async function refresh(){
 function toggleAuto(){ AUTO=!AUTO; $('#auto').classList.toggle('on',AUTO); $('#auto').textContent=AUTO?'auto ⟳':'auto off'; }
 async function tick(){ await srcList(); if(AUTO) refresh(); }
 refresh(); tick(); setInterval(tick,3000);
+</script>
+</body></html>
+"""
+
+
+# --- #federation: Cross-controller page (peers, their models/nodes, controller config) ------------
+# Phase 2. Renders GET /peers (peers.py's gossip cache). Actions land in later phases:
+#   Phase 4 adds "Pull" (fetch a model's weights FROM a peer), Phase 5 adds node lending.
+CONTROLLERS_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InfiniteModel — Controllers</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 60px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 13px;font-size:13px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn:active{transform:scale(.98)} .btn.pri{border-color:var(--accent);color:#cfe0ff}
+  .btn.sm{padding:4px 9px;font-size:12px} .btn.danger{border-color:#5a2a2a;color:#ff9a9a} .btn.danger:hover{border-color:var(--bad)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 4px} .card .sub{font-size:12px;color:var(--dim);margin-bottom:12px}
+  .fld{display:flex;flex-direction:column;gap:4px} .fld label{font-size:12px;color:var(--muted)}
+  .fld input{background:var(--bg);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 10px;font-size:13px}
+  .actrow{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .peer{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:var(--surface2)}
+  .peer .ph{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .peer .pn{font-weight:600;font-size:14px}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .dot.ok{background:var(--good)} .dot.stale{background:var(--warn)} .dot.error{background:var(--bad)}
+  .chip{font-size:10.5px;color:var(--muted);border:1px solid var(--border2);border-radius:9px;padding:1px 7px}
+  .mono{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  table{width:100%;border-collapse:collapse;margin-top:9px}
+  th,td{text-align:left;font-size:12.5px;padding:5px 8px;border-bottom:1px solid var(--border)}
+  th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .note{color:var(--dim);font-size:12.5px} .err{color:var(--bad);font-size:12px}
+  .tbls{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:980px){.tbls{grid-template-columns:1fr}}
+  .scroll{overflow-x:auto}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a class="on" href="/controllers">Controllers</a></nav>
+  <span class="grow"></span>
+  <button class="btn" onclick="refresh(true)">Refresh now</button>
+</header>
+
+<div class="card">
+  <h2>This controller</h2>
+  <div class="sub">How other controllers see us. They reach us at <span class="mono">GET /peer_info</span>.</div>
+  <div id="self" class="mono">…</div>
+</div>
+
+<div class="card">
+  <h2>Add a controller</h2>
+  <div class="sub">Controllers on the same LAN find each other automatically by UDP broadcast.
+    Add one by hand only when broadcast cannot reach it — a different subnet, a VLAN, or across a VPN.</div>
+  <div class="actrow">
+    <div class="fld"><label>Host / IP</label><input id="ph" placeholder="192.168.1.116"></div>
+    <div class="fld"><label>HTTP port</label><input id="pp" type="number" placeholder="21434"></div>
+    <button class="btn pri" onclick="addPeer()">Add controller</button>
+    <span id="addmsg" class="note"></span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Peer controllers</h2>
+  <div class="sub">Discovered by broadcast and polled every 30s. Their models and nodes are shown as
+    of the last successful poll.</div>
+  <div id="peers"><div class="note">loading…</div></div>
+</div>
+
+<script>
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const gb = v => (v==null||isNaN(v)) ? '—' : (Math.round(v*10)/10)+' GB';
+
+function peerRow(p){
+  const models = (p.models||[]);
+  const nodes  = (p.nodes||[]);
+  const mrows = models.length ? models.map(m =>
+      '<tr><td>'+esc(m.friendly)+'</td><td class="mono">'+esc(m.quant||'none')+'</td>'
+      +'<td class="num">'+gb(m.size_gb)+'</td>'
+      +'<td class="mono">'+esc((m.stages||[]).join(', ')||'—')+'</td>'
+      +'<td class="num">'+(m.active>0?'<span style="color:var(--good)">● '+m.active+'</span>':'0')+'</td></tr>'
+    ).join('') : '<tr><td colspan="5" class="note">no models resident</td></tr>';
+  const nrows = nodes.length ? nodes.map(n =>
+      '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
+      +'<td class="num">'+gb(n.vram_used_gb)+' / '+gb(n.vram_total_gb)+'</td>'
+      +'<td class="num">'+gb(n.free_mem_gb)+'</td>'
+      +'<td class="mono">'+(n.vram_enabled?'gpu':'')+(n.vram_enabled&&n.ram_enabled?'+':'')+(n.ram_enabled?'cpu':'')
+      +((!n.vram_enabled&&!n.ram_enabled)?'<span style="color:var(--warn)">disabled</span>':'')+'</td></tr>'
+    ).join('') : '<tr><td colspan="5" class="note">no nodes</td></tr>';
+  return '<div class="peer">'
+    +'<div class="ph"><span class="dot '+esc(p.state)+'"></span>'
+    +'<span class="pn">'+esc(p.name||p.host)+'</span>'
+    +'<a class="mono" href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.host)+':'+esc(p.http_port)+'</a>'
+    +'<span class="chip">'+esc(p.version||'?')+'</span>'
+    +(p.cluster_id?'<span class="chip">cluster '+esc(p.cluster_id)+'</span>':'')
+    +'<span class="chip">'+esc(p.source||'')+'</span>'
+    +'<span class="grow"></span>'
+    +'<span class="note">seen '+esc(p.last_seen_s)+'s ago</span>'
+    +'<button class="btn sm danger" onclick="rmPeer('+JSON.stringify(p.host)+','+p.http_port+')">Forget</button>'
+    +'</div>'
+    +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
+    +'<div class="tbls">'
+    +'<div class="scroll"><table><thead><tr><th>Model</th><th>Quant</th><th>Size</th><th>Stages</th><th>Active</th></tr></thead><tbody>'+mrows+'</tbody></table></div>'
+    +'<div class="scroll"><table><thead><tr><th>Node</th><th>Device</th><th>VRAM</th><th>Free RAM</th><th>Tiers</th></tr></thead><tbody>'+nrows+'</tbody></table></div>'
+    +'</div></div>';
+}
+
+async function refresh(force){
+  try{
+    const r = await fetch(force?'/peer_refresh':'/peers', {method: force?'POST':'GET'});
+    const j = await r.json();
+    const s = j.self||{};
+    document.getElementById('ctl').textContent = (s.name||'') + ' · ' + (s.version||'');
+    document.getElementById('self').innerHTML =
+      esc(s.name||'?')+' — http :'+esc(s.http_port)+' — '+esc(s.version||'?')
+      +(s.cluster_id?' — cluster '+esc(s.cluster_id):' — cluster &lt;unset&gt;');
+    const ps = j.peers||[];
+    document.getElementById('peers').innerHTML = ps.length
+      ? ps.map(peerRow).join('')
+      : '<div class="note">No other controllers found yet. They announce themselves every 60s; '
+        +'if one is on another subnet/VLAN/VPN, add it by hand above.</div>';
+  }catch(e){
+    document.getElementById('peers').innerHTML = '<div class="err">failed to load peers: '+esc(e.message||e)+'</div>';
+  }
+}
+
+async function addPeer(){
+  const h = document.getElementById('ph').value.trim();
+  const p = document.getElementById('pp').value.trim() || '21434';
+  const msg = document.getElementById('addmsg');
+  if(!h){ msg.textContent='enter a host'; return; }
+  msg.textContent='adding…';
+  try{
+    const r = await fetch('/peer_add?host='+encodeURIComponent(h)+'&port='+encodeURIComponent(p), {method:'POST'});
+    const j = await r.json();
+    msg.textContent = j.ok ? (j.reachable?'added and reachable':'added but NOT reachable: '+(j.error||'')) : ('failed: '+(j.error||''));
+    document.getElementById('ph').value='';
+    refresh(false);
+  }catch(e){ msg.textContent='failed: '+(e.message||e); }
+}
+
+async function rmPeer(host, port){
+  await fetch('/peer_remove?host='+encodeURIComponent(host)+'&port='+port, {method:'POST'});
+  refresh(false);
+}
+
+refresh(false);
+setInterval(()=>refresh(false), 5000);
 </script>
 </body></html>
 """
