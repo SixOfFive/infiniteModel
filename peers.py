@@ -368,13 +368,46 @@ def _node_hostnames() -> dict:
 
 
 def model_hosts(m) -> list:
-    by_id = _node_hostnames()
+    """Hostnames a LoadedModel occupies, from EVERY source that can answer.
+
+    Two sources because neither is complete on its own:
+      * plan.stages carries hostname directly (what /status renders) — but an ADOPTED model
+        (hitless controller restart, worker kept its shards) comes back with an empty plan.
+      * stage_node_ids maps through the registry — but a worker that re-registered after a restart
+        is minted a NEW node_id (server.py:659), so an adopted model's ids can be stale.
+    Union both and dedupe. Empty is a legitimate answer (nothing resolvable) — callers treat "no
+    claim" as "not claimed", which fails OPEN rather than stranding a node."""
     out = []
+    try:
+        for s in (getattr(getattr(m, "plan", None), "stages", None) or []):
+            h = getattr(s, "hostname", "")
+            if h and h not in out:
+                out.append(h)
+    except Exception:   # noqa: BLE001
+        pass
+    by_id = _node_hostnames()
     for nid in (getattr(m, "stage_node_ids", None) or []):
         h = by_id.get(nid)
         if h and h not in out:
             out.append(h)
     return out
+
+
+def claims_diagnostic() -> dict:
+    """Why a model does/doesn't advertise a claim — so an empty claim set is debuggable from the
+    dashboard instead of being a silent hole in Phase 5's exclusivity."""
+    engine = getattr(state, "engine", None)
+    by_id = _node_hostnames()
+    rows = []
+    for fr, m in list(getattr(engine, "models", {}) or {}).items():
+        plan_hosts = [getattr(s, "hostname", "") for s in
+                      (getattr(getattr(m, "plan", None), "stages", None) or [])]
+        ids = list(getattr(m, "stage_node_ids", None) or [])
+        rows.append({"model": fr, "plan_stage_hosts": [h for h in plan_hosts if h],
+                     "stage_node_ids": ids,
+                     "ids_resolved": [by_id.get(i) for i in ids],
+                     "hosts": model_hosts(m)})
+    return {"registry_node_ids": sorted(by_id), "models": rows, "claims": my_claims()}
 
 
 def my_claims() -> list:

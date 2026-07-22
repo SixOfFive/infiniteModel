@@ -259,6 +259,12 @@ def register(app):
         return JSONResponse({"ok": True, "respect_peer_claims": peers.respect_peer_claims(),
                              "my_claims": sorted(mine), "peer_claims": claimed, "nodes": rows})
 
+    @app.get("/peer_claims_debug")
+    async def peer_claims_debug() -> JSONResponse:
+        """Why each resident model does or doesn't produce a claim (Phase 5 exclusivity depends on
+        claims being non-empty, and an ADOPTED model can legitimately resolve to nothing)."""
+        return JSONResponse({"ok": True, **peers.claims_diagnostic()})
+
     @app.post("/peer_lend")
     async def peer_lend(node: str) -> JSONResponse:
         """Stop using a node here so another controller can take it.
