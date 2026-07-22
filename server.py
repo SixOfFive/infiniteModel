@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c181"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c182"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -2472,6 +2472,17 @@ def build_app() -> FastAPI:
 
     async def _start_discovery_responder():
         _dcfg = wire.load_config()
+        # #federation: a controller that must NOT recruit workers (a peer that holds no weights, a
+        # staging box) answers no discovery queries — it still ANNOUNCES itself, so peering is
+        # unaffected: peers.announce_once() teaches the other controller about us from the query
+        # itself, and their reply teaches us about them. ENV, not config.json, because config.json
+        # is in EXTRA_UPDATE_FILES and a self-update would overwrite a local edit.
+        _respond = os.environ.get("INFINITEMODEL_DISCOVERY_RESPOND",
+                                  "1" if _dcfg.get("discovery_respond", True) else "0")
+        if str(_respond).strip().lower() in ("0", "false", "no", "off"):
+            print("[*] discovery responder DISABLED (INFINITEMODEL_DISCOVERY_RESPOND=0) — this "
+                  "controller will not answer worker broadcasts; peer federation still works")
+            return None
         try:
             dport = int(_dcfg.get("discovery_port") or 50099)
         except (TypeError, ValueError):
