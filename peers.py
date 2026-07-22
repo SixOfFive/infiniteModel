@@ -511,7 +511,25 @@ def dir_manifest(root: str) -> list:
     return sorted(out, key=lambda e: e["path"])
 
 
-async def pull_from_peer(p: dict, model: str, target: str, dest: str) -> dict:
+def is_cache_file(rel: str) -> bool:
+    """A pre-compiled shard-cache unit (_shards/<quant>/…) rather than a source weight file.
+
+    These are regenerable — any controller can rebuild them from the weights — but they are often
+    LARGER than the weights themselves (qwen3-4b: 7.4 GB of bf16 vs 15.2 GB with int4+int8 caches).
+    On a small-disk peer that difference decides whether a model fits at all, so pulling them is
+    opt-in."""
+    return rel.replace("\\", "/").startswith("_shards/")
+
+
+def split_manifest(files: list) -> tuple:
+    """(weights, caches) — same split the manifest reports and the puller filters on."""
+    w = [f for f in files if not is_cache_file(f.get("path", ""))]
+    c = [f for f in files if is_cache_file(f.get("path", ""))]
+    return w, c
+
+
+async def pull_from_peer(p: dict, model: str, target: str, dest: str,
+                         include_caches: bool = False) -> dict:
     """Download every file of `model` from peer `p` into `dest`. Updates PULLS[target] as it goes.
 
     Streams to `<file>.part` and renames on completion, so an interrupted pull can never leave a
@@ -530,6 +548,15 @@ async def pull_from_peer(p: dict, model: str, target: str, dest: str) -> dict:
         files = man.get("files") or []
         if not files:
             raise RuntimeError("peer reports no files for that model")
+        if not include_caches:
+            weights, caches = split_manifest(files)
+            if caches:
+                skipped = sum(int(f.get("size") or 0) for f in caches)
+                st["skipped_cache_files"] = len(caches)
+                st["skipped_cache_bytes"] = skipped
+                print(f"[peers] {target}: skipping {len(caches)} shard-cache file(s) "
+                      f"({skipped/1e9:.2f} GB) — pass caches=1 to include them", flush=True)
+            files = weights
         st["files_total"] = len(files)
         st["total_bytes"] = sum(int(f.get("size") or 0) for f in files)
         st["state"] = "downloading"

@@ -163,9 +163,15 @@ def register(app):
             return JSONResponse({"ok": False, "error": "model directory unavailable"},
                                 status_code=404)
         files = await asyncio.to_thread(peers.dir_manifest, d)
+        w, c = peers.split_manifest(files)
         return JSONResponse({"ok": True, "model": friendly, "target": target,
                              "files": files,
-                             "total_bytes": sum(f["size"] for f in files)})
+                             "total_bytes": sum(f["size"] for f in files),
+                             # split out so a small-disk peer can decide before committing:
+                             # shard caches are regenerable and often bigger than the weights.
+                             "weights_bytes": sum(f["size"] for f in w),
+                             "cache_bytes": sum(f["size"] for f in c),
+                             "cache_files": len(c)})
 
     @app.get("/peer_model_file")
     async def peer_model_file(model: str, path: str):
@@ -189,7 +195,7 @@ def register(app):
         return FileResponse(full, media_type="application/octet-stream")
 
     @app.post("/peer_pull")
-    async def peer_pull(host: str, model: str, port: int = 0) -> JSONResponse:
+    async def peer_pull(host: str, model: str, port: int = 0, caches: int = 0) -> JSONResponse:
         """Copy a model's weights from a peer controller instead of re-downloading from HuggingFace.
 
         Runs in the background (a pull is GBs); poll /peer_pull_status. On success the model is
@@ -214,7 +220,8 @@ def register(app):
         dest = os.path.join(MODELS_DIR, _safe_name(target))
 
         async def _run():
-            st = await peers.pull_from_peer(peer, model, target, dest)
+            st = await peers.pull_from_peer(peer, model, target, dest,
+                                            include_caches=bool(caches))
             if st.get("state") != "done":
                 return
             friendly = _friendly_from_hf(target)          # register exactly like /add_model
