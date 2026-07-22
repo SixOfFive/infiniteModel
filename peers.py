@@ -37,6 +37,7 @@ import json
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import state
@@ -336,6 +337,133 @@ def _announce_once(timeout: float = 2.0) -> int:
     finally:
         s.close()
     return seen
+
+
+# --- #federation Phase 4: pull a model's weights FROM a peer ---------------------------------------
+# Progress ledger for in-flight peer pulls. target -> {...}. Mutated in place (state.publish shares
+# references), read by GET /peer_pull_status and rendered on the Controllers page.
+PULLS: dict = {}
+
+
+def pull_state(target: str) -> dict:
+    return PULLS.get(target) or {}
+
+
+def pulls_public() -> list:
+    out = []
+    for t, p in sorted(PULLS.items()):
+        tot, done = float(p.get("total_bytes") or 0), float(p.get("done_bytes") or 0)
+        out.append({**p, "target": t,
+                    "pct": (round(100.0 * done / tot, 1) if tot > 0 else None)})
+    return out
+
+
+def safe_rel(root: str, rel: str) -> str:
+    """Resolve `rel` under `root`, refusing anything that escapes it.
+
+    /peer_model_file takes a caller-supplied path, so this is the security boundary: absolute paths,
+    drive letters, symlink games and ../ traversal all have to fail CLOSED, or a peer could read
+    arbitrary files off this controller."""
+    import os
+    raw = str(rel or "")
+    norm = raw.replace("\\", "/")
+    if not norm or ".." in norm.split("/"):
+        raise ValueError("invalid path")
+    # REJECT absolute forms outright rather than coercing them to relative. Silently stripping a
+    # leading "/" would turn /etc/passwd into <root>/etc/passwd — harmless but dishonest — and on
+    # Windows os.path.join(root, "C:/Windows/x") returns the DRIVE-QUALIFIED path, a real escape.
+    if norm.startswith("/") or os.path.isabs(raw) or (len(raw) > 1 and raw[1] == ":"):
+        raise ValueError("absolute paths are not allowed")
+    root_real = os.path.realpath(root)
+    full = os.path.realpath(os.path.join(root_real, norm))
+    try:
+        inside = os.path.commonpath([root_real, full]) == root_real
+    except ValueError:                     # different drives on Windows -> definitively outside
+        inside = False
+    if not inside:
+        raise ValueError("path escapes the model directory")
+    return full
+
+
+def dir_manifest(root: str) -> list:
+    """Every real file under `root` as (rel, size), sorted — the peer-pull contract."""
+    import os
+    out = []
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            fp = os.path.join(dirpath, fn)
+            if not os.path.isfile(fp):
+                continue
+            rel = os.path.relpath(fp, root).replace("\\", "/")
+            try:
+                out.append({"path": rel, "size": os.path.getsize(fp)})
+            except OSError:
+                pass
+    return sorted(out, key=lambda e: e["path"])
+
+
+async def pull_from_peer(p: dict, model: str, target: str, dest: str) -> dict:
+    """Download every file of `model` from peer `p` into `dest`. Updates PULLS[target] as it goes.
+
+    Streams to `<file>.part` and renames on completion, so an interrupted pull can never leave a
+    truncated weight file that looks whole to a later load. Skips files already present at the
+    advertised size, so a re-run resumes rather than re-downloading."""
+    import os
+    st = PULLS[target] = {"state": "manifest", "peer": peer_base(p), "peer_name": p.get("name", ""),
+                          "model": model, "started": time.time(), "done_bytes": 0,
+                          "total_bytes": 0, "file": "", "files_done": 0, "files_total": 0,
+                          "error": "", "finished": 0.0}
+    try:
+        man = await asyncio.to_thread(
+            _http_get_json, f"{peer_base(p)}/peer_model_manifest?model={urllib.parse.quote(model)}", 30.0)
+        if not man.get("ok"):
+            raise RuntimeError(man.get("error") or "peer refused the manifest")
+        files = man.get("files") or []
+        if not files:
+            raise RuntimeError("peer reports no files for that model")
+        st["files_total"] = len(files)
+        st["total_bytes"] = sum(int(f.get("size") or 0) for f in files)
+        st["state"] = "downloading"
+        os.makedirs(dest, exist_ok=True)
+        for f in files:
+            rel, size = f["path"], int(f.get("size") or 0)
+            st["file"] = rel
+            out = safe_rel(dest, rel)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            if os.path.exists(out) and os.path.getsize(out) == size and size > 0:
+                st["done_bytes"] += size          # already have it (resume)
+                st["files_done"] += 1
+                continue
+            url = (f"{peer_base(p)}/peer_model_file?model={urllib.parse.quote(model)}"
+                   f"&path={urllib.parse.quote(rel)}")
+
+            def _fetch(u=url, o=out):
+                req = urllib.request.Request(u, headers={"User-Agent": "infinitemodel-peer/1"})
+                got = 0
+                with urllib.request.urlopen(req, timeout=120.0) as r, open(o + ".part", "wb") as fh:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        got += len(chunk)
+                        st["done_bytes"] += len(chunk)
+                os.replace(o + ".part", o)
+                return got
+
+            await asyncio.to_thread(_fetch)
+            st["files_done"] += 1
+        st["state"] = "done"
+        st["finished"] = time.time()
+        print(f"[peers] pulled {model} from {peer_base(p)} "
+              f"({st['files_done']} files, {st['done_bytes']/1e9:.2f} GB)", flush=True)
+        return st
+    except Exception as exc:   # noqa: BLE001 — a failed pull must not take the controller down
+        st["state"] = "error"
+        st["error"] = f"{type(exc).__name__}: {exc}"
+        st["finished"] = time.time()
+        print(f"[peers] pull of {model} from {peer_base(p)} FAILED: {st['error']}", flush=True)
+        return st
 
 
 async def announce_loop() -> None:

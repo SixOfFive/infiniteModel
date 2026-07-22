@@ -12,6 +12,8 @@ build_app() calls register(app) to attach them.
 from __future__ import annotations
 
 import json as _json
+import os
+import urllib.parse
 import urllib.error
 import urllib.request
 
@@ -142,6 +144,96 @@ def register(app):
         return JSONResponse({"ok": True, "key": key, "reachable": ok,
                              "error": peers.PEERS[key].get("error", ""),
                              "peers": peers.peers_public()})
+
+    # --- #federation Phase 4: serve our model files to a peer, and pull a peer's -----------------
+
+    @app.get("/peer_model_manifest")
+    async def peer_model_manifest(model: str) -> JSONResponse:
+        """Every file of one of OUR models, so a peer can mirror it byte-for-byte.
+
+        Resolves through _controller_model_dir, so a model still only in the HF cache is
+        materialised into models/ first — the peer then sees exactly what a local load would."""
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        target = MODELS[friendly][0] if friendly in MODELS else friendly
+        d = await asyncio.to_thread(_controller_model_dir, target)
+        if not d or not os.path.isdir(d):
+            return JSONResponse({"ok": False, "error": "model directory unavailable"},
+                                status_code=404)
+        files = await asyncio.to_thread(peers.dir_manifest, d)
+        return JSONResponse({"ok": True, "model": friendly, "target": target,
+                             "files": files,
+                             "total_bytes": sum(f["size"] for f in files)})
+
+    @app.get("/peer_model_file")
+    async def peer_model_file(model: str, path: str):
+        """Stream ONE file of one of our models. `path` is caller-supplied, so peers.safe_rel is
+        the security boundary — traversal/absolute/symlink escapes fail closed."""
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        target = MODELS[friendly][0] if friendly in MODELS else friendly
+        d = await asyncio.to_thread(_controller_model_dir, target)
+        if not d or not os.path.isdir(d):
+            return JSONResponse({"ok": False, "error": "model directory unavailable"},
+                                status_code=404)
+        try:
+            full = peers.safe_rel(d, path)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        if not os.path.isfile(full):
+            return JSONResponse({"ok": False, "error": "no such file"}, status_code=404)
+        return FileResponse(full, media_type="application/octet-stream")
+
+    @app.post("/peer_pull")
+    async def peer_pull(host: str, model: str, port: int = 0) -> JSONResponse:
+        """Copy a model's weights from a peer controller instead of re-downloading from HuggingFace.
+
+        Runs in the background (a pull is GBs); poll /peer_pull_status. On success the model is
+        registered locally exactly as /add_model would, so it is immediately loadable here."""
+        p = int(port or peers._cfg()["http_port"])
+        key = peers.peer_key(host, p)
+        peer = peers.PEERS.get(key) or {"host": host, "http_port": p, "name": ""}
+        target = model.strip()
+        try:                                   # a peer may advertise the friendly name; keep both
+            man = await asyncio.to_thread(
+                peers._http_get_json,
+                f"http://{host}:{p}/peer_model_manifest?model={urllib.parse.quote(target)}", 30.0)
+            if man.get("ok") and man.get("target"):
+                target = man["target"]
+        except Exception as exc:               # noqa: BLE001
+            return JSONResponse({"ok": False, "error": f"peer manifest failed: {exc}"},
+                                status_code=502)
+        cur = peers.pull_state(target)
+        if cur.get("state") in ("manifest", "downloading"):
+            return JSONResponse({"ok": False, "error": "a pull for that model is already running",
+                                 "pull": cur}, status_code=409)
+        dest = os.path.join(MODELS_DIR, _safe_name(target))
+
+        async def _run():
+            st = await peers.pull_from_peer(peer, model, target, dest)
+            if st.get("state") != "done":
+                return
+            friendly = _friendly_from_hf(target)          # register exactly like /add_model
+            if friendly not in MODELS:
+                MODELS[friendly] = (target, target)
+                CUSTOM_MODELS[friendly] = target
+                save_custom_models()
+                log_activity(f"added model {friendly} ({target}) — pulled from peer "
+                             f"{peer.get('name') or host}")
+            DELETED_MODELS.discard(friendly)
+            st["friendly"] = friendly
+
+        asyncio.create_task(_run())
+        return JSONResponse({"ok": True, "started": True, "target": target,
+                             "peer": f"{host}:{p}", "dest": dest})
+
+    @app.get("/peer_pull_status")
+    async def peer_pull_status() -> JSONResponse:
+        return JSONResponse({"ok": True, "pulls": peers.pulls_public()})
 
     @app.post("/peer_remove")
     async def peer_remove(host: str, port: int = 0) -> JSONResponse:

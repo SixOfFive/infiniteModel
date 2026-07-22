@@ -1671,6 +1671,13 @@ CONTROLLERS_HTML = r"""<!doctype html>
   </div>
 </div>
 
+<div class="card" id="pullcard" style="display:none">
+  <h2>Model transfers</h2>
+  <div class="sub">Copying weights from a peer controller — no HuggingFace round trip. Interrupted
+    transfers resume: completed files are skipped on a re-run.</div>
+  <div id="pulls"></div>
+</div>
+
 <div class="card">
   <h2>Peer controllers</h2>
   <div class="sub">Discovered by broadcast and polled every 30s. Their models and nodes are shown as
@@ -1689,8 +1696,10 @@ function peerRow(p){
       '<tr><td>'+esc(m.friendly)+'</td><td class="mono">'+esc(m.quant||'none')+'</td>'
       +'<td class="num">'+gb(m.size_gb)+'</td>'
       +'<td class="mono">'+esc((m.stages||[]).join(', ')||'—')+'</td>'
-      +'<td class="num">'+(m.active>0?'<span style="color:var(--good)">● '+m.active+'</span>':'0')+'</td></tr>'
-    ).join('') : '<tr><td colspan="5" class="note">no models resident</td></tr>';
+      +'<td class="num">'+(m.active>0?'<span style="color:var(--good)">● '+m.active+'</span>':'0')+'</td>'
+      +'<td><button class="btn sm" title="Copy this model\'s weights from that controller instead of re-downloading from HuggingFace"'
+      +' onclick="pullModel('+JSON.stringify(p.host)+','+p.http_port+','+JSON.stringify(m.friendly||m.target)+')">Pull</button></td></tr>'
+    ).join('') : '<tr><td colspan="6" class="note">no models resident</td></tr>';
   const nrows = nodes.length ? nodes.map(n =>
       '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
       +'<td class="num">'+gb(n.vram_used_gb)+' / '+gb(n.vram_total_gb)+'</td>'
@@ -1711,7 +1720,7 @@ function peerRow(p){
     +'</div>'
     +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
     +'<div class="tbls">'
-    +'<div class="scroll"><table><thead><tr><th>Model</th><th>Quant</th><th>Size</th><th>Stages</th><th>Active</th></tr></thead><tbody>'+mrows+'</tbody></table></div>'
+    +'<div class="scroll"><table><thead><tr><th>Model</th><th>Quant</th><th>Size</th><th>Stages</th><th>Active</th><th></th></tr></thead><tbody>'+mrows+'</tbody></table></div>'
     +'<div class="scroll"><table><thead><tr><th>Node</th><th>Device</th><th>VRAM</th><th>Free RAM</th><th>Tiers</th></tr></thead><tbody>'+nrows+'</tbody></table></div>'
     +'</div></div>';
 }
@@ -1755,8 +1764,47 @@ async function rmPeer(host, port){
   refresh(false);
 }
 
-refresh(false);
+async function pullModel(host, port, model){
+  if(!confirm('Copy "'+model+'" from '+host+' to this controller?')) return;
+  try{
+    const r = await fetch('/peer_pull?host='+encodeURIComponent(host)+'&port='+port
+                          +'&model='+encodeURIComponent(model), {method:'POST'});
+    const j = await r.json();
+    if(!j.ok) alert('pull failed: '+(j.error||'unknown'));
+    pulls();
+  }catch(e){ alert('pull failed: '+(e.message||e)); }
+}
+
+function pullRow(p){
+  const pct = (p.pct==null) ? '' : p.pct+'%';
+  const bar = (p.pct==null) ? '' :
+    '<div style="height:5px;background:#0a0e14;border-radius:3px;overflow:hidden;margin-top:5px">'
+    +'<i style="display:block;height:100%;width:'+Math.min(100,p.pct)+'%;background:var(--accent)"></i></div>';
+  const col = p.state==='done' ? 'var(--good)' : (p.state==='error' ? 'var(--bad)' : 'var(--warn)');
+  return '<div style="padding:7px 0;border-bottom:1px solid var(--border)">'
+    +'<span style="color:'+col+'">●</span> <b>'+esc(p.target)+'</b> '
+    +'<span class="note">from '+esc(p.peer_name||p.peer)+'</span> '
+    +'<span class="chip">'+esc(p.state)+'</span> '
+    +'<span class="note">'+esc(p.files_done)+'/'+esc(p.files_total)+' files · '
+    +(p.done_bytes/1e9).toFixed(2)+' / '+(p.total_bytes/1e9).toFixed(2)+' GB '+pct+'</span>'
+    +(p.file?' <span class="mono">'+esc(p.file)+'</span>':'')
+    +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
+    +bar+'</div>';
+}
+
+async function pulls(){
+  try{
+    const r = await fetch('/peer_pull_status');
+    const j = await r.json();
+    const ps = j.pulls||[];
+    document.getElementById('pullcard').style.display = ps.length ? '' : 'none';
+    document.getElementById('pulls').innerHTML = ps.map(pullRow).join('');
+  }catch(e){ /* transfers panel is best-effort */ }
+}
+
+refresh(false); pulls();
 setInterval(()=>refresh(false), 5000);
+setInterval(pulls, 2000);
 </script>
 </body></html>
 """
