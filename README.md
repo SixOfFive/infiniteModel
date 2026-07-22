@@ -246,6 +246,17 @@ if it's absent):
 { "controller_host": "10.0.0.5", "http_port": 21434, "control_port": 50100, "data_port": 50101 }
 ```
 
+> **Zero-config on a single LAN — you can skip this step.** Workers find the controller by UDP
+> broadcast (`discovery_port`, default 50099): the worker asks, the controller answers with the
+> address that is correct *from that worker's subnet*. Discovery runs when `controller_host` is
+> `"auto"`, **and** as an automatic fallback whenever the configured host is unreachable at
+> startup — so a fresh clone whose `config.json` points at someone else's LAN still just works.
+> Install deps, run the worker, done.
+>
+> Broadcast does **not** cross subnets, VLANs or VPNs — keep a static `controller_host` for those.
+> Running two controllers on one LAN? Set a matching `cluster_id` on each controller and its
+> workers so a worker can never join the wrong fleet (unset = join whoever answers).
+
 **2. Start the controller** (on the box that holds the weights):
 
 ```bash
@@ -257,8 +268,10 @@ Open the dashboard at `http://<controller>:21434/`.
 **3. Start a worker on each other machine:**
 
 ```bash
-./client.sh --device cpu+gpu          # Linux  (Windows: client.bat)
-./client.sh --controller 10.0.0.5     # override the controller if it's not in config.json
+./client.sh --device cpu+gpu          # Linux (Windows: client.bat) — discovers the controller
+./client.sh --controller 10.0.0.5     # or address it explicitly (always wins when reachable)
+./client.sh --controller auto         # force broadcast discovery, ignoring config.json
+./client.sh --cluster-id lab-a        # only join the controller advertising this cluster_id
 ```
 
 Each worker registers within a couple seconds and appears on the dashboard.

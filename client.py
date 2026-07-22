@@ -141,7 +141,7 @@ def _selected_names(all_names, start: int, end: int, has_embed: bool,
 # clone, so a plain import is safe.
 from wire import (_pack_tensor, _unpack_tensor, _set_keepalive, _tp_hetsplit,   # noqa: F401
                   install_log_tee, drain_new_logs, _fuse_moe_experts,
-                  load_config, repo_raw_url)
+                  load_config, repo_raw_url, discover_controller)
 
 # #wire-caps + #ntensor-manifest: manifest-frame helpers + capability constants (canonical home:
 # wire.py, shared with the controller). GUARDED so a per-file self-update convergence window
@@ -1189,7 +1189,55 @@ def _hr(bps: float) -> str:
 
 # code-split Inc 8: _fwd_watchdog_loop + _console_panel_loop live in worker_update.py now (VERBATIM).
 
+def _controller_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
+    """Can we open the control-plane TCP port right now? Used ONLY to decide whether to fall back
+    to #discovery at FIRST start — never in the reconnect loop, so a controller restart can't make
+    a worker wander off to a different fleet mid-life."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _resolve_controller(args: argparse.Namespace) -> None:
+    """#discovery: settle args.controller/control_port BEFORE the first connect.
+
+      controller_host "auto"/"discover"/""  -> always broadcast-discover
+      a static host that is UNREACHABLE     -> discover ONCE as a rescue, then use what answers
+
+    The rescue is what delivers "clone, install deps, run" with no config edit: a fresh checkout
+    ships this fleet's controller IP, which is meaningless on someone else's LAN — unreachable ->
+    discovered. On THIS fleet the controller answers, so behaviour is byte-for-byte unchanged.
+    Explicit --controller still wins whenever it is reachable, and static remains the documented
+    path for anything broadcast can't cross (subnets, VLANs, VPN)."""
+    host = str(getattr(args, "controller", "") or "").strip()
+    want = str(getattr(args, "cluster_id", "") or "")
+    auto = host.lower() in ("auto", "discover", "")
+    if not auto and _controller_reachable(host, args.control_port):
+        return
+    if not auto:
+        print(f"[discovery] controller {host}:{args.control_port} unreachable — "
+              f"falling back to broadcast discovery", flush=True)
+    got = discover_controller(cluster_id=want, timeout=float(getattr(args, "discovery_timeout", 2.5)))
+    if got:
+        args.controller = got["host"]
+        args.control_port = int(got["control_port"])
+        return
+    if auto:
+        raise SystemExit(
+            "[discovery] controller_host is 'auto' but no controller answered.\n"
+            "  - Is the controller running, and on this same LAN/subnet? (broadcast does NOT\n"
+            "    cross subnets, VLANs or VPN — use a static host for those.)\n"
+            "  - Pass an explicit address:  python client.py --controller <ip>\n"
+            "  - Or set controller_host in config.json.")
+    print(f"[discovery] nothing answered either; continuing with {host}:{args.control_port} "
+          f"(the reconnect loop will keep retrying)", flush=True)
+
+
 async def run(args: argparse.Namespace) -> None:
+    _resolve_controller(args)      # #discovery: may rewrite args.controller/control_port
     reg = build_registration(args)
     # Pick + announce the LAN route BEFORE connecting: the chosen IP becomes our
     # control-connection source, hence the address the controller records and sends
@@ -1311,8 +1359,15 @@ def run_self_test_load(model_id: str, attn: str = "eager", quant: str = "none",
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="InfiniteModel worker client.")
     p.add_argument("--controller", default=load_config()["controller_host"],
-                   help="controller host/IP (default from config.json)")
+                   help="controller host/IP, or 'auto' to find it by UDP broadcast "
+                        "(default from config.json; an unreachable static host auto-discovers)")
     p.add_argument("--control-port", type=int, default=load_config()["control_port"])
+    # #discovery: pin this worker to ONE fleet when several controllers share a LAN. Empty =
+    # join whoever answers (the zero-config path).
+    p.add_argument("--cluster-id", default=load_config().get("cluster_id", ""),
+                   help="only join a controller advertising this cluster_id (default: any)")
+    p.add_argument("--discovery-timeout", type=float, default=2.5,
+                   help="seconds to wait for a controller to answer a discovery broadcast")
     p.add_argument("--data-port", type=int, default=50200,
                    help="local data-plane port for inter-stage tensors (default 50200)")
     p.add_argument("--os-reserve-gb", type=float, default=2.0,

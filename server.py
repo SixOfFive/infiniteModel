@@ -2425,6 +2425,58 @@ def build_app() -> FastAPI:
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
+    class _DiscoveryResponder(asyncio.DatagramProtocol):
+        """#discovery: UDP responder for worker broadcast queries (shape B1).
+
+        Replies UNICAST to the querier with this controller's control endpoint. The advertised host
+        is computed with local_ip_for(peer) — the source IP the routing table would use to reach
+        THAT worker — so a multi-homed / Tailscale'd controller hands each worker the address that
+        actually works from where it sits, rather than a hostname's first (often 100.x) answer.
+
+        cluster_id gate: a controller with a cluster_id set stays SILENT to a worker asking for a
+        different one, so two fleets sharing an L2 never cross-recruit. A worker that asks with no
+        cluster_id is answered by anyone (that is the zero-config path)."""
+
+        def connection_made(self, transport) -> None:
+            self.transport = transport
+
+        def datagram_received(self, data: bytes, addr) -> None:
+            try:
+                msg = json.loads(data.decode("utf-8", "replace"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            if not isinstance(msg, dict) or msg.get("im") != wire.DISCOVERY_MAGIC or not msg.get("q"):
+                return
+            # NOTE: wire.load_config() (cached), NOT a module-level _cfg — `_cfg` in this file is
+            # LOCAL to parse_args()/load_node_config(), so referencing it here is a NameError.
+            mine = str(wire.load_config().get("cluster_id") or "")
+            want = str(msg.get("cluster_id") or "")
+            if mine and want and want != mine:
+                return                      # different fleet — stay silent
+            reply = {"im": wire.DISCOVERY_MAGIC, "r": 1,
+                     "host": wire.local_ip_for(addr[0]) or _display_host(),
+                     "control_port": ARGS.control_port, "http_port": ARGS.http_port,
+                     "cluster_id": mine, "name": socket.gethostname(), "version": VERSION}
+            with contextlib.suppress(Exception):
+                self.transport.sendto(json.dumps(reply).encode(), addr)
+
+    async def _start_discovery_responder():
+        _dcfg = wire.load_config()
+        try:
+            dport = int(_dcfg.get("discovery_port") or 50099)
+        except (TypeError, ValueError):
+            dport = 50099
+        try:
+            tr, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                _DiscoveryResponder, local_addr=("0.0.0.0", dport), allow_broadcast=True)
+            print(f"[*] discovery responder on udp/{dport} "
+                  f"(cluster_id={_dcfg.get('cluster_id') or '<unset>'})")
+            return tr
+        except Exception as exc:   # noqa: BLE001 — never fatal; static addressing still works
+            print(f"[!] discovery responder disabled ({exc!r}); workers must use a static "
+                  f"controller_host / --controller")
+            return None
+
     async def lifespan(app: FastAPI):
         # Resilient accept loop (NOT asyncio.start_server): its internal Proactor
         # accept loop silently dies on a transient WinError 64 during a worker
@@ -2434,6 +2486,10 @@ def build_app() -> FastAPI:
         # accept loop task, so the shutdown block below is unchanged.
         ctrl = await _resilient_serve(ARGS.host, ARGS.control_port, handle_control, "control")
         await engine.ensure_data_listener()
+        # #discovery: answer worker broadcast queries so a fresh worker needs NO config.json edit.
+        # Deliberately best-effort — a bind failure (port taken, container netns, hardened host)
+        # must never stop the controller: static config.json addressing still works untouched.
+        disc_tr = await _start_discovery_responder()
         serve = ctrl.task
         reaper = asyncio.create_task(reaper_loop())
         sampler = asyncio.create_task(metrics_sampler())
@@ -2593,6 +2649,9 @@ def build_app() -> FastAPI:
             print("\n[*] shutting down controller…")
             for t in (serve, reaper, sampler, updater, idle_unloader, juggler_sweeper, persist_reloader):
                 t.cancel()
+            if disc_tr is not None:            # #discovery: stop answering broadcasts
+                with contextlib.suppress(Exception):
+                    disc_tr.close()
             ctrl.close()
             with contextlib.suppress(Exception):
                 if engine.data_server is not None:

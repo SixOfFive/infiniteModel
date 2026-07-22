@@ -441,6 +441,13 @@ _CONFIG_DEFAULTS = {
     "worker_data_port": 50200,
     "update_repo": "SixOfFive/infiniteModel",   # GitHub owner/name for self-update (public, no token)
     "update_branch": "main",
+    # #discovery: zero-config controller discovery (UDP broadcast query -> unicast reply).
+    # controller_host "auto" discovers ALWAYS; a static host that is unreachable at startup
+    # falls back to discovery ONCE (so a fresh clone whose config.json points at someone
+    # else's LAN still just runs). cluster_id "" = unset = join whichever controller answers;
+    # set it on BOTH controller and workers to pin a worker to one fleet on a shared LAN.
+    "discovery_port": 50099,
+    "cluster_id": "",
 }
 _CONFIG_CACHE = None
 
@@ -468,6 +475,149 @@ def load_config() -> dict:
         print(f"[config] config.json unreadable ({exc!r}); using built-in defaults", flush=True)
     _CONFIG_CACHE = cfg
     return cfg
+
+
+# --- #discovery: zero-config controller discovery -------------------------------------------------
+# Shape B1 (client broadcast QUERY -> controller unicast REPLY), chosen over mDNS deliberately:
+# dependency-free (no zeroconf), works on the Windows controller, and — because the controller
+# answers from the interface that received the query — the reply's source IP is BY CONSTRUCTION the
+# right same-subnet address for that worker. That sidesteps the Tailscale wrong-IP trap that made
+# mDNS resolve a node to its 100.x CGNAT address instead of its LAN IP.
+#
+# Broadcast does NOT cross subnets/VLANs/VPN. That is why static config stays the fallback and
+# remains fully supported: discovery is an ergonomic win for the single-LAN case, never a
+# replacement for explicit addressing.
+DISCOVERY_MAGIC = "infinitemodel-discovery-v1"
+
+
+def local_ip_for(peer: str) -> str:
+    """The local IPv4 the OS would use as SOURCE to reach `peer`. UDP connect() only sets the
+    socket's default destination — no packet is sent — so this is a free, portable routing-table
+    lookup. This is what makes the discovery reply carry the correct per-subnet controller IP on a
+    multi-homed / Tailscale'd box instead of a hostname lookup's first (often wrong) answer."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((peer, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
+def _local_ipv4s() -> set:
+    """Every non-loopback IPv4 this host owns (best effort, stdlib only)."""
+    import socket
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    d = local_ip_for("8.8.8.8")          # the default-route NIC, even if the hostname doesn't resolve
+    if d:
+        ips.add(d)
+    return {ip for ip in ips if not ip.startswith("127.")}
+
+
+def _broadcast_targets() -> list:
+    """255.255.255.255 plus a per-NIC directed /24 broadcast. The limited broadcast only leaves the
+    default-route interface, so a dual-homed box (e.g. MOBILE, LAN + Tailscale) would otherwise miss
+    a controller on its second NIC. The /24 assumption is a heuristic; it costs one stray datagram
+    when wrong and the limited broadcast still covers the normal case."""
+    tgts = ["255.255.255.255"]
+    for ip in sorted(_local_ipv4s()):
+        b = ip.rsplit(".", 1)[0] + ".255"
+        if b not in tgts:
+            tgts.append(b)
+    return tgts
+
+
+def discover_controller(cluster_id: str = "", port: int = 0, timeout: float = 2.5,
+                        verbose: bool = True) -> dict:
+    """Broadcast a discovery query and return the chosen controller as
+    {host, control_port, http_port, cluster_id, name, version} — or {} if nothing answered.
+
+    Re-sends every ~0.5s for `timeout` seconds (one dropped datagram must not fail onboarding).
+    Ambiguity policy: a worker silently joining the WRONG fleet is far worse than a slow start, so
+    when several distinct controllers answer we prefer (1) an exact cluster_id match, then (2) a
+    controller on our own /24, and we always LOG every responder so a mis-join is visible."""
+    import json
+    import socket
+    import time
+    cfg = load_config()
+    port = int(port or cfg.get("discovery_port") or 50099)
+    want = str(cluster_id or cfg.get("cluster_id") or "")
+    query = json.dumps({"im": DISCOVERY_MAGIC, "q": 1, "cluster_id": want}).encode()
+    targets = _broadcast_targets()
+    found: dict = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.settimeout(0.25)
+        s.bind(("", 0))
+        if verbose:
+            print(f"[discovery] searching for a controller on udp/{port} "
+                  f"(cluster_id={want or '<any>'}) …", flush=True)
+        deadline, next_send = time.time() + max(0.5, timeout), 0.0
+        while time.time() < deadline:
+            if time.time() >= next_send:
+                next_send = time.time() + 0.5
+                for t in targets:
+                    try:
+                        s.sendto(query, (t, port))
+                    except OSError:
+                        pass       # an interface may refuse broadcast; the others still go
+            try:
+                raw, addr = s.recvfrom(65535)
+            except (socket.timeout, OSError):
+                continue
+            try:
+                msg = json.loads(raw.decode("utf-8", "replace"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(msg, dict) or msg.get("im") != DISCOVERY_MAGIC or not msg.get("r"):
+                continue
+            cid = str(msg.get("cluster_id") or "")
+            if want and cid != want:
+                continue           # a different fleet answered — ignore it
+            host = str(msg.get("host") or addr[0])
+            try:
+                cport = int(msg.get("control_port") or cfg["control_port"])
+            except (TypeError, ValueError):
+                continue
+            found.setdefault((host, cport), {
+                "host": host, "control_port": cport,
+                "http_port": int(msg.get("http_port") or cfg["http_port"]),
+                "cluster_id": cid, "name": str(msg.get("name") or ""),
+                "version": str(msg.get("version") or ""),
+            })
+    finally:
+        s.close()
+    if not found:
+        if verbose:
+            print("[discovery] no controller answered", flush=True)
+        return {}
+    cands = list(found.values())
+    if len(cands) > 1 and verbose:
+        print(f"[discovery] ⚠ {len(cands)} controllers answered — set `cluster_id` on this worker "
+              f"to pin it to one fleet:", flush=True)
+        for c in cands:
+            print(f"[discovery]     {c['host']}:{c['control_port']} "
+                  f"({c['name'] or '?'}, cluster_id={c['cluster_id'] or '<unset>'})", flush=True)
+    pick = None
+    if want:
+        pick = next((c for c in cands if c["cluster_id"] == want), None)
+    if pick is None:                                   # prefer a controller on our own /24
+        mine = {ip.rsplit(".", 1)[0] for ip in _local_ipv4s()}
+        pick = next((c for c in cands if c["host"].rsplit(".", 1)[0] in mine), None)
+    if pick is None:
+        pick = cands[0]
+    if verbose:
+        print(f"[discovery] using controller {pick['host']}:{pick['control_port']}"
+              + (f" ({pick['name']})" if pick["name"] else ""), flush=True)
+    return pick
 
 
 def repo_raw_url() -> str:

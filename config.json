@@ -1,10 +1,13 @@
 {
   "_comment": "Central cluster configuration — single source of truth for hosts/ports + the self-update source. Edit here, not in code. No secrets: self-update pulls from the PUBLIC GitHub repo's raw endpoint (update_repo/update_branch), which needs no token.",
+  "_discovery": "controller_host may be an IP or \"auto\" (find the controller by UDP broadcast on discovery_port). A STATIC host that is unreachable at worker startup also falls back to discovery once — so a fresh clone runs with no edits. Broadcast does NOT cross subnets/VLANs/VPN: keep a static host for those. cluster_id \"\" = join whichever controller answers; set it on the controller AND its workers to pin a fleet when two controllers share a LAN.",
   "controller_host": "192.168.15.38",
   "http_port": 21434,
   "control_port": 50100,
   "data_port": 50101,
   "worker_data_port": 50200,
+  "discovery_port": 50099,
+  "cluster_id": "",
   "update_repo": "SixOfFive/infiniteModel",
   "update_branch": "main"
 }
