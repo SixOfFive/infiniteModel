@@ -458,16 +458,48 @@ def federation_enabled() -> bool:
     return bool(cfg.get("federate", True))
 
 
+def _norm_name(v) -> str:
+    """Collapse a client-facing model name to its canonical dash form for MATCHING — mirrors the
+    controller's own resolve_model_name normalisation, but dependency-free (peers.py is stdlib-only):
+      lowercases; strips a trailing ':latest' (possibly stacked); turns the family:size ':' into '-'.
+    So 'nomic-embed-text:latest', 'qwen3:4b', 'qwen3-4b:latest' all reduce the way the resolver does.
+    Raw HF ids ('org/name') are left untouched. Federation matching skipped this, so a request that
+    named a model in ANY colon form (the Ollama default) failed to match a peer's dash-form friendly
+    name and never federated — it fell through to a local load that has no nodes to run it."""
+    n = str(v or "").strip().lower()
+    if not n or "/" in n:
+        return n
+    while n.endswith(":latest"):
+        n = n[: -len(":latest")]
+    if ":" not in n:
+        return n
+    head, _, tail = n.partition(":")
+    return f"{head}-{tail}" if tail else head
+
+
 def _model_aliases(m: dict) -> set:
-    """Every name a peer's model answers to, normalised for matching."""
+    """Every name a peer's model answers to, normalised for matching. Includes BOTH the literal
+    forms (friendly/target/aliases/name/internal_name — a /status card names itself differently
+    than a /peer_info summary) AND their canonical dash forms, so matching is symmetric with the
+    requester side (_name_candidates)."""
     out = set()
-    for v in (m.get("friendly"), m.get("target")):
+    for v in (m.get("friendly"), m.get("target"), m.get("name"), m.get("internal_name")):
         if v:
             out.add(str(v).strip().lower())
+            out.add(_norm_name(v))
     for v in (m.get("aliases") or []):
         if v:                      # a None in the list would become the literal alias "none"
             out.add(str(v).strip().lower())
+            out.add(_norm_name(v))
+    out.discard("")
     return out
+
+
+def _name_candidates(name: str) -> set:
+    """The forms a requested name might match a peer model under: the raw lowercased name and its
+    canonical dash form. Both, because a peer might advertise either."""
+    raw = str(name or "").strip().lower()
+    return {raw, _norm_name(raw)} - {""}
 
 
 def find_model_peer(name: str) -> tuple:
@@ -477,7 +509,7 @@ def find_model_peer(name: str) -> tuple:
     at a controller we cannot currently reach would turn a servable request into a timeout. Among
     candidates we prefer the least busy (fewest active requests) so federation spreads rather than
     piles onto one box."""
-    want = str(name or "").strip().lower()
+    want = _name_candidates(name)
     if not want:
         return (None, None)
     best = (None, None, 1 << 30)
@@ -485,7 +517,7 @@ def find_model_peer(name: str) -> tuple:
         if peer_state(p) != "ok":
             continue
         for m in ((p.get("info") or {}).get("models") or []):
-            if want in _model_aliases(m):
+            if want & _model_aliases(m):
                 act = int(m.get("active") or 0)
                 if act < best[2]:
                     best = (p, m, act)
