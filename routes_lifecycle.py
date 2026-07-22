@@ -17,7 +17,8 @@ def register(app):
                    replicas: int = 1, cpu_only: bool = False,
                    moe_offload: bool = False, force: bool = False,
                    node: str = "", kv_quant: str = "",
-                   kv_offload: bool = False, temperature: str = "",
+                   kv_offload: bool = False, kv_slots: int = 1,
+                   temperature: str = "",
                    min_p: str = "", precompile: bool = True,
                    draft_gpu: bool = False, draft_margin_gb: str = "",
                    t2i_offload: bool = False) -> JSONResponse:
@@ -66,6 +67,15 @@ def register(app):
             return JSONResponse({"ok": False, "error":
                                  "kv_offload and kv_quant are mutually exclusive (pick one)"},
                                 status_code=400)
+        # #kv-slots: per-replica concurrent decode slots C (opt-in; default 1 = today's exact
+        # one-generation-per-replica behavior). Clamp band 1..8 (measured q-curves: CUDA forward
+        # cost is flat to q=16, Strix steps at 16 — 8 is the validated opt-in ceiling). KV memory
+        # scales xC: the planner reserves C x per-stream full-ctx KV and the load FAILS if that
+        # doesn't fit. Hybrid/kv_quant/kv_offload/tp>1 are hard-gated to 1 inside engine.load;
+        # a chain with any pre-'kvslots' worker REFUSES C>1 outright (wire-cap all-or-nothing).
+        if not (1 <= int(kv_slots) <= 8):
+            return JSONResponse({"ok": False,
+                                 "error": f"bad kv_slots '{kv_slots}' (1-8)"}, status_code=400)
         # #load-temp: per-model DEFAULT temperature — used when a request doesn't send one
         # (explicit request values always win). Empty = unset (requests keep the global default).
         default_temp = None
@@ -152,6 +162,7 @@ def register(app):
                 lms = await engine.replicate(friendly, ctx, replicas,
                                              consolidate=cons, prefer_vram=pv, quant=quant,
                                              kv_quant=kv_quant, kv_offload=kv_offload,
+                                             kv_slots=kv_slots,
                                              default_temp=default_temp,
                                              default_min_p=default_min_p)
                 return JSONResponse({"ok": True, "model": friendly, "ctx": lms[0].ctx,
@@ -168,6 +179,7 @@ def register(app):
                                    gpu_spread=(mode == "all-gpu"),
                                    moe_offload=moe_offload, force=force, pin_host=node,
                                    kv_quant=kv_quant, kv_offload=kv_offload,
+                                   kv_slots=kv_slots,
                                    default_temp=default_temp, default_min_p=default_min_p,
                                    requested_by=_req_ip,
                                    draft_gpu=draft_gpu, draft_margin_gb=_draft_margin,

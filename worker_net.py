@@ -84,7 +84,26 @@ class WorkerNetMixin:
 
     def _run_stage(self, model_id, x, cache_start, reset, all_logits, inject=None,
                    position_ids=None, capture_hidden=False, capture_pre_norm=False,
-                   bidir_spans=None, nt=None):
+                   bidir_spans=None, nt=None, slot=0):
+        # #kv-slots: slot>0 routes this forward to that slot's INDEPENDENT KV cache. Gated at the
+        # door: the controller only sends slot>0 to a chain whose every node advertised 'kvslots'
+        # (#wire-caps, load-time all-or-nothing), but a per-file self-update convergence window can
+        # still leave THIS box with a new worker_net + a stale shard_forward — running such a frame
+        # against the single-cache forward() would silently fold two requests into ONE cache
+        # (cross-request corruption). Refuse LOUDLY instead (the controller fails the request with
+        # a causal error; no KV is touched). TP never sees slots (kv_slots is clamped to 1 for
+        # tp>1 at load) — refuse that too rather than broadcast a slot the peers would ignore.
+        if slot:
+            sh = self.shards[model_id]
+            if self._tp is not None and model_id == self._tp_model_id:
+                raise RuntimeError("#kv-slots: slot>0 on a tensor-parallel model is unsupported")
+            if not getattr(sh, "_slot_capable", False):
+                raise RuntimeError(
+                    "#kv-slots: this shard's forward() has no slot support (stale "
+                    "shard_forward.py mid self-update) — refusing to fold slots into one cache")
+            return sh.forward(x, cache_start, reset, all_logits, inject,
+                              position_ids, capture_hidden, capture_pre_norm,
+                              bidir_spans, nt, slot)
         # TP rank 0 drives the group: broadcast this forward's input to the peers (who run
         # their sharded forward in lockstep), then run ours, all-reducing via the mesh hooks.
         # #logits-diet: nt is NOT in the broadcast tuple — the controller excludes TP models
@@ -142,7 +161,19 @@ class WorkerNetMixin:
                     continue
                 if hdr.get("kind") == "crop":  # spec-decode KV rollback / #prefix-kv resume
                     if shard is not None:
-                        shard.crop(int(hdr.get("cache_position", 0)))
+                        # #kv-slots: crop THE REQUEST'S slot only (slot absent == 0 == legacy).
+                        # A slot>0 crop against a stale (slot-incapable) shard is SKIPPED rather
+                        # than misapplied to the single shared cache — the following forward then
+                        # fails loudly on the mask/KV mismatch instead of silently corrupting.
+                        _cslot = int(hdr.get("slot", 0) or 0)
+                        if _cslot and not getattr(shard, "_slot_capable", False):
+                            print(f"[data] crop slot={_cslot} on a slot-incapable shard "
+                                  f"({model_id}) — skipped (stale shard_forward.py?)", flush=True)
+                        else:
+                            try:
+                                shard.crop(int(hdr.get("cache_position", 0)), _cslot)
+                            except TypeError:   # stale shard_build.crop (no slot param); slot 0 only
+                                shard.crop(int(hdr.get("cache_position", 0)))
                     with contextlib.suppress(Exception):  # propagate down the chain, via
                         # _send_next (reconnect-once) so the crop rides the SAME (possibly
                         # freshly re-dialed) socket the following data frames will use — the
@@ -197,6 +228,12 @@ class WorkerNetMixin:
                 cache_start = int(hdr.get("cache_position", 0))
                 reset = bool(hdr.get("reset", True))
                 all_logits = bool(hdr.get("all_logits", False))
+                # #kv-slots: which per-request KV slot this frame belongs to. Absent == 0 == the
+                # legacy single-cache path, byte-identical. Cap-gated controller-side ('kvslots'
+                # in wire.WIRE_CAPS, all-or-nothing per chain at load); _run_stage refuses a
+                # slot>0 frame if THIS box's shard_forward is stale (never fold slots into one
+                # cache). #pipefill chunks and #prefix-kv suffix frames carry their gen's slot.
+                slot = int(hdr.get("slot", 0) or 0)
                 # #pipefill CONTRACT (cap-gated controller-side; advertised via wire.WIRE_CAPS):
                 # a prefill may arrive as SEVERAL back-to-back ids/hidden frames — chunk 0
                 # reset=True at cache_position 0, chunks 1..C-1 reset=False at increasing
@@ -313,7 +350,7 @@ class WorkerNetMixin:
                     out = await asyncio.to_thread(self._run_stage, model_id, x, cache_start,
                                                   reset, all_logits, inject, position_ids,
                                                   capture_hidden, capture_pre_norm, bidir_spans,
-                                                  nt)
+                                                  nt, slot)
                     kind = "logits" if shard.has_head else "hidden"
                     if ntensor_req and shard.has_head and _pack_ntensor is not None:
                         # #ntensor-manifest: head stage, controller requested the manifest frame.
@@ -368,6 +405,12 @@ class WorkerNetMixin:
                             ohdr["position_ids"] = position_ids
                         if bidir_spans is not None:   # #gemma4-bidir: reach every stage's mask
                             ohdr["bidir_spans"] = bidir_spans
+                        # #kv-slots: the slot id must ride hop-by-hop (this parser REBUILDS the
+                        # next-hop header) so every downstream stage appends into the SAME slot's
+                        # cache. Head replies are rid-keyed at the controller — no slot needed
+                        # there, keeping reply frames byte-identical. slot 0 adds nothing (legacy).
+                        if slot and not shard.has_head:
+                            ohdr["slot"] = slot
                         # propagate the capture flag to the next stage so it reaches the head stage
                         if capture_hidden and not shard.has_head:
                             ohdr["capture_hidden"] = True

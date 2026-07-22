@@ -566,11 +566,15 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
                  device: str = "cpu", gpu_mem_gb: float = 0.0,
                  attn: str = "eager", quant: str = "none",
                  tp_rank: int = 0, tp_size: int = 1, tp_allreduce=None,
-                 kv_quant: str = "none", kv_offload: bool = False) -> None:
+                 kv_quant: str = "none", kv_offload: bool = False,
+                 kv_slots: int = 1) -> None:
         import torch
         from transformers import AutoModelForCausalLM
         self.torch = torch
         self.kv_offload = bool(kv_offload)   # #kv-offload: KV in system RAM (OffloadedCache)
+        # #kv-slots: per-request KV slot count C (dict slot->cache; shard_forward routes each
+        # forward/crop to its request's slot). Set before placement so the KV budget scales xC.
+        self.kv_slots = max(1, int(kv_slots or 1))
         # Qwen2.5-Omni: AutoModelForCausalLM can't build Qwen2_5OmniTextConfig. Build ONLY the
         # Thinker TEXT decoder (Qwen2_5OmniThinkerTextModel) + a fresh lm_head, wrapped so
         # .model.layers / .lm_head match the served 'model.*'/'lm_head' weights (controller
@@ -705,6 +709,9 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
                 mods += [self.norm, self.head]
             self.loaded_bytes = sum(self._mod_bytes(m) for m in mods if m is not None)
         self.kv = None  # per-generation KV cache (DynamicCache), reset on reset=True
+        # #kv-slots: authoritative slot->cache store; self.kv is the RUNNING slot's binding
+        # (shard_forward binds/writes-back under _fwd_lock). Empty + slot 0 == legacy behavior.
+        self._kv_by_slot = {}
         # #fwd-serialize: forwards on ONE shard mutate the single shared self.kv. Normally a model's
         # forwards are strictly sequential (the controller's per-model lock + awaiting each result),
         # so this is uncontended. The exception is an ORPHANED forward: when the controller reclaims a

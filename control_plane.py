@@ -408,6 +408,7 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 _f = engine.pending.pop(_rid, None)
                 engine.pending_model.pop(_rid, None)
                 engine.pending_friendly.pop(_rid, None)
+                getattr(engine, "pending_slot", {}).pop(_rid, None)   # #kv-slots lockstep
                 if _f is not None and not _f.done():
                     _nh = msg.get("next_host") or "?"
                     _st = msg.get("stage")
@@ -434,6 +435,7 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 _f = engine.pending.pop(_rid, None)
                 engine.pending_model.pop(_rid, None)
                 engine.pending_friendly.pop(_rid, None)
+                getattr(engine, "pending_slot", {}).pop(_rid, None)   # #kv-slots lockstep
                 _err = str(msg.get("error") or "stage compute error")
                 _live = _f is not None and not _f.done()
                 if _live:
@@ -572,6 +574,118 @@ async def gen_stall_watchdog() -> None:
         for key, m in list(engine.models.items()):
             if getattr(m, "active", 0) <= 0:
                 continue
+            # #kv-slots (C>1): reclaim per (model, slot) — one wedged slot must never reclaim
+            # its healthy siblings, so the model-level path below (zero active, swap the lock)
+            # is WRONG for a slotted model and is skipped entirely. Each slot carries its own
+            # token stamps (slot_state, stamped by generate); a stalled slot has ONLY its own
+            # request cancelled, ONLY its own pending futures failed (pending_slot match), its
+            # own #prefix-kv record nulled, and its slot returned to the pool via the ownership
+            # token swap (the orphaned lease's release then no-ops — no double-free). We do NOT
+            # touch model.active here: failing the future / cancelling the task resumes the
+            # generation, whose finally decrements it (the hop_error anti-double-count rule).
+            if int(getattr(m, "kv_slots", 1) or 1) > 1:
+                try:
+                    _ds = float(ENGINE_CONFIG.get("gen_stall_decode_s", GEN_STALL_DECODE_S))
+                except (TypeError, ValueError):
+                    _ds = GEN_STALL_DECODE_S
+                for _sl, _st in list((getattr(m, "slot_state", None) or {}).items()):
+                    _sl_last = float(_st.get("last_token_ts") or 0.0)
+                    _sl_started = float(_st.get("gen_started_ts") or 0.0)
+                    _sl_decoding = _sl_last > _sl_started > 0
+                    _sl_eff = min(stall_s, _ds) if (_sl_decoding and _ds > 0) else stall_s
+                    # prefill liveness: fwd_progress is MODEL-level (worker heartbeats credit
+                    # rids, not slots) — during any live prefill it shields every slot's
+                    # PREFILL branch (conservative: never reclaims a slow prefill early; at
+                    # most 1 prefill runs per replica via prefill_lock anyway). Decode stays
+                    # tokens-only PER SLOT so a dead hop still reclaims that slot fast.
+                    _sl_basis = (_sl_last if _sl_decoding
+                                 else max(_sl_last, getattr(m, "fwd_progress_ts", 0.0) or 0.0))
+                    if _sl_basis <= 0 or (now - _sl_basis) <= _sl_eff:
+                        continue
+                    _idle_s = int(now - _sl_basis)
+                    _r = _st.get("rec")
+                    if _r is not None:
+                        _r["cancel"] = True
+                        _r["reclaimed"] = True   # #endpoint-weather: retryable 503/529 marker
+                        _t = _r.get("task")
+                        if _t is not None and not _t.done():
+                            with contextlib.suppress(Exception):
+                                _t.cancel()
+                        _inflight_release(_r)
+                    _psl = getattr(engine, "pending_slot", {}) or {}
+                    # default 0, NOT None: _send/_send_prefill record pending_slot only for
+                    # slot>0 (``if slot:`` guard), so on this C>1 replica an UNRECORDED rid IS
+                    # slot 0 — ``_psl.get(r)`` (None) would never match _sl==0 and a wedged
+                    # slot 0 would fail no in-flight future (rec-less internal gens would hang
+                    # until the generic hop/GEN timeout).
+                    for _rid in [r for r, fr in
+                                 list(getattr(engine, "pending_friendly", {}).items())
+                                 if fr == key and _psl.get(r, 0) == _sl]:
+                        _f = engine.pending.get(_rid)
+                        engine.pending.pop(_rid, None)
+                        engine.pending_model.pop(_rid, None)
+                        engine.pending_friendly.pop(_rid, None)
+                        _psl.pop(_rid, None)
+                        if _f is not None and not _f.done():
+                            with contextlib.suppress(Exception):
+                                _f.set_exception(ConnectionError(
+                                    "gen-stall watchdog reclaim (kv-slot)"))
+                    with contextlib.suppress(Exception):   # half-appended KV possible -> record dead
+                        (getattr(m, "kv_ids_slots", None) or {})[_sl] = None
+                    if m.slot_owner.get(_sl) is _st.get("lease"):
+                        m.slot_owner.pop(_sl, None)
+                        m.slot_state.pop(_sl, None)
+                        if _sl not in m.slot_free:
+                            m.slot_free.append(_sl)
+                        m.slots_active = max(0, int(getattr(m, "slots_active", 0) or 0) - 1)
+                        with contextlib.suppress(Exception):
+                            m.slot_sem.release()
+                    else:
+                        m.slot_state.pop(_sl, None)   # lease already gone — just drop the stamps
+                    engine._last_load_failure = time.time()   # self-update cool-down (anti-churn)
+                    log_activity(f"gen-stall watchdog: {_ollama_name(key)} slot {_sl} wedged — "
+                                 f"no token for {_idle_s}s "
+                                 f"({'decode' if _sl_decoding else 'prefill'}, "
+                                 f"thresh {int(_sl_eff)}s) — reclaimed the slot; sibling slots "
+                                 f"keep serving")
+                    # #wedge-quarantine per (model,slot): repeated wedges of the SAME slot inside
+                    # the window still mean a systematically broken replica — the re-place is
+                    # inherently model-wide (fresh shards for every slot), same as C=1.
+                    try:
+                        _thr = int(ENGINE_CONFIG.get("wedge_reload_n", 3) or 0)
+                    except (TypeError, ValueError):
+                        _thr = 3
+                    _wr = getattr(engine, "_wedge_recent", None)
+                    if _wr is None:
+                        _wr = engine._wedge_recent = {}
+                    _wk = f"{key}::slot{_sl}"
+                    _cnt, _ts = _wr.get(_wk, (0, 0.0))
+                    _cnt = _cnt + 1 if (now - _ts) < 900.0 else 1
+                    _wr[_wk] = (_cnt, now)
+                    if (_thr > 0 and _cnt >= _thr and not engine._juggle_lock.locked()
+                            and not getattr(getattr(m, "spec", None), "is_embedding", False)):
+                        _wr[_wk] = (0, now)
+                        log_activity(f"wedge-quarantine: {_ollama_name(key)} slot {_sl} wedged "
+                                     f"{_cnt} times in {int((now - _ts) / 60) if _ts else 0}+ min "
+                                     f"— forcing a fresh re-place (self-heal, keeps kv_slots)")
+
+                        async def _selfheal_slot(fr=key, _tp=getattr(m, "tp_size", 1),
+                                                 _ctx=m.ctx, _q=(m.quant or "none")):
+                            async with engine._juggle_lock:   # one managed re-place at a time
+                                try:
+                                    if fr not in engine.models:
+                                        return
+                                    await engine.reconfigure(fr, tp=_tp, ctx=_ctx, quant=_q,
+                                                             consolidate=True, prefer_vram=True,
+                                                             cpu_only=False)   # kv_slots preserved
+                                    log_activity(f"wedge-quarantine: {_ollama_name(fr)} "
+                                                 f"re-placed OK")
+                                except Exception as _exc:
+                                    log_activity(f"wedge-quarantine: re-place of "
+                                                 f"{_ollama_name(fr)} failed ({_exc!r}) — will "
+                                                 f"retry after the next wedge")
+                        asyncio.create_task(_selfheal_slot())
+                continue
             last = getattr(m, "last_token_ts", 0.0) or 0.0
             # #active-decode-stall: once this gen produced its first token (last_token_ts advanced past
             # gen_started_ts) it's DECODING — apply the SHORTER gen_stall_decode_s so a wedged hop (the
@@ -642,6 +756,7 @@ async def gen_stall_watchdog() -> None:
                 engine.pending.pop(_rid, None)
                 engine.pending_model.pop(_rid, None)
                 engine.pending_friendly.pop(_rid, None)
+                getattr(engine, "pending_slot", {}).pop(_rid, None)   # #kv-slots lockstep
                 if _f is not None and not _f.done():
                     with contextlib.suppress(Exception):
                         _f.set_exception(ConnectionError("gen-stall watchdog reclaim"))

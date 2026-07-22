@@ -41,6 +41,7 @@ class EngineLifecycleMixin:
                 if rid is not None:
                     self.pending_model.pop(rid, None)
                     self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
+                    getattr(self, "pending_slot", {}).pop(rid, None)   # #kv-slots lockstep
                 if hdr.get("kind") == "error":
                     if fut and not fut.done():
                         fut.set_exception(RuntimeError(hdr.get("error", "stage error")))
@@ -139,6 +140,7 @@ class EngineLifecycleMixin:
                             self.pending.pop(rid, None)
                             self.pending_model.pop(rid, None)
                             self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
+                            getattr(self, "pending_slot", {}).pop(rid, None)   # #kv-slots lockstep
                             fut.set_exception(ConnectionError(
                                 "data connection closed (head did not re-deliver within grace)"))
                 with contextlib.suppress(Exception):
@@ -189,6 +191,7 @@ class EngineLifecycleMixin:
         self.pending.clear()
         self.pending_model.clear()
         self.pending_friendly.clear()   # #5 keep replica map in lockstep
+        getattr(self, "pending_slot", {}).clear()   # #kv-slots lockstep
         _release_ram()              # actually hand the freed draft RAM back (gc cycles + OS)
 
     def invalidate_model(self, friendly: str, reason: str) -> None:
@@ -211,6 +214,7 @@ class EngineLifecycleMixin:
             _f = self.pending.pop(_rid, None)
             self.pending_model.pop(_rid, None)
             self.pending_friendly.pop(_rid, None)
+            getattr(self, "pending_slot", {}).pop(_rid, None)   # #kv-slots lockstep
             if _f is not None and not _f.done():
                 with contextlib.suppress(Exception):
                     _f.set_exception(ConnectionError(f"{friendly} replica invalidated: {reason}"))
@@ -298,8 +302,38 @@ class EngineLifecycleMixin:
         return rs
 
     def replica_count(self, base: str) -> int:
-        """Number of concurrent decode slots for `base` (one per resident replica; >=1)."""
+        """Number of resident replicas of `base` (>=1)."""
         return max(1, len(self.replicas_of(base)))
+
+    def slot_count(self, base: str) -> int:
+        """#kv-slots: TOTAL concurrent decode slots for `base` — the sum of kv_slots across its
+        resident replicas (each replica contributes C independent KV streams; a legacy C=1
+        replica contributes exactly 1, so a fleet with no kv_slots loads returns EXACTLY the
+        old replica_count). Feeds _inflight_admit's 'C slots + queue_depth' accounting."""
+        rs = self.replicas_of(base)
+        if not rs:
+            return 1
+        return max(1, sum(max(1, int(getattr(m, "kv_slots", 1) or 1)) for m in rs))
+
+    def _init_slot_pool(self, lm) -> None:
+        """#kv-slots: attach the per-replica slot pool to a LoadedModel loaded with kv_slots>1.
+        slot_sem bounds concurrency at C (FIFO, like the old per-model lock at C=1); slot_free
+        holds the un-leased slot ids; slot_owner maps slot -> the owning lease's token (the
+        watchdog swaps it on a per-slot reclaim so the orphan's release becomes a no-op);
+        slot_state carries per-slot activity stamps for the per-slot gen-stall watchdog;
+        kv_ids_slots is the per-slot #prefix-kv record; prefill_lock admits at most ONE
+        in-PREFILL generation per replica (decode slots keep flowing between #pipefill chunks).
+        C<=1 models never get a pool — every C=1 path stays on model.lock, byte-identical."""
+        C = max(1, int(getattr(lm, "kv_slots", 1) or 1))
+        if C <= 1:
+            return
+        lm.slot_sem = asyncio.Semaphore(C)
+        lm.slot_free = list(range(C))
+        lm.slot_owner = {}
+        lm.slot_state = {}
+        lm.kv_ids_slots = {}
+        lm.prefill_lock = asyncio.Lock()
+        lm.slots_active = 0
 
     def _pick_replica(self, base: str) -> Optional["LoadedModel"]:
         """Route a request for `base` to the least-loaded resident replica (active+queued),

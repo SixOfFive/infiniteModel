@@ -58,11 +58,13 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
         return JSONResponse({"type": "error",
                              "error": {"type": "not_found_error", "message": str(exc)}},
                             status_code=404)
-    rec = _inflight_admit(ip, friendly, engine.replica_count(friendly))  # K slots + queue; else 429
+    # #kv-slots: slots = replicas x per-replica kv_slots (== replica count on a C=1 fleet)
+    _slots = engine.slot_count(friendly)
+    rec = _inflight_admit(ip, friendly, _slots)  # slots + queue; else 429
     if rec is None:
         # #queue-depth: retryable overflow -> 429+Retry-After (Anthropic overloaded_error envelope).
         return JSONResponse({"type": "error", "error": {"type": "overloaded_error",
-            "message": f"queue full for '{friendly}': 1 slot + "
+            "message": f"queue full for '{friendly}': {_slots} slot(s) + "
                        f"{ENGINE_CONFIG.get('queue_depth', DEFAULT_QUEUE_DEPTH)} queued"}},
             status_code=429, headers={"Retry-After": "1"})
     # #cold-contract: known-but-cold model + auto-load OFF -> retryable typed signal (not a terminal

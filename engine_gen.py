@@ -76,7 +76,131 @@ def _prefix_kv_min() -> int:
     return max(16, n)
 
 
+def _lcp_len(a, b) -> int:
+    """#kv-slots: longest-common-prefix length of two id lists (C-speed fast path for the
+    every-turn agent shape — pure extension/retry — mirroring _prefill_reuse's own LCP)."""
+    if not a or not b:
+        return 0
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+class _SlotLease:
+    """#kv-slots: one generation's decode-slot lease on a replica — the async CM that replaced
+    the whole-generation ``async with model.lock``.
+
+    C == 1 (kv_slots absent/1 — every legacy load): acquires model.lock EXACTLY like the old
+    ``async with`` (the lock OBJECT is captured at enter, so the gen-stall watchdog's
+    lock-swap reclaim keeps today's semantics: the orphan releases the OLD object). slot 0,
+    zero new state — byte-identical serialization.
+
+    C > 1: acquires one permit of model.slot_sem (asyncio.Semaphore(C), FIFO like Lock) and
+    picks a slot id from model.slot_free — preferring the free slot whose per-slot #prefix-kv
+    record (model.kv_ids_slots) has the LONGEST common prefix with THIS request's prompt, so
+    a multi-turn client tends to land back on the slot that already holds its context (the
+    'longest LCP wins, its slot is reused' rule). The lease owns the slot for the generation's
+    whole lifetime (prefill + decode + crops all carry its id). Ownership is tokenized
+    (model.slot_owner[slot] is THIS lease's token): the per-slot gen-stall watchdog reclaim
+    frees a wedged slot by swapping the token and releasing the semaphore ITSELF — the
+    orphaned gen's __aexit__ then sees the mismatch and releases NOTHING (no double-release,
+    no double-free of the slot id). Slot-pool exhaustion (all C busy -> this request queues)
+    logs one activity line per model per minute, max."""
+
+    def __init__(self, model, prompt_ids=None):
+        self.model = model
+        self.prompt_ids = prompt_ids or []
+        self.slot = 0
+        self.token = None          # C>1 ownership token (None on the C=1 lock path)
+        self._lock = None          # C=1: the captured lock object
+        self._sem = None           # C>1: the captured semaphore
+
+    async def __aenter__(self):
+        m = self.model
+        C = int(getattr(m, "kv_slots", 1) or 1)
+        if C <= 1 or getattr(m, "slot_sem", None) is None:
+            self._lock = m.lock
+            await self._lock.acquire()
+            return 0
+        sem = m.slot_sem
+        if sem.locked():
+            # all C slots busy -> queueing. Observability (once per minute per model, max):
+            # without this line slot-pool exhaustion is invisible in telemetry.
+            now = time.time()
+            if now - (getattr(m, "_slot_full_log_ts", 0.0) or 0.0) > 60.0:
+                m._slot_full_log_ts = now
+                with contextlib.suppress(Exception):
+                    log_activity(f"{m.friendly}: all {C} kv-slots busy — request queued "
+                                 f"(slot pool exhausted)")
+        await sem.acquire()
+        self._sem = sem
+        free = m.slot_free
+        # longest-LCP slot choice over the FREE slots' per-slot #prefix-kv records
+        recs = getattr(m, "kv_ids_slots", None) or {}
+        best, best_l = free[0], -1
+        for s in free:
+            l = _lcp_len(recs.get(s), self.prompt_ids)
+            if l > best_l:
+                best, best_l = s, l
+        free.remove(best)
+        self.slot = best
+        self.token = object()
+        m.slot_owner[best] = self.token
+        m.slots_active = int(getattr(m, "slots_active", 0) or 0) + 1
+        return best
+
+    async def __aexit__(self, *exc):
+        m = self.model
+        if self._sem is None:
+            if self._lock is not None:
+                with contextlib.suppress(Exception):
+                    self._lock.release()
+            return False
+        # return the slot ONLY if the watchdog hasn't already reclaimed it (token match)
+        if m.slot_owner.get(self.slot) is self.token:
+            m.slot_owner.pop(self.slot, None)
+            m.slot_state.pop(self.slot, None)
+            m.slot_free.append(self.slot)
+            m.slots_active = max(0, int(getattr(m, "slots_active", 0) or 0) - 1)
+            self._sem.release()
+        return False
+
+
 class EngineGenMixin:
+
+    # ---- #kv-slots: per-slot #prefix-kv record access -------------------------------------
+    # C == 1 keeps the classic single model.kv_ids attribute (every existing writer/reader —
+    # spec decode, capture paths, the C=1 watchdog reclaim — stays byte-identical); C > 1
+    # stores one record per slot in model.kv_ids_slots so streams never cross-contaminate.
+
+    def _kv_rec_get(self, model, slot: int = 0):
+        if int(getattr(model, "kv_slots", 1) or 1) <= 1:
+            return getattr(model, "kv_ids", None)
+        return (getattr(model, "kv_ids_slots", None) or {}).get(int(slot))
+
+    def _kv_rec_set(self, model, slot: int, ids) -> None:
+        if int(getattr(model, "kv_slots", 1) or 1) <= 1:
+            model.kv_ids = ids
+            return
+        d = getattr(model, "kv_ids_slots", None)
+        if d is None:
+            d = model.kv_ids_slots = {}
+        d[int(slot)] = ids
+
+    def _kv_rec_null(self, model, slot: int = 0) -> None:
+        self._kv_rec_set(model, slot, None)
+
+    def _pending_slot_map(self) -> dict:
+        """rid -> slot map (parallel to pending_friendly) so the per-slot gen-stall watchdog can
+        fail ONLY the wedged slot's in-flight futures. Lazy so mixin test harnesses need no init."""
+        d = getattr(self, "pending_slot", None)
+        if d is None:
+            d = self.pending_slot = {}
+        return d
 
     async def embed(self, friendly: str, input_ids, attention_mask) -> list:
         """Run one encoder forward on `friendly`'s single node and return the pooled, L2-normed
@@ -385,7 +509,8 @@ class EngineGenMixin:
         return self._pipefill_arch_ok(model)
 
     async def _prefill_reuse(self, model: LoadedModel, prompt_ids: list, mm=None,
-                             position_ids=None, nt_mode=None, nt_clip: int = 0, nt_k: int = 0):
+                             position_ids=None, nt_mode=None, nt_clip: int = 0, nt_k: int = 0,
+                             slot: int = 0):
         """#prefix-kv: prefill dispatcher with CROSS-REQUEST prefix reuse (audit finding 29).
 
         THE DEFECT this fixes: every request re-prefilled its ENTIRE prompt from position 0,
@@ -416,9 +541,13 @@ class EngineGenMixin:
         reduced form) for the FINAL prompt position, all either call site consumes.
         RECORD CONTRACT: model.kv_ids is nulled (here via _crop/_send_prefill) BEFORE any KV
         mutation and re-published only by the CALLER after this returns — a failure anywhere
-        leaves it None, so the next request safely full-prefills."""
+        leaves it None, so the next request safely full-prefills.
+        #kv-slots: the record + crop + suffix frames are all SLOT-scoped — this generation
+        owns `slot` (chosen at admission by longest-LCP over the free slots' records, so the
+        best-matching resident stream is the one resumed); C=1 keeps the classic single
+        model.kv_ids record via _kv_rec_get."""
         import torch
-        cached = getattr(model, "kv_ids", None)
+        cached = self._kv_rec_get(model, slot)
         L = 0
         _min = _prefix_kv_min()
         if (cached and _min and mm is None and position_ids is None
@@ -438,12 +567,14 @@ class EngineGenMixin:
         if L <= 0:
             return await self._send_prefill(model, torch.tensor([prompt_ids], dtype=torch.long),
                                             mm=mm, position_ids=position_ids,
-                                            nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k)
+                                            nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k,
+                                            slot=slot)
         # -- resume: crop every stage to the shared prefix, prefill only the suffix -------------
-        await self._crop(model, L)      # nulls model.kv_ids; in-order ahead of the suffix frames
+        await self._crop(model, L, slot=slot)   # nulls the slot's record; in-order ahead of the suffix
         res = await self._send_prefill(model,
                                        torch.tensor([prompt_ids[L:]], dtype=torch.long),
-                                       base=L, nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k)
+                                       base=L, nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k,
+                                       slot=slot)
         # #prefix-kv observability: without this line a reuse is invisible in telemetry (the
         # render-oom-guard lesson) — one activity line per HIT, with the tokens saved.
         with contextlib.suppress(Exception):
@@ -456,7 +587,7 @@ class EngineGenMixin:
                     all_logits: bool = False, mm=None, position_ids=None,
                     capture_hidden: bool = False, capture_pre_norm: bool = False,
                     ntensor: bool = False, nt_mode=None, nt_clip: int = 0, nt_k: int = 0,
-                    prefill_wait: bool = False):
+                    prefill_wait: bool = False, slot: int = 0):
         """Push one frame (token ids) through `model`'s pipeline and return last-stage
         logits — last position only, or every position when all_logits=True (verify).
         mm = (positions, embeds_tensor) (#22 inc 3): on a prefill (reset), a companion
@@ -498,9 +629,10 @@ class EngineGenMixin:
         # cross-request record claimed are gone the moment this dispatches. Null FIRST (before
         # any await can fail) so EVERY reset path (decode prefills, capture_thinker, MTP,
         # routes_diag/routes_shards qcheck probes) invalidates centrally; the decode paths that
-        # KNOW the post-prefill contents re-publish after their prefill returns.
+        # KNOW the post-prefill contents re-publish after their prefill returns. (#kv-slots:
+        # slot-scoped — a reset on slot s wipes only slot s's stream on every stage.)
         if reset:
-            model.kv_ids = None
+            self._kv_rec_null(model, slot)
         if model.stage0_writer is None:
             await self._freshen_stage0(model, force=True)   # rebuild from saved dial if dropped
         if model.stage0_writer is None:
@@ -512,6 +644,8 @@ class EngineGenMixin:
         self.pending[rid] = fut
         self.pending_model[rid] = model.target_id   # so a head drop fails only this model
         self.pending_friendly[rid] = model.friendly   # #5 routed REPLICA key -> replica-precise recovery
+        if slot:   # #kv-slots: rid -> slot so the per-slot watchdog fails ONLY this slot's futures
+            self._pending_slot_map()[rid] = slot
 
         async def _flush(w) -> None:
             _bspans = None
@@ -529,6 +663,8 @@ class EngineGenMixin:
             hdr = {"req_id": rid, "model_id": model.target_id, "kind": "ids",
                    "cache_position": cache_position,
                    "reset": reset, "all_logits": all_logits, **meta}
+            if slot:   # #kv-slots: route every stage to THIS slot's KV stream (absent == 0 ==
+                hdr["slot"] = slot   # legacy byte-identical frames on every C=1 model)
             # #mm-pairing: DECLARE the companion mm frame on the ids header. Stage 0 claims the
             # staged embeds only when declared (and fails LOUD if declared-but-missing, instead of
             # silently running the vision prefill unspliced); undeclared frames never claim, so a
@@ -596,9 +732,11 @@ class EngineGenMixin:
             self.pending.pop(rid, None)  # never leak the future
             self.pending_model.pop(rid, None)
             self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
+            getattr(self, "pending_slot", {}).pop(rid, None)   # #kv-slots: keep slot map in lockstep
 
     async def _send_prefill(self, model: LoadedModel, x, mm=None, position_ids=None,
-                            nt_mode=None, nt_clip: int = 0, nt_k: int = 0, base: int = 0):
+                            nt_mode=None, nt_clip: int = 0, nt_k: int = 0, base: int = 0,
+                            slot: int = 0):
         """#pipefill: prefill dispatcher. Eligible prompts (see _pipefill_chunk) are streamed
         through the pipeline as a BURST of chunk frames so the stages overlap; everything else
         falls through to the classic one-shot _send prefill, byte-identical to before.
@@ -652,12 +790,13 @@ class EngineGenMixin:
         q = int(x.shape[1])
         # #prefix-kv: ANY prefill (full at 0 or suffix at base) mutates the shard KV — the
         # cross-request record is stale from here until the owning decode path re-publishes it.
-        model.kv_ids = None
+        # (#kv-slots: only THIS slot's record/stream — sibling slots are untouched.)
+        self._kv_rec_null(model, slot)
         cstep = self._pipefill_chunk(model, q, mm, position_ids)
         if not cstep:
             return await self._send(model, x, base, base == 0, mm=mm, position_ids=position_ids,
                                     nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k,
-                                    prefill_wait=base > 0)
+                                    prefill_wait=base > 0, slot=slot)
         # -- chunked pipelined path ------------------------------------------------------------
         # #logits-diet gating for the LAST chunk mirrors _send's own downgrade ladder, so the
         # final reply keeps the exact same wire mode the one-shot prefill would have used.
@@ -681,6 +820,8 @@ class EngineGenMixin:
             hdr = {"req_id": rid, "model_id": model.target_id, "kind": "ids",
                    "cache_position": base + off, "reset": base + off == 0,
                    "all_logits": False, **meta}
+            if slot:   # #kv-slots: every chunk carries the gen's slot id (absent == 0 == legacy)
+                hdr["slot"] = slot
             if last:
                 if nt_mode is not None:   # the caller's reply directive rides the FINAL chunk
                     hdr["ntensor"] = True
@@ -708,6 +849,8 @@ class EngineGenMixin:
                 self.pending[rid] = fut
                 self.pending_model[rid] = model.target_id
                 self.pending_friendly[rid] = model.friendly   # #5 replica-precise recovery
+                if slot:   # #kv-slots: rid -> slot for the per-slot watchdog fail
+                    self._pending_slot_map()[rid] = slot
                 rids.append(rid)
                 futs.append(fut)
                 try:
@@ -770,6 +913,7 @@ class EngineGenMixin:
                 self.pending.pop(_rid, None)
                 self.pending_model.pop(_rid, None)
                 self.pending_friendly.pop(_rid, None)
+                getattr(self, "pending_slot", {}).pop(_rid, None)   # #kv-slots lockstep
             for _f in futs:
                 # Retrieve any SECOND chunk failure so a near-simultaneous double fault (gather
                 # surfaced the first) can't log "exception was never retrieved" at GC.
@@ -777,18 +921,22 @@ class EngineGenMixin:
                     with contextlib.suppress(Exception):
                         _f.exception()
 
-    async def _crop(self, model: LoadedModel, length: int) -> None:
+    async def _crop(self, model: LoadedModel, length: int, slot: int = 0) -> None:
         """Tell every stage of `model` to truncate its KV cache to `length` (spec rollback,
         #prefix-kv resume). Fire-and-forget: in-order delivery on each stage's connection
-        guarantees the crop is applied before the next frame the controller sends afterwards."""
+        guarantees the crop is applied before the next frame the controller sends afterwards.
+        #kv-slots: the crop acts on THE REQUEST'S slot only (the header key is added when >0;
+        absent == slot 0 == legacy byte-identical frame) — a crop on slot 1 must never shorten
+        slots 0/2's independent streams."""
         # #prefix-kv: KV contents change under this frame — invalidate the cross-request record;
         # the callers that know the exact post-crop ids (spec decode's round loop, the prefix
         # resume's owner) re-publish afterwards, everyone else safely full-prefills next.
-        model.kv_ids = None
+        self._kv_rec_null(model, slot)
         if model.stage0_writer is not None:
-            nbytes = await _write_frame(model.stage0_writer,
-                                        {"model_id": model.target_id, "kind": "crop",
-                                         "cache_position": length}, b"")
+            _chdr = {"model_id": model.target_id, "kind": "crop", "cache_position": length}
+            if slot:
+                _chdr["slot"] = slot
+            nbytes = await _write_frame(model.stage0_writer, _chdr, b"")
             net_account(self._stage0_id(model), to_node=nbytes)  # controller -> stage0
 
     # -- draft model (runs entirely on the controller; one per LoadedModel) --
@@ -918,18 +1066,35 @@ class EngineGenMixin:
                                  f"larger ctx")
             if max_new > _ctx - len(prompt_ids):
                 max_new = _ctx - len(prompt_ids)
-        # PER-REPLICA lock: different models AND different replicas of one model decode
-        # concurrently; requests routed to the SAME replica queue on its lock.
-        # Track queue depth for /status (queued = waiting on this model's lock; active = generating).
+        # PER-REPLICA admission: different models AND different replicas of one model decode
+        # concurrently; requests routed to the SAME replica queue on its slot pool. #kv-slots:
+        # kv_slots==1 (default) -> _SlotLease degenerates to EXACTLY the old whole-generation
+        # ``async with model.lock`` (same object, same FIFO); kv_slots==C>1 -> a Semaphore(C)
+        # permit + one slot id owned for this generation's lifetime (prefill+decode+crop all
+        # carry it), so up to C generations interleave their per-token hops through the SAME
+        # pipeline — the stages naturally overlap different slots' tokens with NO new scheduler.
+        # Track queue depth for /status (queued = waiting on a slot; active = generating).
         model.queued += 1
         acquired = False
+        _lease = _SlotLease(model, prompt_ids)
         try:
-            async with model.lock:
+            async with _lease:
+                _slot = _lease.slot
                 acquired = True
                 model.queued -= 1
-                model.active += 1
+                model.active += 1   # #kv-slots: 0..C concurrent gens — 'active' = sum over slots
                 model.last_token_ts = time.time()   # #gen-stall-watchdog: start the no-progress timer at gen begin
                 model.gen_started_ts = model.last_token_ts   # #active-decode-stall: prefill marker (token 1 advances last_token_ts past this)
+                # #kv-slots (C>1): per-(model,slot) activity record — the gen-stall watchdog
+                # reclaims per SLOT (one wedged slot must not reclaim its siblings), so it needs
+                # per-slot token stamps + this request's INFLIGHT rec + the lease token (to free
+                # the slot safely). None at C=1 — the model-level watchdog path is untouched.
+                _sst = None
+                if _lease.token is not None:
+                    _sst = model.slot_state[_slot] = {
+                        "last_token_ts": model.last_token_ts,
+                        "gen_started_ts": model.gen_started_ts,
+                        "rec": rec, "lease": _lease.token}
                 # #stage0-stale-reconnect: rebuild a stale (idle-since-last-request) stage0 conn BEFORE
                 # the prefill so this request rides a fresh, proven socket instead of a possibly
                 # half-open one (the 'loaded but never replies' / ~600s hang). No-op when hot (busy
@@ -953,11 +1118,16 @@ class EngineGenMixin:
                     # gets the spliced vision tokens at prefill.
                     # #91 MTP: when speculative+greedy is requested but there's no separate draft
                     # model, fall through to the checkpoint's own MTP (nextn) self-draft if it has one.
+                    # #kv-slots: spec + MTP are gated to C=1 (_lease.token is None) — both drive a
+                    # SINGLE controller-resident draft state (model.draft_kv / the MTP head's own
+                    # cache), which two concurrent slots would corrupt. Plain decode serves C>1.
                     mtp_head = None
-                    if (speculative and greedy and mm is None and model.draft_model is None):
+                    if (speculative and greedy and mm is None and model.draft_model is None
+                            and _lease.token is None):
                         with contextlib.suppress(Exception):
                             mtp_head = await self._ensure_mtp_head(model)
-                    if speculative and model.draft_model is not None and greedy and mm is None:
+                    if (speculative and model.draft_model is not None and greedy and mm is None
+                            and _lease.token is None):
                         async for item in self._decode_spec(model, prompt_ids, max_new, spec_k):
                             if item[0] is not None:
                                 _ntoks += 1
@@ -980,11 +1150,14 @@ class EngineGenMixin:
                     else:
                         async for item in self._decode_plain(model, prompt_ids, max_new,
                                                              temperature, top_p, mm=mm, mrope=mrope,
-                                                             min_p=min_p, sampling=sampling):
+                                                             min_p=min_p, sampling=sampling,
+                                                             slot=_slot):
                             if item[0] is not None:
                                 _ntoks += 1
                                 _out_ids.append(item[0])   # #ctx-history
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
+                                if _sst is not None:   # #kv-slots: per-slot progress (slot watchdog)
+                                    _sst["last_token_ts"] = model.last_token_ts
                                 _dt = time.monotonic() - _t0
                                 if _dt > 1e-6:           # LIVE decode rate -> card updates mid-gen (#46)
                                     model.last_tok_s = _ntoks / _dt
@@ -1025,11 +1198,14 @@ class EngineGenMixin:
                 model.queued -= 1
 
     async def _decode_plain(self, model, prompt_ids, max_new, temperature, top_p, mm=None,
-                            mrope=None, min_p: float = 0.0, sampling=None):
+                            mrope=None, min_p: float = 0.0, sampling=None, slot: int = 0):
         """Prefill-once + one-token-at-a-time KV-cache decode (M2e). mm=(positions, embeds)
         (#22 inc 3) splices multimodal embeds into the PREFILL only; decode steps are plain.
         mrope=(prefill_position_ids [3][q], base) (#22 inc 4) carries 3D image positions:
-        the prefill uses the full layout; each decode token uses [base+step] on all 3 dims."""
+        the prefill uses the full layout; each decode token uses [base+step] on all 3 dims.
+        slot (#kv-slots): the decode slot this generation owns — every frame (prefill chunks,
+        decode hops, crops) carries it so all stages route to THIS slot's KV stream. 0 on
+        every C=1 model — byte-identical legacy frames (the header key is only added when >0)."""
         import torch
         # #runtime-knobs: unpack the extended sampling family once, outside the token loop.
         _sp = sampling or {}
@@ -1083,8 +1259,23 @@ class EngineGenMixin:
         # #prefix-kv: when the LAST generation's KV (still resident on every stage) shares a
         # long prefix with this prompt, _prefill_reuse crops to the shared prefix and prefills
         # ONLY the suffix; everything else takes the classic full prefill — same reply shape.
-        res = await self._prefill_reuse(model, prompt_ids, mm=mm, position_ids=prefill_pos,
-                                        nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
+        # #kv-slots (C>1): at most ONE in-PREFILL generation per replica at a time — a prefill
+        # (esp. a #pipefill chunk burst) occupies stages for seconds, and the worker inbound
+        # loop is strictly sequential per connection, so a second concurrent prefill would
+        # head-of-line-block the sibling slots' single-token decode frames behind it. The
+        # prefill semaphore (inside the slot semaphore — slot held, prefill serialized) keeps
+        # decode slots flowing between bursts; #pipefill chunks yield between chunks, which is
+        # exactly the interleave point. C=1: no lock exists — path byte-identical.
+        _pfl = getattr(model, "prefill_lock", None) if int(
+            getattr(model, "kv_slots", 1) or 1) > 1 else None
+        if _pfl is not None:
+            async with _pfl:
+                res = await self._prefill_reuse(model, prompt_ids, mm=mm,
+                                                position_ids=prefill_pos, nt_mode=_nt_mode,
+                                                nt_clip=ntok, nt_k=_nt_k, slot=slot)
+        else:
+            res = await self._prefill_reuse(model, prompt_ids, mm=mm, position_ids=prefill_pos,
+                                            nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k, slot=slot)
         cur = len(prompt_ids)
         model.kv_pos = cur          # KV depth so far (prompt); climbs per decode token
         # #prefix-kv: publish the cross-request record — exactly the ids now in every stage's
@@ -1100,8 +1291,9 @@ class EngineGenMixin:
         # silently reuse image-embed KV as text KV. The read gate requires mm is None anyway,
         # so a vision follow-up turn could never resume regardless; full-id publishing on mm
         # requests buys nothing. (_kv still appends in-loop below — harmless, unpublished.)
+        # #kv-slots: the record is PER-SLOT (_kv_rec_*) — C=1 keeps the classic model.kv_ids.
         _kv = list(prompt_ids)
-        model.kv_ids = _kv if mm is None else None
+        self._kv_rec_set(model, slot, _kv if mm is None else None)
         produced = 0
         while produced < max_new:
             if model.friendly not in self.models or model.stage0_writer is None:
@@ -1150,12 +1342,13 @@ class EngineGenMixin:
             try:
                 res = await self._send(model, torch.tensor([[tok_id]], dtype=torch.long), cur,
                                        False, position_ids=dpos,
-                                       nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k)
+                                       nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k, slot=slot)
             except BaseException:
                 # #prefix-kv: append state unknown mid-send (incl. CancelledError from a client
                 # drop / gen-stall reclaim / _ForwardSuperseded landing in this await) -> the
-                # record is invalid; null it so the next request full-prefills.
-                model.kv_ids = None
+                # record is invalid; null it so the next request full-prefills. (#kv-slots:
+                # only THIS slot's record — sibling slots' records stay valid.)
+                self._kv_rec_null(model, slot)
                 raise
             cur += 1
             model.kv_pos = cur

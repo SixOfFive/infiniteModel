@@ -600,12 +600,15 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
         friendly = resolve_model_name(model)
     except Exception:
         return _not_found_json(model, mode)   # unknown model -> 404 (OpenAI envelope|Ollama shape)
-    rec = _inflight_admit(ip, friendly, engine.replica_count(friendly))  # K slots for K replicas
+    # #kv-slots: admission counts TOTAL decode slots — replicas x their per-replica kv_slots
+    # (slot_count == replica_count on a fleet with no kv_slots loads, so C=1 is unchanged).
+    _slots = engine.slot_count(friendly)
+    rec = _inflight_admit(ip, friendly, _slots)
     if rec is None:
-        # #queue-depth: overflow beyond (1 slot + queue_depth) is RETRYABLE — return 429+Retry-After
+        # #queue-depth: overflow beyond (slots + queue_depth) is RETRYABLE — return 429+Retry-After
         # (a fan-out client should back off and retry, not treat it as a hard 503 outage).
         return JSONResponse(
-            {"error": f"queue full for '{friendly}': 1 slot + "
+            {"error": f"queue full for '{friendly}': {_slots} slot(s) + "
                       f"{ENGINE_CONFIG.get('queue_depth', DEFAULT_QUEUE_DEPTH)} queued — "
                       f"retry shortly"}, status_code=429, headers={"Retry-After": "1"})
     # #cold-contract (BUG-1/2): a KNOWN-but-not-resident model with auto-load OFF must return a

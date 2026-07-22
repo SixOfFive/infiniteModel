@@ -85,7 +85,8 @@ class WorkerLoadMixin:
                                       moe_offload=moe_offload,       # #moe-offload (pipeline only)
                                       cache=cache,                   # #shard-cache Inc 2 serve-from-cache
                                       kv_quant=a.get("kv_quant", "none"),   # #172 TurboQuant KV preset
-                                      kv_offload=bool(a.get("kv_offload", False)))  # #kv-offload: KV in RAM
+                                      kv_offload=bool(a.get("kv_offload", False)),  # #kv-offload: KV in RAM
+                                      kv_slots=int(a.get("kv_slots", 1) or 1))  # #kv-slots: C KV streams
         else:
             # TENSOR-PARALLEL PATH (tp>1) — TP-v2 PER-RANK STREAMING: this rank fetches ONLY its
             # 1/tp tensor slice from /weights_tp and builds reduced-dim modules directly, so a node

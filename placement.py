@@ -54,6 +54,13 @@ class ModelSpec:
     #                                       dtype (fp32 stays fp32 at quant=none) + the card display
     is_embedding: bool = False            # encoder/sentence-embedding model (BERT-family): served by
     #                                       the single-node embedding path (no pipeline/TP/KV/lm_head)
+    # #kv-slots: per-request KV slot count C this spec is being PLANNED for (set via
+    # for_kv_slots at load; 1 = the classic single-stream figure, bit-identical). Baked into
+    # kv_bytes_per_layer so EVERY controller-side consumer — plan_pipeline's required bytes,
+    # _fit_ctx, _assess_placement, the co-located colo_need math, the /status kv_reserved
+    # card — reserves C x per-stream KV automatically, exactly mirroring the worker's own
+    # shard_build._kv_bytes_per_layer xC choke point.
+    kv_slots: int = 1
 
     @property
     def per_layer_weight_bytes(self) -> int:
@@ -87,7 +94,9 @@ class ModelSpec:
         return self.hidden_size * self.weight_dtype_bytes
 
     def kv_bytes_per_layer(self, ctx_len: int) -> int:
-        return 2 * self.num_kv_heads * self.head_dim * ctx_len * KV_DTYPE_BYTES
+        # #kv-slots: C independent per-request streams each grow their own full-ctx KV -> xC.
+        return (2 * self.num_kv_heads * self.head_dim * ctx_len * KV_DTYPE_BYTES
+                * max(1, int(self.kv_slots or 1)))
 
     def per_layer_total_bytes(self, ctx_len: int) -> int:
         return self.per_layer_weight_bytes + self.kv_bytes_per_layer(ctx_len)
@@ -134,6 +143,15 @@ class ModelSpec:
                            meas_embed=self.embed_bytes,
                            meas_norm=self.final_norm_bytes)
         return self
+
+    def for_kv_slots(self, slots: int) -> "ModelSpec":
+        """#kv-slots: return a spec whose KV bytes reflect `slots` concurrent per-request KV
+        streams (C x per-stream full-ctx KV — see kv_bytes_per_layer). Weights are unaffected.
+        slots<=1 returns self unchanged (bit-identical planning for every legacy load)."""
+        slots = max(1, int(slots or 1))
+        if slots <= 1:
+            return self
+        return replace(self, kv_slots=slots)
 
 
 MODEL_SPECS: dict[str, ModelSpec] = {

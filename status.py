@@ -124,7 +124,11 @@ def build_status() -> dict:
                          or lm.spec.total_weight_bytes)
         ram_weights = max(0, weights_total - vram_used)
         kv_reserved = lm.spec.kv_bytes_per_layer(lm.ctx) * lm.spec.num_layers
-        kv_used = lm.spec.kv_bytes_per_layer(lm.kv_pos) * lm.spec.num_layers
+        # #kv-slots: kv_reserved is honestly xC (spec.kv_slots is baked in — C streams ARE
+        # reserved), but kv_pos tracks only the most recent generation's depth, so scale the
+        # USED figure back to the single-stream estimate rather than claim C x one stream.
+        kv_used = (lm.spec.kv_bytes_per_layer(lm.kv_pos) * lm.spec.num_layers
+                   // max(1, int(getattr(lm.spec, "kv_slots", 1) or 1)))
         # #172: under TurboQuant KV the worker RESERVES the bit-packed footprint, not bf16 — so report
         # the honest reserved/used (packed all-layers + one bf16 dequant transient for reserved) instead
         # of the bf16 spec estimate, which would overstate the card ~4-5x. Falls back to the bf16
@@ -195,6 +199,12 @@ def build_status() -> dict:
             "quant": lm.quant,     # the quant this model was loaded with (none/int8)
             "kv_quant": getattr(lm, "kv_quant", "none"),     # #172 TurboQuant KV preset (none/turbo2/3/4)
             "kv_offload": bool(getattr(lm, "kv_offload", False)),  # #kv-offload: KV cache in system RAM
+            # #kv-slots: per-replica decode slot count C + how many are currently leased.
+            # C=1 (every legacy load): slots_active mirrors the classic active flag (0/1).
+            "kv_slots": max(1, int(getattr(lm, "kv_slots", 1) or 1)),
+            "slots_active": (int(getattr(lm, "slots_active", 0) or 0)
+                             if int(getattr(lm, "kv_slots", 1) or 1) > 1
+                             else min(1, int(lm.active or 0))),
             # #persist (autoload-on-restart) / #no-unload (absolute do-not-auto-unload veto): pin state
             # for this model, driving the detail-modal checkboxes. Keyed by friendly OR base (replicas).
             "persist": bool((getattr(lm, "friendly", None) in (ENGINE_CONFIG.get("persist_models") or {}))
@@ -364,7 +374,8 @@ def build_status() -> dict:
         for _k in (_ld.get("friendly"), _ld.get("display_name")):
             if _k:
                 _lm_by_key[_k] = _ld
-    _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "kv_offload", "def_temperature", "def_min_p",
+    _RUNTIME_KEYS = ("ctx", "quant", "kv_quant", "kv_offload", "kv_slots", "slots_active",
+                     "def_temperature", "def_min_p",
                      "sampling_defaults", "vram_used_gb", "ram_used_gb", "cpu_frac",
                      "kv_reserved_gb", "kv_used_gb", "tok_s", "ema_tok_s", "max_tok_s",
                      "last_tok_s", "kv_pos", "fwd_prog_age_s", "active", "queued",
@@ -622,8 +633,8 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
         entry["aliases"] = _al
     if loaded:                                   # live request queue depth (Inc 4)
         lm = engine.models[name]
-        entry["active"] = lm.active              # currently generating (0/1)
-        entry["queued"] = lm.queued             # requests waiting on this model's lock
+        entry["active"] = lm.active              # currently generating (0/1; 0..C with #kv-slots)
+        entry["queued"] = lm.queued             # requests waiting on this model's slot pool
         if getattr(lm, "is_t2i", False):         # #t2i-serve: image model — live render progress
             entry["t2i"] = True
             _pr = getattr(engine, "_t2i_progress", {}).get(getattr(lm, "t2i_req", None))

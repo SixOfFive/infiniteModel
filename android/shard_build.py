@@ -43,12 +43,17 @@ class ShardBuildMixin:
         return 2 * int(ctx) * nkv * hd * 2 if nkv else 0
 
     def _kv_bytes_per_layer(self, ctx: int) -> int:
-        """Full-ctx KV bytes ONE layer RESTS at: bf16 normally, or the smaller BIT-PACKED TurboQuant
-        footprint when kv_quant is active (self.kv_quant != 'none'). The placement budget reserves this
-        per layer; kv_reserve_probe adds one bf16 transient/device for the sequential dequant peak — the
-        two stay mirrored. kv_quant='none' -> bf16, bit-identical to the pre-#172 reservation. Any error
-        resolving the quant size falls back to bf16 (conservative — never under-reserve -> decode OOM)."""
+        """Full-ctx KV bytes ONE layer RESTS at — ACROSS ALL KV SLOTS (#kv-slots: C independent
+        per-request streams each grow their own full-ctx cache, so the reservation is C x the
+        single-stream figure; kv_slots=1 — the default and every legacy load — is bit-identical
+        to the old single-stream value). bf16 normally, or the smaller BIT-PACKED TurboQuant
+        footprint when kv_quant is active (self.kv_quant != 'none'; kv_quant is hard-gated to
+        kv_slots=1 at load, so the two multipliers never combine). The placement budget reserves
+        this per layer; kv_reserve_probe scales its per-slot geometry-aware figure by the same
+        slot count — the two stay mirrored. Any error resolving the quant size falls back to
+        bf16 (conservative — never under-reserve -> decode OOM)."""
         name = (getattr(self, "kv_quant", "none") or "none")
+        slots = max(1, int(getattr(self, "kv_slots", 1) or 1))   # #kv-slots: C streams
         if name != "none":
             try:
                 nkv, hd = self._kv_dims(ctx)
@@ -56,10 +61,10 @@ class ShardBuildMixin:
                     import kv_quant
                     per_tok = kv_quant.kv_quant_bytes_per_token_per_layer(name, nkv, hd)
                     if per_tok > 0:
-                        return int(ctx) * per_tok
+                        return int(ctx) * per_tok * slots
             except Exception:
                 pass   # bf16 fallback below (conservative)
-        return self._kv_bf16_per_layer(ctx)
+        return self._kv_bf16_per_layer(ctx) * slots
 
     def _kv_layer_mask(self) -> list:
         """#7: per-OWNED-layer bool — True = a layer that holds a growing full-ctx KV cache.
@@ -418,7 +423,7 @@ class ShardBuildMixin:
                     plan_ram_bytes: int = 0, tp_weights=None, ctx: int = 0,
                     gpu_budget_gb: float = -1.0, moe_offload: bool = False,
                     cache: str = "", kv_quant: str = "none",
-                    kv_offload: bool = False) -> "Shard":
+                    kv_offload: bool = False, kv_slots: int = 1) -> "Shard":
         """Build a shard by STREAMING weights one layer at a time straight into RAM — no temp
         file, no disk. `fetch(start, end, embed, head) -> bytes` returns a safetensors blob for
         that slice. Each layer is fetched, loaded, quantized and FREED before the next, so peak
@@ -496,6 +501,11 @@ class ShardBuildMixin:
             # prefetch) instead of VRAM — frees the GPU KV reserve for actual model layers. Read in
             # shard_forward (cache build) + _place_modules/kv_reserve_probe (no GPU KV reserve).
             self.kv_offload = bool(kv_offload)
+            # #kv-slots: per-request KV slot count C (dict slot->cache in shard_forward). MUST be
+            # set BEFORE _place_modules/kv_reserve_probe run — both reserve C x the per-stream
+            # full-ctx KV. 1 (default, every legacy load message) is bit-identical to before.
+            self.kv_slots = max(1, int(kv_slots or 1))
+            self._kv_by_slot = {}   # slot id -> this slot's KV cache (shard_forward binds per forward)
             # Build the meta skeleton WHILE the config dir (with the remote .py) is alive so
             # from_config can resolve a trust_remote_code class. For a remote-code model keep BUFFERS
             # REAL (accelerate include_buffers=False) — per-layer computed buffers (rotary inv_freq …)
@@ -1014,11 +1024,17 @@ class ShardBuildMixin:
                    device=device, gpu_mem_gb=gpu_mem_gb, attn=attn, quant=quant,
                    kv_quant=kv_quant)
 
-    def crop(self, length: int) -> None:
-        """Truncate the KV cache to `length` tokens (speculative-decode rollback)."""
-        if self.kv is not None:
+    def crop(self, length: int, slot: int = 0) -> None:
+        """Truncate the KV cache to `length` tokens (speculative-decode rollback, #prefix-kv
+        resume). #kv-slots: acts on THE REQUEST'S slot cache only — a crop for slot 1 must
+        never shorten slot 0/2's independent streams. slot 0 with the slot dict empty falls
+        back to the legacy self.kv binding (byte-identical single-cache behavior)."""
+        slot = int(slot or 0)
+        kvmap = getattr(self, "_kv_by_slot", None) or {}
+        kv = kvmap.get(slot, self.kv if slot == 0 else None)
+        if kv is not None:
             with contextlib.suppress(Exception):
-                self.kv.crop(length)
+                kv.crop(length)
 
     def _splice_mm(self, h, inject):
         """#22 increment 3 (embed-injection): replace the token embeddings at multimodal
@@ -1066,6 +1082,11 @@ class ShardBuildMixin:
         # add it once below. kv_quant='none' -> resting == pl (bf16), transient 0 -> bit-identical.
         _kvq = (getattr(self, "kv_quant", "none") or "none")
         _kvq_on = _kvq != "none"
+        # #kv-slots: C independent per-request KV streams each grow to full ctx — reserve C x the
+        # per-slot resting figure (the load must FAIL here, clean and replannable, if C streams
+        # can't fit; never OOM mid-decode). The bf16 dequant transient stays x1 (kv_quant is
+        # hard-gated to kv_slots=1 at load anyway). kv_slots=1 (default) is bit-identical.
+        _slots = max(1, int(getattr(self, "kv_slots", 1) or 1))
         # #7: a hybrid arch's linear-attn (Gated-DeltaNet) layers grow no full-ctx KV — only its
         # full-attention layers do. Reserve per_layer on the KV-holding layers only (all of them
         # for a dense model). _kv_layer_mask is conservative (unknown -> True) so we never
@@ -1100,7 +1121,7 @@ class ShardBuildMixin:
                         resting = int(ctx) * _pt
                 except Exception:
                     resting = pl
-            by_dev[d] = by_dev.get(d, 0) + resting
+            by_dev[d] = by_dev.get(d, 0) + resting * _slots   # #kv-slots: C streams per layer
             max_bf16[d] = max(max_bf16.get(d, 0), pl)
         if _kvq_on:   # + one bf16 dequant transient per device that holds any KV layer
             for d in list(by_dev):

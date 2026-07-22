@@ -249,6 +249,58 @@ class EngineLoadMixin:
                 vram[nid] = vram.get(nid, 0) + int(b.get("vram", 0))
         return ram, vram
 
+    def _kvslots_clamp(self, kv_slots: int, tp: int, kv_quant: str, kv_offload: bool,
+                       model_dir: str) -> tuple:
+        """#kv-slots load-time hard gates: returns (effective_kv_slots, reason). Only the
+        plain-DynamicCache/#kv-prealloc shard branch supports slot-keyed caches, so anything
+        else clamps to 1 (logged by the caller, never an error — the load still serves):
+        - tp>1: the TP rank-0 broadcast carries no slot id (peers would desync);
+        - kv_quant: the TurboQuant cache is a single-stream custom cache;
+        - kv_offload: the OffloadedCache prefetch machinery is single-stream;
+        - hybrid / per-type / omni / qwen2.5-VL architectures (layer_types, thinker_config,
+          mrope3d model_type — the SAME conservative config.json sniff as _pipefill_arch_ok):
+          linear-attention recurrent state and per-type KV are not slot-keyed;
+        - an unreadable config.json clamps too (conservative — never guess).
+        Also clamps to the 1..8 band (measured q-curves: CUDA flat to 16, Strix regime step at
+        16; 8 is the validated opt-in ceiling)."""
+        kv_slots = max(1, min(8, int(kv_slots or 1)))
+        if kv_slots <= 1:
+            return 1, ""
+        if tp > 1:
+            return 1, "tensor-parallel (the TP broadcast carries no slot id)"
+        if (kv_quant or "none") != "none":
+            return 1, f"kv_quant={kv_quant} (TurboQuant cache is single-stream)"
+        if kv_offload:
+            return 1, "kv_offload (OffloadedCache is single-stream)"
+        try:
+            with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+                _cfg = json.load(fh)
+            _tc = _cfg.get("text_config", _cfg)
+            _mt = str(_cfg.get("model_type") or _tc.get("model_type") or "").lower()
+            if (_tc.get("layer_types") or []) or _cfg.get("thinker_config") is not None \
+                    or _mt in ("qwen2_5_vl", "qwen2_5_vl_text"):
+                return 1, ("hybrid/per-type/mrope architecture (recurrent or per-type state "
+                           "is not slot-keyed)")
+        except Exception:
+            return 1, "architecture sniff failed (conservative)"
+        return kv_slots, ""
+
+    def _kvslots_cap_check(self, kv_slots: int, stages, node_by_id) -> None:
+        """#kv-slots wire-cap gate (load-time, all-or-nothing — the pipefill doctrine): slots>1
+        only when EVERY chain node advertises 'kvslots'. An old worker would write every slot
+        into its single cache (silent cross-request KV corruption), so a chain with any older
+        node REFUSES the load with a clear message instead of degrading."""
+        if int(kv_slots or 1) <= 1:
+            return
+        _nocap = sorted({(node_by_id[s.node_id].hostname if s.node_id in node_by_id
+                          else s.node_id)
+                         for s in stages if "kvslots" not in registry.node_caps(s.node_id)})
+        if _nocap:
+            raise RuntimeError(
+                f"kv_slots={kv_slots} needs the 'kvslots' wire cap on EVERY chain node — "
+                f"missing on {', '.join(_nocap)} (stale worker code; self-update those nodes "
+                f"or load with kv_slots=1)")
+
     async def load(self, friendly: str, ctx: int, consolidate: bool = True,
                    prefer_vram: bool = True, quant: str = "none", tp: int = 1,
                    cpu_only: bool = False, reg_key: Optional[str] = None,
@@ -257,6 +309,7 @@ class EngineLoadMixin:
                    force: bool = False, moe_offload: bool = False,
                    gpu_spread: bool = False, pin_host: str = "",
                    kv_quant: str = "", kv_offload: bool = False,
+                   kv_slots: int = 1,
                    default_temp: Optional[float] = None,
                    default_min_p: Optional[float] = None,
                    requested_by: str = "",
@@ -283,7 +336,8 @@ class EngineLoadMixin:
                                          spread=spread, proportional=proportional, force=force,
                                          moe_offload=moe_offload, gpu_spread=gpu_spread,
                                          pin_host=pin_host, kv_quant=kv_quant,
-                                         kv_offload=kv_offload, default_temp=default_temp,
+                                         kv_offload=kv_offload, kv_slots=kv_slots,
+                                         default_temp=default_temp,
                                          default_min_p=default_min_p,
                                          requested_by=requested_by,
                                          draft_gpu=draft_gpu, draft_margin_gb=draft_margin_gb,
@@ -307,6 +361,7 @@ class EngineLoadMixin:
                    force: bool = False, moe_offload: bool = False,
                    gpu_spread: bool = False, pin_host: str = "",
                    kv_quant: str = "", kv_offload: bool = False,
+                   kv_slots: int = 1,
                    default_temp: Optional[float] = None,
                    default_min_p: Optional[float] = None,
                    requested_by: str = "",
@@ -498,10 +553,25 @@ class EngineLoadMixin:
             kv_offload = bool(kv_offload or ENGINE_CONFIG.get("kv_offload", False))
             if kv_offload and kv_quant != "none":
                 kv_offload = False
+            # #kv-slots: hard-gate to C=1 for anything but the plain-DynamicCache branch
+            # (tp / kv_quant / kv_offload / hybrid / per-type / omni / mrope3d), clamp to <=8,
+            # then bake C into the SPEC's KV bytes so the whole plan (plan_pipeline, _fit_ctx,
+            # the ctx guardrails, colo_need, /status kv_reserved) reserves C x per-stream KV —
+            # a load whose C*KV doesn't fit FAILS here (CapacityError) or at the worker's own
+            # xC kv_reserve_probe (KV_RESERVE_OOM -> replan), never OOMs mid-decode.
+            _kvs_req = max(1, min(8, int(kv_slots or 1)))
+            kv_slots, _kvs_why = self._kvslots_clamp(kv_slots, tp, kv_quant, kv_offload,
+                                                     model_dir)
+            if _kvs_req > 1 and kv_slots == 1 and _kvs_why:
+                log_activity(f"{friendly}: kv_slots={_kvs_req} -> 1 — {_kvs_why} is hard-gated "
+                             f"to a single KV stream")
+            # (spec.for_kv_slots is applied AFTER the TP branches below — a TP/auto-TP load
+            # never carries slots, so its plan must see the unscaled 1-stream KV figure.)
             await self.ensure_data_listener()
             log_activity(f"load {friendly}: planning (ctx={ctx}, quant={quant}"
                          + (f", kv_quant={kv_quant}" if kv_quant != "none" else "")
                          + (", KV-OFFLOAD (KV cache in system RAM)" if kv_offload else "")
+                         + (f", kv_slots={kv_slots} (KV reserved x{kv_slots})" if kv_slots > 1 else "")
                          + (f", default_temp={default_temp}" if default_temp is not None else "")
                          + (f", default_min_p={default_min_p}" if default_min_p is not None else "")
                          + (f", tp={tp}" if tp > 1 else "")
@@ -573,6 +643,12 @@ class EngineLoadMixin:
                                                   kv_offload=kv_offload,
                                                   default_temp=default_temp,
                                                   default_min_p=default_min_p)
+
+            # #kv-slots: bake C into the SPEC's KV bytes here — past the TP/auto-TP branches
+            # (both are hard-gated to C=1 and must plan the unscaled 1-stream figure), before
+            # the pipeline planner — so plan_pipeline / _fit_ctx / the ctx guardrails /
+            # colo_need / the /status kv_reserved card all reserve C x per-stream full-ctx KV.
+            spec = spec.for_kv_slots(kv_slots)
 
             # FIT-AS-MANY + NODE-SHARING (Inc 3a/3b): keep other resident models and place this
             # one wherever there's room — INCLUDING nodes already serving a model. Each node is
@@ -806,6 +882,9 @@ class EngineLoadMixin:
                         ctx, plan = fit_ctx, fplan
                     else:
                         raise CapacityError((plan.error or "planning failed")
+                                            + (f" [kv_slots={kv_slots}: KV is reserved x{kv_slots} — "
+                                               f"a smaller kv_slots or ctx may fit]" if kv_slots > 1
+                                               else "")
                                             + f" — even ctx {CTX_AUTOFIT_FLOOR} won't fit; the model's "
                                               "weights exceed the usable pool (free memory or use a "
                                               "smaller quant)" + (
@@ -813,6 +892,10 @@ class EngineLoadMixin:
                             else "" if self.models else ""),
                             terminal=self._cap_terminal())   # #at-capacity
                 stages = plan.stages
+                # #kv-slots: all-or-nothing wire-cap gate — REFUSE (clear message) if any chosen
+                # chain node lacks 'kvslots'; an old worker would fold every slot into its single
+                # cache (silent cross-request KV corruption), so degrading is not an option.
+                self._kvslots_cap_check(kv_slots, stages, node_by_id)
                 # #76 guardrail: estimate the VRAM/RAM split for weights + full-ctx KV on THIS
                 # placement (the plan only proved it fits each node's TOTAL RAM+VRAM, not that KV
                 # lands in VRAM). For an AUTO ctx, cap it so the KV stays on the GPU (the deepseek
@@ -1051,6 +1134,7 @@ class EngineLoadMixin:
                         "quant": quant,              # 'none' | 'int8' | 'int4' | 'int2' (load-time choice)
                         "kv_quant": kv_quant,        # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4)
                         "kv_offload": kv_offload,    # #kv-offload: KV cache in system RAM (OffloadedCache)
+                        "kv_slots": kv_slots,        # #kv-slots: C per-request KV streams (worker reserves xC)
                         "ctx": ctx,                  # full ctx -> worker pre-reserves KV (fail-fast)
                         # #63: this stage's planned resident bytes (quantized). The worker reserves
                         # this much RAM up front (a balloon) and consumes it shard-by-shard as layers
@@ -1236,9 +1320,11 @@ class EngineLoadMixin:
                 reg_key, target_id, spec, ctx, plan,
                 [s.node_id for s in stages], tok, eos, now,
                 quant=quant, kv_quant=kv_quant, kv_offload=kv_offload,
+                kv_slots=kv_slots,
                 default_temperature=default_temp, default_min_p=default_min_p,
                 stage0_writer=stage0_writer, last_used=now,
                 stage0_dial=_s0_dial, last_send_ts=now)   # #stage0-stale-reconnect: how to re-dial + freshness clock
+            self._init_slot_pool(lm)   # #kv-slots: semaphore + slot pool (no-op at C=1)
             lm.base, lm.replica_idx = friendly, replica_idx   # data-parallel grouping (#39)
             lm.plan_basis = basis                             # placement basis (#65)
             lm.load_warnings, lm.load_assess = load_warnings, assess   # pre-load guardrail (#76)
@@ -2106,7 +2192,7 @@ class EngineLoadMixin:
     async def replicate(self, friendly: str, ctx: int, count: int,
                         consolidate: bool = True, prefer_vram: bool = True,
                         quant: str = "none", kv_quant: str = "",
-                        kv_offload: bool = False,
+                        kv_offload: bool = False, kv_slots: int = 1,
                         default_temp: Optional[float] = None,
                         default_min_p: Optional[float] = None) -> list["LoadedModel"]:
         """Load `count` full copies of `friendly` on DISJOINT node sets — the small-model
@@ -2127,7 +2213,8 @@ class EngineLoadMixin:
                 try:
                     lm = await self.load(friendly, ctx, consolidate=consolidate,
                                          prefer_vram=prefer_vram, quant=quant, kv_quant=kv_quant,
-                                         kv_offload=kv_offload, default_temp=default_temp,
+                                         kv_offload=kv_offload, kv_slots=kv_slots,
+                                         default_temp=default_temp,
                                          default_min_p=default_min_p,
                                          reg_key=key, exclude_nodes=set(used), replica_idx=i)
                 except Exception as exc:
@@ -2493,7 +2580,8 @@ class EngineLoadMixin:
         return lm
 
     async def reconfigure(self, friendly: str, tp: int, ctx: int, quant: str,
-                          consolidate: bool, prefer_vram: bool, cpu_only: bool) -> LoadedModel:
+                          consolidate: bool, prefer_vram: bool, cpu_only: bool,
+                          kv_slots: Optional[int] = None) -> LoadedModel:
         """#88 managed reload: switch a RESIDENT model to/from tensor-parallel (or change its TP
         width / ctx / quant) as ONE operation, rolling back to a WORKING pipeline copy if the new
         layout fails — so the model is NEVER left evicted-with-nothing-loaded. Reuses engine.load
@@ -2505,6 +2593,12 @@ class EngineLoadMixin:
         if prev is None:
             raise ValueError(f"'{friendly}' is not resident — load it before reconfiguring")
         prev_tp, prev_ctx, prev_quant = getattr(prev, "tp_size", 1), prev.ctx, (prev.quant or "none")
+        # #kv-slots: None = PRESERVE the resident copy's slot count across the re-place (the
+        # wedge-quarantine self-heal + juggler go through here — a reconfigure must not silently
+        # drop a model back to C=1). An explicit value changes it (route callers). tp>1 clamps
+        # to 1 downstream in load() regardless.
+        prev_kvs = max(1, int(getattr(prev, "kv_slots", 1) or 1))
+        kv_slots = prev_kvs if kv_slots is None else max(1, int(kv_slots or 1))
         from_label = f"tp{prev_tp}" if prev_tp > 1 else "pipeline"
         to_label = ((f"tp{tp}" + ("-cpu" if cpu_only else "")) if tp > 1 else "pipeline")
         self.reconfiguring = {"model": _ollama_name(friendly), "from": from_label, "to": to_label,
@@ -2513,7 +2607,8 @@ class EngineLoadMixin:
                      f"(ctx {prev_ctx}->{ctx}, quant {prev_quant}->{quant})")
         try:
             lm = await self.load(friendly, ctx, consolidate=consolidate, prefer_vram=prefer_vram,
-                                 quant=quant, tp=tp, cpu_only=cpu_only, force=True)
+                                 quant=quant, tp=tp, cpu_only=cpu_only, force=True,
+                                 kv_slots=kv_slots)
             log_activity(f"{friendly}: reconfigured -> {lm.plan_basis}")
             return lm
         except Exception as exc:
@@ -2523,7 +2618,8 @@ class EngineLoadMixin:
             log_activity(f"{friendly}: reconfigure to {to_label} FAILED ({exc!r}) -> rolling back to "
                          f"pipeline @ ctx={prev_ctx} {prev_quant}")
             try:
-                await self.load(friendly, prev_ctx, quant=prev_quant, force=True)
+                await self.load(friendly, prev_ctx, quant=prev_quant, force=True,
+                                kv_slots=prev_kvs)
                 log_activity(f"{friendly}: rolled back to a pipeline copy (serving restored)")
             except Exception as exc2:
                 log_activity(f"{friendly}: ROLLBACK ALSO FAILED ({exc2!r}) — model is NOT resident")
@@ -2873,6 +2969,7 @@ class EngineLoadMixin:
             snap = dict(ctx=m.ctx, quant=(m.quant or "none"), tp=getattr(m, "tp_size", 1),
                         kv_quant=(_kvq if _kvq != "none" else ""),
                         kv_offload=bool(getattr(m, "kv_offload", False)),
+                        kv_slots=max(1, int(getattr(m, "kv_slots", 1) or 1)),   # #kv-slots kept
                         default_temp=getattr(m, "default_temperature", None),
                         default_min_p=getattr(m, "default_min_p", None),
                         moe_offload=bool(getattr(m, "moe_offload", False)))
@@ -2894,6 +2991,7 @@ class EngineLoadMixin:
                     await self.load(friendly, snap["ctx"], consolidate=True, prefer_vram=True,
                                     quant=snap["quant"], tp=snap["tp"], cpu_only=False, force=True,
                                     kv_quant=snap["kv_quant"], kv_offload=snap["kv_offload"],
+                                    kv_slots=snap["kv_slots"],
                                     default_temp=snap["default_temp"], default_min_p=snap["default_min_p"],
                                     moe_offload=snap["moe_offload"])
                 except Exception as exc:
@@ -2901,6 +2999,7 @@ class EngineLoadMixin:
                     try:
                         await self.load(friendly, snap["ctx"], quant=snap["quant"], tp=snap["tp"],
                                         force=True, kv_quant=snap["kv_quant"], kv_offload=snap["kv_offload"],
+                                        kv_slots=snap["kv_slots"],
                                         default_temp=snap["default_temp"],
                                         default_min_p=snap["default_min_p"], moe_offload=snap["moe_offload"])
                     except Exception as exc2:
@@ -3189,12 +3288,20 @@ class EngineLoadMixin:
         tok = await asyncio.to_thread(_get_tokenizer, target_id)
         eos = self._eos_ids(tok)
         dial = (_dial_host(node0.data_host), node0.data_port)
+        # #kv-slots: the workers KEPT their slot-keyed shards (the load msg in `assign` carries
+        # kv_slots) — re-adopt at the same C and rebuild the controller-side slot pool, so a
+        # hitless controller restart doesn't silently serialize a slotted model back to C=1.
+        # The adopted spec's KV accounting scales xC too (coexistence reserve honesty).
+        _kvs = max(1, int(a0.get("kv_slots") or 1))
+        spec = spec.for_kv_slots(_kvs)
         lm = LoadedModel(reg_key, target_id, spec, ctx, plan,
                          [s.node_id for s in stages], tok, eos, now,
                          quant=quant, kv_quant=(a0.get("kv_quant") or "none"),
                          kv_offload=bool(a0.get("kv_offload")),
+                         kv_slots=_kvs,
                          stage0_writer=await self._connect_retry(*dial),
                          last_used=now, stage0_dial=dial, last_send_ts=now)
+        self._init_slot_pool(lm)   # #kv-slots (no-op at C=1)
         lm.base, lm.replica_idx = friendly, 0
         lm.plan_basis = "adopted from running workers (controller restart)"
         return lm

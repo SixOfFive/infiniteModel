@@ -521,10 +521,15 @@ def register(app):
             if S < 4:
                 return {"error": "prompt too short"}
             # prefill on the distributed pipeline; capture per-position logits + pre-norm hidden.
-            async with m.lock:
+            # #kv-slots: lease a slot like a real generation. On a kv_slots>1 replica live gens
+            # hold slot LEASES, not m.lock, so ``async with m.lock`` would exclude nothing and
+            # this probe's reset+crop on slot 0 would stomp a running gen's KV. _SlotLease
+            # degenerates to exactly ``async with m.lock`` on every C=1 model.
+            from engine_gen import _SlotLease
+            async with _SlotLease(m) as _slot:
                 logits, h_pre = await engine._send(m, ids, 0, True, all_logits=True,
-                                                   capture_pre_norm=True)
-                await engine._crop(m, 0)   # reset the probe's KV so it can't pollute a later gen
+                                                   capture_pre_norm=True, slot=_slot)
+                await engine._crop(m, 0, slot=_slot)   # reset the probe's KV so it can't pollute a later gen
 
             def _compute() -> dict:
                 th = h_pre[:, 0:S - 1]
@@ -584,18 +589,22 @@ def register(app):
             ids = m.tokenizer(p, return_tensors="pt").input_ids
             P = int(ids.shape[1])
 
-            async with m.lock:
-                prelog = await engine._send(m, ids, 0, True)            # prefill -> KV @ P
+            # #kv-slots: lease a slot like a real generation (see _dprobe) — on a kv_slots>1
+            # replica m.lock excludes nothing, and this probe's resets/crops on slot 0 would
+            # crash a live gen's mask/KV. _SlotLease == ``async with m.lock`` on C=1 models.
+            from engine_gen import _SlotLease
+            async with _SlotLease(m) as _slot:
+                prelog = await engine._send(m, ids, 0, True, slot=_slot)  # prefill -> KV @ P
                 a = int(prelog[0, -1].float().argmax())
                 lb0, hb0 = await engine._send(m, torch.tensor([[a]], dtype=torch.long), P, False,
-                                              all_logits=True, capture_pre_norm=True)
+                                              all_logits=True, capture_pre_norm=True, slot=_slot)
                 b = int(lb0[0, 0].float().argmax())
                 lb1, hb1 = await engine._send(m, torch.tensor([[b]], dtype=torch.long), P + 1, False,
-                                              all_logits=True, capture_pre_norm=True)
-                await engine._crop(m, P)
+                                              all_logits=True, capture_pre_norm=True, slot=_slot)
+                await engine._crop(m, P, slot=_slot)
                 la, ha = await engine._send(m, torch.tensor([[a, b]], dtype=torch.long), P, False,
-                                            all_logits=True, capture_pre_norm=True)
-                await engine._crop(m, 0)
+                                            all_logits=True, capture_pre_norm=True, slot=_slot)
+                await engine._crop(m, 0, slot=_slot)
 
             def _cmp(x, y) -> dict:
                 xf, yf = x.float(), y.float()

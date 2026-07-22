@@ -200,18 +200,25 @@ class ShardForwardMixin:
     # no `nt` parameter — is never handed one (the head then replies full logits, which the
     # controller always still accepts as the downgrade path).
     _nt_capable = True
+    # #kv-slots: worker_net gates the 'slot' header field on THIS attribute (getattr, default
+    # False) so a stale shard_forward.py during per-file self-update convergence — whose
+    # forward() has no `slot` parameter and a SINGLE self.kv — is never handed a slot>0 frame
+    # (worker_net raises LOUDLY instead of silently folding two slots into one cache).
+    _slot_capable = True
 
     def forward(self, x, cache_start: int = 0, reset: bool = True,
                 all_logits: bool = False, inject=None, position_ids=None,
                 capture_hidden: bool = False, capture_pre_norm: bool = False,
-                bidir_spans=None, nt=None):
+                bidir_spans=None, nt=None, slot: int = 0):
         # #fwd-serialize: serialize forwards on this shard so a still-running ORPHANED forward (from a
         # reclaimed/disconnected gen — the worker thread can't be cancelled) can't concurrently mutate
         # the shared self.kv underneath a fresh forward, which desyncs the KV length from the causal
         # mask -> the SDPA "expanded size N must match M" crash. Non-blocking: a racing new forward
         # fails FAST (the controller re-prefills) rather than blocking a thread-pool slot for the
         # orphan's full (possibly minutes-long CPU prefill) runtime. Uncontended on the normal path
-        # (a model's forwards are sequential via the controller's per-model lock).
+        # (a model's forwards are sequential via the worker's sequential inbound loop + the
+        # controller's per-replica slot pool; with #kv-slots the interleave happens ACROSS stages,
+        # never within one — compute still serializes per GPU, which is correct).
         # Lazily ensure the lock exists — a Shard built via a path that doesn't run the full __init__
         # (cached/skeleton install) would otherwise AttributeError here and break ALL generation.
         lock = getattr(self, "_fwd_lock", None)
@@ -220,6 +227,7 @@ class ShardForwardMixin:
         cancel = getattr(self, "_fwd_cancel", None)
         if cancel is None:
             cancel = self._fwd_cancel = threading.Event()
+        slot = int(slot or 0)
         if not lock.acquire(blocking=False):
             # #fwd-cancel: an ORPHANED forward holds the lock — the controller reclaimed its request
             # (hop timeout / disconnect / gen-stall watchdog) but a worker thread can't be cancelled,
@@ -229,23 +237,42 @@ class ShardForwardMixin:
             # short grace for it to release. If it yields we proceed (the controller re-prefills into a
             # fresh cache); if it's stuck inside one un-yieldable op past the grace, fail fast as
             # before (worker-restart is the backstop). Self-healing: no controller protocol change.
-            cancel.set()
+            # #kv-slots: the cancel is SLOT-SCOPED — a superseding forward may only cancel the SAME
+            # slot's orphan (its own predecessor). A different slot's running forward is a healthy
+            # sibling stream, not our orphan: wait the grace for it WITHOUT signalling, then fail
+            # fast as before. slot 0 vs slot 0 (the only case pre-#kv-slots) keeps today's behavior.
+            if getattr(self, "_fwd_slot_running", 0) == slot:
+                cancel.set()
             if not lock.acquire(timeout=_ORPHAN_CANCEL_GRACE_S):
                 raise RuntimeError("shard busy with a prior (orphaned) forward — re-prefill required")
         cancel.clear()   # WE own the lock now — clear so a stale signal can't abort our own forward
+        self._fwd_slot_running = slot   # #kv-slots: who owns the lock (slot-scoped orphan cancel)
         # #fwd-watchdog: stamp start + a per-layer progress heartbeat (updated in the layer loops).
         # The worker watchdog escalates a forward whose progress ts goes STALE (stuck inside one
-        # un-yieldable op, where cooperative cancel can't help) to a supervisor relaunch.
+        # un-yieldable op, where cooperative cancel can't help) to a supervisor relaunch. The
+        # watchdog + heartbeat describe THE RUNNING forward (one at a time under _fwd_lock), so
+        # they are slot-scoped by construction — the rid attributes progress to the right request.
         # #prefill-progress: adopt the req_id staged by worker_net AFTER winning the lock, so the
         # heartbeat's progress report names the forward that is ACTUALLY running (an orphaned
         # forward keeps its original rid — the controller ignores rids no longer pending).
         self._fwd_cur_rid = getattr(self, "_fwd_next_rid", None)
         self._fwd_started_ts = self._fwd_progress_ts = time.time()
+        # #kv-slots: bind self.kv to THE REQUEST'S slot cache for the duration of this forward
+        # (safe under _fwd_lock — one forward at a time), so every inner path (_forward_impl's
+        # rebuild-on-seqstart, layer update(), the cudagraph reconcile) keeps reading/writing
+        # `self.kv` UNCHANGED. The dict is the authoritative store; the write-back in finally
+        # captures a rebuild (self.kv reassigned inside _forward_impl). slot 0 with no other
+        # slots ever used == the legacy single-cache behavior, byte-identical.
+        kvmap = getattr(self, "_kv_by_slot", None)
+        if kvmap is None:
+            kvmap = self._kv_by_slot = {}
+        self.kv = kvmap.get(slot, self.kv if slot == 0 else None)
         try:
             return self._forward_impl(x, cache_start, reset, all_logits, inject,
                                       position_ids, capture_hidden, capture_pre_norm,
                                       bidir_spans, nt)
         finally:
+            kvmap[slot] = self.kv   # #kv-slots: persist this slot's (possibly rebuilt) cache
             lock.release()
 
     def _make_kv_quant_cache(self, name):
@@ -847,6 +874,10 @@ class ShardForwardMixin:
                         # StaticCache that can't re-quantize TurboQuant KV -> stay eager when active
                         and not getattr(self, "kv_offload", False)   # #kv-offload: graph can't mirror
                         # a CPU-resident OffloadedCache -> stay eager when active
+                        and int(getattr(self, "kv_slots", 1) or 1) <= 1   # #kv-slots: the graph's
+                        # StaticCache mirror (_gkv/_gkv_pos) is a SINGLETON — it can only track ONE
+                        # KV stream, so a model loaded with kv_slots>1 keeps the eager per-slot
+                        # DynamicCache path. Per-slot mirrors are future work, not built here.
                         and not getattr(self, "_mm_capable", False)):
                     _lts = getattr(self.cfg, "layer_types", None)
                     _rot = self.model.model.rotary_emb

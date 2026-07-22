@@ -420,10 +420,15 @@ def register(app):
             hid = int(getattr(tcfg, "hidden_size", 0) or getattr(mcfg, "hidden_size"))
             out["hidden_size"] = hid
             xt = torch.tensor([ids])
-            async with lm.lock:
-                base = await engine._send(lm, xt, 0, True, False)
+            # #kv-slots: lease a slot like a real generation — on a kv_slots>1 replica live
+            # gens hold slot leases, not lm.lock, so locking lm.lock would exclude nothing and
+            # these reset prefills on slot 0 would wipe a running gen's KV mid-decode.
+            # _SlotLease degenerates to exactly ``async with lm.lock`` on every C=1 model.
+            from engine_gen import _SlotLease
+            async with _SlotLease(lm) as _slot:
+                base = await engine._send(lm, xt, 0, True, False, slot=_slot)
                 emb = torch.randn(len(pos), hid, dtype=torch.bfloat16)
-                inj = await engine._send(lm, xt, 0, True, False, mm=(pos, emb))
+                inj = await engine._send(lm, xt, 0, True, False, mm=(pos, emb), slot=_slot)
             ba = torch.as_tensor(base).float()
             ia = torch.as_tensor(inj).float()
             out["baseline_argmax"] = int(ba.argmax())
@@ -511,6 +516,20 @@ def register(app):
                 return JSONResponse({"ok": False, "error": f"{friendly} not loaded"},
                                     status_code=409)
             lm = engine.models[friendly]
+            # #kv-slots: speech is a C=1 (Omni-only) doctrine — capture_thinker runs LOCK-FREE on
+            # slot 0 with NO _SlotLease and threads NO slot id (see engine_gen.capture_thinker,
+            # #idle-unload). The production speech path only ever loads Omni C=1, but this
+            # diagnostic accepts an ARBITRARY loaded model; on a kv_slots>1 replica its reset
+            # prefills on slot 0 would stomp a live slot-0 generation's KV (length/mask crash or
+            # corrupted output) — the same slot-isolation class the probe fixes closed. Refuse a
+            # multi-slot model here rather than lease inside the lock-free production path.
+            _C = int(getattr(lm, "kv_slots", 1) or 1)
+            if _C > 1:
+                return JSONResponse(
+                    {"ok": False, "error": f"{friendly} has kv_slots={_C}; speech capture is "
+                     f"C=1 only (capture_thinker runs lock-free on slot 0 and would stomp a "
+                     f"live slot's KV). Load an Omni model or a C=1 replica."},
+                    status_code=409)
             tok = lm.tokenizer
             sys_prompt = ("You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
                           "Group, capable of perceiving auditory and visual inputs, as well as "

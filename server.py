@@ -1019,11 +1019,13 @@ _INFLIGHT_SEQ = 0
 
 
 def _inflight_admit(ip: str, model: str, slots: int = 1):
-    """Register a request for `model`. `slots` = concurrent running slots available (one per
-    resident replica — #39 data-parallel; 1 for a single-placement model). Admit if a running
-    slot is free, else queue it if the queue isn't full (>= queue_depth waiting); otherwise
-    return None (caller rejects with 503). Running concurrency is still enforced downstream by
-    each replica's per-model lock — this gate only bounds how much can pile up per model."""
+    """Register a request for `model`. `slots` = concurrent running slots available — the SUM
+    of per-replica decode slots (#39 data-parallel replicas x #kv-slots kv_slots each; callers
+    pass engine.slot_count(base), which is 1 for a single-placement C=1 model — the classic
+    '1 slot + queue_depth'). Admit if a running slot is free, else queue it if the queue isn't
+    full (>= queue_depth waiting); otherwise return None (caller rejects with 429/503). Running
+    concurrency is still enforced downstream by each replica's per-model lock (C=1) or slot
+    semaphore (C>1) — this gate only bounds how much can pile up per model."""
     global _INFLIGHT_SEQ
     depth = int(ENGINE_CONFIG.get("queue_depth", DEFAULT_QUEUE_DEPTH))
     running = sum(1 for r in INFLIGHT.values()
@@ -1663,6 +1665,15 @@ class LoadedModel:
     quant: str = "none"   # the quant this model was loaded with, so an auto-reload keeps it
     kv_quant: str = "none"  # #172 TurboQuant KV-cache preset (none|turbo2|turbo3|turbo4); shown on the card
     kv_offload: bool = False  # #kv-offload: KV cache in system RAM (OffloadedCache) instead of VRAM
+    # #kv-slots: per-replica concurrent decode slots C (opt-in /load?kv_slots=C, clamp <=8;
+    # default 1 = today's exact one-generation-per-replica serialization on model.lock). C>1
+    # replaces the whole-generation lock with an asyncio.Semaphore(C) + slot pool (slot_sem /
+    # slot_free / slot_owner / slot_state / kv_ids_slots / prefill_lock — attached by
+    # engine_lifecycle._init_slot_pool as dynamic attrs, absent on C=1 models): each admitted
+    # generation owns ONE slot for its lifetime and every frame carries the slot id, so each
+    # shard keeps C independent KV streams and the pipeline stages interleave different slots'
+    # tokens. KV memory scales xC — planned via spec.for_kv_slots + the worker's own xC reserve.
+    kv_slots: int = 1
     # #load-temp: per-model DEFAULT sampling temperature — applied when a request doesn't send one
     # (explicit request values always win). None = unset (requests keep the global 0.0 default).
     default_temperature: Optional[float] = None
@@ -1698,8 +1709,10 @@ class LoadedModel:
     draft_model: object = None
     draft_kv: object = None
     draft_id: Optional[str] = None
-    # Live request counters (Inc 4 queue-depth): active = currently generating (0/1 — the
-    # per-model lock serializes), queued = requests waiting on that lock.
+    # Live request counters (Inc 4 queue-depth): active = currently generating — 0/1 under the
+    # per-model lock (kv_slots=1), 0..C under the #kv-slots pool (the SUM over slots, so every
+    # 'is this model busy?' consumer — idle-unload, juggler drain, LRU eviction, the dashboard —
+    # sees any-slot-active without change); queued = requests waiting for a slot.
     active: int = 0
     queued: int = 0
     # Live KV-cache depth: tokens in the current/last generation's context (prompt +
@@ -1955,6 +1968,11 @@ class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin, EngineSpeech
         # SHARE, so it can't tell a dead replica's in-flight request from a healthy sibling's. This
         # map lets invalidate_model + the gen-stall watchdog fail ONLY the dead replica's futures.
         self.pending_friendly: dict[int, str] = {}
+        # #kv-slots: req_id -> the decode slot the request's frames ride (only rids with slot>0
+        # are recorded). Lets the PER-SLOT gen-stall watchdog fail ONLY the wedged slot's
+        # in-flight futures, never a healthy sibling slot's. Kept in lockstep with
+        # pending_friendly at every add/pop site.
+        self.pending_slot: dict[int, int] = {}
         self.data_server: Optional[asyncio.AbstractServer] = None
         self.req_counter = 0
         # The engine lock guards ATOMIC mutation of engine state (self.models, self.loadings, node

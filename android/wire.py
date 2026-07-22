@@ -184,7 +184,16 @@ def _unpack_tensor(meta, raw):
 # / KV-reset / mask semantics were audited for multi-frame prefill bursts (#wire-caps
 # all-or-nothing, same doctrine as 'ntdiet'). A chain with any older node keeps the one-shot
 # single-frame prefill, byte-identical to before.
-WIRE_CAPS = ("ntensor", "ntdiet", "pipefill")
+# 'kvslots' (#kv-slots): this build's worker_net/shard_forward understand the per-request
+# 'slot' header field — the shard keeps a DICT of KV caches keyed by slot id (one independent
+# stream per slot) and routes every forward/crop to THE REQUEST'S slot, so several
+# generations can interleave through one pipeline without sharing a cache. An old worker
+# would write EVERY slot's tokens into its single self.kv (silent cross-request KV
+# corruption), so the controller uses slots>1 for a model ONLY when every chain node
+# advertises this cap — the gate is LOAD-time and all-or-nothing (a /load?kv_slots>1
+# REFUSES a chain with any older node; engine_load._kvslots_cap_check). 'slot' absent ==
+# slot 0 == the legacy single-cache behavior, byte-identical frames end to end.
+WIRE_CAPS = ("ntensor", "ntdiet", "pipefill", "kvslots")
 
 # #ntensor-manifest tensor kinds (u8 on the wire). 0/1 = full tensors; 2-4 carry the #logits-diet
 # reduced head replies: 2 = greedy argmax token ids (int64, [q]); 3/4 = top-K candidate values
