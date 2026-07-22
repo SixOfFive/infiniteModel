@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c196"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c197"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1123,7 +1123,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     asyncio.create_task(worker.handle_t2a_gen(msg, reply))
                 elif mtype == "unload":
                     await worker.handle_unload(msg.get("model_id"), tenant)
-                elif t == "handoff":            # #handoff: move this node to another controller
+                elif mtype == "handoff":        # #handoff: move this node to another controller
                     res = await worker.handle_handoff(msg, tenant)
                     await reply({"type": "handoff_result", "node_id": node_id, **res})
                     if res.get("ok"):
