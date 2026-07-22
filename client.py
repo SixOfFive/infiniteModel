@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c197"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c198"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1225,6 +1225,44 @@ def _controller_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
 
 
 DISCOVERY_RETRY_S = 30.0    # #discovery: wait between broadcast attempts when nobody has answered
+# #failover: how long our controller must be UNREACHABLE before we go looking for another one.
+# Deliberately far longer than any planned outage — a hitless controller restart is ~20 s and a
+# forced /update + restart well under a minute — because the cost of being wrong is a worker
+# wandering off mid-deploy and taking its shards with it. Below this we behave exactly as before:
+# retry the SAME controller forever. `failover_after_s: 0` in config.json disables it entirely.
+FAILOVER_AFTER_S = 180.0
+
+
+async def _failover_probe(args, worker) -> bool:
+    """Our controller has been gone a long time — is a DIFFERENT one out there? Re-target if so.
+
+    Returns True if we re-homed. The shards stay resident: they are re-owned (worker_load.
+    reassign_orphans) so the new controller's tenant-scoped inventory reports them and it ADOPTS
+    them, exactly as it would after a hitless restart. That is the whole feature — a controller can
+    die and the models it had loaded keep running under the survivor, with no reload.
+
+    Deliberately conservative: any answer from our CURRENT controller means it is back and we simply
+    keep waiting for it, and a probe that finds nobody changes nothing."""
+    want = str(getattr(args, "cluster_id", "") or "")
+    timeout = float(getattr(args, "discovery_timeout", 2.5))
+    try:
+        got = await asyncio.to_thread(discover_controller, want, 0, timeout, True)
+    except Exception as exc:   # noqa: BLE001 — a failed probe must never break the reconnect loop
+        print(f"[failover] discovery probe failed ({exc!r})", flush=True)
+        return False
+    if not got:
+        return False
+    new_host, new_port = str(got["host"]), int(got["control_port"])
+    if (new_host, new_port) == (str(args.controller), int(args.control_port)):
+        return False                      # our own controller answered — it is coming back
+    old_tenant = f"{args.controller}:{args.control_port}"
+    print(f"[failover] controller {old_tenant} has been unreachable for "
+          f"{FAILOVER_AFTER_S:.0f}s; {got.get('name') or new_host} answered — moving there",
+          flush=True)
+    with contextlib.suppress(Exception):
+        worker.reassign_orphans(old_tenant, f"{new_host}:{new_port}")
+    args.controller, args.control_port = new_host, new_port
+    return True
 
 
 async def _resolve_controller(args: argparse.Namespace) -> None:
@@ -1338,10 +1376,17 @@ async def run(args: argparse.Namespace) -> None:
     else:
         print(f"[net] no LAN interface matched the controller subnet — letting the OS "
               f"pick the route (default source {route['os_default'] or '?'})")
-    state = {"backoff": 1.0}
+    state = {"backoff": 1.0, "down_since": 0.0}
+    # #failover: 0 (or a negative) disables re-homing entirely — this worker then belongs to its
+    # controller for life, which is the right setting for a node deliberately pinned to one fleet.
+    try:
+        _failover_after = float(load_config().get("failover_after_s", FAILOVER_AFTER_S))
+    except (TypeError, ValueError):
+        _failover_after = FAILOVER_AFTER_S
 
     def on_connected() -> None:
         state["backoff"] = 1.0  # a good connection resets the backoff
+        state["down_since"] = 0.0   # #failover: we are healthy again; restart the outage clock
 
     while True:
         # #handoff: a controller moved this node to a peer — dial the new one from now on.
@@ -1360,6 +1405,18 @@ async def run(args: argparse.Namespace) -> None:
             print(f"[!] connection lost ({exc!r})")
         else:
             print("[!] disconnected by controller")
+        # #failover: start (or continue) the outage clock. Once our controller has been gone longer
+        # than the threshold, probe for another one on EVERY cycle — the survivor may itself take a
+        # while to start answering broadcasts (a standby responder only speaks once it sees its peer
+        # go stale), so one probe at the threshold is not enough.
+        if not state["down_since"]:
+            state["down_since"] = time.time()
+        if _failover_after > 0 and (time.time() - state["down_since"]) >= _failover_after:
+            if await _failover_probe(args, worker):
+                reg["loaded"] = []          # refreshed from the tenant-scoped inventory on register
+                state["backoff"] = 1.0
+                state["down_since"] = time.time()   # give the NEW controller its own clock
+                continue
         # exponential backoff (cap 30s) + jitter so all nodes don't stampede the
         # controller at once when it comes back up
         delay = state["backoff"] + random.uniform(0, min(state["backoff"], 3.0))

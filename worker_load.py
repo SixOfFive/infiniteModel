@@ -846,6 +846,30 @@ class WorkerLoadMixin:
               f"dropping this session to reconnect there", flush=True)
         return {"ok": True, "moved": moved, "to": new_tenant}
 
+    def reassign_orphans(self, old_tenant: str, new_tenant: str) -> list:
+        """#failover: the controller that owned these shards is GONE — give them to a new one.
+
+        Identical in effect to the last half of handle_handoff, but SELF-initiated: nobody is left
+        to send us a handoff command, so the worker decides. Only shards belonging to the departed
+        tenant (or to nobody) move — a third controller's shards are never swept up by someone
+        else's outage.
+
+        The weights are untouched. All that changes is who may adopt them: inventory(new_tenant)
+        will now report them, and the new controller adopts through the ordinary #adopt path. Do NOT
+        confuse this with a reload — the whole point is that a multi-GB model survives its
+        controller dying, in place, at zero cost."""
+        moved = []
+        for mid in list(self.shards):
+            owner = self.shard_owner.get(mid)
+            if owner is not None and old_tenant and owner != old_tenant:
+                continue                      # someone else's shard — not ours to re-home
+            self.shard_owner[mid] = new_tenant
+            moved.append(mid)
+        if moved:
+            print(f"[failover] {len(moved)} shard(s) re-homed from {old_tenant or '<none>'} "
+                  f"to {new_tenant} — kept resident for adoption", flush=True)
+        return moved
+
     async def handle_unload(self, model_id: str | None = None, tenant: str = "") -> None:
         """Per-model unload when model_id is given; otherwise a teardown of this TENANT's models.
 

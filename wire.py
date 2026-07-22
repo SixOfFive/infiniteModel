@@ -450,6 +450,11 @@ _CONFIG_DEFAULTS = {
     # set it on BOTH controller and workers to pin a worker to one fleet on a shared LAN.
     "discovery_port": 50099,
     "cluster_id": "",
+    # #failover: seconds our controller must be UNREACHABLE before a worker looks for another one
+    # and re-homes its resident shards there (kept in memory — the new controller ADOPTS them, no
+    # reload). Well above any planned restart/deploy so a routine bounce never moves a worker.
+    # 0 disables: the worker then waits for its own controller forever, as it always did.
+    "failover_after_s": 180.0,
 }
 _CONFIG_CACHE = None
 

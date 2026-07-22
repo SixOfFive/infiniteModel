@@ -314,20 +314,46 @@ def register(app):
             return JSONResponse({"ok": False,
                                  "error": f"peer {to}:{p} is not a healthy known controller"},
                                 status_code=400)
-        host_nids = {nid for nid, n in registry._nodes.items() if n.hostname == node}
+        # #failover FAILBACK: node=* / all hands the WHOLE fleet over in one call. After a takeover
+        # the survivor owns every node, and giving them back one at a time is both tedious and
+        # wrong — a pipeline spread over several nodes would trip the split guard on each partial
+        # move. Moving them together is the only way that model comes home intact.
+        _all = str(node).strip() in ("*", "all")
+        if _all:
+            host_nids = set(registry._nodes)
+            _hostnames = sorted({n.hostname for n in registry._nodes.values()})
+        else:
+            host_nids = {nid for nid, n in registry._nodes.items() if n.hostname == node}
+            _hostnames = [node]
         if not host_nids:
-            return JSONResponse({"ok": False, "error": f"no live node named {node!r}"},
+            return JSONResponse({"ok": False,
+                                 "error": "no live nodes to hand over" if _all
+                                          else f"no live node named {node!r}"},
                                 status_code=404)
         # Handing over the controller's OWN co-located worker gives a remote controller this box's
         # GPU. Legitimate eventually, but far too easy to do by accident (auto-placement often lands
         # on the controller host), so it needs an explicit force=1.
-        if not force and any(getattr(registry._nodes[nid], "data_host", "") in _LOCAL_IPS
-                             for nid in host_nids):
-            return JSONResponse(
-                {"ok": False, "node": node,
-                 "error": f"{node} is this controller's own co-located worker — handing it to a "
-                          f"peer gives that controller this box's hardware. Pass force=1 if that "
-                          f"is really what you want."}, status_code=409)
+        # (node=* deliberately obeys the same rule: "hand over everything" must not quietly include
+        # this box's own GPU. Without force it moves every OTHER node and leaves ours behind.)
+        _colocated = {nid for nid in host_nids
+                      if getattr(registry._nodes[nid], "data_host", "") in _LOCAL_IPS}
+        if _colocated and not force:
+            if not _all:
+                return JSONResponse(
+                    {"ok": False, "node": node,
+                     "error": f"{node} is this controller's own co-located worker — handing it to a "
+                              f"peer gives that controller this box's hardware. Pass force=1 if that "
+                              f"is really what you want."}, status_code=409)
+            _skipped = sorted({registry._nodes[nid].hostname for nid in _colocated})
+            host_nids -= _colocated
+            _hostnames = [h for h in _hostnames if h not in _skipped]
+            if not host_nids:
+                return JSONResponse(
+                    {"ok": False, "error": "the only live node is this controller's own "
+                                           "co-located worker — pass force=1 to hand it over too"},
+                    status_code=409)
+        else:
+            _skipped = []
         moving, split = [], []
         for fr, m in list(engine.models.items()):
             ids = set(m.stage_node_ids or [])
@@ -343,10 +369,10 @@ def register(app):
                 status_code=409)
         # links are keyed by node_id (ControlLink carries node_id, not a Node) — same lookup
         # /restart_node uses: engine.links.get(nd.node_id).
-        link = next((l for l in (engine.links.get(nid) for nid in host_nids) if l is not None),
-                    None)
-        if link is None:
-            return JSONResponse({"ok": False, "error": f"no control link for {node}"},
+        links = [l for l in (engine.links.get(nid) for nid in sorted(host_nids)) if l is not None]
+        if not links:
+            return JSONResponse({"ok": False,
+                                 "error": f"no control link for {'any node' if _all else node}"},
                                 status_code=404)
         # NB: (peer.get("info") or {}) — a peer record initialises "info": None, so the KEY exists
         # and .get("info", {}) hands back None, not the default. That was a 500 on first live use.
@@ -355,35 +381,43 @@ def register(app):
                             or peers._cfg()["control_port"])
         except (TypeError, ValueError):
             ctrl_port = int(peers._cfg()["control_port"])
-        await link.send({"type": "handoff", "to_host": peer["host"], "to_port": ctrl_port,
-                         "models": [MODELS[f][0] if f in MODELS else f for f in moving]})
+        _cmd = {"type": "handoff", "to_host": peer["host"], "to_port": ctrl_port,
+                "models": [MODELS[f][0] if f in MODELS else f for f in moving]}
+        for l in links:
+            await l.send(_cmd)
         # Stop planning onto it here. Forget the moved models WITHOUT unloading — the shards stay
         # resident and become the peer's; unloading would defeat the entire point.
         for fr in moving:
             engine.models.pop(fr, None)
-        cfg = NODE_CONFIG.setdefault(node, {"ram": True, "vram": True})
-        cfg["ram"] = cfg["vram"] = False
+        for h in _hostnames:
+            cfg = NODE_CONFIG.setdefault(h, {"ram": True, "vram": True})
+            cfg["ram"] = cfg["vram"] = False
         save_node_config()
         # ...and tell the RECEIVER to enable it. Disabling is per-controller and sticky, so without
         # this the node arrives owned-but-unusable: hand a node A->B->A and A still has the tiers it
         # switched off on the first hop, so its planner silently ignores hardware it now owns again.
         # (Observed live: amdcomp + zippy came home disabled.) Best-effort — the node has already
         # moved, so a failure here is reported, never a rollback.
-        reclaimed = ""
-        try:
-            r = await asyncio.to_thread(
-                peers.http_post_json,
-                f"{peers.peer_base(peer)}/peer_reclaim?node={urllib.parse.quote(node)}", 15.0)
-            reclaimed = "ok" if r.get("ok") else str(r.get("error") or "refused")
-        except Exception as exc:   # noqa: BLE001
-            reclaimed = f"{type(exc).__name__}: {exc}"
-        if reclaimed != "ok":
-            log_activity(f"federation: {peer.get('name') or to} did not confirm reclaim of {node} "
-                         f"({reclaimed}) — enable its tiers there if the planner ignores it")
-        log_activity(f"federation: handed node {node} to {peer.get('name') or to} "
+        reclaimed = {}
+        for h in _hostnames:
+            try:
+                r = await asyncio.to_thread(
+                    peers.http_post_json,
+                    f"{peers.peer_base(peer)}/peer_reclaim?node={urllib.parse.quote(h)}", 15.0)
+                reclaimed[h] = "ok" if r.get("ok") else str(r.get("error") or "refused")
+            except Exception as exc:   # noqa: BLE001
+                reclaimed[h] = f"{type(exc).__name__}: {exc}"
+            if reclaimed[h] != "ok":
+                log_activity(f"federation: {peer.get('name') or to} did not confirm reclaim of {h} "
+                             f"({reclaimed[h]}) — enable its tiers there if the planner ignores it")
+        log_activity(f"federation: handed {len(_hostnames)} node(s) "
+                     f"({', '.join(_hostnames)}) to {peer.get('name') or to} "
                      f"with {len(moving)} resident model(s) — no reload")
-        return JSONResponse({"ok": True, "node": node, "to": f"{peer['host']}:{ctrl_port}",
-                             "models_moved": moving, "peer_reclaim": reclaimed})
+        return JSONResponse({"ok": True, "node": node, "nodes": _hostnames,
+                             "to": f"{peer['host']}:{ctrl_port}", "models_moved": moving,
+                             "skipped_colocated": _skipped,
+                             "peer_reclaim": ("ok" if all(v == "ok" for v in reclaimed.values())
+                                              else reclaimed)})
 
     @app.post("/peer_reclaim")
     async def peer_reclaim(node: str) -> JSONResponse:

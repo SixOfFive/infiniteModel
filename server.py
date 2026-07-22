@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c188"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c189"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -2426,6 +2426,12 @@ from formats import (_iso, _digest, _human_params, _details, _model_info,
                      _partial_suffix_len, _segment_tools, _estimate_tokens)   # noqa: E402,F401
 
 
+# #failover: set from INFINITEMODEL_DISCOVERY_RESPOND=standby in _start_discovery_responder().
+# Module-level so _DiscoveryResponder.datagram_received (a hot-ish UDP path) reads a plain bool
+# rather than re-parsing the environment per datagram.
+_DISCOVERY_STANDBY = False
+
+
 def build_app() -> FastAPI:
     from contextlib import asynccontextmanager
 
@@ -2463,6 +2469,13 @@ def build_app() -> FastAPI:
                 with contextlib.suppress(Exception):
                     peers.record_peer(addr[0], msg.get("http_port"), str(msg.get("name") or ""),
                                       str(msg.get("version") or ""), want, source="udp")
+            # #failover STANDBY: a worker query, on a controller told to recruit only when its peer
+            # is down. Silent while any peer is healthy (so workers never drift between two live
+            # controllers — ownership stays deliberate), vocal the moment none is, which is exactly
+            # when a stranded worker needs somewhere to go. Peer announces are ALWAYS answered
+            # above/below this gate: federation must keep working while we are standing by.
+            elif _DISCOVERY_STANDBY and peers.healthy_peers():
+                return
             reply = {"im": wire.DISCOVERY_MAGIC, "r": 1,
                      "host": wire.local_ip_for(addr[0]) or _display_host(),
                      "control_port": ARGS.control_port, "http_port": ARGS.http_port,
@@ -2479,10 +2492,17 @@ def build_app() -> FastAPI:
         # is in EXTRA_UPDATE_FILES and a self-update would overwrite a local edit.
         _respond = os.environ.get("INFINITEMODEL_DISCOVERY_RESPOND",
                                   "1" if _dcfg.get("discovery_respond", True) else "0")
-        if str(_respond).strip().lower() in ("0", "false", "no", "off"):
+        _mode = str(_respond).strip().lower()
+        if _mode in ("0", "false", "no", "off"):
             print("[*] discovery responder DISABLED (INFINITEMODEL_DISCOVERY_RESPOND=0) — this "
                   "controller will not answer worker broadcasts; peer federation still works")
             return None
+        # #failover: 'standby' is the setting that makes a two-controller LAN both SAFE and
+        # survivable. Off would leave stranded workers with nobody to join; on would let them drift
+        # between two live controllers at every reconnect. Standby answers only while no peer is
+        # healthy — i.e. only when someone actually needs rescuing.
+        global _DISCOVERY_STANDBY
+        _DISCOVERY_STANDBY = _mode in ("standby", "failover", "2")
         try:
             dport = int(_dcfg.get("discovery_port") or 50099)
         except (TypeError, ValueError):
@@ -2491,7 +2511,9 @@ def build_app() -> FastAPI:
             tr, _ = await asyncio.get_running_loop().create_datagram_endpoint(
                 _DiscoveryResponder, local_addr=("0.0.0.0", dport), allow_broadcast=True)
             print(f"[*] discovery responder on udp/{dport} "
-                  f"(cluster_id={_dcfg.get('cluster_id') or '<unset>'})")
+                  f"(cluster_id={_dcfg.get('cluster_id') or '<unset>'}"
+                  + (", STANDBY: answers workers only while no peer controller is healthy"
+                     if _DISCOVERY_STANDBY else "") + ")")
             return tr
         except Exception as exc:   # noqa: BLE001 — never fatal; static addressing still works
             print(f"[!] discovery responder disabled ({exc!r}); workers must use a static "
