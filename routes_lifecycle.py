@@ -85,6 +85,17 @@ def register(app):
             if _peer is not None:
                 _q = "&".join(kv for kv in str(request.url.query or "").split("&")
                               if kv and not kv.startswith("owner="))
+                # OUR defaults, not the peer's. The caller asked THIS controller to load something;
+                # anything they left unspecified should follow the policy configured HERE. Without
+                # this the request arrives bare and the peer fills the gaps from its own
+                # autoload_quant/autoload_ctx, so a controller's own defaults quietly did nothing.
+                _qkeys = {kv.split("=", 1)[0] for kv in _q.split("&") if kv}
+                if "quant" not in _qkeys:
+                    _q += f"&quant={ENGINE_CONFIG.get('autoload_quant') or 'int4'}"
+                if "ctx" not in _qkeys and not ctx:
+                    _actx = int(ENGINE_CONFIG.get("autoload_ctx") or 0)
+                    if _actx > 0:
+                        _q += f"&ctx={_actx}"
                 _lbl = _pm.peer_label(_peer)
                 log_activity(f"load {model}: federating to {_lbl} ({_why})")
                 try:

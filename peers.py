@@ -186,9 +186,23 @@ def _stamp(row: dict, p: dict) -> dict:
             "owner_key": peer_key(p["host"], p["http_port"]), "owner_url": peer_base(p)}
 
 
+PEER_STATUS_FRESH_S = 45.0   # a cached /status older than this is not trusted for rendering
+
+
+def _rich(p: dict) -> dict:
+    """The peer's last /status snapshot, if recent enough to render. {} otherwise."""
+    st = p.get("status")
+    if not isinstance(st, dict):
+        return {}
+    return st if (time.time() - float(p.get("status_ts") or 0)) <= PEER_STATUS_FRESH_S else {}
+
+
 def federated_nodes() -> list:
     """Every node our healthy peers own, stamped with the owner. Deduped against OUR OWN nodes:
-    a node can only be driven by one controller, so if it is in our registry it is ours to show."""
+    a node can only be driven by one controller, so if it is in our registry it is ours to show.
+
+    Rows come from the peer's own /status when we have a fresh one (identical to what IT renders,
+    sparklines included) and fall back to the /peer_info summary otherwise."""
     mine = set()
     registry = getattr(state, "registry", None)
     try:
@@ -198,13 +212,27 @@ def federated_nodes() -> list:
         pass
     out, seen = [], set()
     for p in healthy_peers():
-        for n in ((p.get("info") or {}).get("nodes") or []):
+        rows = (_rich(p).get("nodes") or []) or ((p.get("info") or {}).get("nodes") or [])
+        for n in rows:
             h = str(n.get("hostname") or "")
             if not h or h in mine or h in seen:
                 continue
             seen.add(h)
             out.append(_stamp(n, p))
     return out
+
+
+def _peer_model_card(m: dict, p: dict) -> dict:
+    """One of the peer's OWN model cards, made honest about what is and isn't true HERE.
+
+    Everything measured stays verbatim — that is the entire point. What changes is anything that
+    would imply a local capability we do not have: the weights are not on OUR disk, so `ready` is
+    false and the shard-cache block is dropped (otherwise the detail modal offers to compile a cache
+    for files we do not hold)."""
+    out = {**m, "ready": False, "status": "peer", "loaded": True}
+    out.pop("cached", None)
+    out.pop("upgrade", None)      # a placement upgrade is the OWNER's to apply, not ours
+    return _stamp(out, p)
 
 
 def federated_models() -> list:
@@ -223,12 +251,22 @@ def federated_models() -> list:
         pass
     out, seen = [], set()
     for p in healthy_peers():
-        for m in ((p.get("info") or {}).get("models") or []):
-            names = _model_aliases(m)
+        # `not m["federated"]`: a peer's /status also carries ITS view of everyone else (including
+        # us). Only rows the peer DRIVES are its own to advertise — re-broadcasting a second-hand
+        # row would attribute a third controller's model to this one, and bounce our own models
+        # back at us wearing the peer's name.
+        rich = [m for m in (_rich(p).get("models") or [])
+                if m.get("loaded") and not m.get("federated")]
+        for m in (rich or ((p.get("info") or {}).get("models") or [])):
+            # A /status card names itself with name/internal_name; a /peer_info summary with
+            # friendly/target. Match on every one of them so dedupe works whichever we got.
+            names = _model_aliases({"friendly": m.get("friendly") or m.get("internal_name"),
+                                    "target": m.get("target"),
+                                    "aliases": (m.get("aliases") or []) + [m.get("name")]})
             if not names or (names & mine) or (names & seen):
                 continue
             seen |= names
-            out.append(_stamp(m, p))
+            out.append(_peer_model_card(m, p) if rich else _stamp(m, p))
     return out
 
 
@@ -248,6 +286,14 @@ def find_peer(sel: str) -> dict | None:
 def peer_for_model(name: str) -> dict | None:
     """The healthy peer that has `name` resident (federated load/unload target)."""
     return find_model_peer(name)[0]
+
+
+def http_get_text(url: str, timeout: float = 20.0) -> str:
+    """GET a text/SVG body from a peer (the detail-graph proxy). Raises on failure — the caller
+    decides whether to fall back."""
+    req = urllib.request.Request(url, headers={"User-Agent": "infinitemodel-peer/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
 
 
 def http_post_json(url: str, timeout: float = 120.0) -> dict:
@@ -373,7 +419,8 @@ def _model_aliases(m: dict) -> set:
         if v:
             out.add(str(v).strip().lower())
     for v in (m.get("aliases") or []):
-        out.add(str(v).strip().lower())
+        if v:                      # a None in the list would become the literal alias "none"
+            out.add(str(v).strip().lower())
     return out
 
 
@@ -422,10 +469,33 @@ async def poll_peer(p: dict) -> bool:
         for f in ("name", "version", "cluster_id"):
             if info.get(f):
                 p[f] = info[f]
-        return True
     except Exception as exc:   # noqa: BLE001 — a dead peer must never break the loop
         p["error"] = f"{type(exc).__name__}: {exc}"
         return False
+    await _poll_peer_status(p)
+    return True
+
+
+async def _poll_peer_status(p: dict) -> None:
+    """Also cache the peer's FULL dashboard payload — its own `/status?graphs=1`.
+
+    /peer_info is a summary: enough to decide whether to borrow a model, not enough to RENDER one.
+    A model's card (measured VRAM/RAM, KV reservation, CPU fraction, load time, lifetime totals) and
+    its server-rendered tok/s sparkline are computed by the controller that drives it and exist
+    nowhere else — reconstructing them from a summary is how the peer rows ended up hollow: no
+    graphs, no memory utilisation. So we fetch the real thing on the gossip cadence and show the
+    owner's own card verbatim.
+
+    Failure is soft: the previous snapshot stays and the summary remains the fallback, because a
+    peer whose /status hiccups should degrade to less detail, never to a blank fleet."""
+    try:
+        st = await asyncio.to_thread(
+            _http_get_json, f"http://{p['host']}:{p['http_port']}/status?graphs=1", 20.0)
+        if isinstance(st, dict) and st.get("nodes") is not None:
+            p["status"] = st
+            p["status_ts"] = time.time()
+    except Exception as exc:   # noqa: BLE001 — richness is a bonus; never fail the gossip round
+        p["status_error"] = f"{type(exc).__name__}: {exc}"
 
 
 async def gossip_round() -> dict:

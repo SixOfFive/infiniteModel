@@ -5,6 +5,48 @@ build_app() calls register(app) to attach them. Controller-only leaf; in EXTRA_U
 """
 from __future__ import annotations
 
+# stdlib, imported here rather than taken from the injected server namespace (server.py's
+# `import urllib.request` sits inside a function, so `urllib` is not one of its module globals).
+import urllib.parse   # noqa: E402
+
+
+def _graph_owner(host: str):
+    """#unified-fleet: the peer controller that owns `host` — a NODE hostname or a resident MODEL
+    name — or None when it is ours (or unknown). Used to send a detail-graph request to whichever
+    controller actually has the samples."""
+    try:
+        import peers
+    except Exception:   # noqa: BLE001 — no federation leaf: everything is ours
+        return None
+    h = str(host or "").strip().lower()
+    if not h:
+        return None
+    # OURS ALWAYS WINS. Both controllers can legitimately have a model of the same name resident
+    # (two copies, one each); asking the peer for a graph of a model we are decoding ourselves would
+    # show someone else's throughput on our row.
+    try:
+        for n in registry.alive_sorted():
+            if str(getattr(n, "hostname", "")).strip().lower() == h:
+                return None
+        for fr, m in (getattr(engine, "models", None) or {}).items():
+            if h in {str(fr).strip().lower(), str(_ollama_name(fr)).strip().lower(),
+                     str(getattr(m, "target_id", "")).strip().lower()}:
+                return None
+    except Exception:   # noqa: BLE001 — inconclusive: fall through and let the peer scan decide
+        pass
+    for p in peers.healthy_peers():
+        st = peers._rich(p)
+        for n in (st.get("nodes") or []):
+            if str(n.get("hostname") or "").strip().lower() == h:
+                return p
+        for m in (st.get("models") or []):
+            if not m.get("loaded"):
+                continue
+            if h in {str(m.get(k) or "").strip().lower()
+                     for k in ("name", "internal_name", "target")} - {""}:
+                return p
+    return None
+
 
 def register(app):
 
@@ -91,6 +133,12 @@ def register(app):
             for m in st.get("models", []):
                 if not m.get("loaded"):
                     continue
+                if m.get("federated"):
+                    # #unified-fleet: this card came from the OWNER and already carries the
+                    # sparkline IT rendered from ITS history. We have no samples for a model we
+                    # never decoded, so rendering one here would overwrite a real graph with an
+                    # empty one — which is exactly how the peer rows ended up graphless.
+                    continue
                 _host = m.get("internal_name") or m.get("name")
                 if not m.get("media") and not m.get("is_embedding"):
                     m["spark_tps"] = _spark_svg(_host, "tps")
@@ -106,6 +154,20 @@ def register(app):
         if kind not in ("bw", "ram", "vram", "tps", "usage"):
             return Response(content="unknown graph kind", status_code=404,
                             media_type="text/plain")
+        # #unified-fleet: clicking a peer row's sparkline asks US for a detail graph of a node or
+        # model we have no samples for — we would render an empty chart. The history lives with the
+        # controller that drives it, so fetch it from there. Only when the subject really is a
+        # peer's; anything of ours is served locally exactly as before.
+        _owner = _graph_owner(host)
+        if _owner is not None:
+            try:
+                import peers as _peers
+                _svg = await asyncio.to_thread(
+                    _peers.http_get_text,
+                    f"{_peers.peer_base(_owner)}/graph/{kind}/{urllib.parse.quote(host)}", 20.0)
+                return Response(content=_svg, media_type="image/svg+xml")
+            except Exception as exc:   # noqa: BLE001 — fall through to our own (empty) render
+                print(f"[peers] proxying graph {kind}/{host} failed ({exc!r})", flush=True)
         return Response(content=_detail_svg(host, kind), media_type="image/svg+xml")
 
     @app.get("/nethistory")

@@ -404,10 +404,17 @@ def build_status() -> dict:
     except Exception as _exc:   # noqa: BLE001 — federation is additive; /status must never 500 on it
         print(f"[status] peer view unavailable ({_exc!r})", flush=True)
     for _pm in _peer_models:
+        # A peer's resident model presents as a LOADED card (it IS loaded — on the other
+        # controller's nodes). When peers.py had a fresh /status from the owner, _pm IS that
+        # controller's own card and is passed straight through — measured VRAM/RAM, KV reservation,
+        # tok/s sparkline and all. Hand-rebuilding a card from the gossip summary was what left
+        # these rows without graphs or memory figures.
+        if _pm.get("name"):
+            model_cards.append(_pm)
+            continue
+        # Fallback: only the /peer_info summary was available (peer's /status unreachable or
+        # stale). Synthesise the thinner card so the model is at least listed and addressable.
         _nm = _pm.get("display_name") or _pm.get("friendly") or ""
-        # A peer's resident model presents as a LOADED card (it IS loaded — on the other controller's
-        # nodes) with ready=False: its weights are not on OUR disk, so our Load button would have to
-        # download them. Requests still work today via Phase 3 request federation.
         _card = {"name": _nm, "internal_name": _pm.get("friendly") or _nm,
                  "target": _pm.get("target") or "", "draft": "", "ready": False,
                  "status": "peer", "loaded": True, "federated": True,
