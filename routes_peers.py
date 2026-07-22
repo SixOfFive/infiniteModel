@@ -204,12 +204,18 @@ def register(app):
         key = peers.peer_key(host, p)
         peer = peers.PEERS.get(key) or {"host": host, "http_port": p, "name": ""}
         target = model.strip()
+        peer_friendly = ""
         try:                                   # a peer may advertise the friendly name; keep both
             man = await asyncio.to_thread(
                 peers._http_get_json,
                 f"http://{host}:{p}/peer_model_manifest?model={urllib.parse.quote(target)}", 30.0)
             if man.get("ok") and man.get("target"):
                 target = man["target"]
+            # Adopt the PEER's friendly name, not one re-derived from the HF id: beast serves
+            # nomic-ai/nomic-embed-text-v1.5 as "nomic-embed-text", and _friendly_from_hf would
+            # have registered it here as "nomic-embed-text-v1.5". Divergent names across
+            # controllers break federation routing, which matches on the requested name.
+            peer_friendly = str(man.get("model") or "")
         except Exception as exc:               # noqa: BLE001
             return JSONResponse({"ok": False, "error": f"peer manifest failed: {exc}"},
                                 status_code=502)
@@ -224,7 +230,7 @@ def register(app):
                                             include_caches=bool(caches))
             if st.get("state") != "done":
                 return
-            friendly = _friendly_from_hf(target)          # register exactly like /add_model
+            friendly = peer_friendly or _friendly_from_hf(target)   # register like /add_model
             if friendly not in MODELS:
                 MODELS[friendly] = (target, target)
                 CUSTOM_MODELS[friendly] = target
