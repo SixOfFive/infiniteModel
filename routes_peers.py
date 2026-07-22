@@ -297,6 +297,66 @@ def register(app):
         log_activity(f"federation: lent node {node} to a peer (both tiers disabled here)")
         return JSONResponse({"ok": True, "node": node, "config": cfg})
 
+    @app.post("/peer_handoff")
+    async def peer_handoff(node: str, to: str, port: int = 0) -> JSONResponse:
+        """Transfer a node — WITH its resident shards — to a peer controller. No reload.
+
+        The worker keeps the weights in VRAM, reassigns their owner, drops this session and
+        reconnects to the peer, which ADOPTS them. That is the ordinary #adopt path (how hitless
+        restart already works) aimed at a different controller.
+
+        REFUSED when a resident model has stages on this node AND elsewhere: handing over one leg
+        of a multi-stage pipeline would leave a model half-owned by each controller, which no
+        amount of retrying fixes. Move single-node models, or hand over every node they span."""
+        p = int(port or peers._cfg()["http_port"])
+        peer = peers.PEERS.get(peers.peer_key(to, p))
+        if not peer or peers.peer_state(peer) != "ok":
+            return JSONResponse({"ok": False,
+                                 "error": f"peer {to}:{p} is not a healthy known controller"},
+                                status_code=400)
+        host_nids = {nid for nid, n in registry._nodes.items() if n.hostname == node}
+        if not host_nids:
+            return JSONResponse({"ok": False, "error": f"no live node named {node!r}"},
+                                status_code=404)
+        moving, split = [], []
+        for fr, m in list(engine.models.items()):
+            ids = set(m.stage_node_ids or [])
+            if not (ids & host_nids):
+                continue
+            (moving if ids <= host_nids else split).append(fr)
+        if split:
+            return JSONResponse(
+                {"ok": False, "node": node, "spans_other_nodes": split,
+                 "error": f"{len(split)} resident model(s) span {node} AND other nodes "
+                          f"({', '.join(split)}); handing over one stage would split the pipeline "
+                          f"across controllers. Unload them, or hand over every node they use."},
+                status_code=409)
+        # links are keyed by node_id (ControlLink carries node_id, not a Node) — same lookup
+        # /restart_node uses: engine.links.get(nd.node_id).
+        link = next((l for l in (engine.links.get(nid) for nid in host_nids) if l is not None),
+                    None)
+        if link is None:
+            return JSONResponse({"ok": False, "error": f"no control link for {node}"},
+                                status_code=404)
+        try:
+            ctrl_port = int(peer.get("info", {}).get("control_port")
+                            or peers._cfg()["control_port"])
+        except (TypeError, ValueError):
+            ctrl_port = int(peers._cfg()["control_port"])
+        await link.send({"type": "handoff", "to_host": peer["host"], "to_port": ctrl_port,
+                         "models": [MODELS[f][0] if f in MODELS else f for f in moving]})
+        # Stop planning onto it here. Forget the moved models WITHOUT unloading — the shards stay
+        # resident and become the peer's; unloading would defeat the entire point.
+        for fr in moving:
+            engine.models.pop(fr, None)
+        cfg = NODE_CONFIG.setdefault(node, {"ram": True, "vram": True})
+        cfg["ram"] = cfg["vram"] = False
+        save_node_config()
+        log_activity(f"federation: handed node {node} to {peer.get('name') or to} "
+                     f"with {len(moving)} resident model(s) — no reload")
+        return JSONResponse({"ok": True, "node": node, "to": f"{peer['host']}:{ctrl_port}",
+                             "models_moved": moving})
+
     @app.post("/peer_reclaim")
     async def peer_reclaim(node: str) -> JSONResponse:
         """Take a lent node back: re-enable both tiers here."""

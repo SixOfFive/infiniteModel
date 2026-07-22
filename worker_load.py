@@ -812,6 +812,40 @@ class WorkerLoadMixin:
             out.append(entry)
         return out
 
+    async def handle_handoff(self, msg: dict, tenant: str = "") -> dict:
+        """#handoff: transfer this node (and its RESIDENT shards) to another controller.
+
+        The shards are NOT unloaded — ownership is reassigned and the session is dropped, so the
+        worker reconnects to the new controller, reports those shards in its (tenant-scoped)
+        inventory, and the new controller ADOPTS them. Same weights, same VRAM, no re-stream: this
+        is the ordinary #adopt path (how a hitless controller restart already works) pointed at a
+        DIFFERENT controller instead of the same one.
+
+        Reassigning shard_owner is what makes it work: without it the new controller's
+        inventory(tenant) would filter the shards out as someone else's and they would sit
+        resident-but-invisible, pinning VRAM forever."""
+        host = str(msg.get("to_host") or "").strip()
+        try:
+            port = int(msg.get("to_port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not host or port <= 0:
+            return {"ok": False, "error": "handoff needs to_host and to_port"}
+        want = msg.get("models")            # None/empty = every shard we own
+        new_tenant = f"{host}:{port}"
+        moved = []
+        for mid in list(self.shards):
+            if want and mid not in want:
+                continue
+            if not self.owns(mid, tenant):  # never hand over a third controller's shard
+                continue
+            self.shard_owner[mid] = new_tenant
+            moved.append(mid)
+        self._handoff = (host, port)        # run()'s reconnect loop re-targets on this
+        print(f"[handoff] {len(moved)} shard(s) reassigned to {new_tenant}; "
+              f"dropping this session to reconnect there", flush=True)
+        return {"ok": True, "moved": moved, "to": new_tenant}
+
     async def handle_unload(self, model_id: str | None = None, tenant: str = "") -> None:
         """Per-model unload when model_id is given; otherwise a teardown of this TENANT's models.
 

@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c195"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c196"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -871,6 +871,10 @@ class Worker(WorkerLoadMixin, WorkerNetMixin):
         # grace FREES, the first controller's live models. None/absent = unowned = anyone may claim
         # (back-compat: pre-existing and adopted shards).
         self.shard_owner: dict[str, str] = {}
+        # #handoff: (host, port) of a controller this node is being transferred to. Set by
+        # handle_handoff; run()'s reconnect loop re-targets to it and clears it. Shards are KEPT
+        # (ownership already reassigned) so the new controller adopts them without a re-stream.
+        self._handoff = None
         self._weight_tmps: dict[str, str] = {}                   # model_id -> temp file backing its mmap
         self.data_server: asyncio.AbstractServer | None = None   # shared data port; bound on first load
         self._tp = None              # _TPAllReduce when a load is tensor-parallel (single TP model)
@@ -1119,6 +1123,11 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     asyncio.create_task(worker.handle_t2a_gen(msg, reply))
                 elif mtype == "unload":
                     await worker.handle_unload(msg.get("model_id"), tenant)
+                elif t == "handoff":            # #handoff: move this node to another controller
+                    res = await worker.handle_handoff(msg, tenant)
+                    await reply({"type": "handoff_result", "node_id": node_id, **res})
+                    if res.get("ok"):
+                        return          # end the session; run() reconnects to the new controller
                     await reply({"type": "unloaded", "node_id": node_id,
                                  "model_id": msg.get("model_id")})
                     print(f"[unload] stage torn down (model_id={msg.get('model_id')})")
@@ -1177,7 +1186,11 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
         # Per-request transients still flush: staged multimodal embeds must not leak into a
         # fresh controller epoch (req_id restarts from 0). Every other teardown reason —
         # old controller, worker-side exit — keeps the full unload exactly as before.
-        if getattr(worker, "_ctrl_adopts", False) and worker.shards:
+        if getattr(worker, "_handoff", None) and worker.shards:
+            # #handoff: never unload here — the shards are the whole point of the transfer.
+            worker.pending_mm.clear()
+            print(f"[handoff] keeping {len(worker.shards)} loaded model(s) for the new controller")
+        elif getattr(worker, "_ctrl_adopts", False) and worker.shards:
             worker.pending_mm.clear()
             print(f"[adopt] control link lost — keeping {len(worker.shards)} loaded model(s) "
                   "for controller re-adoption")
@@ -1331,6 +1344,14 @@ async def run(args: argparse.Namespace) -> None:
         state["backoff"] = 1.0  # a good connection resets the backoff
 
     while True:
+        # #handoff: a controller moved this node to a peer — dial the new one from now on.
+        _ho = getattr(worker, "_handoff", None)
+        if _ho:
+            worker._handoff = None
+            args.controller, args.control_port = _ho[0], int(_ho[1])
+            reg["loaded"] = []          # refreshed from the tenant-scoped inventory on register
+            print(f"[handoff] re-targeting to controller {args.controller}:{args.control_port}")
+            state["backoff"] = 1.0
         try:
             await session(args, reg, worker, on_connected)
         except (ConnectionRefusedError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
