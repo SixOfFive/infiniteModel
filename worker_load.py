@@ -146,14 +146,19 @@ class WorkerLoadMixin:
         for mid in list(self._weight_tmps):
             self._cleanup_weight_tmp(mid)
 
-    async def handle_load(self, msg: dict) -> dict:
+    async def handle_load(self, msg: dict, tenant: str = "") -> dict:
         model_id = msg["model_id"]
         a = msg
         # Reload of the SAME model: drop just its old shard first; keep other models resident.
         # (The Inc 1/2 controller still unloads every node before a load, so usually nothing
         # else is resident yet — this matters once Inc 3 enables fit-as-many.)
+        # ⚠ #multi-controller: this unconditional unload is why two controllers serving the SAME
+        # model_id clobber each other — B's load evicts A's shard. Record the owner so inventory /
+        # scoped-unload can tell them apart; TRUE per-tenant shard keys are the next step.
         await self._unload_model(model_id)
         self.assignments[model_id] = msg
+        if tenant:
+            self.shard_owner[model_id] = tenant
         # A tensor-parallel PEER (tp_rank>0) is NOT in the pipeline: it has no data port and
         # no 'next' — it's driven entirely by rank 0's broadcasts over the all-reduce mesh.
         is_peer = int(a.get("tp_size", 1)) > 1 and int(a.get("tp_rank", 0)) > 0
@@ -558,6 +563,7 @@ class WorkerLoadMixin:
         if _sh is not None:
             self._release_shard_vram(_sh)   # #vram-release-rocm: free GPU storages in place first
         self.assignments.pop(model_id, None)
+        self.shard_owner.pop(model_id, None)   # #multi-controller: release the tenant claim
         # Drop any staged multimodal embeds for THIS model so they can't be mis-consumed by a
         # later request after a controller restart (req_id resets to 0 -> key reuse).
         for k in [k for k in self.pending_mm if k[0] == model_id]:
@@ -768,16 +774,31 @@ class WorkerLoadMixin:
         return {"req_id": msg.get("req_id"), "unit": msg.get("unit"),
                 "bytes": len(blob), "tensors": len(mtensors)}
 
-    def inventory(self) -> list:
-        """#adopt: describe every loaded model for the register message, so a controller that
-        restarted can RE-ADOPT them instead of re-streaming. Each entry carries the ORIGINAL
+    def owns(self, model_id: str, tenant: str) -> bool:
+        """#multi-controller: is `model_id` this tenant's shard?
+
+        A shard with NO recorded owner is claimed by whoever asks. That is the back-compat case —
+        shards loaded before this change, and shards adopted from a previous controller epoch —
+        and it preserves today's exact single-controller behaviour (including hitless re-adoption)
+        while a second controller can never be handed someone else's models."""
+        owner = self.shard_owner.get(model_id)
+        return owner is None or not tenant or owner == tenant
+
+    def inventory(self, tenant: str = "") -> list:
+        """#adopt: describe this TENANT's loaded models for the register message, so a controller
+        that restarted can RE-ADOPT them instead of re-streaming. Each entry carries the ORIGINAL
         load message (`self.assignments[mid]` — the complete recipe the controller sent: kind,
         layer range, ctx, quant, kv flags, device …) plus live byte counts off the shard. All
-        values came off the JSON control link or are ints, so the report is JSON-safe."""
+        values came off the JSON control link or are ints, so the report is JSON-safe.
+
+        ⚠ #multi-controller: reporting EVERY shard to EVERY controller is what makes attaching a
+        worker to a second controller destructive — the newcomer either co-drives another
+        controller's shards or, failing to assemble them, frees them after _ADOPT_GRACE_S (90s).
+        Filtering by owner is the precondition for a worker serving two controllers at all."""
         out = []
         for mid, a in list(self.assignments.items()):
             sh = self.shards.get(mid)
-            if sh is None or not isinstance(a, dict):
+            if sh is None or not isinstance(a, dict) or not self.owns(mid, tenant):
                 continue
             entry = {"model_id": mid, "assign": a,
                      "gpu_bytes": int(getattr(sh, "gpu_bytes", 0) or 0),
@@ -791,13 +812,29 @@ class WorkerLoadMixin:
             out.append(entry)
         return out
 
-    async def handle_unload(self, model_id: str | None = None) -> None:
-        """Per-model unload when model_id is given; otherwise a FULL teardown of every model
-        (what the controller sends today, and what the session does on disconnect)."""
+    async def handle_unload(self, model_id: str | None = None, tenant: str = "") -> None:
+        """Per-model unload when model_id is given; otherwise a teardown of this TENANT's models.
+
+        ⚠ #multi-controller: the no-model_id form is a FULL teardown — it closes the shared data
+        server and clears every shard — and the controller broadcasts it to every link on /unload
+        and /update. With two controllers attached that means one controller's routine unload
+        destroys the other's resident models. When `tenant` is given and OTHER tenants still hold
+        shards, drop only ours and leave the data server up; the full teardown still runs when we
+        are the last tenant (identical to today's single-controller behaviour)."""
         if model_id is not None:
             await self._unload_model(model_id)
             self._maybe_self_restart_if_stuck()
             return
+        if tenant:
+            others = [m for m in list(self.shards) if not self.owns(m, tenant)]
+            if others:
+                mine = [m for m in list(self.shards) if self.owns(m, tenant)]
+                print(f"[tenant] scoped unload for {tenant}: dropping {len(mine)} shard(s), "
+                      f"keeping {len(others)} owned by another controller", flush=True)
+                for mid in mine:
+                    await self._unload_model(mid)
+                self._maybe_self_restart_if_stuck()
+                return
         self._teardown_tp()
         if self._tp_thread is not None:
             with contextlib.suppress(Exception):

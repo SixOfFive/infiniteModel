@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c194"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c195"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -865,6 +865,12 @@ class Worker(WorkerLoadMixin, WorkerNetMixin):
         self.next_peer: dict[str, str] = {}                      # model_id -> next-hop label (bandwidth)
         self._next_last_send: dict[str, float] = {}              # #stage0-stale-reconnect: model_id -> last forward ts
         self.assignments: dict[str, dict] = {}                   # model_id -> load msg (debug/reload)
+        # #multi-controller: model_id -> the controller ("host:port") that loaded it. Lets
+        # inventory() report only the asking controller's shards and lets a full-teardown unload be
+        # scoped to one tenant — without this a second controller adopts, or after the 90s adopt
+        # grace FREES, the first controller's live models. None/absent = unowned = anyone may claim
+        # (back-compat: pre-existing and adopted shards).
+        self.shard_owner: dict[str, str] = {}
         self._weight_tmps: dict[str, str] = {}                   # model_id -> temp file backing its mmap
         self.data_server: asyncio.AbstractServer | None = None   # shared data port; bound on first load
         self._tp = None              # _TPAllReduce when a load is tensor-parallel (single TP model)
@@ -1020,8 +1026,12 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
         # #adopt: refresh the dynamic loaded-model inventory on EVERY (re)connect — a freshly
         # restarted controller uses it to re-ADOPT the models this worker kept across the
         # restart (old controllers just ignore the extra field).
+        # #multi-controller: this session's tenant id. inventory() is filtered by it so we NEVER
+        # hand a controller another controller's shards (which it would adopt, or free after the
+        # 90s adopt grace). One controller => every shard is ours => byte-identical behaviour.
+        tenant = f"{args.controller}:{args.control_port}"
         with contextlib.suppress(Exception):
-            reg["loaded"] = worker.inventory()
+            reg["loaded"] = worker.inventory(tenant)
         async with wlock:
             writer.write(_enc(reg))
             await writer.drain()
@@ -1039,7 +1049,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
         worker._ctrl_adopts = bool(ack.get("adopt"))
         if not worker._ctrl_adopts and worker.shards:
             print(f"[adopt] controller lacks adoption — dropping {len(worker.shards)} kept model(s)")
-            await worker.handle_unload()
+            await worker.handle_unload(None, tenant)
         on_connected()  # registration succeeded -> reset reconnect backoff
         print(f"[+] registered as {node_id} on {args.controller}:{args.control_port} "
               f"(server {ack.get('server_version', '?')})")
@@ -1066,7 +1076,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                 mtype = msg.get("type")
                 if mtype == "load":
                     try:
-                        info = await worker.handle_load(msg)
+                        info = await worker.handle_load(msg, tenant)
                         # #1: echo model_id so the controller resolves THIS model's load future
                         # (a single shared future cross-resolved on a co-loaded node).
                         await reply({"type": "ready", "node_id": node_id,
@@ -1108,7 +1118,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     # loop keeps serving unload/ping; handler replies keyed by req_id.
                     asyncio.create_task(worker.handle_t2a_gen(msg, reply))
                 elif mtype == "unload":
-                    await worker.handle_unload(msg.get("model_id"))
+                    await worker.handle_unload(msg.get("model_id"), tenant)
                     await reply({"type": "unloaded", "node_id": node_id,
                                  "model_id": msg.get("model_id")})
                     print(f"[unload] stage torn down (model_id={msg.get('model_id')})")
@@ -1120,7 +1130,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     # the box is left clean. Safe here — a forced update unloads all models first, so
                     # nothing is mmap-resident to evict. (#forced-update)
                     with contextlib.suppress(Exception):
-                        await worker.handle_unload(None)   # drop ALL shards if any remain
+                        await worker.handle_unload(None, tenant)   # drop OUR shards if any remain
                     freed = await asyncio.to_thread(_flush_os_cache)
                     with contextlib.suppress(Exception):
                         await reply({"type": "freed", "node_id": node_id, "free_gb": round(freed, 2)})
@@ -1172,7 +1182,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
             print(f"[adopt] control link lost — keeping {len(worker.shards)} loaded model(s) "
                   "for controller re-adoption")
         else:
-            await worker.handle_unload()
+            await worker.handle_unload(None, tenant)
         with contextlib.suppress(Exception):
             writer.close()
             await writer.wait_closed()
