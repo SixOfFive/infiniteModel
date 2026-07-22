@@ -364,10 +364,26 @@ def register(app):
         cfg = NODE_CONFIG.setdefault(node, {"ram": True, "vram": True})
         cfg["ram"] = cfg["vram"] = False
         save_node_config()
+        # ...and tell the RECEIVER to enable it. Disabling is per-controller and sticky, so without
+        # this the node arrives owned-but-unusable: hand a node A->B->A and A still has the tiers it
+        # switched off on the first hop, so its planner silently ignores hardware it now owns again.
+        # (Observed live: amdcomp + zippy came home disabled.) Best-effort — the node has already
+        # moved, so a failure here is reported, never a rollback.
+        reclaimed = ""
+        try:
+            r = await asyncio.to_thread(
+                peers.http_post_json,
+                f"{peers.peer_base(peer)}/peer_reclaim?node={urllib.parse.quote(node)}", 15.0)
+            reclaimed = "ok" if r.get("ok") else str(r.get("error") or "refused")
+        except Exception as exc:   # noqa: BLE001
+            reclaimed = f"{type(exc).__name__}: {exc}"
+        if reclaimed != "ok":
+            log_activity(f"federation: {peer.get('name') or to} did not confirm reclaim of {node} "
+                         f"({reclaimed}) — enable its tiers there if the planner ignores it")
         log_activity(f"federation: handed node {node} to {peer.get('name') or to} "
                      f"with {len(moving)} resident model(s) — no reload")
         return JSONResponse({"ok": True, "node": node, "to": f"{peer['host']}:{ctrl_port}",
-                             "models_moved": moving})
+                             "models_moved": moving, "peer_reclaim": reclaimed})
 
     @app.post("/peer_reclaim")
     async def peer_reclaim(node: str) -> JSONResponse:
