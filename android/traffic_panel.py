@@ -166,19 +166,32 @@ def tablet_load():
         return None
 
 
-def resize_worker_pane(cols, rows):
-    """Widen the worker's tmux window to match this panel.
+LOG_INDENT = 2                                      # left margin of a worker-log line
+
+
+def log_width(w):
+    """Chars of worker-log CONTENT the panel can show, given usable width `w` (== cols - 1).
+
+    Single source of truth: the worker's tmux pane is resized to exactly this, and log lines are
+    sliced to exactly this. If the two ever disagree the wider one gets clipped -- which is how
+    the tail lost its last few characters when the pane was sized to `cols` but drawn at w-2."""
+    return max(8, w - LOG_INDENT)
+
+
+def resize_worker_pane(content_w, rows):
+    """Size the worker's tmux window to the width the log is actually DRAWN at.
 
     The worker session is created DETACHED, and a detached tmux session gets the default 80x24 --
-    so the client's output hard-wraps at 80 columns, about 2/3 of the tablet's width, and the log
-    tail below looks narrow no matter how wide we draw it. Resizing the window fixes new output.
+    so the client's output hard-wraps at 80 columns, about 2/3 of the tablet's width. Resizing
+    makes new output use the full line; sizing it to `content_w` (not `cols`) means a wrapped
+    line lands exactly in the space we render, so nothing is ever cut off the right edge.
     tmux does NOT reflow existing scrollback, so history stays wrapped as it was captured; the
-    full width appears as fresh lines arrive. Best-effort and silent (no tmux / old tmux / no
+    correct width appears as fresh lines arrive. Best-effort and silent (no tmux / old tmux / no
     session are all fine)."""
     try:
         import subprocess
         subprocess.run(["tmux", "resize-window", "-t", WRK_SESSION,
-                        "-x", str(max(40, cols)), "-y", str(max(24, rows))],
+                        "-x", str(max(20, content_w)), "-y", str(max(24, rows))],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
     except Exception:
         pass
@@ -446,7 +459,8 @@ def render():
     if (cols, lines) != (_last_size[0], _last_size[1]):
         _last_size[0], _last_size[1] = cols, lines
         sys.stdout.write("\033[2J")                   # full clear on (re)size -> no stale artifacts
-        resize_worker_pane(cols, max(24, lines))      # keep the worker's pane as wide as we are
+        # size the worker's pane to the width we DRAW the log at, so nothing is clipped
+        resize_worker_pane(log_width(cols - 1), max(24, lines))
     sw = max(8, cols - (PREFIX_W + 4))                # bars width; +4 = "  " + arrow + 1 margin
     color = cols >= PREFIX_W + 12
     win_s = int(sw * POLL)
@@ -617,8 +631,9 @@ def render():
     room = lines - len(out) - 1                        # -1 for the section header itself
     if room >= 2:
         out.append(f"  {BOLD}WORKER LOG{RST} {DIM}· this tablet · tmux '{WRK_SESSION}'{RST}")
-        for ln in worker_log(room):                    # 2-space indent + (w-2) == w, one col spare
-            out.append(f"  {DIM}{ln[:max(8, w - 2)]}{RST}")
+        lw = log_width(w)                              # exactly the pane width -> never clipped
+        for ln in worker_log(room):                    # indent + lw == w, leaving one col spare
+            out.append(f"{' ' * LOG_INDENT}{DIM}{ln[:lw]}{RST}")
 
     sys.stdout.write("\033[H")
     sys.stdout.write("\033[K\n".join(out[:lines]))
