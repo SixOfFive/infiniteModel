@@ -399,7 +399,7 @@ def claims_diagnostic() -> dict:
     engine = getattr(state, "engine", None)
     by_id = _node_hostnames()
     rows = []
-    for fr, m in list(getattr(engine, "models", {}) or {}).items():
+    for fr, m in list((getattr(engine, "models", None) or {}).items()):
         plan_hosts = [getattr(s, "hostname", "") for s in
                       (getattr(getattr(m, "plan", None), "stages", None) or [])]
         ids = list(getattr(m, "stage_node_ids", None) or [])
