@@ -821,9 +821,17 @@ class EngineLoadMixin:
                     # #cache-reserve (audit #16): _ctrl_reserve_gb (hoisted above the loop) is the FULL
                     # bf16 reserve only when this load actually streams bf16; a cache-served load reads
                     # ~0.27x, so it charges the small cache-scaled reserve instead — freeing 12-14 GB of
-                    # plannable RAM on beast/om3nbox for the common int4-cache path.
+                    # plannable RAM on a DISCRETE co-located box (beast) for the common int4-cache path.
+                    # #cache-reserve-unified: NOT on a unified-memory box. There the controller reserve
+                    # is not spare RAM headroom — it is the SAME physical pool #17's clamp then hands to
+                    # VRAM (it subtracts this very node_reserve_gb), so relaxing it for a cache-served
+                    # load directly licenses ~14 GB MORE weight commitment. Observed live on om3nbox
+                    # (InferenceEngine packed to 54/60 GB by stacked int4 auto-loads + evict/reload
+                    # churn, its 5090 sibling being disabled so every load lands on the one box).
+                    # Keep the full bf16 reserve on unified nodes — RAM spent there IS VRAM lost.
                     if n.data_host in _LOCAL_IPS:
-                        node_reserve_gb += _ctrl_reserve_gb
+                        node_reserve_gb += (CONTROLLER_RAM_RESERVE_GB if self._is_unified_node(n)
+                                            else _ctrl_reserve_gb)
                     ram_for_resident = (n.eff_ram_gb - node_reserve_gb
                                         - _res_ram.get(n.node_id, 0) / GB)   # #parallel-load reserve
                     if ram_for_resident <= 0:
@@ -2658,6 +2666,26 @@ class EngineLoadMixin:
                    + own_bytes / GB
                    - rv / GB)
 
+    def _is_unified_node(self, n) -> bool:
+        """#unified-mem: True when this node's "VRAM" is GTT carved from the SAME physical RAM as
+        its heartbeat free_mem (om3nbox Strix Halo gfx1151; steamdeck Van Gogh) — so a RAM reserve
+        and a VRAM budget spend ONE pool, and every GB not reserved is a GB the planner may hand to
+        weights. Same guarded import + heuristic as _unified_mem_clamp (single source of truth): a
+        stale placement.py (per-file CDN lag, #cdn-lag-deploy) reports False, which keeps the
+        pre-existing behavior instead of crashing a load. Discrete-GPU/CPU nodes never match."""
+        try:
+            import placement as _pl
+        except Exception:
+            return False
+        _ufn = getattr(_pl, "is_unified_mem_node", None)
+        if _ufn is None:
+            return False
+        try:
+            return bool(_ufn(n.device_name, n.vram_total_gb, n.total_mem_gb,
+                             explicit=getattr(n, "unified_mem", None)))
+        except Exception:
+            return False
+
     def _unified_mem_clamp(self, n, usable_gb: float, free_vram_gb: float,
                            reserve_gb: float, own_gb: float = 0.0):
         """#unified-mem (audit #17): on an APU whose "VRAM" is GTT carved from the SAME physical
@@ -2677,13 +2705,11 @@ class EngineLoadMixin:
         limits live in placement.is_unified_mem_node. Guarded imports: a stale placement.py
         (per-file CDN lag, see #cdn-lag-deploy) keeps the OLD unclamped behavior instead of
         crashing every load; discrete-GPU (CUDA) nodes never match, so this is inert for them."""
+        if not self._is_unified_node(n):     # shared detection (see _is_unified_node)
+            return usable_gb, free_vram_gb
         try:
             import placement as _pl
         except Exception:
-            return usable_gb, free_vram_gb
-        _ufn = getattr(_pl, "is_unified_mem_node", None)
-        if _ufn is None or not _ufn(n.device_name, n.vram_total_gb, n.total_mem_gb,
-                                    explicit=getattr(n, "unified_mem", None)):
             return usable_gb, free_vram_gb
         usable_gb = _pl.clamp_unified_usable_gb(
             usable_gb, n.free_mem_gb,
