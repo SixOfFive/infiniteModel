@@ -185,6 +185,24 @@ def _rows(x) -> int:
     return n
 
 
+def _m_bucket(m: int) -> int:
+    """#m-bucket: round a Triton-launch row count UP to its compile bucket — the next power of
+    two (0/1 pass through; decode M=1 has its own GEMV kernel). Every distinct M presented to a
+    @triton.jit kernel is fresh JIT-specialization/autotune surface, and on a slow-compile box
+    (gfx1151 APU) a request stream of arbitrary prompt lengths turned that into 20-103s stalls
+    per NOVEL length (#large-m-naive live regression, 2026-07-21). Padding rows up to the bucket
+    and slicing them back off caps the space at ~log2(chunk) shapes TOTAL (M=1..64 ->
+    {2,4,8,16,32,64}: six), costs <2x rows worst-case on the padded call, and is numerically
+    exact — each output row of these GEMM/GEMV kernels depends only on its own input row, so
+    zero pad rows never touch real rows (same argument as the existing zero K-padding)."""
+    if m <= 1:
+        return m
+    b = 2
+    while b < m:
+        b <<= 1
+    return b
+
+
 def _cpu_fp32_worth(x) -> bool:
     """True when x is on CPU and big enough that an fp32 GEMM beats the bf16 path."""
     return (_CPU_FP32_GEMM and x.device.type == "cpu"
@@ -533,13 +551,19 @@ def _quant4_linear_cls():
 
             def forward(self, x):
                 fz = getattr(self, "_fused", None)
-                # #large-m-naive: prefill-shaped calls (rows >= the threshold MEASURED at prepare
-                # time) skip the decode-tuned fused Triton kernel and take the naive tail below —
-                # dequant ONCE + one BLAS GEMM, i.e. the self-check's own reference numerics.
-                # Triton-only by construction: needs the retained qweight (tinygemm frees it and
-                # never sets a threshold), and decode M=1 can never reach the threshold.
+                # #large-m-naive + #m-bucket: calls whose ROW BUCKET (the shape the fused Triton
+                # kernel would actually execute after _m_bucket padding) reaches the prepare-
+                # time-benched threshold skip the decode-tuned kernel and take the naive tail
+                # below — dequant ONCE + one BLAS GEMM, i.e. the self-check's own reference
+                # numerics. Bucket-compare, not raw rows: a 1500-row chunk tail pads up to the
+                # same 2048 bucket the bench measured, so it must fall through with it (naive
+                # cost is monotonic in M, so naive winning at the bucket covers every M the
+                # bucket serves). Triton-only by construction: needs the retained qweight
+                # (tinygemm frees it and never sets a threshold), and decode M=1 can never
+                # reach the threshold.
                 _nm = getattr(self, "_naive_m_min", 0)
-                if fz is not None and _nm and self.qweight is not None and _rows(x) >= _nm:
+                if fz is not None and _nm and self.qweight is not None \
+                        and _m_bucket(_rows(x)) >= _nm:
                     fz = None
                 if fz is not None:
                     # fused-dequant int4 GEMM (2D only): flatten, bf16 activations, restore shape.
@@ -708,14 +732,23 @@ def _w4a16_triton_op_locked():
                            scale.stride(0), scale.stride(1), zero.stride(0), zero.stride(1),
                            yf.stride(0), GROUP=group_size)
                 return yf.to(torch.bfloat16).view(1, N)
-            y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+            # #m-bucket: pad rows up to the power-of-two bucket so this decode-tuned tl.dot
+            # kernel is only ever launched (and JIT-specialized) at ~log2(chunk) distinct M
+            # shapes — every novel prompt length otherwise presents a fresh M to Triton (seen
+            # live on gfx1151 as tens of seconds per NOVEL length). Zero pad rows are exact
+            # (row-independent dot products) and sliced back off below.
+            Mp = _m_bucket(M)
+            if Mp != M:
+                import torch.nn.functional as _F
+                x = _F.pad(x, (0, 0, 0, Mp - M))
+            y = torch.empty((Mp, N), device=x.device, dtype=torch.bfloat16)
             BM, BN = 16, 128
-            grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
-            _k[grid](x, qweight, scale, zero, y, M, N, K,
+            grid = (triton.cdiv(Mp, BM), triton.cdiv(N, BN))
+            _k[grid](x, qweight, scale, zero, y, Mp, N, K,
                      x.stride(0), x.stride(1), qweight.stride(1), qweight.stride(0),
                      scale.stride(0), scale.stride(1), zero.stride(0), zero.stride(1),
                      y.stride(0), y.stride(1), GROUP=group_size, BM=BM, BN=BN)
-            return y
+            return y if Mp == M else y[:M]
 
         _W4A16_OP = _op
         _builtins.print("[int4] triton w4a16 kernel built (ROCm fast int4)", flush=True)
@@ -727,10 +760,27 @@ def _w4a16_triton_op_locked():
 
 
 # #large-m-naive: measured large-M dispatch decisions, keyed (tag, N, in_pad, group) so 40
-# layers of the same shape pay ONE bench (the _pad_choice precedent). Value = smallest benched
-# row count where the naive path wins (forward falls through at rows >= it); 0 = keep fused.
+# layers of the same shape pay ONE bench (the _pad_choice precedent). Value = the benched
+# production-chunk bucket when the naive path wins there (forward falls through when a call's
+# ROW BUCKET — _m_bucket(_rows(x)) — reaches it); 0 = keep fused everywhere.
 _LARGE_M_CHOICE: dict = {}
-_LARGE_M_BENCH_ROWS = (64, 256, 2048)   # 2048 = the INFINITEMODEL_PREFILL_CHUNK default
+
+
+def _prefill_bench_m() -> int:
+    """#large-m-naive + #m-bucket: the ONE row count the fused side is benched at — the
+    _m_bucket of the production prefill chunk (INFINITEMODEL_PREFILL_CHUNK, default 2048;
+    0 = chunking disabled -> keep 2048 as the whole-prompt proxy). Production compiles this
+    exact bucket anyway on its first full chunk, so benching it triggers NO bench-only Triton
+    shapes — unlike the old (64, 256, 2048) sweep, whose M=64/256 probes JIT-specialized
+    shapes at EVERY load that the request stream might never present (+66s/load observed on
+    gfx1151, 2026-07-21)."""
+    try:
+        c = int(os.environ.get("INFINITEMODEL_PREFILL_CHUNK", "2048") or "2048")
+    except (TypeError, ValueError):
+        c = 2048
+    if c <= 1:
+        c = 2048
+    return _m_bucket(c)
 
 
 def _bench_large_m_naive(mod, tag: str) -> int:
@@ -743,12 +793,19 @@ def _bench_large_m_naive(mod, tag: str) -> int:
     naive path dequants the weight ONCE per call and hands one bf16 GEMM to hipBLAS/cuBLAS,
     amortizing the remat over the whole chunk. Which side wins is shape/arch-dependent (the
     APU's BLAS may itself be below peak), so — like the MoE pad-vs-unpadded #dram-dealias bench —
-    the choice is MEASURED on the production tensors/op at prepare time, never guessed. Returns
-    the smallest benched row count where dequant-once+GEMM beats the fused kernel by >=13%
-    (crossover is monotonic in M: naive amortizes a fixed remat, fused revisit cost grows with
-    M — so rows between bench points inherit the decision conservatively), or 0 = keep fused
-    everywhere. Decode is untouched either way (M=1 has its own autotuned split-K GEMV, and the
-    threshold can never be < the smallest bench row). Numerics: the fall-through IS the
+    the choice is MEASURED on the production tensors/op at prepare time, never guessed.
+
+    Bench discipline (#m-bucket): the fused side is timed at EXACTLY ONE row count — the
+    production prefill-chunk bucket (_prefill_bench_m) — because every fused probe is a Triton
+    launch whose shape gets JIT-specialized, and probing shapes the request stream may never
+    present recompiles them at every load. The naive side (plain BLAS, no JIT) is timed at the
+    same M for the comparison. M==1 is deliberately NOT probed: decode has its own autotuned
+    GEMV and never consults this threshold. Returns the chunk bucket when dequant-once+GEMM
+    beats the fused kernel there by >=13%, else 0 (keep fused). forward compares each call's
+    ROW BUCKET against the threshold — sub-chunk tails that would PAD UP to the losing bucket
+    fall through with it (naive cost is monotonic in M, so naive winning at the bucket covers
+    every M the bucket serves); smaller buckets keep the fused kernel (the pre-#large-m-naive
+    status quo, now compile-bounded by _m_bucket). Numerics: the fall-through IS the
     self-check's reference path (_dequant + F.linear), so no new self-check is needed. Any
     bench failure -> 0 (keep fused, uncached so a transient hiccup doesn't pin the shape).
     Off-switch: IM_LARGE_M_NAIVE=0."""
@@ -773,22 +830,18 @@ def _bench_large_m_naive(mod, tag: str) -> int:
             torch.cuda.synchronize()
             return (time.perf_counter() - t0) / iters * 1e3
 
-        thr = 0
-        log = []
-        for M in _LARGE_M_BENCH_ROWS:
-            xt = torch.randn(M, mod.in_features, device=dev, dtype=torch.bfloat16)
-            xk = xt if in_pad == mod.in_features else F.pad(xt, (0, in_pad - mod.in_features))
-            xk = xk.contiguous()
-            t_f = _ms(lambda: op(xk, qw, mod.group_size, szt))
-            t_n = _ms(lambda: F.linear(xt, mod._dequant(torch.bfloat16)))
-            log.append(f"M={M} fused={t_f:.2f}ms naive={t_n:.2f}ms")
-            if t_n < t_f * 0.87:                  # same >=13%-win margin as the de-alias bench
-                thr = M
-                break                             # monotonic: larger M favors naive even more
+        M = _prefill_bench_m()
+        xt = torch.randn(M, mod.in_features, device=dev, dtype=torch.bfloat16)
+        xk = xt if in_pad == mod.in_features else F.pad(xt, (0, in_pad - mod.in_features))
+        xk = xk.contiguous()
+        t_f = _ms(lambda: op(xk, qw, mod.group_size, szt))
+        t_n = _ms(lambda: F.linear(xt, mod._dequant(torch.bfloat16)))
+        thr = M if t_n < t_f * 0.87 else 0        # same >=13%-win margin as the de-alias bench
         _LARGE_M_CHOICE[key] = thr
         _builtins.print(f"[{tag}] large-M dispatch [N={qw.shape[0]},Kpad={in_pad}]: "
-                        f"{'; '.join(log)} -> "
-                        f"{f'naive at rows>={thr}' if thr else 'fused for all M'}", flush=True)
+                        f"M={M} fused={t_f:.2f}ms naive={t_n:.2f}ms -> "
+                        f"{f'naive at row-bucket>={thr}' if thr else 'fused for all M'}",
+                        flush=True)
         return thr
     except Exception as exc:                      # never let a bench hiccup break placement
         _builtins.print(f"[{tag}] large-M bench skipped ({exc!r})", flush=True)
@@ -912,17 +965,30 @@ def _w4a16_moe_op_locked():
             eid = eid.to(torch.int32).contiguous()
             B = x.shape[0]
             N = q.shape[1]
+            # #m-bucket: the autotuner keys this kernel on EXACT B (["B","N","K","sqn"]), so
+            # every novel tiny-prompt B (tokens*top_k; the standard-MoE caller gates tokens <=
+            # _FUSED_MOE_T_MAX) re-benched the whole config set — novel-prompt-length stalls on
+            # slow-compile boxes. Bucket the decode/tiny-prompt regime to powers of two (pad
+            # rows with expert-0 ids + zero activations -> zero partials, sliced back off) so
+            # at most log2(128) B keys ever exist there. B > 128 (gpt-oss prefill, which has
+            # no eager fallback) stays EXACT: pow2-padding whole prefill chunks would tax
+            # every call up to 2x on this per-row GEMV, and chunk-sized B repeats anyway.
+            Bp = _m_bucket(B) if B <= 128 else B
+            if Bp != B:
+                x = _F.pad(x, (0, 0, 0, Bp - B))
+                eid = _F.pad(eid, (0, Bp - B))
             # split-K atomic-adds fp32 partials -> y must be fp32 + zero-initialized, then cast to bf16
-            y = torch.zeros((B, N), device=x.device, dtype=torch.float32)
-            grid = lambda meta: (B, triton.cdiv(N, meta["BN"]), meta["SPLITK"])  # noqa: E731
-            _mk[grid](x, eid, q, scale, zero, y, B, N, Kpad,
+            y = torch.zeros((Bp, N), device=x.device, dtype=torch.float32)
+            grid = lambda meta: (Bp, triton.cdiv(N, meta["BN"]), meta["SPLITK"])  # noqa: E731
+            _mk[grid](x, eid, q, scale, zero, y, Bp, N, Kpad,
                       x.stride(0), x.stride(1),
                       q.stride(0), q.stride(2), q.stride(1),
                       scale.stride(0), scale.stride(1), scale.stride(2),
                       zero.stride(0), zero.stride(1), zero.stride(2),
                       y.stride(0), y.stride(1),
                       GROUP=group_size)
-            return y.to(torch.bfloat16)
+            yb = y.to(torch.bfloat16)
+            return yb if Bp == B else yb[:B]
 
         _W4A16_MOE_OP = _op
         _builtins.print("[int4] triton fused-MoE w4a16 kernel built (ROCm decode fast path)", flush=True)
