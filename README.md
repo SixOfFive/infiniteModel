@@ -239,23 +239,26 @@ builds the entire venv in one step. **Full, self-contained guide → [docs/ROCM.
 
 ## Usage
 
-**1. Configure** `config.json` (the single source of truth for hosts/ports — built-in defaults apply
-if it's absent):
+**1. Configure — normally nothing to do.** Out of the box `config.json` ships
+`"controller_host": "auto"`, so a worker finds its controller by **UDP broadcast** (`discovery_port`,
+default 50099): the worker asks, the controller answers with the address that is correct *from that
+worker's subnet*. Clone, install dependencies, run — no file to edit.
+
+If a controller hasn't answered yet the worker prints a NOT-CONNECTED line and **retries every 30
+seconds**, so boxes may boot in any order — a worker started before its controller joins on its own
+as soon as the controller is up.
+
+Any worker that can hear the broadcast may join, which is the intent on a home/lab LAN. Override
+only when you need to:
 
 ```json
 { "controller_host": "10.0.0.5", "http_port": 21434, "control_port": 50100, "data_port": 50101 }
 ```
 
-> **Zero-config on a single LAN — you can skip this step.** Workers find the controller by UDP
-> broadcast (`discovery_port`, default 50099): the worker asks, the controller answers with the
-> address that is correct *from that worker's subnet*. Discovery runs when `controller_host` is
-> `"auto"`, **and** as an automatic fallback whenever the configured host is unreachable at
-> startup — so a fresh clone whose `config.json` points at someone else's LAN still just works.
-> Install deps, run the worker, done.
->
-> Broadcast does **not** cross subnets, VLANs or VPNs — keep a static `controller_host` for those.
-> Running two controllers on one LAN? Set a matching `cluster_id` on each controller and its
-> workers so a worker can never join the wrong fleet (unset = join whoever answers).
+> Broadcast does **not** cross subnets, VLANs or VPNs — set a static `controller_host` for those
+> (an unreachable static host still falls back to discovery). Only if you must keep **two** fleets
+> apart on one LAN, set a matching `cluster_id` on each controller and its workers; unset (the
+> default) means join whichever controller answers.
 
 **2. Start the controller** (on the box that holds the weights):
 

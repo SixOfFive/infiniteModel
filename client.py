@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c192"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c193"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1201,43 +1201,61 @@ def _controller_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
         return False
 
 
-def _resolve_controller(args: argparse.Namespace) -> None:
+DISCOVERY_RETRY_S = 30.0    # #discovery: wait between broadcast attempts when nobody has answered
+
+
+async def _resolve_controller(args: argparse.Namespace) -> None:
     """#discovery: settle args.controller/control_port BEFORE the first connect.
 
-      controller_host "auto"/"discover"/""  -> always broadcast-discover
+      controller_host "auto"/"discover"/""  -> broadcast-discover, RETRYING FOREVER
       a static host that is UNREACHABLE     -> discover ONCE as a rescue, then use what answers
 
-    The rescue is what delivers "clone, install deps, run" with no config edit: a fresh checkout
-    ships this fleet's controller IP, which is meaningless on someone else's LAN — unreachable ->
-    discovered. On THIS fleet the controller answers, so behaviour is byte-for-byte unchanged.
-    Explicit --controller still wins whenever it is reachable, and static remains the documented
-    path for anything broadcast can't cross (subnets, VLANs, VPN)."""
+    Discovery never gives up and never exits: a worker powered on before its controller (or during
+    a controller restart) must simply keep asking and join the moment someone answers — that is what
+    makes "clone, install deps, run" true even when the boxes boot in an arbitrary order. Every
+    failed round prints an explicit NOT-CONNECTED line naming the reason, so a silent worker is
+    never mistaken for a connected one.
+
+    Any worker that can hear the broadcast is allowed to join — discovery is deliberately permissive
+    (cluster_id defaults to unset = join whoever answers). Explicit --controller still wins whenever
+    it is reachable, and static addressing remains the path for anything broadcast can't cross
+    (subnets, VLANs, VPN)."""
     host = str(getattr(args, "controller", "") or "").strip()
     want = str(getattr(args, "cluster_id", "") or "")
     auto = host.lower() in ("auto", "discover", "")
+    timeout = float(getattr(args, "discovery_timeout", 2.5))
     if not auto and _controller_reachable(host, args.control_port):
         return
     if not auto:
+        # Static host configured but not answering: try discovery ONCE as a rescue, then fall
+        # through to the normal reconnect loop (which already retries the static address).
         print(f"[discovery] controller {host}:{args.control_port} unreachable — "
               f"falling back to broadcast discovery", flush=True)
-    got = discover_controller(cluster_id=want, timeout=float(getattr(args, "discovery_timeout", 2.5)))
-    if got:
-        args.controller = got["host"]
-        args.control_port = int(got["control_port"])
+        got = await asyncio.to_thread(discover_controller, want, 0, timeout, True)
+        if got:
+            args.controller, args.control_port = got["host"], int(got["control_port"])
+            return
+        print(f"[discovery] nothing answered either; continuing with {host}:{args.control_port} "
+              f"(the reconnect loop will keep retrying)", flush=True)
         return
-    if auto:
-        raise SystemExit(
-            "[discovery] controller_host is 'auto' but no controller answered.\n"
-            "  - Is the controller running, and on this same LAN/subnet? (broadcast does NOT\n"
-            "    cross subnets, VLANs or VPN — use a static host for those.)\n"
-            "  - Pass an explicit address:  python client.py --controller <ip>\n"
-            "  - Or set controller_host in config.json.")
-    print(f"[discovery] nothing answered either; continuing with {host}:{args.control_port} "
-          f"(the reconnect loop will keep retrying)", flush=True)
+    attempt = 0
+    while True:
+        attempt += 1
+        got = await asyncio.to_thread(discover_controller, want, 0, timeout, True)
+        if got:
+            args.controller, args.control_port = got["host"], int(got["control_port"])
+            print(f"[discovery] connected: controller {args.controller}:{args.control_port}"
+                  + (f" ({got['name']})" if got.get("name") else ""), flush=True)
+            return
+        print(f"[discovery] NOT CONNECTED — no controller has replied to our broadcast yet "
+              f"(attempt {attempt}); retrying in {DISCOVERY_RETRY_S:.0f}s. "
+              f"Is the controller running on this LAN? Broadcast does not cross subnets/VLANs/VPN "
+              f"— for those use: --controller <ip>", flush=True)
+        await asyncio.sleep(DISCOVERY_RETRY_S)
 
 
 async def run(args: argparse.Namespace) -> None:
-    _resolve_controller(args)      # #discovery: may rewrite args.controller/control_port
+    await _resolve_controller(args)   # #discovery: may rewrite args.controller/control_port
     reg = build_registration(args)
     # Pick + announce the LAN route BEFORE connecting: the chosen IP becomes our
     # control-connection source, hence the address the controller records and sends

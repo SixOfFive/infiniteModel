@@ -434,7 +434,9 @@ def _fuse_moe_experts(sd: dict, model) -> dict:
 # pulls from the PUBLIC GitHub repo's raw endpoint — NO auth/token needed — so there are no secrets
 # here or in config.json, and the source is safe to publish.
 _CONFIG_DEFAULTS = {
-    "controller_host": "192.168.15.103",
+    # "auto" = find the controller by UDP broadcast (#discovery). This is the DEFAULT so a fresh
+    # clone works with no config edit; put an IP here/in config.json for subnet/VLAN/VPN spans.
+    "controller_host": "auto",
     "http_port": 21434,
     "control_port": 50100,
     "data_port": 50101,
