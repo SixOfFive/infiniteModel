@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c172"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.2-m4c173"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -2424,7 +2424,6 @@ from formats import (_iso, _digest, _human_params, _details, _model_info,
 def build_app() -> FastAPI:
     from contextlib import asynccontextmanager
 
-    @asynccontextmanager
     class _DiscoveryResponder(asyncio.DatagramProtocol):
         """#discovery: UDP responder for worker broadcast queries (shape B1).
 
@@ -2477,6 +2476,7 @@ def build_app() -> FastAPI:
                   f"controller_host / --controller")
             return None
 
+    @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Resilient accept loop (NOT asyncio.start_server): its internal Proactor
         # accept loop silently dies on a transient WinError 64 during a worker
