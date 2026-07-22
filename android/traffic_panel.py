@@ -4,8 +4,12 @@ InfiniteModel tablet bandwidth panel  (standalone, READ-ONLY).
 
 Polls the controller's /status and draws a static, non-scrolling table of every node's
 traffic to the rest of the fleet (node <-> all) plus the controller and a fleet TOTAL.
-Each node spans TWO rows: a stats line topped by a GREEN download sparkline, and a RED
-upload sparkline beneath it.
+A GRAPHED node spans TWO rows: a stats line topped by a GREEN download sparkline, and a RED
+upload sparkline beneath it. A node is graphed only if it is worth the vertical space -- it is
+MOVING data (>= IDLE_FLOOR), HOLDS a loaded model, or is OFF-BUILD (version skew, which must
+stay visible). Every other node collapses into a single dim 'IDLE n: ...' list of names, and
+the rows that buys are handed to the worker-log tail at the bottom. The controller is always
+graphed.
 
   VER        - that node's client build (client_version). The controller row shows the SERVER
                build instead — a different version stream, so it is never flagged. A node whose
@@ -478,8 +482,36 @@ def render():
         hdr = (fmt_prefix(("NODE", "VER", "DOWN", "UP", "FROM→…→NEXT", "RESIDENT", "MAX", "XFER"))
                + "  ↓ download / ↑ upload")          # plain (color=False) -> safe to slice
         out.append(DIM + hdr[:cols] + RST)
-        budget = max(1, (lines - 9) // 2)              # 2 rows/node; reserve header/ctrl/total/legend/tablet/models
-        shown = node_names[:budget]
+
+        # A quiet node with nothing loaded earns no graph -- it collapses into a one-line IDLE
+        # list, and the two rows it would have cost go to the worker log instead. It still gets a
+        # full graph if it is MOVING data (>= IDLE_FLOOR, the same threshold that already flattens
+        # a sparkline), HOLDS a model, or is OFF-BUILD -- version skew must never hide in the list.
+        def graphed(nm):
+            return (stat[nm][0] >= IDLE_FLOOR
+                    or bool(res.get(nm) and res[nm][0])
+                    or (bool(fleet_ver) and vers.get(nm) != fleet_ver))
+
+        graph_names = [nm for nm in node_names if graphed(nm)]     # keeps busiest-first order
+        gset = set(graph_names)
+        idle_names = [nm for nm in node_names if nm not in gset]
+
+        idle_lines = []                                # built first: they cost the node budget rows
+        if idle_names:
+            lead = f"  IDLE {len(idle_names)}: "
+            indent = " " * len(lead)
+            line = lead
+            for nm in idle_names:
+                piece = nm + "  "
+                if len(line) + len(piece) > cols and line.strip():
+                    idle_lines.append(line.rstrip())
+                    line = indent + piece
+                else:
+                    line += piece
+            idle_lines.append(line.rstrip())
+
+        budget = max(1, (lines - 9 - len(idle_lines)) // 2)   # 2 rows/node; reserve fixed footers
+        shown = graph_names[:budget]
         for name in shown:
             i, o = cur[name]
             peak, winx = stat[name]
@@ -487,8 +519,10 @@ def render():
                                   route_label(name, up, down, mesh),
                                   resid_label(res.get(name)), peak, winx, "", color, cols, sw,
                                   ver_warn=bool(fleet_ver) and vers.get(name) != fleet_ver))
-        if len(node_names) > len(shown):
-            out.append(f"{DIM}   …{len(node_names) - len(shown)} more node(s){RST}")
+        if len(graph_names) > len(shown):
+            out.append(f"{DIM}   …{len(graph_names) - len(shown)} more active node(s){RST}")
+        for ln in idle_lines:
+            out.append(f"{DIM}{ln[:cols]}{RST}")
 
         cpeak, cwinx = stat["controller"]
         out.extend(node_lines("controller", srv_ver, ci, co,   # SERVER build, not a client build
@@ -503,14 +537,18 @@ def render():
                                      base=BOLD, color=color) + RST)
         # Legend: colored swatches (fixed plain width) + a tail truncated by PLAIN length, so the
         # line can never wrap and break the static layout no matter how narrow the terminal is.
+        # Skew notice goes FIRST in the tail: it is the actionable bit, so it must survive the
+        # width truncation rather than be the first thing clipped off the end.
         nskew = sum(1 for nm in node_names if fleet_ver and vers.get(nm) != fleet_ver)
         lead_plain = "  ██ download  ██ upload   "
         lead = f"  {GRN}██{RST} download  {RED}██{RST} upload   "
-        tail_p = (f"↓green ↑red (scaled to MAX) · FROM→node→NEXT: 'home'=controller · "
-                  f"VER=client build, controller row=server {srv_ver} · "
-                  + (f"{nskew} node(s) OFF-BUILD" if nskew else "all nodes on-build"))
-        tail_p = tail_p[:max(0, cols - len(lead_plain))]
-        out.append(lead + (YEL if nskew else DIM) + tail_p + RST)
+        skew_p = f"{nskew} node(s) OFF-BUILD · " if nskew else ""
+        rest_p = (f"↓green ↑red (scaled to MAX) · VER=client build, ctrl row=server {srv_ver} · "
+                  f"IDLE=quiet & unloaded & on-build · FROM→node→NEXT: 'home'=controller")
+        room_l = max(0, cols - len(lead_plain))
+        skew_p = skew_p[:room_l]
+        rest_p = rest_p[:max(0, room_l - len(skew_p))]
+        out.append(lead + (f"{YEL}{skew_p}{RST}" if skew_p else "") + DIM + rest_p + RST)
         # This tablet's own load (the panel process runs here, so /proc is the tablet's).
         cpu_pct, cpu_s = tablet_cpu()
         if cpu_pct is not None:
