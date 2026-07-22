@@ -247,6 +247,21 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         print(f"[+] joined  {node.node_id}  {node.hostname}  {node.device}  "
               f"{node.usable_mem_gb:.1f} GB usable  ({peer_host})")
 
+        # #failover: this node is BACK, and we had switched its tiers off because we lent/handed it
+        # to a peer. Nobody negotiated its return (a worker that fails over just shows up), so
+        # without this it would sit owned-but-invisible to our planner — the same silent-dead-node
+        # failure /peer_handoff's reclaim call fixes for the negotiated path.
+        # The `lent` marker is what makes this safe: a node the OPERATOR disabled carries no marker
+        # and stays disabled, so we only ever undo our own lending.
+        _ncfg = NODE_CONFIG.get(node.hostname)
+        if isinstance(_ncfg, dict) and _ncfg.get("lent"):
+            _ncfg["ram"] = _ncfg["vram"] = True
+            _ncfg.pop("lent", None)
+            with contextlib.suppress(Exception):
+                save_node_config()
+            log_activity(f"federation: {node.hostname} came back to us — re-enabling the tiers we "
+                         "disabled when we lent it out")
+
         # Worker-restart auto-recovery (#77): if this same physical worker (same data endpoint +
         # hostname) was ALREADY registered under an older node id, it RESTARTED and re-registered
         # before its old link was noticed dropped. That restart wiped the worker's shard + KV, so

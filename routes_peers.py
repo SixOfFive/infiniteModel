@@ -289,6 +289,7 @@ def register(app):
         cfg = NODE_CONFIG.setdefault(node, {"ram": True, "vram": True})
         cfg["ram"] = False
         cfg["vram"] = False
+        cfg["lent"] = True      # #failover: so a return re-enables it (control_plane register)
         save_node_config()
         host_nids = {nid for nid, n in registry._nodes.items() if n.hostname == node}
         for fr in [fr for fr, m in engine.models.items()
@@ -392,6 +393,7 @@ def register(app):
         for h in _hostnames:
             cfg = NODE_CONFIG.setdefault(h, {"ram": True, "vram": True})
             cfg["ram"] = cfg["vram"] = False
+            cfg["lent"] = True  # #failover: so a return re-enables it (control_plane register)
         save_node_config()
         # ...and tell the RECEIVER to enable it. Disabling is per-controller and sticky, so without
         # this the node arrives owned-but-unusable: hand a node A->B->A and A still has the tiers it
@@ -425,6 +427,7 @@ def register(app):
         cfg = NODE_CONFIG.setdefault(node, {"ram": True, "vram": True})
         cfg["ram"] = True
         cfg["vram"] = True
+        cfg.pop("lent", None)   # #failover: reclaimed explicitly — no longer out on loan
         save_node_config()
         log_activity(f"federation: reclaimed node {node} (both tiers re-enabled here)")
         return JSONResponse({"ok": True, "node": node, "config": cfg})
