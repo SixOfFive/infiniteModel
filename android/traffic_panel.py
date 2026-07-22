@@ -386,9 +386,10 @@ def fmt_prefix(vals, base="", color=False, ver_warn=False):
     return (base + " " + " ".join(cells)) if base else (" " + " ".join(cells))
 
 
-def node_lines(name, ver, i, o, nxt, resid, peak, winx, base, color, cols, sw, ver_warn=False):
+def node_lines(name, ver, i, o, nxt, resid, peak, winx, base, color, maxw, sw, ver_warn=False):
     """Two stacked rows for one node: stats + green download spark, then the red upload spark
-    aligned beneath. Colored rows fit by construction; plain rows are sliced to `cols`."""
+    aligned beneath. Colored rows fit by construction (PREFIX_W + 3 + sw == maxw); plain rows are
+    sliced to `maxw`, which is cols-1 so the final column is never written."""
     vals = (name, ver, human(i), human(o), nxt, resid, human(peak), human_bytes(winx))
     if color:
         dn = f"{GRN}↓{spark(hin[name], sw, peak)}{RST}"
@@ -397,8 +398,8 @@ def node_lines(name, ver, i, o, nxt, resid, peak, winx, base, color, cols, sw, v
         l2 = base + " " * PREFIX_W + "  " + up + RST
         return [l1, l2]
     pre = fmt_prefix(vals, color=False)
-    l1 = (pre + "  ↓" + spark(hin[name], sw, peak))[:cols]
-    l2 = (" " * PREFIX_W + "  ↑" + spark(hout[name], sw, peak))[:cols]
+    l1 = (pre + "  ↓" + spark(hin[name], sw, peak))[:maxw]
+    l2 = (" " * PREFIX_W + "  ↑" + spark(hout[name], sw, peak))[:maxw]
     if base:
         l1, l2 = base + l1 + RST, base + l2 + RST
     return [l1, l2]
@@ -438,6 +439,10 @@ def render():
         cols, lines = 110, 30
     cols = max(56, cols)
     lines = max(6, lines)
+    # NEVER write the final column. A line of exactly `cols` chars leaves the cursor in the
+    # terminal's pending-wrap state, so the row spills onto the next line and walks the whole
+    # static layout down one. Everything below is bounded by `w`, not `cols`.
+    w = cols - 1
     if (cols, lines) != (_last_size[0], _last_size[1]):
         _last_size[0], _last_size[1] = cols, lines
         sys.stdout.write("\033[2J")                   # full clear on (re)size -> no stale artifacts
@@ -462,10 +467,11 @@ def render():
     cver = cver or _local_cver() or "?"                # fallback: read the guest client.py VERSION
     title = (f" FLEET BANDWIDTH  round trip: home → node → home   client {cver}"
              f"   (MAX·XFER=last {win_s}s)   poll {POLL:.0f}s   {now}")
-    out.append(f"\033[1;36m{title[:cols].ljust(cols)}\033[0m")
+    out.append(f"\033[1;36m{title[:w].ljust(w)}\033[0m")
 
     if err:
-        out.append(f"\033[31m controller {CTRL_IP} unreachable: {err}\033[0m"[:cols + 9])
+        msg = f" controller {CTRL_IP} unreachable: {err}"[:w]
+        out.append(f"\033[31m{msg}\033[0m")
     else:
         down, up, mesh = build_edges(st)               # forward + reverse node edges (round trip)
         res, fleet_models = build_resident(st)
@@ -501,7 +507,7 @@ def render():
 
         hdr = (fmt_prefix(("NODE", "VER", "DOWN", "UP", "FROM→…→NEXT", "RESIDENT", "MAX", "XFER"))
                + "  ↓ download / ↑ upload")          # plain (color=False) -> safe to slice
-        out.append(DIM + hdr[:cols] + RST)
+        out.append(DIM + hdr[:w] + RST)
 
         # A quiet node with nothing loaded earns no graph -- it collapses into a one-line IDLE
         # list, and the two rows it would have cost go to the worker log instead. It still gets a
@@ -523,7 +529,7 @@ def render():
             line = lead
             for nm in idle_names:
                 piece = nm + "  "
-                if len(line) + len(piece) > cols and line.strip():
+                if len(line) + len(piece) > w and line.strip():
                     idle_lines.append(line.rstrip())
                     line = indent + piece
                 else:
@@ -539,17 +545,17 @@ def render():
             peak, winx = stat[name]
             out.extend(node_lines(name, vers.get(name, "?"), i, o,
                                   route_label(name, up, down, mesh),
-                                  resid_label(res.get(name)), peak, winx, "", color, cols, sw,
+                                  resid_label(res.get(name)), peak, winx, "", color, w, sw,
                                   ver_warn=bool(fleet_ver) and vers.get(name) != fleet_ver))
         if len(graph_names) > len(shown):
             out.append(f"{DIM}   …{len(graph_names) - len(shown)} more active node(s){RST}")
         for ln in idle_lines:
-            out.append(f"{DIM}{ln[:cols]}{RST}")
+            out.append(f"{DIM}{ln[:w]}{RST}")
 
         cpeak, cwinx = stat["controller"]
         out.extend(node_lines("controller", srv_ver, ci, co,   # SERVER build, not a client build
                               route_label("controller", up, down, mesh),
-                              "", cpeak, cwinx, MAG, color, cols, sw))
+                              "", cpeak, cwinx, MAG, color, w, sw))
         tpeak, twinx = stat["__total__"]
         fleet_gb = sum(v[2] for v in res.values())
         fleet_layers = sum(v[1] for v in res.values())
@@ -559,7 +565,7 @@ def render():
         # Plain mode embeds no ANSI, so it can be sliced to fit a terminal narrower than PREFIX_W;
         # colored mode fits by construction (color is only on when cols >= PREFIX_W + 12).
         out.append(BOLD + (fmt_prefix(tvals, base=BOLD, color=True) if color
-                           else fmt_prefix(tvals)[:cols]) + RST)
+                           else fmt_prefix(tvals)[:w]) + RST)
         # Legend: colored swatches (fixed plain width) + a tail truncated by PLAIN length, so the
         # line can never wrap and break the static layout no matter how narrow the terminal is.
         # Skew notice goes FIRST in the tail: it is the actionable bit, so it must survive the
@@ -570,7 +576,7 @@ def render():
         skew_p = f"{nskew} node(s) OFF-BUILD · " if nskew else ""
         rest_p = (f"↓green ↑red (scaled to MAX) · VER=client build, ctrl row=server {srv_ver} · "
                   f"IDLE=quiet & unloaded & on-build · FROM→node→NEXT: 'home'=controller")
-        room_l = max(0, cols - len(lead_plain))
+        room_l = max(0, w - len(lead_plain))
         skew_p = skew_p[:room_l]
         rest_p = rest_p[:max(0, room_l - len(skew_p))]
         out.append(lead + (f"{YEL}{skew_p}{RST}" if skew_p else "") + DIM + rest_p + RST)
@@ -588,7 +594,7 @@ def render():
         # cpu sparkline over the SAME window as the network graphs, right beside the current %
         # (green <60%, yellow <85%, red above). Width capped so the line never wraps.
         head, tail = f"  TABLET  cpu {cpu_s}  ", f"   mem {mem_s}{ld_s}"
-        gw = min(sw, max(0, cols - len(head) - len(tail)))
+        gw = min(sw, max(0, w - len(head) - len(tail)))
         cgraph = pct_spark(_cpu_hist, gw, 100.0) if gw >= 6 else ""
         ccol = GRN if (cpu_pct or 0) < 60 else ("\033[33m" if (cpu_pct or 0) < 85 else RED)
         out.append(f"  {BOLD}TABLET{RST}  cpu {cpu_s}  {ccol}{cgraph}{RST}{tail}")
@@ -599,7 +605,7 @@ def render():
             if nmn and nmn not in mnames:
                 mnames.append(nmn)
         mtxt = ", ".join(mnames) if mnames else "(none loaded)"
-        avail = max(12, cols - 10)
+        avail = max(12, w - 10)
         if len(mtxt) > avail:
             mtxt = mtxt[:avail - 1] + "…"
         out.append(f"  {BOLD}MODELS{RST} {mtxt}")
@@ -611,8 +617,8 @@ def render():
     room = lines - len(out) - 1                        # -1 for the section header itself
     if room >= 2:
         out.append(f"  {BOLD}WORKER LOG{RST} {DIM}· this tablet · tmux '{WRK_SESSION}'{RST}")
-        for ln in worker_log(room):                    # 2-space indent + cols-2 == exactly full width
-            out.append(f"  {DIM}{ln[:max(8, cols - 2)]}{RST}")
+        for ln in worker_log(room):                    # 2-space indent + (w-2) == w, one col spare
+            out.append(f"  {DIM}{ln[:max(8, w - 2)]}{RST}")
 
     sys.stdout.write("\033[H")
     sys.stdout.write("\033[K\n".join(out[:lines]))
