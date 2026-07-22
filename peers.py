@@ -184,7 +184,7 @@ def self_info() -> dict:
                 "ctx": int(getattr(m, "ctx", 0) or 0),
                 "size_gb": round(float(getattr(m, "size_gb", 0) or 0), 2),
                 "active": int(getattr(m, "active", 0) or 0),
-                "stages": [getattr(n, "hostname", "") for n in getattr(m, "stage_nodes", [])] or None,
+                "stages": model_hosts(m) or None,
             })
     except Exception as exc:   # noqa: BLE001 — /peer_info must never 500 a peer's gossip round
         models = []
@@ -352,16 +352,38 @@ def respect_peer_claims() -> bool:
     return bool(cfg.get("respect_peer_claims", True))
 
 
+def _node_hostnames() -> dict:
+    """node_id -> hostname. LoadedModel records stage_node_ids (IDs, server.py:1662), NOT node
+    objects, so every "which hosts is this model on" answer has to go through the registry."""
+    registry = getattr(state, "registry", None)
+    out = {}
+    try:
+        for nid, n in (getattr(registry, "_nodes", {}) or {}).items():
+            h = getattr(n, "hostname", "")
+            if h:
+                out[nid] = h
+    except Exception:   # noqa: BLE001
+        pass
+    return out
+
+
+def model_hosts(m) -> list:
+    by_id = _node_hostnames()
+    out = []
+    for nid in (getattr(m, "stage_node_ids", None) or []):
+        h = by_id.get(nid)
+        if h and h not in out:
+            out.append(h)
+    return out
+
+
 def my_claims() -> list:
     """Hostnames WE currently hold a shard on — advertised so peers keep off them."""
     engine = getattr(state, "engine", None)
     out = set()
     try:
         for m in list(getattr(engine, "models", {}).values()):
-            for n in getattr(m, "stage_nodes", []) or []:
-                h = getattr(n, "hostname", "")
-                if h:
-                    out.add(h)
+            out.update(model_hosts(m))
     except Exception:   # noqa: BLE001 — claims are advisory; never break a load computing them
         pass
     return sorted(out)
