@@ -32,6 +32,32 @@ def register(app):
                 e["name"] = e["model"] = nm
                 seen.add(nm)
                 out.append(e)
+        # #federation: also advertise models a PEER controller has RESIDENT. We can genuinely serve
+        # these — the Phase 3 middleware proxies the request to that peer — so hiding them would
+        # make a usable model look unavailable. Tagged `federated`/`peer` so a client (and the
+        # dashboard) can tell "served elsewhere" from "loaded here"; a name we already list always
+        # wins, because local weights beat a remote hop.
+        with contextlib.suppress(Exception):
+            import peers
+            if peers.federation_enabled():
+                for p in peers.peers_public():
+                    if p.get("state") != "ok":
+                        continue
+                    for m in (p.get("models") or []):
+                        nm = _ollama_name(m.get("friendly") or "")
+                        if not nm or nm in seen:
+                            continue
+                        seen.add(nm)
+                        out.append({
+                            "name": nm, "model": nm,
+                            "modified_at": _iso(START_TIME),
+                            "size": int(round(float(m.get("size_gb") or 0) * (1 << 30))),
+                            "digest": "", "details": {"format": "safetensors", "families": []},
+                            "infinitemodel": {"target": m.get("target", ""), "distributed": True,
+                                              "federated": True,
+                                              "peer": p.get("name") or p.get("host"),
+                                              "peer_url": p.get("url", "")},
+                        })
         return {"models": out}
 
     @app.get("/v1/models")
