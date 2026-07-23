@@ -159,6 +159,7 @@ def peers_public() -> list:
             "url": f"http://{p['host']}:{p['http_port']}/",
             "models": info.get("models") or [],
             "nodes": info.get("nodes") or [],
+            "disk_models": info.get("disk_models") or [],   # on-disk = pullable (incl. not-loaded)
         })
     return out
 
@@ -368,6 +369,60 @@ async def kick(p: dict) -> None:
 
 # --- what we serve to peers ----------------------------------------------------------------------
 
+def _model_size_gb(m) -> float:
+    """A resident model's weight size, from its SPEC (the LoadedModel carries no size_gb)."""
+    try:
+        b = float(getattr(getattr(m, "spec", None), "total_weight_bytes", 0) or 0)
+        if b > 0:
+            return round(b / 1e9, 2)
+    except Exception:   # noqa: BLE001
+        pass
+    return round(float(getattr(m, "size_gb", 0) or 0), 2)
+
+
+def disk_models() -> list:
+    """Every model this controller has WEIGHTS ON DISK for — PULLABLE by a peer whether or not it is
+    currently loaded. The resident list only shows what's running; this is what lets a peer copy a
+    model we aren't serving right now (the "no list of models not loaded to transfer" gap). Cheap:
+    model_ready is a TTL-cached filesystem check and specs for on-disk models resolve locally."""
+    out = []
+    engine = getattr(state, "engine", None)
+    MODELS = getattr(state, "MODELS", None) or {}
+    model_ready = getattr(state, "model_ready", None)
+    resolve_spec = getattr(state, "resolve_spec", None)
+    dwb = getattr(state, "_display_weight_bytes", None)
+    ollama = getattr(state, "_ollama_name", None)
+    if not (MODELS and callable(model_ready)):
+        return out
+    resident = set()
+    try:
+        for mm in (getattr(engine, "models", {}) or {}).values():
+            t = getattr(mm, "target_id", "") or getattr(mm, "target", "")
+            if t:
+                resident.add(t)
+    except Exception:   # noqa: BLE001
+        pass
+    for friendly, tv in list(MODELS.items()):
+        try:
+            tgt = tv[0] if isinstance(tv, (tuple, list)) else tv
+            if not tgt or not model_ready(tgt):
+                continue
+            sz = 0.0
+            try:
+                spec = resolve_spec(tgt) if callable(resolve_spec) else None
+                if spec and callable(dwb):
+                    sz = float(dwb(tgt, spec) or 0) / 1e9
+            except Exception:   # noqa: BLE001
+                pass
+            out.append({"friendly": friendly,
+                        "display_name": ollama(friendly) if callable(ollama) else friendly,
+                        "target": tgt, "size_gb": round(sz, 2),
+                        "loaded": tgt in resident})
+        except Exception:   # noqa: BLE001
+            continue
+    return sorted(out, key=lambda e: e["friendly"])
+
+
 def _model_runtime(friendly: str, m) -> dict:
     """One resident model as a peer needs to SEE it — #unified-fleet.
 
@@ -383,7 +438,9 @@ def _model_runtime(friendly: str, m) -> dict:
         "quant": g("quant", "") or "none",
         "kv_quant": g("kv_quant", "") or "none",
         "ctx": int(g("ctx", 0) or 0),
-        "size_gb": round(float(g("size_gb", 0) or 0), 2),
+        # size comes off the model's SPEC — LoadedModel has no `size_gb` attr, so the old
+        # getattr(m,"size_gb") always read 0 (why every peer model showed "0 GB" in the UI).
+        "size_gb": _model_size_gb(m),
         "active": int(g("active", 0) or 0),
         "queued": int(g("queued", 0) or 0),
         "stages": model_hosts(m) or None,
@@ -444,8 +501,14 @@ def self_info() -> dict:
     except Exception as exc:   # noqa: BLE001
         nodes = []
         print(f"[peers] self_info nodes unavailable ({exc!r})", flush=True)
+    try:
+        disk = disk_models()   # every model we have ON DISK, so a peer can pull one we aren't running
+    except Exception as exc:   # noqa: BLE001
+        disk = []
+        print(f"[peers] self_info disk_models unavailable ({exc!r})", flush=True)
     return {"im": "infinitemodel-peer", "v": 1, **ident,
-            "models": models, "nodes": nodes, "claims": my_claims(), "t": time.time()}
+            "models": models, "nodes": nodes, "disk_models": disk,
+            "claims": my_claims(), "t": time.time()}
 
 
 # --- gossip --------------------------------------------------------------------------------------

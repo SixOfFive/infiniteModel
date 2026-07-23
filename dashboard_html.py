@@ -1720,16 +1720,26 @@ const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<'
 const gb = v => (v==null||isNaN(v)) ? '—' : (Math.round(v*10)/10)+' GB';
 
 function peerRow(p){
-  const models = (p.models||[]);
   const nodes  = (p.nodes||[]);
-  const mrows = models.length ? models.map(m =>
-      '<tr><td>'+esc(m.friendly)+'</td><td class="mono">'+esc(m.quant||'none')+'</td>'
-      +'<td class="num">'+gb(m.size_gb)+'</td>'
-      +'<td class="mono">'+esc((m.stages||[]).join(', ')||'—')+'</td>'
-      +'<td class="num">'+(m.active>0?'<span style="color:var(--good)">● '+m.active+'</span>':'0')+'</td>'
-      +'<td><button class="btn sm" title="Copy this model\'s weights from that controller instead of re-downloading from HuggingFace"'
-      +' onclick="pullModel('+JSON.stringify(p.host)+','+p.http_port+','+JSON.stringify(m.friendly||m.target)+')">Pull</button></td></tr>'
-    ).join('') : '<tr><td colspan="6" class="note">no models resident</td></tr>';
+  // Resident models (with runtime info), keyed for enrichment of the on-disk rows.
+  const resident = {};
+  (p.models||[]).forEach(m => { if(m.friendly) resident[m.friendly]=m; if(m.target) resident[m.target]=m; });
+  // The pullable list = every model the peer has ON DISK (includes ones NOT loaded — the whole point).
+  // Fall back to just the resident list if talking to an older peer that doesn't advertise disk_models.
+  const disk = (p.disk_models||[]);
+  const list = disk.length ? disk
+    : (p.models||[]).map(m=>({friendly:m.friendly, display_name:m.friendly, target:m.target, size_gb:m.size_gb, loaded:true}));
+  const mrows = list.length ? list.map(dm => {
+      const rm = resident[dm.friendly] || resident[dm.target] || null;
+      const loaded = dm.loaded || !!rm;
+      const stat = loaded
+        ? '<span style="color:var(--good)">● loaded'+(rm&&rm.stages&&rm.stages.length?' <span class="mono note">'+esc(rm.stages.join(','))+'</span>':'')+'</span>'
+        : '<span class="note">on disk</span>';
+      return '<tr><td>'+esc(dm.display_name||dm.friendly)+'</td>'
+        +'<td class="num">'+gb(dm.size_gb)+'</td><td>'+stat+'</td>'
+        +'<td><button class="btn sm" title="Copy this model\'s weights from '+esc(p.name||p.host)+' to THIS controller (resumes if interrupted; skips files already present)"'
+        +' onclick="pullModel(this,'+JSON.stringify(p.host)+','+p.http_port+','+JSON.stringify(dm.friendly||dm.target)+')">Pull</button></td></tr>';
+    }).join('') : '<tr><td colspan="4" class="note">no models on disk</td></tr>';
   const nrows = nodes.length ? nodes.map(n =>
       '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
       +'<td class="num">'+gb(n.vram_used_gb)+' / '+gb(n.vram_total_gb)+'</td>'
@@ -1750,7 +1760,7 @@ function peerRow(p){
     +'</div>'
     +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
     +'<div class="tbls">'
-    +'<div class="scroll"><table><thead><tr><th>Model</th><th>Quant</th><th>Size</th><th>Stages</th><th>Active</th><th></th></tr></thead><tbody>'+mrows+'</tbody></table></div>'
+    +'<div class="scroll"><table><thead><tr><th>Model (on disk = pullable)</th><th>Weights</th><th>Status</th><th></th></tr></thead><tbody>'+mrows+'</tbody></table></div>'
     +'<div class="scroll"><table><thead><tr><th>Node</th><th>Device</th><th>VRAM</th><th>Free RAM</th><th>Tiers</th></tr></thead><tbody>'+nrows+'</tbody></table></div>'
     +'</div></div>';
 }
@@ -1794,15 +1804,18 @@ async function rmPeer(host, port){
   refresh(false);
 }
 
-async function pullModel(host, port, model){
-  if(!confirm('Copy "'+model+'" from '+host+' to this controller?')) return;
+async function pullModel(btn, host, port, model){
+  // NO confirm() — repeated dialogs get auto-suppressed by browsers ("prevent additional dialogs"),
+  // which silently made the button do nothing. Give inline feedback on the button instead.
+  if(btn){ btn.disabled=true; btn.dataset.t=btn.textContent; btn.textContent='starting…'; }
   try{
     const r = await fetch('/peer_pull?host='+encodeURIComponent(host)+'&port='+port
                           +'&model='+encodeURIComponent(model), {method:'POST'});
     const j = await r.json();
-    if(!j.ok) alert('pull failed: '+(j.error||'unknown'));
+    if(j.ok){ if(btn){ btn.textContent='pulling ✓'; } }
+    else { alert('pull failed: '+(j.error||'unknown')); if(btn){ btn.disabled=false; btn.textContent=btn.dataset.t||'Pull'; } }
     pulls();
-  }catch(e){ alert('pull failed: '+(e.message||e)); }
+  }catch(e){ alert('pull failed: '+(e.message||e)); if(btn){ btn.disabled=false; btn.textContent=btn.dataset.t||'Pull'; } }
 }
 
 function pullRow(p){
