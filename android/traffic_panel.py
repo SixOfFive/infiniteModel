@@ -39,19 +39,140 @@ output of this tablet's own worker, read from its detached tmux pane ('wrk') via
 That is a local read-only peek at a pane we already own; it sends nothing to the fleet. If the
 node rows fill the screen there is no room left and the log is simply omitted.
 
-Native Termux (no proot/torch); pure /status consumer -- touches nothing in the fleet client.
-  python traffic_panel.py [controller_ip] [poll_seconds]
+The controller is found the SAME way the fleet client finds it: a UDP-broadcast discovery query
+(#discovery), so when the controller moves (or there are several) the panel follows without an
+edit. Pass an explicit IP to pin it; 'auto' (the default) discovers. Discovered controllers are
+listed on their own line, and any federated peers a controller names are folded in with them.
+
+Native Termux (no proot/torch); a read-only /status consumer -- the only thing it emits is the
+discovery broadcast, which mutates nothing in the fleet.
+  python traffic_panel.py [controller_ip|auto] [poll_seconds]
 """
 import json
 import os
+import socket
 import sys
 import time
 from collections import deque, defaultdict
 from urllib.request import urlopen
 
-CTRL_IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.15.38"
-POLL    = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
-URL     = f"http://{CTRL_IP}:21434/status"
+# Controller address. An explicit IP as argv[1] PINS it (static override, no broadcast); "auto"
+# (or "-"/omitted) DISCOVERS it by UDP broadcast, the fleet client's own zero-config mechanism.
+_arg1     = sys.argv[1] if len(sys.argv) > 1 else "auto"
+STATIC_IP = "" if _arg1.strip().lower() in ("auto", "-", "discover", "") else _arg1.strip()
+POLL      = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
+HTTP_PORT = 21434                                  # default controller HTTP port (a reply overrides)
+
+# ---- controller discovery (#discovery): byte-for-byte the wire.py broadcast the client speaks ----
+DISCOVERY_MAGIC = "infinitemodel-discovery-v1"
+DISCOVERY_PORT  = 50099
+CLUSTER_ID      = ""                               # "" = accept whichever fleet answers
+_ctrl      = [None]                                # the controller currently being polled (or None)
+_ctrls     = [[]]                                  # every controller the last broadcast round found
+_last_disc = [0.0]                                 # ts of last broadcast — rate-limits re-discovery
+DISC_MIN_GAP = 8.0                                 # s: never re-broadcast more often than this
+
+
+def _local_ipv4s():
+    """Every non-loopback IPv4 this device owns (stdlib only)."""
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 9)); ips.add(s.getsockname()[0])   # default-route NIC; no packet sent
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return {ip for ip in ips if not ip.startswith("127.")}
+
+
+def _broadcast_targets():
+    """255.255.255.255 plus each NIC's directed /24 broadcast, so a dual-homed tablet (Wi-Fi +
+    Tailscale) still reaches a controller on its LAN interface."""
+    tgts = ["255.255.255.255"]
+    for ip in sorted(_local_ipv4s()):
+        b = ip.rsplit(".", 1)[0] + ".255"
+        if b not in tgts:
+            tgts.append(b)
+    return tgts
+
+
+def discover_controllers(timeout=2.0):
+    """Every controller that answers ONE broadcast round (#multi-controller), same-/24 ranked first.
+    Byte-for-byte the wire.py query/reply the fleet client uses, so panel and worker see the same
+    set. Returns [{host, http_port, name, version, cluster_id}], or [] if silence. Stdlib only."""
+    query = json.dumps({"im": DISCOVERY_MAGIC, "q": 1, "cluster_id": CLUSTER_ID}).encode()
+    targets = _broadcast_targets()
+    found = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.settimeout(0.25)
+        s.bind(("", 0))
+        deadline, next_send = time.time() + max(0.5, timeout), 0.0
+        while time.time() < deadline:
+            if time.time() >= next_send:                         # re-send every 0.5s (drops happen)
+                next_send = time.time() + 0.5
+                for t in targets:
+                    try:
+                        s.sendto(query, (t, DISCOVERY_PORT))
+                    except OSError:
+                        pass                                     # a NIC may refuse; others still go
+            try:
+                raw, addr = s.recvfrom(65535)
+            except (socket.timeout, OSError):
+                continue
+            try:
+                msg = json.loads(raw.decode("utf-8", "replace"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(msg, dict) or msg.get("im") != DISCOVERY_MAGIC or not msg.get("r"):
+                continue
+            cid = str(msg.get("cluster_id") or "")
+            if CLUSTER_ID and cid != CLUSTER_ID:
+                continue                                         # a different fleet answered
+            host = str(msg.get("host") or addr[0])
+            try:
+                hp = int(msg.get("http_port") or HTTP_PORT)
+            except (TypeError, ValueError):
+                hp = HTTP_PORT
+            found.setdefault((host, hp), {
+                "host": host, "http_port": hp, "cluster_id": cid,
+                "name": str(msg.get("name") or ""), "version": str(msg.get("version") or "")})
+    finally:
+        s.close()
+    mine = {ip.rsplit(".", 1)[0] for ip in _local_ipv4s()}
+    return sorted(found.values(),
+                  key=lambda c: 0 if c["host"].rsplit(".", 1)[0] in mine else 1)
+
+
+def ensure_controller(force=False):
+    """The controller to poll, discovering / re-discovering as needed. A static IP short-circuits
+    discovery. `force` (the current one stopped answering) triggers a re-broadcast, but is still
+    rate-limited by DISC_MIN_GAP and KEEPS the old pick if the round comes back empty — a transient
+    miss must not blank the panel. Prefers to stay on the same controller while it still answers."""
+    if STATIC_IP:
+        if _ctrl[0] is None:
+            _ctrl[0] = {"host": STATIC_IP, "http_port": HTTP_PORT, "name": "",
+                        "version": "", "cluster_id": ""}
+            _ctrls[0] = [_ctrl[0]]
+        return _ctrl[0]
+    if _ctrl[0] is not None and not force:
+        return _ctrl[0]
+    if _ctrl[0] is not None and time.time() - _last_disc[0] < DISC_MIN_GAP:
+        return _ctrl[0]                                          # too soon to re-broadcast; hold
+    _last_disc[0] = time.time()
+    got = discover_controllers()
+    if got:
+        _ctrls[0] = got
+        if not (_ctrl[0] and any(c["host"] == _ctrl[0]["host"] for c in got)):
+            _ctrl[0] = got[0]                                    # current one gone -> best-ranked
+    return _ctrl[0]
 
 HIST       = 600                                   # in/out rate samples kept per row (>= sparkline)
 LOG_PATH   = os.path.expanduser("~/.im/traffic.csv")
@@ -436,8 +557,8 @@ def log_csv(ts, samples):
         pass
 
 
-def fetch():
-    with urlopen(URL, timeout=4) as r:
+def fetch(host, hp):
+    with urlopen(f"http://{host}:{hp}/status", timeout=4) as r:
         return json.load(r)
 
 
@@ -466,11 +587,20 @@ def render():
     win_s = int(sw * POLL)
     out = []
     now = time.strftime("%H:%M:%S")
+    ctrl = ensure_controller()                         # discover (or reuse) the controller to poll
     try:
-        st = fetch()
+        if ctrl is None:
+            raise RuntimeError("no controller found on the LAN yet")
+        st = fetch(ctrl["host"], ctrl["http_port"])
         err = None
     except Exception as e:
         st, err = None, str(e)
+        ensure_controller(force=True)                  # it moved/died -> re-broadcast (rate-limited)
+
+    if st and ctrl:                                    # fill name/version from the polled /status so
+        cinfo = st.get("controller") or {}             # a static IP (or a terse reply) still labels it
+        ctrl["name"] = ctrl.get("name") or cinfo.get("hostname") or ""
+        ctrl["version"] = ctrl.get("version") or cinfo.get("version") or ""
 
     cver = ""
     if st:                                             # the tablet's own client version, from /status
@@ -483,8 +613,27 @@ def render():
              f"   (MAX·XFER=last {win_s}s)   poll {POLL:.0f}s   {now}")
     out.append(f"\033[1;36m{title[:w].ljust(w)}\033[0m")
 
+    # CONTROLLERS: every controller discovery found, plus any federated peers the polled one names.
+    # '●' marks the one being polled, '○' another discovered controller, '◇' a peer via federation.
+    polled = (ctrl or {}).get("host")
+    seen, parts = set(), []
+    for c in _ctrls[0]:
+        seen.add(c["host"])
+        v = f" v{c['version']}" if c.get("version") else ""
+        parts.append(f"{'●' if c['host'] == polled else '○'} {c.get('name') or '?'} "
+                     f"{c['host']}:{c['http_port']}{v}")
+    for pc in ((((st or {}).get("fleet") or {}).get("via_peers") or {}).get("controllers") or []):
+        h = pc.get("host") if isinstance(pc, dict) else str(pc)
+        if h and h not in seen:
+            seen.add(h)
+            nm = (pc.get("name") if isinstance(pc, dict) else "") or "peer"
+            parts.append(f"◇ {nm} {h}")
+    cl_body = "  ·  ".join(parts) if parts else ("searching…" if not STATIC_IP else polled or "?")
+    out.append(f"{DIM}  CONTROLLERS {len(seen) or (1 if polled else 0)}: {cl_body}"[:w] + RST)
+
     if err:
-        msg = f" controller {CTRL_IP} unreachable: {err}"[:w]
+        who = f"{ctrl['host']}:{ctrl['http_port']}" if ctrl else "the LAN (broadcast)"
+        msg = f" controller {who} unreachable: {err}"[:w]
         out.append(f"\033[31m{msg}\033[0m")
     else:
         down, up, mesh = build_edges(st)               # forward + reverse node edges (round trip)
@@ -492,7 +641,10 @@ def render():
         cur = {}                                       # name -> (in, out) this poll
         vers = {}                                      # name -> client build, for the VER column
         ti = to = 0.0
-        for n in st.get("nodes", []):
+        # nodes owned by THIS controller + peer_nodes federated from other controllers, so the
+        # unified fleet shows on one panel (#unified-fleet). peer_nodes are node-shaped; empty
+        # unless federation is live.
+        for n in list(st.get("nodes") or []) + list(st.get("peer_nodes") or []):
             name = (n.get("hostname") or "?")[:12]
             i = float(n.get("net_in_bps") or 0)
             o = float(n.get("net_out_bps") or 0)
@@ -550,7 +702,7 @@ def render():
                     line += piece
             idle_lines.append(line.rstrip())
 
-        budget = max(1, (lines - 9 - len(idle_lines)) // 2)   # 2 rows/node; reserve fixed footers
+        budget = max(1, (lines - 10 - len(idle_lines)) // 2)  # 2 rows/node; +1 for CONTROLLERS line
         # ...but DISPLAY alphabetically. Picking by traffic and only then sorting keeps a busy node
         # from being dropped just because its name sorts late.
         shown = sorted(graph_names[:budget], key=str.lower)
@@ -614,7 +766,8 @@ def render():
         out.append(f"  {BOLD}TABLET{RST}  cpu {cpu_s}  {ccol}{cgraph}{RST}{tail}")
         # Loaded models on the fleet — names only, comma-separated (placement is in the chart).
         mnames = []
-        for mdl in (st.get("cluster", {}).get("loaded_models") or []):
+        for mdl in (list((st.get("cluster", {}).get("loaded_models") or []))
+                    + list(st.get("peer_models") or [])):     # + federated models (#unified-fleet)
             nmn = (mdl.get("friendly") or mdl.get("display_name") or mdl.get("target") or "").strip()
             if nmn and nmn not in mnames:
                 mnames.append(nmn)
