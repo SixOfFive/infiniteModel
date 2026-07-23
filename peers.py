@@ -71,6 +71,13 @@ def my_http_port() -> int:
         return int(_cfg()["http_port"])
 
 
+def is_master() -> bool:
+    """#master: this controller is the DESIGNATED primary owner of the fleet (a per-controller flag,
+    engine_config.json — NOT synced). Drives the dashboard's one-click 'restore fleet to master'
+    after a failover; it does not change any placement/serving behaviour on its own."""
+    return bool((getattr(state, "ENGINE_CONFIG", None) or {}).get("master", False))
+
+
 def my_identity() -> dict:
     """What we advertise about ourselves over UDP and at /peer_info."""
     return {
@@ -78,6 +85,7 @@ def my_identity() -> dict:
         "http_port": my_http_port(),
         "version": str(getattr(state, "VERSION", "") or ""),
         "cluster_id": str(_cfg().get("cluster_id") or ""),
+        "master": is_master(),
     }
 
 
@@ -152,6 +160,7 @@ def peers_public() -> list:
             "name": p.get("name") or info.get("name") or "",
             "version": p.get("version") or info.get("version") or "",
             "cluster_id": p.get("cluster_id", ""),
+            "master": bool(info.get("master")),   # #master: peer is the designated fleet owner
             "state": peer_state(p), "source": p.get("source", ""),
             "last_seen_s": round(time.time() - float(p.get("last_seen") or 0), 1),
             "last_ok_s": (round(time.time() - float(p["last_ok"]), 1) if p.get("last_ok") else None),

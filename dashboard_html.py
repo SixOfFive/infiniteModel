@@ -1350,6 +1350,7 @@ CONFIG_HTML = r"""<!doctype html>
     <div class="fld tog" title="A request naming a model that is not resident triggers an automatic load using the auto-load defaults above, then serves the request (Ollama-style). Off = requests for non-resident models fail immediately."><input type="checkbox" id="auto_load"><label for="auto_load">Auto-load on request</label></div>
     <div class="fld tog" title="Budget a new model's weights against each GPU's LIVE physically-free VRAM (committed-aware) rather than its nominal capacity — protects resident models' full-context KV reserves from being overcommitted. Leave on unless debugging placement."><input type="checkbox" id="vram_weights_first"><label for="vram_weights_first">Budget weights vs physical-free VRAM</label></div>
     <div class="fld tog" title="Checks every ~60s (and right after an idle-unload frees VRAM) whether the hottest resident model running split across GPU+RAM would now fit entirely in VRAM, and if so promotes it. Only while that model is momentarily idle, it engages a barrier (new requests wait) and re-places it VRAM-only, then resumes — the client connection just pauses briefly, no reconnect. A busy model is skipped (caught at a gap by a later sweep) rather than stalled; embeddings and models that can't fit GPU are skipped. Lets models auto-load hybrid under memory pressure and migrate to full-GPU speed as the busy one out-competes quieter models for VRAM."><input type="checkbox" id="juggler"><label for="juggler">Juggler (promote hybrid→VRAM on free)</label></div>
+    <div class="fld tog" title="#master: mark THIS controller as the designated OWNER of the fleet. Purely a preference — it changes no placement or serving behaviour on its own. Its job is failover ergonomics: after another controller has taken the fleet (e.g. this one was down), the Controllers page shows a one-click 'Restore fleet to master' that hands every node back here. Set it on the controller that should normally hold the workers (e.g. beast). Per-controller (not synced across controllers)."><input type="checkbox" id="master"><label for="master">Master controller (designated fleet owner)</label></div>
   </div>
   <div style="margin-top:14px"><button class="btn pri" onclick="save()" title="Apply and persist every engine setting above — takes effect immediately and survives controller restarts.">Save settings</button><span id="cfg-msg"></span></div>
 </div>
@@ -1383,7 +1384,7 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
 const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s','idle_unload_m','autostart_delay_s'];
-const TOGS=['auto_unload','auto_load','vram_weights_first','juggler'];
+const TOGS=['auto_unload','auto_load','vram_weights_first','juggler','master'];
 // #cfg-dirty: fields the user touched since the last successful save. The 5s /status poll
 // used to overwrite EVERY field wholesale, silently reverting an in-progress edit before
 // the user could click Save. A dirty field is never overwritten by the poll; Save clears
@@ -1677,8 +1678,10 @@ CONTROLLERS_HTML = r"""<!doctype html>
 
 <div class="card">
   <h2>This controller</h2>
-  <div class="sub">How other controllers see us. They reach us at <span class="mono">GET /peer_info</span>.</div>
+  <div class="sub">How other controllers see us. They reach us at <span class="mono">GET /peer_info</span>.
+    Mark a controller <b>master</b> on its <a href="/config">Config</a> page to enable one-click failback.</div>
   <div id="self" class="mono">…</div>
+  <div id="masterbar" style="margin-top:11px"></div>
 </div>
 
 <div class="card">
@@ -1718,6 +1721,7 @@ CONTROLLERS_HTML = r"""<!doctype html>
 <script>
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const gb = v => (v==null||isNaN(v)) ? '—' : (Math.round(v*10)/10)+' GB';
+let SELF = {};   // #master: this controller's identity (incl. node count) from the last /peers poll
 
 function peerRow(p){
   const nodes  = (p.nodes||[]);
@@ -1750,12 +1754,19 @@ function peerRow(p){
   return '<div class="peer">'
     +'<div class="ph"><span class="dot '+esc(p.state)+'"></span>'
     +'<span class="pn">'+esc(p.name||p.host)+'</span>'
+    +(p.master?'<span class="chip" style="border-color:var(--good);color:var(--good)">★ master</span>':'')
     +'<a class="mono" href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.host)+':'+esc(p.http_port)+'</a>'
     +'<span class="chip">'+esc(p.version||'?')+'</span>'
     +(p.cluster_id?'<span class="chip">cluster '+esc(p.cluster_id)+'</span>':'')
     +'<span class="chip">'+esc(p.source||'')+'</span>'
     +'<span class="grow"></span>'
     +'<span class="note">seen '+esc(p.last_seen_s)+'s ago</span>'
+    // #master: fleet handoff — direction depends on who holds the nodes. If WE hold the fleet,
+    // offer to give it to this peer; if THIS PEER holds it, offer to pull it here.
+    +(((SELF.nodes||0)>0 && p.state==='ok')
+       ? '<button class="btn sm" onclick="handoffFleet('+JSON.stringify(p.host)+','+JSON.stringify(p.name||p.host)+')" title="Hand this controller\'s entire fleet (all nodes + loaded shards) to '+esc(p.name||p.host)+', no reload.">⇄ Give fleet</button>' : '')
+    +(((p.nodes||[]).length>0 && (SELF.nodes||0)===0 && p.state==='ok')
+       ? '<button class="btn sm" onclick="reclaimFleet('+JSON.stringify(p.host)+','+JSON.stringify(p.name||p.host)+')" title="Pull '+esc(p.name||p.host)+'\'s entire fleet here, no reload.">⇐ Take fleet</button>' : '')
     +'<button class="btn sm danger" onclick="rmPeer('+JSON.stringify(p.host)+','+p.http_port+')">Forget</button>'
     +'</div>'
     +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
@@ -1769,12 +1780,36 @@ async function refresh(force){
   try{
     const r = await fetch(force?'/peer_refresh':'/peers', {method: force?'POST':'GET'});
     const j = await r.json();
-    const s = j.self||{};
+    const s = j.self||{}; SELF = s;
     document.getElementById('ctl').textContent = (s.name||'') + ' · ' + (s.version||'');
     document.getElementById('self').innerHTML =
       esc(s.name||'?')+' — http :'+esc(s.http_port)+' — '+esc(s.version||'?')
+      +(s.master?' <span class="chip" style="border-color:var(--good);color:var(--good)">★ MASTER</span>':'')
+      +' — holds '+(s.nodes||0)+' node'+((s.nodes===1)?'':'s')
       +(s.cluster_id?' — cluster '+esc(s.cluster_id):' — cluster &lt;unset&gt;');
     const ps = j.peers||[];
+    // #master: one-click failback banner. Handoff can only be ISSUED by whoever owns the nodes, so
+    // the button we show depends on who currently holds the fleet.
+    const master = ps.find(p=>p.master && p.state==='ok');
+    const mb = document.getElementById('masterbar');
+    if(mb){
+      let h='';
+      if((s.nodes||0)>0 && master){
+        // We hold the fleet but a peer is the designated master → hand it back in one click.
+        h='<button class="btn pri" onclick="handoffFleet('+JSON.stringify(master.host)+','+JSON.stringify(master.name||master.host)+')" '
+         +'title="Move every node (and its loaded shards) back to the master controller with no reload (~seconds). Use after a failover to restore normal ownership.">↩ Restore fleet to master ('+esc(master.name||master.host)+')</button>';
+      } else if(s.master && (s.nodes||0)>0){
+        h='<span class="note">★ This is the master and currently holds the fleet.</span>';
+      } else if(s.master){
+        // We ARE master but hold nothing → offer to TAKE it from whichever peer holds the fleet.
+        const owner = ps.find(p=>(p.nodes||[]).length>0 && p.state==='ok');
+        h = owner
+          ? '<button class="btn pri" onclick="reclaimFleet('+JSON.stringify(owner.host)+','+JSON.stringify(owner.name||owner.host)+')" '
+            +'title="Pull every node from the controller that currently holds the fleet back to here, with no reload.">⇐ Take the fleet from '+esc(owner.name||owner.host)+'</button>'
+          : '<span class="note">★ This is the master; no peer is holding the fleet.</span>';
+      }
+      mb.innerHTML=h;
+    }
     document.getElementById('peers').innerHTML = ps.length
       ? ps.map(peerRow).join('')
       : '<div class="note">No other controllers found yet. They announce themselves every 60s; '
@@ -1801,6 +1836,30 @@ async function addPeer(){
 
 async function rmPeer(host, port){
   await fetch('/peer_remove?host='+encodeURIComponent(host)+'&port='+port, {method:'POST'});
+  refresh(false);
+}
+// #master: hand THIS controller's whole fleet to a peer (node=* handoff — no reload).
+async function handoffFleet(host, name){
+  if(!confirm('Hand the ENTIRE fleet to '+name+'?\n\nEvery node and its loaded shards move to '+name
+    +' with no reload (~seconds). This controller keeps serving those models via federation afterward.'))return;
+  try{
+    const r = await fetch('/peer_handoff?node=*&to='+encodeURIComponent(host), {method:'POST'});
+    const j = await r.json();
+    if(j.ok) alert('Handed '+((j.nodes||[]).length)+' node(s) to '+name
+      +((j.models_moved&&j.models_moved.length)?'\nmoved with no reload: '+j.models_moved.join(', '):''));
+    else alert('handoff failed: '+(j.error||'unknown'));
+  }catch(e){ alert('handoff failed: '+(e.message||e)); }
+  refresh(false);
+}
+// #master: pull a peer's whole fleet HERE (the mirror — used when you're on the receiving controller).
+async function reclaimFleet(host, name){
+  if(!confirm('Take the ENTIRE fleet from '+name+' to this controller?\n\nEvery node moves here with no reload.'))return;
+  try{
+    const r = await fetch('/reclaim_fleet?host='+encodeURIComponent(host), {method:'POST'});
+    const j = await r.json();
+    if(j.ok) alert('Fleet reclaimed from '+name+' — nodes now here.');
+    else alert('reclaim failed: '+(j.error||(j.result&&j.result.error)||'unknown'));
+  }catch(e){ alert('reclaim failed: '+(e.message||e)); }
   refresh(false);
 }
 

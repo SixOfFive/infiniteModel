@@ -454,6 +454,7 @@ def build_status() -> dict:
             # #idle-unload: minutes with no requests before a model is unloaded (0 = keep forever)
             "idle_unload_m": ENGINE_CONFIG.get("idle_unload_m", 0.0),
             "juggler": ENGINE_CONFIG.get("juggler", False),                       # #juggler
+            "master": ENGINE_CONFIG.get("master", False),                         # #master: designated fleet owner
             "autostart_delay_s": ENGINE_CONFIG.get("autostart_delay_s", 60.0),   # #autostart-delay
             "wedge_reload_n": ENGINE_CONFIG.get("wedge_reload_n", 3),             # #wedge-quarantine
             # #persist / #no-unload: friendly keys pinned for autoload-on-restart and never-auto-unload

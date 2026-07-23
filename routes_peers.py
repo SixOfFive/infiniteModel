@@ -119,8 +119,14 @@ def register(app):
     @app.get("/peers")
     async def list_peers() -> JSONResponse:
         """Every controller we currently know about, with its last-gossiped inventory."""
-        return JSONResponse({"ok": True, "self": peers.my_identity(),
-                             "peers": peers.peers_public()})
+        # #master: self carries its OWN node count + claims so the Controllers page can tell whether
+        # THIS controller currently holds the fleet (→ show the one-click 'hand fleet to master').
+        _self = dict(peers.my_identity())
+        try:
+            _self["nodes"] = len(registry.alive_sorted())
+        except Exception:   # noqa: BLE001
+            _self["nodes"] = 0
+        return JSONResponse({"ok": True, "self": _self, "peers": peers.peers_public()})
 
     @app.post("/peer_refresh")
     async def peer_refresh() -> JSONResponse:
@@ -420,6 +426,35 @@ def register(app):
                              "skipped_colocated": _skipped,
                              "peer_reclaim": ("ok" if all(v == "ok" for v in reclaimed.values())
                                               else reclaimed)})
+
+    @app.post("/reclaim_fleet")
+    async def reclaim_fleet(host: str, port: int = 0) -> JSONResponse:
+        """#master: PULL the whole fleet HERE from a peer that currently owns it — the mirror of
+        `/peer_handoff?node=*` (which PUSHES). Asks the peer to hand every node to US, so the
+        one-click 'take the fleet' / 'restore to master' works from the RECEIVING controller too
+        (handoff itself can only be issued by the owner). `to=` is the address that peer/workers
+        reach us at — our own source IP toward that peer."""
+        import wire as _wire
+        p = int(port or peers._cfg()["http_port"])
+        peer = peers.PEERS.get(peers.peer_key(host, p))
+        if not peer or peers.peer_state(peer) != "ok":
+            return JSONResponse({"ok": False,
+                                 "error": f"peer {host}:{p} is not a healthy known controller"},
+                                status_code=400)
+        my_host = _wire.local_ip_for(host) or _display_host()
+        try:
+            r = await asyncio.to_thread(
+                peers.http_post_json,
+                f"{peers.peer_base(peer)}/peer_handoff?node=*&to={urllib.parse.quote(str(my_host))}",
+                180.0)
+        except Exception as exc:   # noqa: BLE001
+            return JSONResponse({"ok": False,
+                                 "error": f"reclaim from {peer.get('name') or host} failed: {exc}"},
+                                status_code=502)
+        await peers.kick(peer)
+        return JSONResponse({"ok": bool(r.get("ok")), "from": peer.get("name") or host,
+                             "to": my_host, "result": r},
+                            status_code=(200 if r.get("ok") else 400))
 
     @app.post("/peer_reclaim")
     async def peer_reclaim(node: str) -> JSONResponse:
