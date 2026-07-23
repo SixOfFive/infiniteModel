@@ -4,8 +4,9 @@
 #  Run INSIDE the proot guest, from this android/ folder (after setup.sh):
 #      bash start-client.sh --name tablet
 #
-#  Defaults: controller 192.168.15.38:50100, --device cpu (no CUDA on Android),
-#  --ram "android-tablet" (dmidecode/root aren't available in proot — harmless).
+#  Defaults: controller "auto" = find it by UDP-broadcast discovery (retry forever),
+#  --device cpu (no CUDA on Android), --ram "android-tablet" (dmidecode/root aren't
+#  available in proot — harmless). Pass an explicit --controller to pin a static IP.
 #  Extra flags pass straight through, e.g.:
 #      bash start-client.sh --name tablet --controller 192.168.1.50
 #      bash start-client.sh --name tablet --os-reserve-gb 3
@@ -24,7 +25,7 @@ PY="$HERE/.venv/bin/python"
 code=0
 while true; do
   set +e
-  "$PY" client.py --controller 192.168.15.38 --control-port 50100 \
+  "$PY" client.py --controller auto --control-port 50100 \
        --device cpu --ram "android-tablet" "$@"
   code=$?
   set -e
