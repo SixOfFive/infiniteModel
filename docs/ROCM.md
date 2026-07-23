@@ -162,8 +162,11 @@ To join an existing fleet instead, drop `IM_ALLOW_NO_MODELS`/the local controlle
 launch only the worker with `--controller <controller-ip>`.
 
 For persistence across reboot, run both under `systemctl --user` units (enable
-`loginctl enable-linger "$USER"` once so user services start at boot). No special
-environment variables are required for ROCm.
+`loginctl enable-linger "$USER"` once so user services start at boot). On **gfx1151**,
+add `Environment=TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` to the **worker** unit (or a
+`im-worker.service.d/*.conf` drop-in): it enables AOTriton's flash SDPA backend, without
+which decode attention runs the slow math path — ~1.9× faster long-context decode with it
+(verified 2026-07-23; see docs/ACCELERATION.md). Otherwise no special env vars are required.
 
 ---
 

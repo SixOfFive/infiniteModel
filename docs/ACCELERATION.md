@@ -109,6 +109,7 @@ here, not load-bearing as it was on RDNA (where no vendor int4 GEMM exists at al
 | `IM_FUSED_INT2=0` | Kill switch for the int2 Triton w2a16 kernels — force the naive int2 dequant path. Use to A/B; mirrors `INFINITEMODEL_NO_FUSED_MOE`. |
 | `INFINITEMODEL_CUDA_GRAPH=<ctx>` | Opt-in CUDA-graph decode (single-node, standard-attention, uniform-CUDA models; `<ctx>` sizes the StaticCache mirror — set it to the serving ctx). Copy-handoff design: prefill/verify stay on the proven eager DynamicCache path; the first decode captures `model.forward` over a StaticCache mirror, the second **replays at a new position** and self-checks against the eager DynamicCache decode — activates only on a match (`[cudagraph] decode ACTIVE`), else latches off permanently and serving stays eager (byte-identical). Default-OFF (inert without this var). **HIP/ROCm gfx1151: tested 2026-07-08 (TheRock torch 2.12.0a0+rocm7.13, HIP 7.13.60980, llama-3.3-70b int4) — capture and replay execute without error, but the replayed logits are ~71–74% off (`rel=0.740`/`0.714`, two independent loads); the self-check DISABLES it every time. Leave unset on ROCm until a TheRock/HIP build replays faithfully; NVIDIA is the intended target.** |
 | `INFINITEMODEL_PREFILL_CHUNK=<tokens>` | **Default 2048 (ON).** Processes a long-prompt **prefill** in query-chunks of this many tokens so SDPA never materializes the full `[1, H, q, total]` attention-score tensor. An explicit additive mask disables SDPA's flash backend; on a device without the mem-efficient backend (**ROCm gfx1151**, the CPU math path) SDPA otherwise falls to the math backend and allocates the whole `O(H·q²)` matrix → OOM on long prompts (the 43 GiB single-alloc seen on the Strix Halo). Chunking caps peak score memory to `O(H·C·q)`. Math-identical to the unchunked pass (validated); **standard-attention models only** (per-type/hybrid/omni keep the full pass); decode is unaffected. Set `0` to disable (single full pass); lower it (512–1024) for very long contexts on memory-tight boxes. |
+| `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` | **ROCm/RDNA — RECOMMENDED on gfx1151.** Enables AOTriton's flash / mem-efficient SDPA backend. Without it RDNA has NO flash/mem-efficient kernel, so **decode** attention (mask=None) falls to the **math** backend — reads the whole KV and materializes full `[1,H,1,ctx]` scores every token, so decode slows as context grows (the dominant long-context decode cost). Verified on gfx1151 (TheRock torch 2.12.0a0+rocm7.13, 2026-07-23): flash engages and runs decode attention **5.6× faster** than math (3.04→0.54 ms/call at 4k decode shape), lifting end-to-end long-context decode **~1.9×** (qwen2.5-14b @ 4k ctx: ~4.7→9.0 tok/s), more at longer context; output verified coherent. Prefill keeps the additive-mask math path (see `INFINITEMODEL_PREFILL_CHUNK`). Set on the worker + restart. Verify per-arch before enabling on other RDNA (e.g. gfx1033). |
 
 Set them in the worker's environment (e.g. a systemd `--user` unit `Environment=` line, or the shell
 that launches `client.py`), then restart the worker and reload the model — the fused forward installs at
@@ -266,9 +267,15 @@ These kernels are good but not the ceiling. Ranked by likely payoff:
    win available on ROCm** until a TheRock/HIP build replays faithfully; NVIDIA remains the proven
    target. Note the eager overhead this lever buys back is also smaller than first simmed: a clean
    llama-70b box decodes at 284 ms/token vs the ~222 ms kernel floor (~1.28× headroom, not 2.6×).
-2. **AOTriton flash-attention on ROCm.** SDPA currently runs the slow MATH path on RDNA; AOTriton's flash
-   kernel is gated behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. Attention is a real slice of decode
-   on the hybrid (Gated-DeltaNet + SDPA) models.
+2. **AOTriton flash-attention on ROCm — LANDED (verified gfx1151, 2026-07-23).** RDNA ships no flash/mem-efficient
+   SDPA backend, so **decode** attention ran the slow MATH path — materializing full `[1,H,1,ctx]` scores every
+   token, so decode slowed as context grew (measured: qwen2.5-14b decode 14.9 tok/s @ short ctx → ~4.7 @ 4k → ~1.8
+   at long generations — attention-bound, NOT the int4 GEMV/launch path). Enabling AOTriton's flash kernel via
+   `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (see Environment switches) engages flash/mem-efficient SDPA:
+   **5.6× on the attention op** (3.04→0.54 ms/call at a 4k decode shape) → **~1.9× end-to-end long-context decode**
+   (qwen2.5-14b @ 4k: 4.7→9.0 tok/s), larger at longer context, output coherent. **Applied to the om3nbox worker**
+   (systemd `--user` drop-in `im-worker.service.d/aotriton.conf`). Prefill still uses the additive-mask math path;
+   only decode attention (mask=None) switches to flash. Verify per-arch before enabling on other RDNA (e.g. gfx1033).
 3. **Single-node in-process transport.** Adjacent pipeline stages on the *same* box still hand off over
    loopback TCP; an in-process path removes that per-token round-trip.
 4. **Dense-kernel autotune on RDNA.** The RDNA dense Triton kernel still uses fixed tiles; the AMD iGPU is
