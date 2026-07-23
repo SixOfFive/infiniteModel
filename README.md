@@ -109,6 +109,18 @@ dashboard.
   vision / video / STT / TTS / OCR / embeddings / t2i — fleet memory/throughput, bandwidth,
   per-client connections), curl-able fleet logs (`/logs?node=…`), and idle-gated self-update.
   **Full guide → [docs/OPERATIONS.md](docs/OPERATIONS.md).**
+- **Multiple controllers (federation).** Run more than one controller over a fleet. They discover
+  each other by broadcast, show **one unified view** of the whole fleet (either controller renders
+  its own nodes and models *plus* its peers'), and **borrow** each other's loaded models — a request
+  for a model only a peer has resident is proxied there, so it's one copy of the weights with either
+  controller as a front door. They copy weights **controller-to-controller** (no HuggingFace round
+  trip), take **exclusive ownership** of each worker so two planners never double-book a node's VRAM,
+  and **hand a node and its live shards** between controllers with no reload. A controller can be a
+  full peer with its own workers or a **weightless standby**; on **failover** a dead controller's
+  workers re-home to a survivor — after a grace window that lets a mere reboot *re-adopt* instead of
+  triggering a handover — and it adopts their resident models with no reload. A **master**
+  designation gives one-click failback to restore normal ownership. Full guide →
+  [docs/FEDERATION.md](docs/FEDERATION.md).
 - **Self-healing under load and failure.** Honest overload behavior: contention degrades into
   *retryable* backpressure (`503 + Retry-After` / Anthropic `529`), and slow-but-advancing
   prefills are never reclaimed as wedged (workers heartbeat per-layer forward progress). Worker
@@ -139,6 +151,11 @@ dashboard.
 The controller downloads the model once, plans placement (GPU-first, spill to CPU/RAM; or
 tensor-parallel), and streams each stage's weights to its worker straight into RAM (workers keep no
 model on disk). Generation flows around the ring `controller → stage0 → … → head → controller`.
+
+More than one controller can share a fleet: they discover each other, present one unified view,
+borrow each other's loaded models, take **exclusive** ownership of each worker (so two planners never
+double-book a node), and **fail over** for each other. See
+[docs/FEDERATION.md](docs/FEDERATION.md).
 
 ## Project layout
 
