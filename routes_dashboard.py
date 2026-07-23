@@ -283,6 +283,37 @@ def register(app):
                                          "auto_gpu_gb": round(auto_gpu, 1),
                                          "fleet_gpu_gb": round(fleet_gpu, 1),
                                          "on_cpu_gb": round(max(0.0, on_cpu), 1)}
+        # #unified-fleet: a controller that owns NO usable nodes doesn't fail a load — it FEDERATES
+        # it to a peer (that's what /load does). So the Preview must not report a bare "no nodes
+        # connected"; proxy the plan to the controller that will actually place it and show ITS real
+        # placement, stamped federated. Mirrors /load's rule: federate ONLY when we own no nodes (a
+        # controller WITH nodes that merely doesn't fit still shows the honest local "does not fit").
+        if not d.get("ok"):
+            try:
+                import peers as _peers
+                _own = any(getattr(n, "can_infer", True) for n in registry.alive_sorted())
+                if not _own and _peers.PEERS:
+                    _pp = _peers.peer_for_model(friendly) or max(
+                        _peers.healthy_peers(),
+                        key=lambda q: len(((q.get("info") or {}).get("nodes") or [])), default=None)
+                    if _pp is not None:
+                        _pq = (f"model={urllib.parse.quote(model)}&ctx={ctx}"
+                               f"&quant={urllib.parse.quote(quant)}&mode={urllib.parse.quote(mode)}")
+                        if node:
+                            _pq += f"&node={urllib.parse.quote(node)}"
+                        if cpu_only:
+                            _pq += "&cpu_only=true"
+                        _pr = await asyncio.to_thread(
+                            _peers._http_get_json, f"{_peers.peer_base(_pp)}/plan?{_pq}", 15.0)
+                        if isinstance(_pr, dict):
+                            _lbl = _peers.peer_label(_pp)
+                            _pr["federated"] = True
+                            _pr["federated_to"] = _lbl
+                            _pr["basis"] = (f"federates to {_lbl} (this controller owns no nodes) — "
+                                            + str(_pr.get("basis") or ""))
+                            return JSONResponse(_pr)
+            except Exception as _exc:   # noqa: BLE001 — preview must never 500; fall back to local
+                print(f"[plan] federated preview failed ({_exc!r})", flush=True)
         return JSONResponse(d)
 
     # ---- chunk serving (workers fetch only their slice; nothing on worker disk) ----
