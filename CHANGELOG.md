@@ -4,6 +4,27 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## Release 0.3.1 — multi-controller federation
+
+First version tagged with a semantic version (earlier builds used internal `0.2-m4cNNN` deploy
+counters). Headline: a fleet can now run **more than one controller**, and they cooperate.
+
+- **#federation** — controllers discover each other over the existing UDP discovery channel, gossip
+  inventory, and can **borrow** a model a peer has resident (a request for a model not loaded here is
+  proxied to the peer that has it — one copy of the weights, either controller as the front door).
+- **#unified-fleet** — either controller renders the *whole* fleet (its own nodes + models plus its
+  peers'), with the owner's real cards/graphs, and can drive load/unload anywhere by federating to
+  the owner.
+- **Exclusive node ownership + `/peer_handoff`** — a node (and its live shards) belongs to one
+  controller at a time and can be handed to another with no reload; `node=*` moves the whole fleet.
+- **Controller failover** — if a controller dies, its workers re-home to a surviving controller
+  (`INFINITEMODEL_DISCOVERY_RESPOND=standby`) which adopts their resident models with no reload.
+  Live-verified end to end.
+- **Peer model pull** — copy a model's weights controller-to-controller instead of from HuggingFace
+  (resumable; the whole on-disk catalogue is pullable, not just resident models).
+- **Zero-config discovery** — `controller_host: "auto"` is the default; workers find the controller
+  by broadcast, so a fresh clone runs with no config edit.
+
 ## Distributed core
 - Node registry + heartbeat + capability probe; live dashboard; RAM/VRAM-weighted partition planner.
 - **Pipeline parallelism** over a hand-rolled plain-TCP transport (Windows + Linux): each worker holds
