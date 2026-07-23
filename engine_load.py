@@ -2943,7 +2943,25 @@ class EngineLoadMixin:
             p = plan_pipeline(spec, mems, m.ctx, consolidate=True, prefer_vram=True)
             if not p.ok:
                 return None, 1.0, 99
-            assess = _assess_placement(spec, m.ctx, mems, p.stages, cpu_only=False)
+            # #upgrade-kv-aware: the badge's cpu-spill estimate MUST reserve the same full-ctx KV the
+            # real reload will. With kv_offload OFF the coexistence reserve pins full-ctx KV in VRAM
+            # and weights get only what's LEFT — but _assess_placement fills weights-FIRST, so it
+            # calls a KV-displaced model "fits VRAM" (new_cpu~0) and promises an upgrade the reload
+            # can never keep. That is the exact nag: click ⬆, the KV reserve re-claims VRAM, weights
+            # spill again, badge reappears (qwen3-4b @ ctx=32767 on 4-6 GB GPUs -> perpetual 50% CPU).
+            # Subtract each stage's full-ctx KV from its node's VRAM before assessing weight spill, so
+            # new_cpu matches what the reload actually achieves and the badge only fires when a re-place
+            # genuinely reduces CPU spill / node count.
+            amems = mems
+            if not bool(getattr(m, "kv_offload", False)):
+                kv_by_node: dict = {}
+                for s in p.stages:
+                    kv_by_node[s.node_id] = (kv_by_node.get(s.node_id, 0)
+                                             + s.num_layers * spec.kv_bytes_per_layer(m.ctx))
+                amems = [NodeMem(nm.node_id, nm.hostname, nm.usable_bytes,
+                                 max(0, nm.vram_bytes - kv_by_node.get(nm.node_id, 0)), nm.pref)
+                         for nm in mems]
+            assess = _assess_placement(spec, m.ctx, amems, p.stages, cpu_only=False)
             return p, (assess.get("cpu_weight_frac", 0.0) or 0.0), len(p.stages)
         except Exception:
             return None, 1.0, 99
