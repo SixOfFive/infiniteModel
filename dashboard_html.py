@@ -1718,10 +1718,23 @@ CONTROLLERS_HTML = r"""<!doctype html>
   <div id="peers"><div class="note">loading…</div></div>
 </div>
 
+<div id="cov" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:80;align-items:flex-start;justify-content:center">
+  <div style="background:var(--card,#141922);border:1px solid var(--border);border-radius:11px;padding:20px 22px;max-width:440px;margin-top:16vh;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+    <div id="cmsg" style="font-size:14px;line-height:1.55;color:var(--text);white-space:pre-line"></div>
+    <div style="margin-top:18px;text-align:right"><button class="btn ghost" onclick="cAnswer(false)">Cancel</button>
+      <button class="btn pri" id="cok" onclick="cAnswer(true)">Confirm</button></div>
+  </div>
+</div>
+
 <script>
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const gb = v => (v==null||isNaN(v)) ? '—' : (Math.round(v*10)/10)+' GB';
 let SELF = {};   // #master: this controller's identity (incl. node count) from the last /peers poll
+// #onclick-quotes: a JS string arg safe INSIDE a double-quoted onclick="" attribute. JSON.stringify
+// emits DOUBLE quotes, which truncate the attribute (onclick="fn("x")" parses as onclick="fn(") and
+// silently kills the handler — the bug that made Give-fleet / Pull / Forget do nothing. Single-quote
+// it, HTML-escape &<", and backslash-escape ' (which stays inert in HTML).
+const A = s => "'"+String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/'/g,"\\'")+"'";
 
 function peerRow(p){
   const nodes  = (p.nodes||[]);
@@ -1742,7 +1755,7 @@ function peerRow(p){
       return '<tr><td>'+esc(dm.display_name||dm.friendly)+'</td>'
         +'<td class="num">'+gb(dm.size_gb)+'</td><td>'+stat+'</td>'
         +'<td><button class="btn sm" title="Copy this model\'s weights from '+esc(p.name||p.host)+' to THIS controller (resumes if interrupted; skips files already present)"'
-        +' onclick="pullModel(this,'+JSON.stringify(p.host)+','+p.http_port+','+JSON.stringify(dm.friendly||dm.target)+')">Pull</button></td></tr>';
+        +' onclick="pullModel(this,'+A(p.host)+','+p.http_port+','+A(dm.friendly||dm.target)+')">Pull</button></td></tr>';
     }).join('') : '<tr><td colspan="4" class="note">no models on disk</td></tr>';
   const nrows = nodes.length ? nodes.map(n =>
       '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
@@ -1764,10 +1777,10 @@ function peerRow(p){
     // #master: fleet handoff — direction depends on who holds the nodes. If WE hold the fleet,
     // offer to give it to this peer; if THIS PEER holds it, offer to pull it here.
     +(((SELF.nodes||0)>0 && p.state==='ok')
-       ? '<button class="btn sm" onclick="handoffFleet('+JSON.stringify(p.host)+','+JSON.stringify(p.name||p.host)+')" title="Hand this controller\'s entire fleet (all nodes + loaded shards) to '+esc(p.name||p.host)+', no reload.">⇄ Give fleet</button>' : '')
+       ? '<button class="btn sm" onclick="handoffFleet('+A(p.host)+','+A(p.name||p.host)+')" title="Hand this controller\'s entire fleet (all nodes + loaded shards) to '+esc(p.name||p.host)+', no reload.">⇄ Give fleet</button>' : '')
     +(((p.nodes||[]).length>0 && (SELF.nodes||0)===0 && p.state==='ok')
-       ? '<button class="btn sm" onclick="reclaimFleet('+JSON.stringify(p.host)+','+JSON.stringify(p.name||p.host)+')" title="Pull '+esc(p.name||p.host)+'\'s entire fleet here, no reload.">⇐ Take fleet</button>' : '')
-    +'<button class="btn sm danger" onclick="rmPeer('+JSON.stringify(p.host)+','+p.http_port+')">Forget</button>'
+       ? '<button class="btn sm" onclick="reclaimFleet('+A(p.host)+','+A(p.name||p.host)+')" title="Pull '+esc(p.name||p.host)+'\'s entire fleet here, no reload.">⇐ Take fleet</button>' : '')
+    +'<button class="btn sm danger" onclick="rmPeer('+A(p.host)+','+p.http_port+')">Forget</button>'
     +'</div>'
     +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
     +'<div class="tbls">'
@@ -1796,7 +1809,7 @@ async function refresh(force){
       let h='';
       if((s.nodes||0)>0 && master){
         // We hold the fleet but a peer is the designated master → hand it back in one click.
-        h='<button class="btn pri" onclick="handoffFleet('+JSON.stringify(master.host)+','+JSON.stringify(master.name||master.host)+')" '
+        h='<button class="btn pri" onclick="handoffFleet('+A(master.host)+','+A(master.name||master.host)+')" '
          +'title="Move every node (and its loaded shards) back to the master controller with no reload (~seconds). Use after a failover to restore normal ownership.">↩ Restore fleet to master ('+esc(master.name||master.host)+')</button>';
       } else if(s.master && (s.nodes||0)>0){
         h='<span class="note">★ This is the master and currently holds the fleet.</span>';
@@ -1804,7 +1817,7 @@ async function refresh(force){
         // We ARE master but hold nothing → offer to TAKE it from whichever peer holds the fleet.
         const owner = ps.find(p=>(p.nodes||[]).length>0 && p.state==='ok');
         h = owner
-          ? '<button class="btn pri" onclick="reclaimFleet('+JSON.stringify(owner.host)+','+JSON.stringify(owner.name||owner.host)+')" '
+          ? '<button class="btn pri" onclick="reclaimFleet('+A(owner.host)+','+A(owner.name||owner.host)+')" '
             +'title="Pull every node from the controller that currently holds the fleet back to here, with no reload.">⇐ Take the fleet from '+esc(owner.name||owner.host)+'</button>'
           : '<span class="note">★ This is the master; no peer is holding the fleet.</span>';
       }
@@ -1838,14 +1851,22 @@ async function rmPeer(host, port){
   await fetch('/peer_remove?host='+encodeURIComponent(host)+'&port='+port, {method:'POST'});
   refresh(false);
 }
+// In-page confirm (browser confirm() gets auto-suppressed after repeated dialogs, silently
+// cancelling — a fleet handoff must never depend on that). Survives the 5s peers refresh because
+// the modal is a stable element outside #peers.
+let _cAnswer=null;
+function askConfirm(msg){ return new Promise(res=>{ _cAnswer=res;
+  document.getElementById('cmsg').textContent=msg; document.getElementById('cov').style.display='flex'; }); }
+function cAnswer(ok){ document.getElementById('cov').style.display='none'; const f=_cAnswer; _cAnswer=null; if(f)f(ok); }
 // #master: hand THIS controller's whole fleet to a peer (node=* handoff — no reload).
 async function handoffFleet(host, name){
-  if(!confirm('Hand the ENTIRE fleet to '+name+'?\n\nEvery node and its loaded shards move to '+name
+  if(!await askConfirm('Hand the ENTIRE fleet to '+name+'?\n\nEvery node and its loaded shards move to '+name
     +' with no reload (~seconds). This controller keeps serving those models via federation afterward.'))return;
   try{
     const r = await fetch('/peer_handoff?node=*&to='+encodeURIComponent(host), {method:'POST'});
     const j = await r.json();
     if(j.ok) alert('Handed '+((j.nodes||[]).length)+' node(s) to '+name
+      +((j.skipped_colocated&&j.skipped_colocated.length)?'\n(kept this box\'s own worker: '+j.skipped_colocated.join(', ')+')':'')
       +((j.models_moved&&j.models_moved.length)?'\nmoved with no reload: '+j.models_moved.join(', '):''));
     else alert('handoff failed: '+(j.error||'unknown'));
   }catch(e){ alert('handoff failed: '+(e.message||e)); }
@@ -1853,7 +1874,7 @@ async function handoffFleet(host, name){
 }
 // #master: pull a peer's whole fleet HERE (the mirror — used when you're on the receiving controller).
 async function reclaimFleet(host, name){
-  if(!confirm('Take the ENTIRE fleet from '+name+' to this controller?\n\nEvery node moves here with no reload.'))return;
+  if(!await askConfirm('Take the ENTIRE fleet from '+name+' to this controller?\n\nEvery node moves here with no reload.'))return;
   try{
     const r = await fetch('/reclaim_fleet?host='+encodeURIComponent(host), {method:'POST'});
     const j = await r.json();
@@ -1911,13 +1932,13 @@ function nodeRow(n){
     act   = '<span class="note">not plannable here</span>';
   }else if(n.mine){
     owner = '<span style="color:var(--good)">in use by this controller</span>';
-    act   = '<button class="btn sm" onclick="lend('+JSON.stringify(n.hostname)+')">Lend</button>';
+    act   = '<button class="btn sm" onclick="lend('+A(n.hostname)+')">Lend</button>';
   }else if(n.lent){
     owner = '<span class="note">lent (disabled here)</span>';
-    act   = '<button class="btn sm" onclick="reclaim('+JSON.stringify(n.hostname)+')">Reclaim</button>';
+    act   = '<button class="btn sm" onclick="reclaim('+A(n.hostname)+')">Reclaim</button>';
   }else{
     owner = '<span class="note">free</span>';
-    act   = '<button class="btn sm" onclick="lend('+JSON.stringify(n.hostname)+')">Lend</button>';
+    act   = '<button class="btn sm" onclick="lend('+A(n.hostname)+')">Lend</button>';
   }
   return '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
     +'<td class="num">'+gb(n.vram_total_gb)+'</td><td>'+owner+'</td>'
