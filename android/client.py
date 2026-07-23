@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.2-m4c189"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.1"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -141,7 +141,7 @@ def _selected_names(all_names, start: int, end: int, has_embed: bool,
 # clone, so a plain import is safe.
 from wire import (_pack_tensor, _unpack_tensor, _set_keepalive, _tp_hetsplit,   # noqa: F401
                   install_log_tee, drain_new_logs, _fuse_moe_experts,
-                  load_config, repo_raw_url)
+                  load_config, repo_raw_url, discover_controller)
 
 # #wire-caps + #ntensor-manifest: manifest-frame helpers + capability constants (canonical home:
 # wire.py, shared with the controller). GUARDED so a per-file self-update convergence window
@@ -542,7 +542,8 @@ from worker_quant import (_quantize_int4_, _quantize_int8_, _quantize_experts4_,
                           _quantize_experts4_streamed_nonfused, _quant4_linear_cls,
                           _packed4_3d_cls, _INT4_GROUP, _install_fused_moe_forward,
                           _w4a16_triton_op, _w4a16_moe_op, _pack4_expert,
-                          _pack4_3d)   # noqa: E402,F401
+                          _pack4_3d, _quantize_int2_, _quantize_linear2,
+                          _quant2_linear_cls, _INT2_GROUP)   # noqa: E402,F401
 # Inc 10 NOTE: the quant FLAGS (_CPU_FP32_GEMM, _CPU_FP32_MIN_ROWS, _CPU_BF16_GEMM_OK,
 # _FUSED_INT4) are deliberately NOT back-imported — they are rebound at runtime inside
 # worker_quant (tune_cpu_threads / --no-cpu-fp32) and a from-import would freeze a stale
@@ -688,10 +689,13 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         # weight-only quant (before device placement, so we move quantized weights not bf16).
         # int8: ~1/2 footprint, head quantized too. int4: ~1/4 footprint, head LEFT bf16
         # (logits are quant-sensitive; the head is one matrix so the memory cost is small).
+        # int2 (#int2): ~1/6 footprint (2-bit, group 64), head LEFT bf16 like int4; DENSE only
+        # (the /load route downgrades int2-on-MoE to int4 — no 2-bit expert packer).
         self.quant = quant
         self.kv_quant = kv_quant   # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4); read in shard_forward
-        if quant in ("int8", "int4"):
-            qlayer = _quantize_int4_ if quant == "int4" else _quantize_int8_
+        if quant in ("int8", "int4", "int2"):
+            qlayer = (_quantize_int4_ if quant == "int4"
+                      else _quantize_int2_ if quant == "int2" else _quantize_int8_)
             for lyr in self.owned_layers:
                 qlayer(lyr)
                 if quant == "int4":
@@ -820,7 +824,10 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py",
                                  "state.py", "shard_build.py", "shard_forward.py",
                                  "worker_load.py", "worker_net.py",   # config + shared packer
                                  "kv_quant.py",   # TurboQuant KV-cache quantizer (#172)
-                                 "worker_quant.py"]   # code-split Inc 10: quant/kernel family
+                                 "worker_quant.py",   # code-split Inc 10: quant/kernel family
+                                 "worker_t2i.py",   # #t2i-serve: diffusion image engine (lazy import)
+                                 "worker_tts.py",   # #tts-serve: Kokoro speech engine (lazy import)
+                                 "worker_t2a.py"]   # #t2a-serve: ACE-Step music engine (lazy import)
 # (#distributed-packing) synced like a module — shards.pack_unit_tensors is the shared packer the
 # remote-pack handler calls, so a worker-packed cache unit is bit-identical to a controller-compiled one.
 
@@ -858,6 +865,16 @@ class Worker(WorkerLoadMixin, WorkerNetMixin):
         self.next_peer: dict[str, str] = {}                      # model_id -> next-hop label (bandwidth)
         self._next_last_send: dict[str, float] = {}              # #stage0-stale-reconnect: model_id -> last forward ts
         self.assignments: dict[str, dict] = {}                   # model_id -> load msg (debug/reload)
+        # #multi-controller: model_id -> the controller ("host:port") that loaded it. Lets
+        # inventory() report only the asking controller's shards and lets a full-teardown unload be
+        # scoped to one tenant — without this a second controller adopts, or after the 90s adopt
+        # grace FREES, the first controller's live models. None/absent = unowned = anyone may claim
+        # (back-compat: pre-existing and adopted shards).
+        self.shard_owner: dict[str, str] = {}
+        # #handoff: (host, port) of a controller this node is being transferred to. Set by
+        # handle_handoff; run()'s reconnect loop re-targets to it and clears it. Shards are KEPT
+        # (ownership already reassigned) so the new controller adopts them without a re-stream.
+        self._handoff = None
         self._weight_tmps: dict[str, str] = {}                   # model_id -> temp file backing its mmap
         self.data_server: asyncio.AbstractServer | None = None   # shared data port; bound on first load
         self._tp = None              # _TPAllReduce when a load is tensor-parallel (single TP model)
@@ -883,6 +900,9 @@ class Worker(WorkerLoadMixin, WorkerNetMixin):
         # plain await is safe — no cross-thread queue needed.
         self._ctrl_send = None       # Optional[Callable[[dict], Awaitable[None]]]
         self._node_id: str = ""      # our registered node id (stamped onto the hop_error frame)
+        # #adopt: True once a register-ack advertised adoption — this controller re-adopts kept
+        # shards, so the session teardown KEEPS loaded models across a controller-only restart.
+        self._ctrl_adopts: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +965,15 @@ async def _heartbeat_loop(writer: asyncio.StreamWriter, lock: asyncio.Lock,
             used, total = _gpu_mem_gb()
             hb["vram_used_gb"] = round(used, 2)
             hb["vram_total_gb"] = round(total, 2)
+            # #vram-reusable: this process's VACANT torch allocator pool (reserved - allocated).
+            # Device counters report it as USED, but any new torch allocation in THIS worker
+            # reuses it first — the planner credits it back as free (it only returns to the OS
+            # on a worker restart; on ROCm it can reach many GB after model churn).
+            with contextlib.suppress(Exception):
+                import torch
+                hb["vram_reusable_gb"] = round(sum(
+                    max(0, torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i))
+                    for i in range(torch.cuda.device_count())) / GB, 2)
             with contextlib.suppress(Exception):   # GPU compute utilization % (#46; needs pynvml)
                 import torch
                 hb["gpu_util"] = float(torch.cuda.utilization(0))
@@ -998,6 +1027,15 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
     _enable_keepalive(writer)
     wlock = asyncio.Lock()
     try:
+        # #adopt: refresh the dynamic loaded-model inventory on EVERY (re)connect — a freshly
+        # restarted controller uses it to re-ADOPT the models this worker kept across the
+        # restart (old controllers just ignore the extra field).
+        # #multi-controller: this session's tenant id. inventory() is filtered by it so we NEVER
+        # hand a controller another controller's shards (which it would adopt, or free after the
+        # 90s adopt grace). One controller => every shard is ours => byte-identical behaviour.
+        tenant = f"{args.controller}:{args.control_port}"
+        with contextlib.suppress(Exception):
+            reg["loaded"] = worker.inventory(tenant)
         async with wlock:
             writer.write(_enc(reg))
             await writer.drain()
@@ -1008,6 +1046,14 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
         if ack.get("type") != "registered":
             raise ConnectionError(f"unexpected ack: {ack}")
         node_id = ack["node_id"]
+        # #adopt: does THIS controller re-adopt kept shards? Governs the session-teardown
+        # choice below (keep vs drop). If we are holding shards kept for adoption but the
+        # controller that came back CAN'T adopt (older code / rollback), drop them now —
+        # it doesn't know about them, and they'd pin RAM/VRAM invisibly forever.
+        worker._ctrl_adopts = bool(ack.get("adopt"))
+        if not worker._ctrl_adopts and worker.shards:
+            print(f"[adopt] controller lacks adoption — dropping {len(worker.shards)} kept model(s)")
+            await worker.handle_unload(None, tenant)
         on_connected()  # registration succeeded -> reset reconnect backoff
         print(f"[+] registered as {node_id} on {args.controller}:{args.control_port} "
               f"(server {ack.get('server_version', '?')})")
@@ -1034,13 +1080,16 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                 mtype = msg.get("type")
                 if mtype == "load":
                     try:
-                        info = await worker.handle_load(msg)
+                        info = await worker.handle_load(msg, tenant)
                         # #1: echo model_id so the controller resolves THIS model's load future
                         # (a single shared future cross-resolved on a co-loaded node).
                         await reply({"type": "ready", "node_id": node_id,
                                      "model_id": msg.get("model_id"), **info})
                         if msg.get("kind") == "embedding":   # no layer range — whole encoder on one node
                             print(f"[load] embedding {msg.get('model_id')} "
+                                  f"({info['loaded_bytes']/GB:.2f} GB)")
+                        elif msg.get("kind") == "t2i":       # no layer range — whole pipeline on this node
+                            print(f"[load] t2i {msg.get('model_id')} "
                                   f"({info['loaded_bytes']/GB:.2f} GB)")
                         else:
                             print(f"[load] stage {msg.get('stage')} "
@@ -1060,8 +1109,25 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                         await reply({"type": "error", "node_id": node_id,
                                      "req_id": msg.get("req_id"), "error": repr(exc)})
                         print(f"[pack] FAILED: {exc!r}")
+                elif mtype == "t2i_gen":
+                    # #t2i-serve: renders take minutes — dispatch as a task so this loop keeps
+                    # serving unload/ping; the handler replies keyed by req_id when done.
+                    asyncio.create_task(worker.handle_t2i_gen(msg, reply))
+                elif mtype == "tts_gen":
+                    # #tts-serve: speech synthesis (esp. on CPU) takes many seconds — dispatch
+                    # as a task so this loop keeps serving; handler replies keyed by req_id.
+                    asyncio.create_task(worker.handle_tts_gen(msg, reply))
+                elif mtype == "t2a_gen":
+                    # #t2a-serve: a music render takes many seconds — dispatch as a task so this
+                    # loop keeps serving unload/ping; handler replies keyed by req_id.
+                    asyncio.create_task(worker.handle_t2a_gen(msg, reply))
                 elif mtype == "unload":
-                    await worker.handle_unload(msg.get("model_id"))
+                    await worker.handle_unload(msg.get("model_id"), tenant)
+                elif mtype == "handoff":        # #handoff: move this node to another controller
+                    res = await worker.handle_handoff(msg, tenant)
+                    await reply({"type": "handoff_result", "node_id": node_id, **res})
+                    if res.get("ok"):
+                        return          # end the session; run() reconnects to the new controller
                     await reply({"type": "unloaded", "node_id": node_id,
                                  "model_id": msg.get("model_id")})
                     print(f"[unload] stage torn down (model_id={msg.get('model_id')})")
@@ -1073,19 +1139,31 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     # the box is left clean. Safe here — a forced update unloads all models first, so
                     # nothing is mmap-resident to evict. (#forced-update)
                     with contextlib.suppress(Exception):
-                        await worker.handle_unload(None)   # drop ALL shards if any remain
+                        await worker.handle_unload(None, tenant)   # drop OUR shards if any remain
                     freed = await asyncio.to_thread(_flush_os_cache)
                     with contextlib.suppress(Exception):
                         await reply({"type": "freed", "node_id": node_id, "free_gb": round(freed, 2)})
                     print(f"[free] controller requested RAM release -> {freed:.1f} GB free")
+                elif mtype == "self_update":
+                    # #fleet-update: forced fleet-wide deploy — run the self-update check NOW
+                    # (apply changed files; restart only on a VERSION bump, the same rule as
+                    # the idle poll). The controller sends this right after unloading models +
+                    # free_memory, so forcing the idle gate true is safe here.
+                    print("[update] controller requested an immediate self-update check")
+                    asyncio.create_task(asyncio.to_thread(
+                        _self_update_check, "client.py", (lambda: True)))
                 elif mtype == "restart":
-                    # Controller commanded a full-fleet restart (e.g. to abort a wedged load or
-                    # force a fresh deploy). Ack, then exit(42) so the supervisor (client.bat /
-                    # systemd Restart=always) relaunches on the current code — drops any resident
-                    # shard cleanly on relaunch. (#fleet-restart)
+                    # Controller commanded a restart (fleet restart / forced deploy). Ack, then
+                    # exit(42) so the supervisor (client.bat / systemd Restart=always) relaunches
+                    # — dropping any resident shard cleanly. (#fleet-restart) With update:true
+                    # (#fleet-update), stage the newest files FIRST so the relaunch comes back on
+                    # fresh code immediately instead of waiting on the 15-min poll.
                     print("[restart] controller requested restart - exiting(42) for supervisor relaunch")
                     with contextlib.suppress(Exception):
                         await reply({"type": "restarting", "node_id": node_id})
+                    if msg.get("update"):
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(_self_update_check, "client.py", (lambda: True))
                     os._exit(42)
 
         hb = asyncio.create_task(
@@ -1103,7 +1181,21 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                 raise exc  # surfaces heartbeat-send failure -> reconnect
     finally:
         worker._ctrl_send = None   # #hop-recovery: drop the dead session's control sender
-        await worker.handle_unload()
+        # #adopt: if the controller advertises adoption, KEEP the loaded shards across the
+        # link loss — a controller-only restart re-adopts them on reconnect (no re-stream).
+        # Per-request transients still flush: staged multimodal embeds must not leak into a
+        # fresh controller epoch (req_id restarts from 0). Every other teardown reason —
+        # old controller, worker-side exit — keeps the full unload exactly as before.
+        if getattr(worker, "_handoff", None) and worker.shards:
+            # #handoff: never unload here — the shards are the whole point of the transfer.
+            worker.pending_mm.clear()
+            print(f"[handoff] keeping {len(worker.shards)} loaded model(s) for the new controller")
+        elif getattr(worker, "_ctrl_adopts", False) and worker.shards:
+            worker.pending_mm.clear()
+            print(f"[adopt] control link lost — keeping {len(worker.shards)} loaded model(s) "
+                  "for controller re-adoption")
+        else:
+            await worker.handle_unload(None, tenant)
         with contextlib.suppress(Exception):
             writer.close()
             await writer.wait_closed()
@@ -1120,7 +1212,111 @@ def _hr(bps: float) -> str:
 
 # code-split Inc 8: _fwd_watchdog_loop + _console_panel_loop live in worker_update.py now (VERBATIM).
 
+def _controller_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
+    """Can we open the control-plane TCP port right now? Used ONLY to decide whether to fall back
+    to #discovery at FIRST start — never in the reconnect loop, so a controller restart can't make
+    a worker wander off to a different fleet mid-life."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+DISCOVERY_RETRY_S = 30.0    # #discovery: wait between broadcast attempts when nobody has answered
+# #failover: how long our controller must be UNREACHABLE before we go looking for another one.
+# Deliberately far longer than any planned outage — a hitless controller restart is ~20 s and a
+# forced /update + restart well under a minute — because the cost of being wrong is a worker
+# wandering off mid-deploy and taking its shards with it. Below this we behave exactly as before:
+# retry the SAME controller forever. `failover_after_s: 0` in config.json disables it entirely.
+FAILOVER_AFTER_S = 180.0
+
+
+async def _failover_probe(args, worker) -> bool:
+    """Our controller has been gone a long time — is a DIFFERENT one out there? Re-target if so.
+
+    Returns True if we re-homed. The shards stay resident: they are re-owned (worker_load.
+    reassign_orphans) so the new controller's tenant-scoped inventory reports them and it ADOPTS
+    them, exactly as it would after a hitless restart. That is the whole feature — a controller can
+    die and the models it had loaded keep running under the survivor, with no reload.
+
+    Deliberately conservative: any answer from our CURRENT controller means it is back and we simply
+    keep waiting for it, and a probe that finds nobody changes nothing."""
+    want = str(getattr(args, "cluster_id", "") or "")
+    timeout = float(getattr(args, "discovery_timeout", 2.5))
+    try:
+        got = await asyncio.to_thread(discover_controller, want, 0, timeout, True)
+    except Exception as exc:   # noqa: BLE001 — a failed probe must never break the reconnect loop
+        print(f"[failover] discovery probe failed ({exc!r})", flush=True)
+        return False
+    if not got:
+        return False
+    new_host, new_port = str(got["host"]), int(got["control_port"])
+    if (new_host, new_port) == (str(args.controller), int(args.control_port)):
+        return False                      # our own controller answered — it is coming back
+    old_tenant = f"{args.controller}:{args.control_port}"
+    print(f"[failover] controller {old_tenant} has been unreachable for "
+          f"{FAILOVER_AFTER_S:.0f}s; {got.get('name') or new_host} answered — moving there",
+          flush=True)
+    with contextlib.suppress(Exception):
+        worker.reassign_orphans(old_tenant, f"{new_host}:{new_port}")
+    args.controller, args.control_port = new_host, new_port
+    return True
+
+
+async def _resolve_controller(args: argparse.Namespace) -> None:
+    """#discovery: settle args.controller/control_port BEFORE the first connect.
+
+      controller_host "auto"/"discover"/""  -> broadcast-discover, RETRYING FOREVER
+      a static host that is UNREACHABLE     -> discover ONCE as a rescue, then use what answers
+
+    Discovery never gives up and never exits: a worker powered on before its controller (or during
+    a controller restart) must simply keep asking and join the moment someone answers — that is what
+    makes "clone, install deps, run" true even when the boxes boot in an arbitrary order. Every
+    failed round prints an explicit NOT-CONNECTED line naming the reason, so a silent worker is
+    never mistaken for a connected one.
+
+    Any worker that can hear the broadcast is allowed to join — discovery is deliberately permissive
+    (cluster_id defaults to unset = join whoever answers). Explicit --controller still wins whenever
+    it is reachable, and static addressing remains the path for anything broadcast can't cross
+    (subnets, VLANs, VPN)."""
+    host = str(getattr(args, "controller", "") or "").strip()
+    want = str(getattr(args, "cluster_id", "") or "")
+    auto = host.lower() in ("auto", "discover", "")
+    timeout = float(getattr(args, "discovery_timeout", 2.5))
+    if not auto and _controller_reachable(host, args.control_port):
+        return
+    if not auto:
+        # Static host configured but not answering: try discovery ONCE as a rescue, then fall
+        # through to the normal reconnect loop (which already retries the static address).
+        print(f"[discovery] controller {host}:{args.control_port} unreachable — "
+              f"falling back to broadcast discovery", flush=True)
+        got = await asyncio.to_thread(discover_controller, want, 0, timeout, True)
+        if got:
+            args.controller, args.control_port = got["host"], int(got["control_port"])
+            return
+        print(f"[discovery] nothing answered either; continuing with {host}:{args.control_port} "
+              f"(the reconnect loop will keep retrying)", flush=True)
+        return
+    attempt = 0
+    while True:
+        attempt += 1
+        got = await asyncio.to_thread(discover_controller, want, 0, timeout, True)
+        if got:
+            args.controller, args.control_port = got["host"], int(got["control_port"])
+            print(f"[discovery] connected: controller {args.controller}:{args.control_port}"
+                  + (f" ({got['name']})" if got.get("name") else ""), flush=True)
+            return
+        print(f"[discovery] NOT CONNECTED — no controller has replied to our broadcast yet "
+              f"(attempt {attempt}); retrying in {DISCOVERY_RETRY_S:.0f}s. "
+              f"Is the controller running on this LAN? Broadcast does not cross subnets/VLANs/VPN "
+              f"— for those use: --controller <ip>", flush=True)
+        await asyncio.sleep(DISCOVERY_RETRY_S)
+
+
 async def run(args: argparse.Namespace) -> None:
+    await _resolve_controller(args)   # #discovery: may rewrite args.controller/control_port
     reg = build_registration(args)
     # Pick + announce the LAN route BEFORE connecting: the chosen IP becomes our
     # control-connection source, hence the address the controller records and sends
@@ -1155,8 +1351,12 @@ async def run(args: argparse.Namespace) -> None:
     # something is loaded — download, apply, restart). The ONLY guard is a build IN PROGRESS: restarting
     # mid-stream wedges the load (and a build isn't "loaded" yet). A resident/serving shard no longer
     # blocks the swap — the restart drops in-flight gens (recoverable; the controller re-streams).
+    # #t2i: a live image render ALSO blocks the swap — unlike a text gen (recoverable: the
+    # controller re-streams), a restart throws away a multi-minute render outright.
     asyncio.create_task(_self_update_loop(
-        "client.py", lambda: not worker._building))
+        "client.py", lambda: not worker._building and not any(
+            getattr(s, "kind", "") == "t2i" and getattr(s, "_gen_lock", None) is not None
+            and s._gen_lock.locked() for s in list(worker.shards.values()))))
     asyncio.create_task(mem_maintenance_loop(worker, reg.get("hostname") or args.name or "worker"))
     print(f"InfiniteModel worker {VERSION} - {reg['hostname']} "
           f"({reg['device']}) device-mode={args.device}")
@@ -1176,12 +1376,27 @@ async def run(args: argparse.Namespace) -> None:
     else:
         print(f"[net] no LAN interface matched the controller subnet — letting the OS "
               f"pick the route (default source {route['os_default'] or '?'})")
-    state = {"backoff": 1.0}
+    state = {"backoff": 1.0, "down_since": 0.0}
+    # #failover: 0 (or a negative) disables re-homing entirely — this worker then belongs to its
+    # controller for life, which is the right setting for a node deliberately pinned to one fleet.
+    try:
+        _failover_after = float(load_config().get("failover_after_s", FAILOVER_AFTER_S))
+    except (TypeError, ValueError):
+        _failover_after = FAILOVER_AFTER_S
 
     def on_connected() -> None:
         state["backoff"] = 1.0  # a good connection resets the backoff
+        state["down_since"] = 0.0   # #failover: we are healthy again; restart the outage clock
 
     while True:
+        # #handoff: a controller moved this node to a peer — dial the new one from now on.
+        _ho = getattr(worker, "_handoff", None)
+        if _ho:
+            worker._handoff = None
+            args.controller, args.control_port = _ho[0], int(_ho[1])
+            reg["loaded"] = []          # refreshed from the tenant-scoped inventory on register
+            print(f"[handoff] re-targeting to controller {args.controller}:{args.control_port}")
+            state["backoff"] = 1.0
         try:
             await session(args, reg, worker, on_connected)
         except (ConnectionRefusedError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
@@ -1190,6 +1405,18 @@ async def run(args: argparse.Namespace) -> None:
             print(f"[!] connection lost ({exc!r})")
         else:
             print("[!] disconnected by controller")
+        # #failover: start (or continue) the outage clock. Once our controller has been gone longer
+        # than the threshold, probe for another one on EVERY cycle — the survivor may itself take a
+        # while to start answering broadcasts (a standby responder only speaks once it sees its peer
+        # go stale), so one probe at the threshold is not enough.
+        if not state["down_since"]:
+            state["down_since"] = time.time()
+        if _failover_after > 0 and (time.time() - state["down_since"]) >= _failover_after:
+            if await _failover_probe(args, worker):
+                reg["loaded"] = []          # refreshed from the tenant-scoped inventory on register
+                state["backoff"] = 1.0
+                state["down_since"] = time.time()   # give the NEW controller its own clock
+                continue
         # exponential backoff (cap 30s) + jitter so all nodes don't stampede the
         # controller at once when it comes back up
         delay = state["backoff"] + random.uniform(0, min(state["backoff"], 3.0))
@@ -1238,8 +1465,15 @@ def run_self_test_load(model_id: str, attn: str = "eager", quant: str = "none",
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="InfiniteModel worker client.")
     p.add_argument("--controller", default=load_config()["controller_host"],
-                   help="controller host/IP (default from config.json)")
+                   help="controller host/IP, or 'auto' to find it by UDP broadcast "
+                        "(default from config.json; an unreachable static host auto-discovers)")
     p.add_argument("--control-port", type=int, default=load_config()["control_port"])
+    # #discovery: pin this worker to ONE fleet when several controllers share a LAN. Empty =
+    # join whoever answers (the zero-config path).
+    p.add_argument("--cluster-id", default=load_config().get("cluster_id", ""),
+                   help="only join a controller advertising this cluster_id (default: any)")
+    p.add_argument("--discovery-timeout", type=float, default=2.5,
+                   help="seconds to wait for a controller to answer a discovery broadcast")
     p.add_argument("--data-port", type=int, default=50200,
                    help="local data-plane port for inter-stage tensors (default 50200)")
     p.add_argument("--os-reserve-gb", type=float, default=2.0,
@@ -1267,11 +1501,13 @@ def parse_args() -> argparse.Namespace:
                         "and shapes — so it adapts automatically. 'eager': plain additive-"
                         "mask matmul, bit-exact and reproducible (for correctness checks) "
                         "but slower; pick it only when you need deterministic logits.")
-    p.add_argument("--quant", default="none", choices=["none", "int8", "int4"],
+    p.add_argument("--quant", default="none", choices=["none", "int8", "int4", "int2"],
                    help="weight quantization: 'none' (bf16, default), 'int8' "
-                        "(per-channel weight-only — halves the footprint), or 'int4' "
+                        "(per-channel weight-only — halves the footprint), 'int4' "
                         "(group-wise ~4.25-bit weight-only — ~1/4 footprint, for 200B+ "
-                        "MoEs that won't fit at int8; small decode-speed cost). The "
+                        "MoEs that won't fit at int8; small decode-speed cost), or 'int2' "
+                        "(group-wise ~2.5-bit weight-only — ~1/6 footprint, dense models "
+                        "only; a CAPACITY tier with visible quality loss). The "
                         "per-model quant in the controller's load message overrides this.")
     p.add_argument("--clean", action="store_true",
                    help="OPT-IN: purge cached models/chunks on startup. OFF by "

@@ -17,7 +17,7 @@ from typing import Optional
 import json
 import os
 
-from shards import (INT4_GROUP, _dequant_fp8_to_bf16, _dequant_nvfp4_to_bf16, _fp8_block_size, _fp8_scale_name, _has_moe_experts, _head_key, _is_fp8_meta_name, _model_num_layers, _nvfp4_global_scale_name, _nvfp4_group_size, _nvfp4_scale_name, _skeleton_from_cfg, _text_prefix, _weight_map, build_skeleton_from_config)   # noqa: F401  (shared helpers STAY in shards)
+from shards import (INT4_GROUP, INT2_GROUP, _dequant_fp8_to_bf16, _dequant_nvfp4_to_bf16, _fp8_block_size, _fp8_scale_name, _has_moe_experts, _head_key, _is_fp8_meta_name, _model_num_layers, _nvfp4_global_scale_name, _nvfp4_group_size, _nvfp4_scale_name, _skeleton_from_cfg, _text_prefix, _weight_map, build_skeleton_from_config)   # noqa: F401  (shared helpers STAY in shards)
 from wire import (_fuse_moe_experts)   # noqa: F401
 
 # #distributed-packing Inc 4: a packer-identity tag stamped into the manifest so a load REJECTS a
@@ -26,10 +26,49 @@ from wire import (_fuse_moe_experts)   # noqa: F401
 # the pack MATH changes (not for comments/refactors). A manifest WITHOUT packer_hash is legacy and is
 # grandfathered (accepted) so existing caches keep working.
 PACKER_VERSION = 1
+# int2 has its OWN version line (#38): v2 = the GPTQ-calibrated packer (gptq_pack.py). Every v1
+# int2 cache is plain-RTN token salad — the tag bump makes verify_shard_cache fail it with
+# "packer_hash mismatch — recompile", which is exactly the auto-invalidation we want, WITHOUT
+# touching the int4/int8 v1 caches (their pack math is unchanged).
+INT2_PACKER_VERSION = 2
 
 
 def _packer_tag(quant: str, group_size: int) -> str:
+    if quant == "int2":
+        return f"v{INT2_PACKER_VERSION}-g{group_size}-int2-gptq"
     return f"v{PACKER_VERSION}-g{group_size}-{quant}"
+
+
+def _default_group(quant: str, group_size: int) -> int:
+    """Per-tier default group size: callers that pass the int4 default (or nothing) get the right
+    group for the tier — int2 packs at INT2_GROUP (64), everything else keeps what was asked."""
+    if quant == "int2" and group_size == INT4_GROUP:
+        return INT2_GROUP
+    return group_size
+
+
+def pack_linear_int2(W, group_size: int = INT2_GROUP):
+    """Group-wise asymmetric int2 pack of one Linear weight — the SHARED packer for the shard cache.
+    Returns (qweight uint8 [out, in_pad//4], scale, zero, in_features). MUST stay BIT-IDENTICAL to
+    worker_quant.py `_quantize_linear2` (same min/max/scale/zero/round/clamp/crumb-order: LOWEST
+    2 bits = lowest input column) so a cached shard loads exactly as a freshly-quantized one."""
+    import torch
+    import torch.nn.functional as F
+    out, in_f = W.shape
+    G = group_size
+    ng = (in_f + G - 1) // G
+    in_pad = ng * G
+    Wp = F.pad(W, (0, in_pad - in_f)) if in_pad != in_f else W
+    Wg = Wp.reshape(out, ng, G).float()
+    wmin = Wg.amin(dim=2)
+    wmax = Wg.amax(dim=2)
+    scale = ((wmax - wmin) / 3.0).clamp(min=1e-8)                  # [out, ng]
+    zero = torch.round(-wmin / scale).clamp(0, 3)                  # [out, ng]
+    q = torch.round(Wg / scale.unsqueeze(2) + zero.unsqueeze(2)).clamp(0, 3).to(torch.uint8)
+    q = q.reshape(out, in_pad)
+    qpacked = (q[:, 0::4] | (q[:, 1::4] << 2)
+               | (q[:, 2::4] << 4) | (q[:, 3::4] << 6)).contiguous()   # [out, in_pad//4]
+    return qpacked, scale.to(W.dtype), zero.to(W.dtype), in_f
 
 
 def pack_linear_int4(W, group_size: int = INT4_GROUP):
@@ -96,8 +135,10 @@ def pack_unit_tensors(raw: dict, lin2d, exp3d, skel, quant: str = "int4",
     BIT-IDENTICAL to a locally-packed one BY CONSTRUCTION (same fuse + same pack), exactly like
     `_fuse_moe_experts` is shared. Pure: no I/O, no globals. `skel` (the meta model) drives per-expert
     MoE fusion (None -> no fuse); `lin2d`/`exp3d` are the exact quant scope from `_quant_scope` (None
-    -> name-heuristic fallback, fine for dense arches). int4 packs layer Linears + 3D experts; int8
-    packs layer Linears + lm_head; everything else (norms/embed/biases/router) passes through bf16."""
+    -> name-heuristic fallback, fine for dense arches). int4 packs layer Linears + 3D experts; int2
+    packs layer Linears only (dense tier — no 2-bit expert packer); int8 packs layer Linears +
+    lm_head; everything else (norms/embed/biases/router) passes through bf16."""
+    group_size = _default_group(quant, group_size)   # int2 packs at INT2_GROUP unless overridden
     if skel is not None:
         raw = _fuse_moe_experts(raw, skel)
     out_sd: dict = {}
@@ -126,8 +167,9 @@ def pack_unit_tensors(raw: dict, lin2d, exp3d, skel, quant: str = "int4",
                                   "in_features": in_f, "ng": ng, "group_size": group_size,
                                   "shape": [int(x) for x in W.shape]}
         elif is_layer_lin or is_int8_head:
-            if quant == "int4":
-                qw, sc, ze, in_f = pack_linear_int4(W, group_size)
+            if quant in ("int4", "int2"):
+                _pk = pack_linear_int4 if quant == "int4" else pack_linear_int2
+                qw, sc, ze, in_f = _pk(W, group_size)
                 out_sd[out_name + ".qweight"] = qw
                 out_sd[out_name + ".scale"] = sc
                 out_sd[out_name + ".zero"] = ze
@@ -215,7 +257,8 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     """Quantize a model to a pre-compiled shard cache at _shards/<quant>/ (per-layer safetensors of
     the quantized Linears + bf16 passthrough for embed/norms, plus manifest.json with a sha256 per
     file). Bit-identical to the worker's load-time quant (int4: pack_linear_int4 — group-wise
-    asymmetric, head left bf16; int8: pack_linear_int8 — per-channel symmetric, head quantized too,
+    asymmetric, head left bf16; int2: pack_linear_int2 — same shape at 2 bits / group 64, head left
+    bf16, dense models only; int8: pack_linear_int8 — per-channel symmetric, head quantized too,
     matching the worker). Streams one layer at a time (bounded memory). Dense bf16/fp16, fp8 AND
     nvfp4 sources are supported — a quantized checkpoint (fp8 F8_E4M3 + weight_scale_inv, e.g.
     Mistral3 Devstral/Ministral; or compressed-tensors nvfp4 weight_packed + weight_scale +
@@ -226,8 +269,15 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
-    if quant not in ("int4", "int8"):
-        raise ValueError(f"shard cache supports quant int4|int8 (got {quant!r})")
+    if quant not in ("int4", "int8", "int2"):
+        raise ValueError(f"shard cache supports quant int4|int8|int2 (got {quant!r})")
+    group_size = _default_group(quant, group_size)   # int2 caches pack at INT2_GROUP (64)
+    if quant == "int2":
+        # #38: int2 is the GPTQ-CALIBRATED tier — plain RTN at 2 bits is token salad on every
+        # model tried, so the RTN unit loop below never runs for it. Lazy import (gptq_pack
+        # imports this module back at its top; function-scope breaks the cycle).
+        import gptq_pack
+        return gptq_pack.compile_int2_gptq(model_dir, group_size, progress)
     wm = _weight_map(model_dir)
     fp8_block = _fp8_block_size(model_dir)   # None unless this is an fp8 checkpoint (then dequant->bf16)
     nvfp4_group = _nvfp4_group_size(model_dir)   # None unless compressed-tensors nvfp4 (then dequant->bf16)
@@ -257,7 +307,7 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     if _moe:
         if quant != "int4":
             raise ValueError("MoE shard-cache compile supports int4 only "
-                             "(no worker int8 3D-expert quantizer)")
+                             "(no worker int8/int2 3D-expert quantizer)")
         # fp8/nvfp4-source MoE (#nvfp4-moe): compressed-tensors quantizes nn.Linear modules, so a
         # quantized MoE stores experts PER-EXPERT (`...experts.<N>.<proj>.weight_packed`/`.weight`),
         # each a 2D tensor `_get_bf16` already dequantizes (the SAME path dense nvfp4/fp8 uses); the

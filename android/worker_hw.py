@@ -45,6 +45,70 @@ def _release_vram() -> None:
                                     f"allocated={a:.2f}GB reserved={r:.2f}GB "
                                     f"({'LIVE-REF leak' if a > 1.0 else 'pool reclaimed' if r < 1.0 else 'POOL held'})",
                                     flush=True)
+                    if a > 2.0:   # #39: name WHAT is still live so the leak stops being a mystery
+                        _dump_live_cuda()
+
+
+def _dump_live_cuda(top: int = 8) -> None:
+    """#39 diagnostic: when an unload leaves GBs ALLOCATED (live refs, not pool), walk gc for
+    live CUDA tensors, group by (shape, dtype), and print the top groups + the REFERRER type
+    names of the biggest tensor — enough to name the holder (KV cache list? module? closure?).
+    Best-effort and cheap relative to an unload; only called on the >2 GB residue path."""
+    import gc as _gc
+    with contextlib.suppress(Exception):
+        import torch
+        groups: dict = {}
+        biggest = None
+        for o in _gc.get_objects():
+            try:
+                if torch.is_tensor(o) and o.is_cuda:
+                    b = o.numel() * o.element_size()
+                    k = (tuple(o.shape), str(o.dtype))
+                    n, tot = groups.get(k, (0, 0))
+                    groups[k] = (n + 1, tot + b)
+                    if biggest is None or b > biggest[0]:
+                        biggest = (b, o)
+            except Exception:
+                continue
+        top_g = sorted(groups.items(), key=lambda kv: kv[1][1], reverse=True)[:top]
+        for (shape, dt), (n, tot) in top_g:
+            _builtins.print(f"[vram-live] {n}x {shape} {dt} = {tot / (1024 ** 3):.2f} GB",
+                            flush=True)
+        # name the OWNER of the (int, big-cuda-Tensor) tuples: dump the int values (layer index?
+        # stream id?) and walk each tuple's referrers INCLUDING frames — a suspended coroutine /
+        # generator frame prints its exact source location.
+        allobjs = _gc.get_objects()
+        ints: list = []
+        shown = 0
+        for o in allobjs:
+            try:
+                if not (isinstance(o, tuple) and len(o) == 2 and isinstance(o[0], int)
+                        and torch.is_tensor(o[1]) and o[1].is_cuda
+                        and o[1].numel() * o[1].element_size() > (1 << 27)):
+                    continue
+            except Exception:
+                continue
+            ints.append(o[0])
+            if shown < 2:
+                shown += 1
+                _builtins.print(f"[vram-live] tuple (int {o[0]}, {tuple(o[1].shape)})", flush=True)
+                for r in _gc.get_referrers(o)[:6]:
+                    tn = type(r).__name__
+                    if tn == "frame":
+                        with contextlib.suppress(Exception):
+                            _builtins.print(f"[vram-live]   FRAME {r.f_code.co_filename}:"
+                                            f"{r.f_lineno} in {r.f_code.co_name}", flush=True)
+                        continue
+                    if isinstance(r, dict):
+                        key = next((str(k)[:60] for k, v in r.items() if v is o), "?")
+                        owner = next((type(x).__name__ for x in allobjs
+                                      if getattr(x, "__dict__", None) is r), "plain-dict")
+                        _builtins.print(f"[vram-live]   owner: {owner}[{key}]", flush=True)
+                    elif tn not in ("list_iterator",):
+                        _builtins.print(f"[vram-live]   ref: {tn}"
+                                        + (f" len={len(r)}" if isinstance(r, (list, tuple)) else ""),
+                                        flush=True)
+        _builtins.print(f"[vram-live] {len(ints)} such tuples; ints={sorted(ints)[:12]}…", flush=True)
 
 
 def _release_ram(trim_working_set: bool = False) -> None:
@@ -418,6 +482,17 @@ def build_registration(args: argparse.Namespace) -> dict:
     }
     if _using_gpu(args):
         reg["vram_total_gb"] = round(_gpu_mem_gb()[1], 2)
+    # #media-anywhere: advertise which MEDIA runtimes are installed on THIS worker so the
+    # controller can place a t2a/t2i model on ANY capable GPU, not only the co-located box.
+    # find_spec is a cheap, import-free probe (no heavy acestep/diffusers import at register).
+    import importlib.util as _ilu
+    def _has(_pkg: str) -> bool:
+        try:
+            return _ilu.find_spec(_pkg) is not None
+        except Exception:
+            return False
+    reg["can_t2a"] = _has("acestep")
+    reg["can_t2i"] = _has("diffusers")
     # #wire-caps: advertise this build's wire-protocol capability set (e.g. ["ntensor"]) so the
     # controller can gate new wire formats per node (registry.node_caps). Read via getattr off
     # the wire MODULE — an old wire.py (per-file self-update convergence window) has no

@@ -30,10 +30,11 @@ class WorkerLoadMixin:
         # routed-expert block in CPU RAM (llama.cpp --override-tensor experts=CPU, intra-layer).
         # Pipeline-only (the TP path ignores it); the worker further gates to int4 experts.
         moe_offload = bool(a.get("moe_offload", False))
-        # #shard-cache Inc 2 (serve-from-cache): controller flags '' | 'int4'. When 'int4', fetch
-        # PRE-PACKED int4 layer units (cache=int4 on /weights) and install them directly — no bf16
-        # stream, no per-layer re-quant. Pipeline + int4 only (the controller never sets it for TP).
-        cache = (a.get("cache", "") or "") if quant == "int4" else ""
+        # #shard-cache Inc 2 (serve-from-cache): controller flags '' | 'int4' | 'int2'. When set,
+        # fetch PRE-PACKED layer units (cache=<quant> on /weights) and install them directly — no
+        # bf16 stream, no per-layer re-quant. Pipeline only (the controller never sets it for TP);
+        # gated to the matching quant so a stale flag can never install a cross-tier cache.
+        cache = (a.get("cache", "") or "") if quant in ("int4", "int2") else ""
         if tp_size <= 1:
             # DEFAULT PATH: stream each slice ONE LAYER AT A TIME straight into RAM bytes, then
             # st_load -> HEAP tensors (m4c25). NO temp files anywhere. The old path staged each slice
@@ -145,14 +146,19 @@ class WorkerLoadMixin:
         for mid in list(self._weight_tmps):
             self._cleanup_weight_tmp(mid)
 
-    async def handle_load(self, msg: dict) -> dict:
+    async def handle_load(self, msg: dict, tenant: str = "") -> dict:
         model_id = msg["model_id"]
         a = msg
         # Reload of the SAME model: drop just its old shard first; keep other models resident.
         # (The Inc 1/2 controller still unloads every node before a load, so usually nothing
         # else is resident yet — this matters once Inc 3 enables fit-as-many.)
+        # ⚠ #multi-controller: this unconditional unload is why two controllers serving the SAME
+        # model_id clobber each other — B's load evicts A's shard. Record the owner so inventory /
+        # scoped-unload can tell them apart; TRUE per-tenant shard keys are the next step.
         await self._unload_model(model_id)
         self.assignments[model_id] = msg
+        if tenant:
+            self.shard_owner[model_id] = tenant
         # A tensor-parallel PEER (tp_rank>0) is NOT in the pipeline: it has no data port and
         # no 'next' — it's driven entirely by rank 0's broadcasts over the all-reduce mesh.
         is_peer = int(a.get("tp_size", 1)) > 1 and int(a.get("tp_rank", 0)) > 0
@@ -204,6 +210,137 @@ class WorkerLoadMixin:
                 return {"loaded_params": em.loaded_params,
                         "loaded_bytes": em.loaded_bytes,
                         "gpu_bytes": getattr(em, "gpu_bytes", 0)}
+            # T2I load (#t2i-serve): a diffusers image-generation pipeline (Qwen-Image class)
+            # builds WHOLE on THIS node — no pipeline stages, no KV. v1 constraint: the worker
+            # must be CO-LOCATED with the controller (shared filesystem) — the controller sends
+            # its LOCAL model dir and this branch reads it directly (no weight streaming), and
+            # generated PNGs are handed back as local paths. worker_t2i is imported lazily with
+            # a fetch-if-missing bridge so pre-#t2i workers converge without a restart loop.
+            if a.get("kind") == "t2i":
+                mdir = a.get("model_dir") or ""
+                if not os.path.isdir(mdir):
+                    raise RuntimeError(
+                        f"t2i model dir not visible on this worker: {mdir!r} — v1 serves "
+                        "image models only on a GPU worker co-located with the controller")
+                try:
+                    import worker_t2i
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_t2i.py")
+                    if not _src:
+                        raise RuntimeError("worker_t2i.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_t2i.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_t2i
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_t2i.T2IPipeline, mdir, device,
+                        str(a.get("quant") or "int4"), int(a.get("t2i_edge", 2)),
+                        bool(a.get("t2i_offload", False)))
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes}
+            # TTS load (#tts-serve): a Kokoro speech model builds WHOLE on THIS node (co-located
+            # with the controller — reads the model dir directly, hands back WAV paths). worker_tts
+            # is imported lazily with the same fetch-if-missing bridge as worker_t2i. The leaf falls
+            # back to CPU on its own if the GPU's MIOpen kernels fail to JIT-compile (gfx1151).
+            if a.get("kind") == "tts":
+                mdir = a.get("model_dir") or ""
+                if not os.path.isdir(mdir):
+                    raise RuntimeError(
+                        f"tts model dir not visible on this worker: {mdir!r} — v1 serves "
+                        "speech models only on a worker co-located with the controller")
+                try:
+                    import worker_tts
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_tts.py")
+                    if not _src:
+                        raise RuntimeError("worker_tts.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_tts.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_tts
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_tts.KokoroPipeline, mdir, device,
+                        str(a.get("quant") or "none"), False)
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes,
+                        "media": eng.media_info()}   # #media-detail: voices/device/sr for /status
+            # T2A load (#t2a-serve): an ACE-Step music pipeline builds WHOLE on THIS node (co-located
+            # with the controller — reads the model dir directly, hands back WAV paths). worker_t2a is
+            # imported lazily with the same fetch-if-missing bridge as worker_t2i/worker_tts.
+            if a.get("kind") == "t2a":
+                mdir = a.get("model_dir") or ""
+                # #media-anywhere: a REMOTE worker doesn't share the controller's filesystem, so
+                # the controller's model_dir won't exist here. Fetch the ACE-Step checkpoint from
+                # HF (model_id is the repo id) into this worker's local HF cache — the same
+                # snapshot_download the embedding path uses. Co-located workers keep the fast path.
+                if not (mdir and os.path.isdir(os.path.join(mdir, "ace_step_transformer"))):
+                    def _fetch_ace() -> str:
+                        from huggingface_hub import snapshot_download
+                        try:
+                            _loc = snapshot_download(model_id)
+                        except Exception as _e:
+                            raise RuntimeError(
+                                f"remote t2a worker can't fetch {model_id!r} from HuggingFace "
+                                f"({_e!r}) — a music checkpoint served on a REMOTE GPU must be a "
+                                "public HF repo id (co-located serving still works from local disk)"
+                            ) from _e
+                        if not os.path.isdir(os.path.join(_loc, "ace_step_transformer")):
+                            raise RuntimeError(
+                                f"fetched {model_id!r} but it has no ace_step_transformer/ — "
+                                "not a valid ACE-Step checkpoint")
+                        return _loc
+                    mdir = await asyncio.to_thread(_fetch_ace)
+                try:
+                    import worker_t2a
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_t2a.py")
+                    if not _src:
+                        raise RuntimeError("worker_t2a.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_t2a.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_t2a
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_t2a.T2APipeline, mdir, device,
+                        "none", bool(a.get("t2a_offload", False)))
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes}
             self._building += 1   # mark BUSY across the build so reclaim/self-update can't kill it
             try:
                 shard = await asyncio.to_thread(self._build_shard, base, model_id, a)
@@ -364,6 +501,15 @@ class WorkerLoadMixin:
         CPU-resident shard; harmless on CUDA (frees a touch earlier). Safe at unload (model idle)."""
         import torch
         import contextlib as _cl
+        if getattr(shard, "kind", "") in ("t2i", "t2a", "tts"):
+            # #t2i/#t2a/#tts-vram-release: a media pipeline (T2IPipeline / T2APipeline /
+            # KokoroPipeline) has NONE of the shard attrs walked below (model/embed/norm/head/
+            # encoder), so this generic pass freed NOTHING and the weights stayed pinned on
+            # ROCm/CUDA after unload (observed live for t2i's ~12 GB DiT). Their own release is
+            # RENDER-SAFE: under a live generate it defers the free to the render's end.
+            with _cl.suppress(Exception):
+                shard.release_vram()
+            return
         m = getattr(shard, "model", None)
         mods = [m] if m is not None else []
         for _attr in ("embed", "norm", "head", "encoder"):
@@ -381,6 +527,17 @@ class WorkerLoadMixin:
                     if id(t) in seen:
                         continue
                     seen.add(id(t))
+                    # #39 ROOT CAUSE: the #dram-dealias pad registers a VIEW (buf[:, :rs]) as the
+                    # buffer; emptying only the view leaves the padded BASE's full storage alive
+                    # through the C-level ._base reference (invisible to gc referrers) — measured
+                    # ~10 GB surviving a qwen3-30b unload (48 padded expert stacks + dense pads).
+                    # Empty the BASE first, then the view.
+                    with _cl.suppress(Exception):
+                        b = getattr(t, "_base", None)
+                        if b is not None and getattr(b, "device", None) is not None \
+                                and b.device.type == "cuda" and id(b) not in seen:
+                            seen.add(id(b))
+                            b.data = torch.empty(0, dtype=b.dtype, device=b.device)
                     with _cl.suppress(Exception):
                         t.data = torch.empty(0, dtype=t.dtype, device=t.device)
             with _cl.suppress(Exception):   # drop each int4 layer's cached fused tuple (qweight + op)
@@ -406,6 +563,7 @@ class WorkerLoadMixin:
         if _sh is not None:
             self._release_shard_vram(_sh)   # #vram-release-rocm: free GPU storages in place first
         self.assignments.pop(model_id, None)
+        self.shard_owner.pop(model_id, None)   # #multi-controller: release the tenant claim
         # Drop any staged multimodal embeds for THIS model so they can't be mis-consumed by a
         # later request after a controller restart (req_id resets to 0 -> key reuse).
         for k in [k for k in self.pending_mm if k[0] == model_id]:
@@ -440,6 +598,141 @@ class WorkerLoadMixin:
         m = shards.build_skeleton_from_config(cfg)
         self._pack_skel[model_id] = m
         return m
+
+    async def handle_t2i_gen(self, msg: dict, reply) -> None:
+        """#t2i-serve: run ONE image generation on this worker's resident T2IPipeline and mirror
+        the result over the control link. Dispatched as a TASK by command_loop (a render takes
+        minutes — awaiting it inline would block unload/ping handling), so replies are keyed by
+        req_id. Per-step progress mirrors as `t2i_step` (scheduled threadsafe from the render
+        thread); the finished PNG's LOCAL path returns in `t2i_done` (controller is co-located,
+        v1). _building marks the worker busy so self-update/reclaim won't kill a live render."""
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "t2i":
+            await reply({"type": "t2i_err", "req_id": rid, "model_id": mid,
+                         "error": "t2i model not resident on this worker"})
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_step(i: int, n: int) -> None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(
+                    reply({"type": "t2i_step", "req_id": rid, "model_id": mid,
+                           "step": i, "total": n}), loop)
+
+        try:
+            self._building += 1
+            try:
+                path, secs = await asyncio.to_thread(
+                    eng.generate, str(msg.get("prompt") or ""),
+                    str(msg.get("negative_prompt") or " "),
+                    int(msg.get("width", 1024)), int(msg.get("height", 1024)),
+                    int(msg.get("steps", 20)), float(msg.get("cfg", 4.0)),
+                    msg.get("seed"), _on_step)
+            finally:
+                self._building -= 1
+            await reply({"type": "t2i_done", "req_id": rid, "model_id": mid,
+                         "path": path, "seconds": round(secs, 1)})
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "t2i_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[t2i] generate FAILED: {exc!r}", flush=True)
+
+    async def handle_tts_gen(self, msg: dict, reply) -> None:
+        """#tts-serve: run ONE speech synthesis on this worker's resident KokoroPipeline and
+        mirror the result over the control link. Dispatched as a TASK by command_loop (a long
+        text takes many seconds — awaiting inline would block unload/ping handling), so replies
+        are keyed by req_id. Per-chunk progress mirrors as `tts_step` (scheduled threadsafe from
+        the synth thread); the finished WAV's LOCAL path returns in `tts_done` (controller is
+        co-located, v1). _building marks the worker busy so self-update/reclaim won't kill it."""
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "tts":
+            await reply({"type": "tts_err", "req_id": rid, "model_id": mid,
+                         "error": "tts model not resident on this worker"})
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_step(i: int, n: int) -> None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(
+                    reply({"type": "tts_step", "req_id": rid, "model_id": mid,
+                           "step": i, "total": n}), loop)
+
+        try:
+            self._building += 1
+            try:
+                path, secs, audio_s = await asyncio.to_thread(
+                    eng.generate, str(msg.get("text") or ""),
+                    str(msg.get("voice") or ""), float(msg.get("speed", 1.0)),
+                    str(msg.get("fmt") or "wav"), _on_step)
+            finally:
+                self._building -= 1
+            await reply({"type": "tts_done", "req_id": rid, "model_id": mid,
+                         "path": path, "seconds": round(secs, 1),
+                         "audio_s": round(audio_s, 1)})   # #media-detail: for RTF in the modal
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "tts_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[tts] generate FAILED: {exc!r}", flush=True)
+
+    async def handle_t2a_gen(self, msg: dict, reply) -> None:
+        """#t2a-serve: run ONE music render on this worker's resident T2APipeline and mirror the
+        result over the control link. Dispatched as a TASK by command_loop (a render takes many
+        seconds — awaiting inline would block unload/ping handling), so replies are keyed by
+        req_id. Per-step progress mirrors as `t2a_step` (scheduled threadsafe from the render
+        thread); the finished WAV's LOCAL path returns in `t2a_done` (controller is co-located,
+        v1). _building marks the worker busy so self-update/reclaim won't kill a live render."""
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "t2a":
+            await reply({"type": "t2a_err", "req_id": rid, "model_id": mid,
+                         "error": "t2a model not resident on this worker"})
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_step(i: int, n: int) -> None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(
+                    reply({"type": "t2a_step", "req_id": rid, "model_id": mid,
+                           "step": i, "total": n}), loop)
+
+        try:
+            _dur = float(msg.get("duration", 30.0))
+            self._building += 1
+            try:
+                path, secs = await asyncio.to_thread(
+                    eng.generate, str(msg.get("prompt") or ""),
+                    str(msg.get("lyrics") or ""), _dur,
+                    int(msg.get("steps", 60)), float(msg.get("guidance", 15.0)),
+                    msg.get("seed"), _on_step)
+            finally:
+                self._building -= 1
+            # #media-anywhere: return the WAV as base64 over the control link so a worker that
+            # ISN'T co-located with the controller (no shared FS to read a path from) still works.
+            # Read + delete the local temp here — the bytes are the deliverable now. base64 of a
+            # ~1 MB clip is cheap. (Controllers prefer audio_b64, else fall back to a legacy path.)
+            def _read_del(_p: str) -> str:
+                import base64
+                with open(_p, "rb") as _fh:
+                    _b = _fh.read()
+                with contextlib.suppress(Exception):
+                    os.remove(_p)
+                return base64.b64encode(_b).decode("ascii")
+            _ab64 = await asyncio.to_thread(_read_del, path)
+            await reply({"type": "t2a_done", "req_id": rid, "model_id": mid,
+                         "audio_b64": _ab64, "seconds": round(secs, 1),
+                         "audio_s": round(_dur, 1)})   # #media-detail: for RTF in the modal
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "t2a_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[t2a] generate FAILED: {exc!r}", flush=True)
 
     async def handle_pack(self, msg: dict) -> dict:
         """#distributed-packing Inc 1b/3b: pack ONE shard-cache unit FOR the controller (offloads the
@@ -481,13 +774,125 @@ class WorkerLoadMixin:
         return {"req_id": msg.get("req_id"), "unit": msg.get("unit"),
                 "bytes": len(blob), "tensors": len(mtensors)}
 
-    async def handle_unload(self, model_id: str | None = None) -> None:
-        """Per-model unload when model_id is given; otherwise a FULL teardown of every model
-        (what the controller sends today, and what the session does on disconnect)."""
+    def owns(self, model_id: str, tenant: str) -> bool:
+        """#multi-controller: is `model_id` this tenant's shard?
+
+        A shard with NO recorded owner is claimed by whoever asks. That is the back-compat case —
+        shards loaded before this change, and shards adopted from a previous controller epoch —
+        and it preserves today's exact single-controller behaviour (including hitless re-adoption)
+        while a second controller can never be handed someone else's models."""
+        owner = self.shard_owner.get(model_id)
+        return owner is None or not tenant or owner == tenant
+
+    def inventory(self, tenant: str = "") -> list:
+        """#adopt: describe this TENANT's loaded models for the register message, so a controller
+        that restarted can RE-ADOPT them instead of re-streaming. Each entry carries the ORIGINAL
+        load message (`self.assignments[mid]` — the complete recipe the controller sent: kind,
+        layer range, ctx, quant, kv flags, device …) plus live byte counts off the shard. All
+        values came off the JSON control link or are ints, so the report is JSON-safe.
+
+        ⚠ #multi-controller: reporting EVERY shard to EVERY controller is what makes attaching a
+        worker to a second controller destructive — the newcomer either co-drives another
+        controller's shards or, failing to assemble them, frees them after _ADOPT_GRACE_S (90s).
+        Filtering by owner is the precondition for a worker serving two controllers at all."""
+        out = []
+        for mid, a in list(self.assignments.items()):
+            sh = self.shards.get(mid)
+            if sh is None or not isinstance(a, dict) or not self.owns(mid, tenant):
+                continue
+            entry = {"model_id": mid, "assign": a,
+                     "gpu_bytes": int(getattr(sh, "gpu_bytes", 0) or 0),
+                     "gpu_kv_bytes": int(getattr(sh, "gpu_kv_bytes", 0) or 0),
+                     "loaded_bytes": int(getattr(sh, "loaded_bytes", 0) or 0),
+                     "loaded_params": int(getattr(sh, "loaded_params", 0) or 0)}
+            mi = getattr(sh, "media_info", None)   # media leaves (t2i/t2a/tts): voices/device/sr
+            if callable(mi):
+                with contextlib.suppress(Exception):
+                    entry["media"] = mi()
+            out.append(entry)
+        return out
+
+    async def handle_handoff(self, msg: dict, tenant: str = "") -> dict:
+        """#handoff: transfer this node (and its RESIDENT shards) to another controller.
+
+        The shards are NOT unloaded — ownership is reassigned and the session is dropped, so the
+        worker reconnects to the new controller, reports those shards in its (tenant-scoped)
+        inventory, and the new controller ADOPTS them. Same weights, same VRAM, no re-stream: this
+        is the ordinary #adopt path (how a hitless controller restart already works) pointed at a
+        DIFFERENT controller instead of the same one.
+
+        Reassigning shard_owner is what makes it work: without it the new controller's
+        inventory(tenant) would filter the shards out as someone else's and they would sit
+        resident-but-invisible, pinning VRAM forever."""
+        host = str(msg.get("to_host") or "").strip()
+        try:
+            port = int(msg.get("to_port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not host or port <= 0:
+            return {"ok": False, "error": "handoff needs to_host and to_port"}
+        want = msg.get("models")            # None/empty = every shard we own
+        new_tenant = f"{host}:{port}"
+        moved = []
+        for mid in list(self.shards):
+            if want and mid not in want:
+                continue
+            if not self.owns(mid, tenant):  # never hand over a third controller's shard
+                continue
+            self.shard_owner[mid] = new_tenant
+            moved.append(mid)
+        self._handoff = (host, port)        # run()'s reconnect loop re-targets on this
+        print(f"[handoff] {len(moved)} shard(s) reassigned to {new_tenant}; "
+              f"dropping this session to reconnect there", flush=True)
+        return {"ok": True, "moved": moved, "to": new_tenant}
+
+    def reassign_orphans(self, old_tenant: str, new_tenant: str) -> list:
+        """#failover: the controller that owned these shards is GONE — give them to a new one.
+
+        Identical in effect to the last half of handle_handoff, but SELF-initiated: nobody is left
+        to send us a handoff command, so the worker decides. Only shards belonging to the departed
+        tenant (or to nobody) move — a third controller's shards are never swept up by someone
+        else's outage.
+
+        The weights are untouched. All that changes is who may adopt them: inventory(new_tenant)
+        will now report them, and the new controller adopts through the ordinary #adopt path. Do NOT
+        confuse this with a reload — the whole point is that a multi-GB model survives its
+        controller dying, in place, at zero cost."""
+        moved = []
+        for mid in list(self.shards):
+            owner = self.shard_owner.get(mid)
+            if owner is not None and old_tenant and owner != old_tenant:
+                continue                      # someone else's shard — not ours to re-home
+            self.shard_owner[mid] = new_tenant
+            moved.append(mid)
+        if moved:
+            print(f"[failover] {len(moved)} shard(s) re-homed from {old_tenant or '<none>'} "
+                  f"to {new_tenant} — kept resident for adoption", flush=True)
+        return moved
+
+    async def handle_unload(self, model_id: str | None = None, tenant: str = "") -> None:
+        """Per-model unload when model_id is given; otherwise a teardown of this TENANT's models.
+
+        ⚠ #multi-controller: the no-model_id form is a FULL teardown — it closes the shared data
+        server and clears every shard — and the controller broadcasts it to every link on /unload
+        and /update. With two controllers attached that means one controller's routine unload
+        destroys the other's resident models. When `tenant` is given and OTHER tenants still hold
+        shards, drop only ours and leave the data server up; the full teardown still runs when we
+        are the last tenant (identical to today's single-controller behaviour)."""
         if model_id is not None:
             await self._unload_model(model_id)
             self._maybe_self_restart_if_stuck()
             return
+        if tenant:
+            others = [m for m in list(self.shards) if not self.owns(m, tenant)]
+            if others:
+                mine = [m for m in list(self.shards) if self.owns(m, tenant)]
+                print(f"[tenant] scoped unload for {tenant}: dropping {len(mine)} shard(s), "
+                      f"keeping {len(others)} owned by another controller", flush=True)
+                for mid in mine:
+                    await self._unload_model(mid)
+                self._maybe_self_restart_if_stuck()
+                return
         self._teardown_tp()
         if self._tp_thread is not None:
             with contextlib.suppress(Exception):

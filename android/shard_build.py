@@ -121,6 +121,13 @@ class ShardBuildMixin:
 
         gpu = torch.device("cuda:0")
         free, _total = torch.cuda.mem_get_info(0)
+        # #vram-reusable: this process's VACANT allocator pool is invisible to mem_get_info (the
+        # driver counts it as used) but torch reuses it FIRST for new allocations here — credit
+        # it, or a churned worker under-places (om3nbox: ~13 GB of empty pool read as "used").
+        try:
+            free += max(0, torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0))
+        except Exception:
+            pass
         # NEVER oversubscribe the card: the controller may plan GPU placement optimistically (sizing
         # against an EMPTY GPU), but coexisting models already hold VRAM. Bound EVERY GPU budget by
         # the LIVE free VRAM (mem_get_info reflects what other resident models hold right now), and
@@ -580,7 +587,7 @@ class ShardBuildMixin:
         # PRE-PACKED (Packed4Tensor3D buffers), so there is no per-expert /experts streaming and no
         # fuse/quant — the cached install builds every holder directly. Force the streaming-expert
         # paths off so _quant_after never runs (the install dispatcher below skips it for cache).
-        use_cache = (cache == "int4" and quant == "int4")
+        use_cache = (cache == quant and quant in ("int4", "int2"))
         if use_cache:
             stream_experts = stream_experts_nf = False
         # TP-v2: rebuild every layer's linears as REDUCED-DIM modules (still meta) BEFORE streaming
@@ -649,6 +656,8 @@ class ShardBuildMixin:
                         _quantize_experts4_streamed(lyr, li, fetch_experts, dt)   # fused experts (#62)
                     elif not stream_experts_nf:
                         _quantize_experts4_(lyr)           # fused experts from the resident blob
+                elif quant == "int2":
+                    _quantize_int2_(lyr)                    # #int2: dense 2D linears (no expert tier)
                 elif quant == "int8":
                     _quantize_int8_(lyr)
                 _drop_slice_mmap(lyr)                       # release this layer's tmpfs slice mmap
@@ -671,9 +680,12 @@ class ShardBuildMixin:
             # NO manifest is needed on the worker. NEVER call _fuse_moe_experts / _quantize_* here. The
             # post-loop meta-guard catches any tensor we failed to materialize.
             sd = (_load_file(src) if isinstance(src, str) else st_load(src))
-            QL = _quant4_linear_cls()
+            # #int2: the packed-tensor SHAPE is quant-ambiguous (both tiers ship qweight/scale/zero),
+            # so the holder class + group come from the LOAD's quant — use_cache already guarantees
+            # cache dir == quant, and both packers are bit-identical to their load-time twins.
+            QL = _quant2_linear_cls() if quant == "int2" else _quant4_linear_cls()
             PT = _packed4_3d_cls()
-            G = _INT4_GROUP
+            G = _INT2_GROUP if quant == "int2" else _INT4_GROUP
             packed: dict = {}      # base -> {'q':qweight, 's':scale, 'z':zero}
             plain: dict = {}       # bf16 passthrough keys
             for k, v in sd.items():
@@ -698,6 +710,9 @@ class ShardBuildMixin:
                 if qw is None or sc is None or ze is None:
                     raise RuntimeError(f"cache: incomplete packed tensor {base!r} (have {sorted(tr)})")
                 if qw.dim() == 3:                      # fused 3D MoE experts -> Packed4Tensor3D
+                    if quant != "int4":                # int2 cache is dense-only; never guess a holder
+                        raise RuntimeError(f"cache: 3D expert tensor {base!r} in a {quant} cache — "
+                                           "only int4 has a 3D-expert format; refusing")
                     ppath, _, attr = base.rpartition(".")
                     parent = _nav(ppath)
                     metap = parent._parameters.get(attr)

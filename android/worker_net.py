@@ -187,8 +187,17 @@ class WorkerNetMixin:
                     # next prefill of this (model_id, req_id). Stage-0 only; NOT forwarded down.
                     if shard is not None:
                         emb = _unpack_tensor(hdr, raw)
+                        # #mm-pairing: stamp a staged-at time (3rd slot, stripped at claim) and sweep
+                        # companions never claimed — a reclaimed/cancelled gen leaks its entry, and a
+                        # controller RESTART resets req_id numbering, so a leaked entry could otherwise
+                        # be claimed by an UNRELATED future request (stale image embeds spliced into
+                        # the wrong prompt). 10 min >> any legit mm->ids gap (same two-frame flush).
                         self.pending_mm[(model_id, hdr.get("req_id"))] = (
-                            hdr.get("positions") or [], emb)
+                            hdr.get("positions") or [], emb, time.time())
+                        _mm_cut = time.time() - 600.0
+                        for _mk, _mv in list(self.pending_mm.items()):
+                            if len(_mv) > 2 and _mv[2] < _mm_cut:
+                                self.pending_mm.pop(_mk, None)
                     continue
                 if hdr.get("kind") == "embed":   # encoder: ONE two-tensor frame (ids ++ mask) ->
                     # masked mean-pool + L2-norm vecs, replied straight to the controller. Mirrors
@@ -258,7 +267,36 @@ class WorkerNetMixin:
                     if shard is None:
                         raise RuntimeError(f"no shard for model_id={model_id!r} on this node")
                     x = _unpack_tensor(hdr, raw)
-                    inject = self.pending_mm.pop((model_id, hdr.get("req_id")), None)
+                    # #mm-pairing: the ids frame now DECLARES its mm companion (hdr['mm'], m4c190+
+                    # controller). Declared -> the companion MUST be staged (a lost/mispaired frame
+                    # would silently run the vision prefill UNSPLICED — the model then hallucinates
+                    # on raw placeholder embeddings). Undeclared -> NEVER claim (protects against a
+                    # leaked companion + controller-restart req_id collision splicing stale image
+                    # embeds into an unrelated prompt). Pre-m4c190 controller (no 'mm' key): legacy
+                    # unconditional claim, unchanged behavior.
+                    if "mm" in hdr:
+                        _mm3 = (self.pending_mm.pop((model_id, hdr.get("req_id")), None)
+                                if hdr.get("mm") else None)
+                        if hdr.get("mm") and _mm3 is None:
+                            raise RuntimeError(
+                                f"mm companion frame missing for req {hdr.get('req_id')} "
+                                f"({model_id}) — refusing to run the vision prefill unspliced")
+                    else:
+                        _mm3 = self.pending_mm.pop((model_id, hdr.get("req_id")), None)
+                    inject = _mm3[:2] if _mm3 is not None else None
+                    # #stage0-dtype-guard: a first-stage (has_embed) frame must carry token IDS; a
+                    # floating-point x here is a mispaired mm/ids or a misrouted hidden frame (the
+                    # 2026-07-09/10 bf16-into-F.embedding wedge class on beast — each occurrence
+                    # burned a 240s gen-stall reclaim). Classify it AT THE DOOR with a self-evident
+                    # error instead of letting F.embedding throw its cryptic dtype message.
+                    if (shard.has_embed and bool(hdr.get("reset", True))
+                            and getattr(x, "is_floating_point", None) is not None
+                            and x.is_floating_point()):
+                        raise RuntimeError(
+                            f"stage0 for {model_id} received a floating-point "
+                            f"'{hdr.get('kind')}' frame (dtype={hdr.get('dtype')} "
+                            f"shape={hdr.get('shape')}) where token ids were expected — "
+                            f"mispaired mm/ids or misrouted hidden frame")
                     # #22 inc 4: 3D mRoPE positions ride the frame header (small list); every
                     # stage uses them for its rotary, so propagate them to the next stage too.
                     position_ids = hdr.get("position_ids")
@@ -414,6 +452,23 @@ class WorkerNetMixin:
                                 "error": repr(exc)})
                         print(f"[data] next-hop for {model_id} died -> signalled controller hop_error "
                               f"(req {hdr.get('req_id')}, next={self.next_peer.get(model_id)})", flush=True)
+                    elif self._ctrl_send is not None:
+                        # #stage-error-ctrl: a COMPUTE exception's error frame (sent below) rides the
+                        # one-way DATA chain (this stage -> downstream -> controller); a stale or dead
+                        # hop anywhere on that chain silently eats it, and the controller then blind-
+                        # waits out the gen-stall watchdog (~240s) — the qwen2.5-vl wedge-storm class
+                        # (2026-07-09: 37 wedges in 5.5h on beast, each request re-wedging on retry,
+                        # feeding the kernel panic). Mirror the error over the CONTROL link too — it is
+                        # heartbeat-kept and reconnect-managed, so delivery is near-guaranteed; the
+                        # controller fails this rid's pending future at once (a fast, causal 500
+                        # instead of a silent 240s stall). Idempotent with the data-plane error frame:
+                        # whichever lands first wins, the other finds the future already gone.
+                        with contextlib.suppress(Exception):
+                            await self._ctrl_send({
+                                "type": "stage_error", "node_id": self._node_id,
+                                "model_id": model_id, "req_id": hdr.get("req_id"),
+                                "stage": self.assignments.get(model_id, {}).get("stage"),
+                                "error": f"{exc!r}"})
                     # surface the deepest FILE:line frames (skip caret-only lines) to the controller.
                     # Route the error through _send_next so it RECONNECTS the next hop first — else a
                     # downstream-conn failure would report the error over the SAME dead socket and be
