@@ -791,7 +791,11 @@ async function setPin(name,kind,on){
   catch(e){ toast(String(e.message||e),1); }
   tick();
 }
-async function unload(name){ closeOv(); try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
+// #unload-feedback: unload can take a few seconds (multi-stage teardown), and the ~2s poll keeps
+// re-rendering the row meanwhile — so a feedback-less await looked like "nothing happened" and users
+// double-clicked. Toast immediately, and IGNORE a re-click while one is in flight (per model).
+const _unloading={};
+async function unload(name){ closeOv(); if(_unloading[name])return; _unloading[name]=1; toast('unloading '+name+'…'); try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); }catch(e){ toast(String(e.message||e),1);} finally{ delete _unloading[name]; } tick(); }
 async function cancelLoad(name){ try{ await api('/cancel_load?model='+encodeURIComponent(name),{method:'POST'}); toast('cancelled load'); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function dl(name,action){ try{ await api('/download'+(action==='start'?'':'/'+action)+'?model='+encodeURIComponent(name),{method:'POST'}); toast(action+' '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 

@@ -380,7 +380,13 @@ class EngineLifecycleMixin:
                      + ", ".join(f"{s.hostname} ~{s.est_gb:.1f}GB" for s in m.plan.stages))
         record_unload(friendly, reason, hosts=[s.hostname for s in m.plan.stages])
         loop = asyncio.get_event_loop()
-        for nid in m.stage_node_ids:
+        # #unload-parallel: tear the stages down CONCURRENTLY. The old loop awaited each node's
+        # teardown-confirm in SERIES (up to 10s EACH), so a K-stage model — or a single worker that's
+        # slow to ack because it's mid-forward — made the Unload button take K×(confirm latency), up
+        # to K×10s, with no UI feedback ("why so slow / had to click twice"). Sending every unload
+        # first and awaiting all confirms together makes the total wait the SLOWEST node (≤10s), not
+        # the sum. Per-node behaviour is unchanged (own link, own future, own clear_assignment).
+        async def _teardown(nid):
             link = self.links.get(nid)
             if link:
                 fut = loop.create_future()
@@ -391,6 +397,7 @@ class EngineLifecycleMixin:
             nd = registry._nodes.get(nid)
             if nd:
                 nd.clear_assignment()
+        await asyncio.gather(*(_teardown(nid) for nid in m.stage_node_ids))
         if m.stage0_writer is not None:
             with contextlib.suppress(Exception):
                 m.stage0_writer.close()
