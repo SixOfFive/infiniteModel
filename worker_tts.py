@@ -22,12 +22,17 @@ Two runtime notes baked in from the M0 bring-up:
   * ``import kokoro`` still pulls ``KPipeline`` -> ``misaki.en`` -> ``spacy`` at
     module load, so we inject a harmless ``spacy`` stub into ``sys.modules`` first
     (we never touch ``misaki.en`` — English goes through EspeakFallback).
-  * On gfx1151 (Strix Halo, om3nbox) MIOpen JIT-fails to compile the LSTM dropout
-    kernel (``MIOpenDropoutHIP.cpp: '<utility>' file not found`` — a TheRock
-    ROCm-7.13 bug), so a GPU warmup that raises a HIP/MIOpen compile error
-    transparently RE-BUILDS the model on CPU. Kokoro is 82M params, so CPU
-    synthesis (~4x realtime) is a fine fallback; beast's CUDA path is ~4x FASTER
-    than realtime.
+  * A GPU that cannot EXECUTE this torch build transparently RE-BUILDS the model on
+    CPU (``worker_hw.gpu_exec_unsupported`` — the shared #gpu-exec-fallback predicate).
+    Two families reach it: gfx1151 (Strix Halo, om3nbox), where MIOpen JIT-fails to
+    compile the LSTM dropout kernel (``MIOpenDropoutHIP.cpp: '<utility>' file not
+    found`` — a TheRock ROCm-7.13 bug); and a CUDA card OLDER than the installed
+    wheel's cubins, e.g. amdcomp's GTX 1070 (sm_61) under torch 2.11+cu128, which
+    builds for sm_75+ only — ``torch.cuda.is_available()`` is still True there, so the
+    failure surfaces at the warmup as ``no kernel image is available for execution on
+    the device`` / cuDNN's ``not compatible with devices with SM < 7.5``. Kokoro is 82M
+    params, so CPU synthesis (~4x realtime) is a fine fallback; beast's CUDA path is
+    ~4x FASTER than realtime.
 
 DEPENDS ON (pip, --no-deps for the first two): kokoro, misaki, plus loguru,
 espeakng-loader, phonemizer-fork, num2words, regex, scipy, soundfile. Heavy
@@ -147,9 +152,13 @@ class KokoroPipeline:
         if want.startswith("cuda") and os.environ.get("INFINITEMODEL_TTS_CPU") == "1":
             print("[tts] INFINITEMODEL_TTS_CPU=1 — forcing Kokoro onto CPU", flush=True)
             want = "cpu"
-        # Build on the requested device, then a tiny warmup synth. If the GPU path
-        # raises a HIP/MIOpen kernel-COMPILE error (gfx1151 LSTM-dropout bug), fall
-        # back to CPU transparently — the model is tiny, correctness > speed.
+        # Build on the requested device, then a tiny warmup synth. If the GPU turns out to
+        # be unable to execute this torch build at all — a ROCm JIT failure (gfx1151
+        # LSTM-dropout bug) or a CUDA card below the wheel's minimum compute capability
+        # (amdcomp's sm_61 GTX 1070) — fall back to CPU transparently. The model is tiny,
+        # correctness > speed. NOTE the warmup is what surfaces this: on the CUDA side
+        # `_build(device)` alone SUCCEEDS (moving tensors needs no kernel), so dropping the
+        # warmup would defer the failure to the first real request.
         self.device = self._build_and_warm(want)
 
         self.loaded_params = sum(p.numel() for p in self.model.parameters())
@@ -181,12 +190,9 @@ class KokoroPipeline:
                 self._synth_chunk("Ready.", self.DEFAULT_VOICE, 1.0)
             return device
         except Exception as exc:
-            msg = repr(exc)
-            hip = any(s in msg for s in ("MIOpen", "HIPRTC", "hiprtc", "HIP error",
-                                         "hipErrorNoBinaryForGpu", "miopen",
-                                         "Code object build failed"))
-            if str(device).startswith("cuda") and hip:
-                print(f"[tts] GPU kernel-compile failed on {device} ({exc!r}) — "
+            import worker_hw
+            if str(device).startswith("cuda") and worker_hw.gpu_exec_unsupported(exc):
+                print(f"[tts] GPU cannot execute this torch build on {device} ({exc!r}) — "
                       "falling back to CPU (Kokoro is 82M; CPU is fine)", flush=True)
                 with _suppress():
                     del self.model

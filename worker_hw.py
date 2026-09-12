@@ -228,6 +228,43 @@ def _using_gpu(args: argparse.Namespace) -> bool:
         return False
 
 
+def gpu_exec_unsupported(exc: BaseException, include_oom: bool = False) -> bool:
+    """True when `exc` means "this GPU cannot execute this torch build's kernels" — i.e.
+    the right response is to rebuild the model on CPU, not to fail the load.
+
+    CANONICAL HOME (#gpu-exec-fallback). This predicate used to be a `hip = any(s in msg ...)`
+    literal copy-pasted into worker_tts / worker_stt / worker_t2music, and all three copies
+    listed ONLY ROCm markers — because the only box that had ever tripped it was gfx1151, whose
+    MIOpen JIT-fails to compile the LSTM/dropout kernel. That made the CPU fallback INERT on the
+    CUDA side of the fleet: amdcomp's GTX 1070 is sm_61, the installed torch 2.11+cu128 ships
+    kernels for sm_75+ only, and `torch.cuda.is_available()` still returns True — so the leaf
+    picks "cuda", the warmup raises `CUDA error: no kernel image is available for execution on
+    the device` (or cuDNN's "not compatible with devices with SM < 7.5" for the LSTM), NONE of
+    the ROCm substrings match, and the load HARD-FAILS instead of falling back. A too-old GPU
+    and a JIT-broken GPU are the same situation and must take the same branch, so both families
+    are matched here, once.
+
+    `include_oom` keeps worker_t2music's extra "out of memory" marker opt-in: for MusicGen a
+    GPU that can't fit the model is also a CPU-fallback case, but for the others OOM is a
+    placement bug the controller should see, not something to silently absorb onto the CPU.
+    """
+    msg = repr(exc)
+    markers = [
+        # --- ROCm / HIP: kernel JIT or code-object build failed (gfx1151 MIOpen LSTM bug) ---
+        "MIOpen", "HIPRTC", "hiprtc", "HIP error", "hipErrorNoBinaryForGpu", "miopen",
+        "Code object build failed",
+        # --- CUDA: this torch build has no cubin for the device's compute capability ---
+        "no kernel image is available", "cudaErrorNoKernelImageForDevice",
+        "not compatible with devices with SM",   # cuDNN refusing SM < 7.5
+        "is not compatible with the current PyTorch installation",
+        "CUDA capability sm_",
+        "no longer supports this GPU",
+    ]
+    if include_oom:
+        markers.append("out of memory")
+    return any(s in msg for s in markers)
+
+
 def free_disk_gb() -> float:
     try:
         return shutil.disk_usage(HOME).free / GB

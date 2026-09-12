@@ -41,11 +41,29 @@ When the chosen node IS local the original path-return is used, unchanged:
 kokoro` completes, and phonemizes through EspeakFallback. Do **not** "fix" this by installing the
 full `kokoro` dependency tree — it will fail to build.
 
-**GPU→CPU auto-fallback.** On gfx1151 (Strix Halo / om3nbox) MIOpen JIT-fails to compile Kokoro's
-LSTM dropout kernel (`MIOpenDropoutHIP.cpp: '<utility>' file not found` — a TheRock ROCm-7.13
-bug). A GPU warmup that raises a HIP/MIOpen compile error transparently **re-builds the model on
-CPU**. At 82M params CPU synthesis is ~2× realtime, so the fallback is invisible in practice; an
-NVIDIA box (beast) runs on the GPU at ~4× realtime.
+**GPU→CPU auto-fallback.** A GPU warmup that proves the card cannot execute this torch build
+transparently **re-builds the model on CPU**. At 82M params CPU synthesis is ~2× realtime, so the
+fallback is invisible in practice; a supported NVIDIA box (beast) runs on the GPU at ~4× realtime.
+Two distinct families trip it, and both route through the one shared predicate
+`worker_hw.gpu_exec_unsupported` (`#gpu-exec-fallback`) — also used by `worker_stt` and
+`worker_t2music`:
+
+- **ROCm JIT failure.** On gfx1151 (Strix Halo / om3nbox) MIOpen JIT-fails to compile Kokoro's
+  LSTM dropout kernel (`MIOpenDropoutHIP.cpp: '<utility>' file not found` — a TheRock ROCm-7.13
+  bug).
+- **CUDA card older than the wheel.** `amdcomp`'s GTX 1070 is `sm_61`, and the installed
+  torch 2.11+cu128 ships cubins for `sm_75`+ only. `torch.cuda.is_available()` still returns
+  **True**, and `.to("cuda")` still succeeds (moving tensors needs no kernel), so the mismatch
+  only surfaces when a kernel actually launches — at the warmup, as `CUDA error: no kernel image
+  is available for execution on the device`, or cuDNN's `not compatible with devices with SM <
+  7.5` for the LSTM. The card itself is fine (Ollama serves on it happily with its own
+  Pascal-capable build); it is purely a torch-wheel mismatch.
+
+> Until 2026-09-12 this predicate was three copy-pasted substring lists, all containing **only**
+> the ROCm markers — so the fallback was **inert on the CUDA side** and a too-old card hard-failed
+> the load instead of falling back. `scratch_gpu_exec_fallback_test.py` now locks down both
+> families, the negative control (unrelated errors must still raise), and the parity property
+> that no leaf re-spells the list.
 
 ## Getting the model
 

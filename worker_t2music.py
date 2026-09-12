@@ -230,12 +230,11 @@ class MusicGenPipeline:
             self.model = _b(device)
             return device
         except Exception as exc:
-            msg = repr(exc)
-            hip = any(s in msg for s in ("MIOpen", "HIPRTC", "hiprtc", "HIP error",
-                                         "hipErrorNoBinaryForGpu", "miopen",
-                                         "Code object build failed", "out of memory",
-                                         "CUDA out of memory"))
-            if str(device).startswith("cuda") and hip:
+            import worker_hw
+            # include_oom: for MusicGen a GPU that can't FIT the model is also a CPU case
+            # ("out of memory" also substring-matches "CUDA out of memory").
+            if str(device).startswith("cuda") and \
+                    worker_hw.gpu_exec_unsupported(exc, include_oom=True):
                 print(f"[t2music] GPU build failed on {device} ({exc!r}) — falling back to CPU "
                       "(MusicGen runs on CPU; slower)", flush=True)
                 with _suppress():

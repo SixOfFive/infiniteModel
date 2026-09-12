@@ -162,12 +162,9 @@ class WhisperPipeline:
                 self._run(np.zeros(SR // 5, dtype=np.float32), "", "transcribe")
             return device
         except Exception as exc:
-            msg = repr(exc)
-            hip = any(s in msg for s in ("MIOpen", "HIPRTC", "hiprtc", "HIP error",
-                                         "hipErrorNoBinaryForGpu", "miopen",
-                                         "Code object build failed"))
-            if str(device).startswith("cuda") and hip:
-                print(f"[stt] GPU kernel-compile failed on {device} ({exc!r}) — "
+            import worker_hw
+            if str(device).startswith("cuda") and worker_hw.gpu_exec_unsupported(exc):
+                print(f"[stt] GPU cannot execute this torch build on {device} ({exc!r}) — "
                       "falling back to CPU (Whisper is small; CPU is fine)", flush=True)
                 with _suppress():
                     del self.model

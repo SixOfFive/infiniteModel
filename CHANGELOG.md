@@ -4,7 +4,52 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-21 (latest) — Bazarr-compatible Whisper ASR (`#bazarr-asr`) (0.3.38 / 0.3.34)
+## 2026-09-12 (latest) — the GPU→CPU media fallback was inert on CUDA (`#gpu-exec-fallback`)
+
+### Fixed
+
+- **A GPU too OLD for the installed torch wheel now falls back to CPU instead of hard-failing the
+  load.** Brought up Kokoro TTS on `amdcomp` (GTX 1070, `sm_61`) and found its GPU cannot execute
+  torch 2.11+cu128 at all — that wheel ships cubins for `sm_75`+ only. The trap is that
+  `torch.cuda.is_available()` still returns **True**, and `.to("cuda")` still succeeds, because
+  moving tensors launches no kernel; the mismatch only appears when a kernel actually runs. So the
+  media leaves picked `cuda`, and the warmup raised `CUDA error: no kernel image is available for
+  execution on the device` (or, for Kokoro's LSTM, cuDNN's `not compatible with devices with SM <
+  7.5`). The card is healthy — Ollama serves on it with its own Pascal-capable build.
+
+  `worker_tts` / `worker_stt` / `worker_t2music` each already had a GPU→CPU fallback for exactly
+  this situation, and all three were **inert here**: each carried its own copy-pasted
+  `hip = any(s in msg for s in (...))` substring list, and every copy listed only ROCm markers
+  (`MIOpen` / `HIPRTC` / `hipErrorNoBinaryForGpu` / `Code object build failed`), because gfx1151
+  was the only box that had ever needed it. A CUDA error matched none of them, so the branch was
+  skipped and the exception **re-raised** — the load failed rather than falling back. Three
+  copies, all wrong the same way, each passing its own per-leaf test.
+
+### Changed
+
+- **One canonical predicate, `worker_hw.gpu_exec_unsupported(exc, include_oom=False)`.** All three
+  inline copies deleted and routed through it; it matches both families (ROCm JIT failure *and* a
+  CUDA card below the wheel's minimum compute capability). `include_oom` keeps `worker_t2music`'s
+  extra "out of memory" marker opt-in — for MusicGen a GPU that can't *fit* the model is also a
+  CPU case, but for TTS/STT an OOM is a placement bug the controller must still see, not something
+  to silently absorb onto the CPU. `worker_hw` was already in `EXTRA_UPDATE_FILES`, so this adds
+  no new module for the workers to fetch.
+- **`scratch_gpu_exec_fallback_test.py`** asserts behaviour *and* the structural parity property:
+  the real CUDA strings observed on amdcomp match, the ROCm ones still match, unrelated exceptions
+  still raise (the negative control — a predicate that returned `True` for everything would
+  "fix" the bug while swallowing every genuine load error), OOM is opt-in, the definition exists
+  exactly once, and no leaf re-spells the list. Verified live by mutation: removing the CUDA
+  markers, forcing the predicate to `True`, and re-adding an inline copy to a leaf each fail it.
+
+### Notes
+
+- `amdcomp` was missing `kokoro`, `misaki`, `espeakng_loader` and `phonemizer-fork` in
+  `/root/imenv` — installed per `docs/TTS.md`, which is what flips `can_tts` for placement.
+- Kokoro therefore serves on `amdcomp` **on CPU**. Getting it onto that GPU is not a TTS change
+  at all: it needs a torch wheel with `sm_61` cubins, which is a node-wide downgrade affecting
+  every other model on the box, so it is deliberately **not** done here.
+
+## 2026-08-21 — Bazarr-compatible Whisper ASR (`#bazarr-asr`) (0.3.38 / 0.3.34)
 
 ### Added
 
