@@ -51,13 +51,33 @@ Two distinct families trip it, and both route through the one shared predicate
 - **ROCm JIT failure.** On gfx1151 (Strix Halo / om3nbox) MIOpen JIT-fails to compile Kokoro's
   LSTM dropout kernel (`MIOpenDropoutHIP.cpp: '<utility>' file not found` — a TheRock ROCm-7.13
   bug).
-- **CUDA card older than the wheel.** `amdcomp`'s GTX 1070 is `sm_61`, and the installed
-  torch 2.11+cu128 ships cubins for `sm_75`+ only. `torch.cuda.is_available()` still returns
-  **True**, and `.to("cuda")` still succeeds (moving tensors needs no kernel), so the mismatch
-  only surfaces when a kernel actually launches — at the warmup, as `CUDA error: no kernel image
-  is available for execution on the device`, or cuDNN's `not compatible with devices with SM <
-  7.5` for the LSTM. The card itself is fine (Ollama serves on it happily with its own
-  Pascal-capable build); it is purely a torch-wheel mismatch.
+- **CUDA card older than the wheel.** `amdcomp`'s GTX 1070 is `sm_61`, and torch **`+cu128`**
+  ships cubins for `sm_75`+ only. `torch.cuda.is_available()` still returns **True**, and
+  `.to("cuda")` still succeeds (moving tensors needs no kernel), so the mismatch only surfaces
+  when a kernel actually launches — at the warmup, as `CUDA error: no kernel image is available
+  for execution on the device`, or cuDNN's `not compatible with devices with SM < 7.5` for the
+  LSTM. The card itself is fine (Ollama serves on it happily with its own Pascal-capable build);
+  it is purely a **torch-wheel** mismatch, and the fix is the wheel, not the card — see below.
+
+**Fixing the wheel rather than living on the fallback (amdcomp, 2026-09-12).** The same torch
+version is published against several CUDA runtimes, so a card below the default wheel's floor does
+**not** require a version downgrade. amdcomp moved from `2.11.0+cu128` to **`2.11.0+cu126`** —
+identical version, so `transformers` / `torchvision 0.26.0` / `torchaudio 2.11.0` / `triton 3.6.0`
+all keep their existing pairings — and `cu126` still carries `sm_61`:
+
+```bash
+pip install torch==2.11.0+cu126 torchvision==0.26.0+cu126 torchaudio==2.11.0+cu126 \
+  --index-url https://download.pytorch.org/whl/cu126
+```
+
+Verified afterwards with a **real kernel launch**, which is the only probe that means anything
+here: fp32 matmul, bf16 matmul, a cuDNN LSTM, and a Triton JIT kernel (exact, max err 0.0 — so the
+fused w4a16/w8a16 int-quant path is intact). Kokoro then loads `ready on cuda` with **no fallback**
+and runs at **RTF 0.04 (~25× realtime), 4.3× faster than the same box's CPU path** — so on a
+discrete NVIDIA card the GPU is a clear win, unlike the gfx1151 APU case where CPU measured
+faster. **Check `nvidia-smi` for other tenants first:** Ollama holds ~5.6 GB of this card's 8 GB
+with its own Pascal build, which is what keeps larger iM models off the GPU here — that is a VRAM
+contention limit, not a capability one.
 
 > Until 2026-09-12 this predicate was three copy-pasted substring lists, all containing **only**
 > the ROCm markers — so the fallback was **inert on the CUDA side** and a too-old card hard-failed

@@ -45,9 +45,21 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 
 - `amdcomp` was missing `kokoro`, `misaki`, `espeakng_loader` and `phonemizer-fork` in
   `/root/imenv` — installed per `docs/TTS.md`, which is what flips `can_tts` for placement.
-- Kokoro therefore serves on `amdcomp` **on CPU**. Getting it onto that GPU is not a TTS change
-  at all: it needs a torch wheel with `sm_61` cubins, which is a node-wide downgrade affecting
-  every other model on the box, so it is deliberately **not** done here.
+- **amdcomp moved to `torch 2.11.0+cu126` and now runs Kokoro on the GPU.** The fallback above is
+  what made the node work *at all*; this is the separate fix for the underlying wheel. A card
+  below the default wheel's compute floor does **not** need a torch *downgrade* — the same version
+  is published against several CUDA runtimes, and `cu126` still ships `sm_61`. Moving
+  `2.11.0+cu128` → `2.11.0+cu126` (plus `torchvision 0.26.0+cu126` / `torchaudio 2.11.0+cu126`)
+  keeps the version, so `transformers 5.12.1` and `triton 3.6.0` keep their existing pairings.
+  Re-verified by **real kernel launch** — fp32 matmul, bf16 matmul, cuDNN LSTM, and a Triton JIT
+  kernel (exact, max err 0.0, so the fused int-quant kernels are intact) — plus a live embedding
+  request through the node. Kokoro now loads `ready on cuda` with **no fallback** at **RTF 0.04
+  (~25× realtime), 4.3× faster than the same box's CPU path**. Worth recording because the
+  gfx1151 precedent pointed the other way: there, GPU Kokoro measured *slower* than CPU, so
+  "82M params won't benefit from a GPU" does not generalise off that APU.
+- Remaining limit on that node is **VRAM contention, not capability**: Ollama holds ~5.6 GB of the
+  card's 8 GB with its own Pascal build, so iM fits Kokoro (0.3 GB) but a 0.5B int4 LLM still
+  plans onto CPU there.
 
 ## 2026-08-21 — Bazarr-compatible Whisper ASR (`#bazarr-asr`) (0.3.38 / 0.3.34)
 
