@@ -4,7 +4,40 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-12 (latest) — the GPU→CPU media fallback was inert on CUDA (`#gpu-exec-fallback`)
+## 2026-09-18 (latest) — `can_t2a` now requires bf16 hardware, not just the package (`#t2a-bf16-gate`)
+
+### Fixed
+
+- **A GPU too old for bf16 no longer advertises ACE-Step music capability — so a music request
+  fails cleanly at PLACEMENT instead of crashing mid-render.** Workers advertised `can_t2a` purely
+  from `find_spec("acestep")` succeeding. `amdcomp`'s **GTX 1070 (Pascal, `sm_61`)** imports
+  `acestep` fine and reported `can_t2a=True`, so the controller placed an ACE-Step load onto it —
+  and it loaded, streamed the DiT to the GPU, then **crashed ~54 s into the render** with cuDNN's
+  `RuntimeError('GET was unable to find an engine to execute this computation')`. Root cause:
+  ACE-Step's M1 pipeline is **bf16-only**, and bf16 execution needs an **Ampere+ GPU (CUDA compute
+  capability ≥ (8, 0))** — the same threshold `worker_quant` gates the tinygemm int4 path on and
+  `perf_profile.classify_device` splits CUDA_MODERN / CUDA_LEGACY on. Pascal (`sm_61`) and Turing
+  (`sm_75`) have no bf16 engine. (VRAM was a red herring — freeing the card and lowering the offload
+  gate got it to render, and it still died on the missing bf16 kernel.)
+
+  - **Worker (`worker_hw.build_registration`):** `can_t2a` is now `find_spec("acestep")` **and** a
+    bf16-capable CUDA GPU (`_t2a_bf16_capable`, capability ≥ (8, 0)). The CUDA capability is read
+    once and reused for the existing `compute_cap` report. ROCm was already `can_t2a=False` by not
+    installing `acestep` (torchaudio ABI clash); this closes the CUDA-Pascal hole. A pre-Ampere
+    card now reports `can_t2a=False`.
+  - **Controller backstop (`engine_load._load_t2a_locked`):** the t2a candidate filters and ranking
+    now route through `_t2a_capable(node)`, which rejects a `can_t2a` node whose reported
+    `compute_cap` is **known and < (8, 0)** — catching an OLD worker still advertising `can_t2a`
+    from before this gate (self-update convergence window). An **unknown** capability (a worker
+    predating `#sm-probe`) still trusts `can_t2a`, the same "never slander an absent field" rule
+    `classify_device` uses.
+  - Test `scratch_t2a_bf16_gate_test.py` exercises the real shipped predicates (the worker helper by
+    import, the controller predicate by AST-extracting and executing the actual function) — Pascal
+    `[6,1]` / Turing `[7,5]` rejected, Ampere `[8,6]`+ accepted, unknown-cap trusts `can_t2a` — and
+    asserts the placement filters route through `_t2a_capable` (not the raw flag) so the gate can't
+    be silently dropped, mirroring the `#node-optout` parity test.
+
+## 2026-09-12 — the GPU→CPU media fallback was inert on CUDA (`#gpu-exec-fallback`)
 
 ### Fixed
 

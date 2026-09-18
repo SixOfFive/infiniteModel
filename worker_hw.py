@@ -492,6 +492,25 @@ def detect_ram(override: str = "") -> str:
     return _fmt_ram_mods(mods)
 
 
+def _t2a_bf16_capable(cuda_sm) -> bool:
+    """#t2a-bf16-gate (2026-09-18): can `cuda_sm` execute ACE-Step's bf16-only pipeline?
+
+    True iff `cuda_sm` — a (major, minor) CUDA compute capability, or None — is a CUDA GPU of
+    capability >= (8, 0) (Ampere or newer). This is the SAME >= (8, 0) bf16 threshold that
+    worker_quant gates the tinygemm int4 path on (~line 727) and that perf_profile.classify_device
+    splits CUDA_MODERN / CUDA_LEGACY on. A pre-Ampere card (Pascal sm_61 GTX 1070 / Quadro P620)
+    imports `acestep` fine but has NO bf16 engine — cuDNN raises "unable to find an engine to
+    execute this computation" MID-RENDER (found on amdcomp's 1070, 2026-09-18) — so can_t2a must
+    require real bf16 hardware, not merely the package, or the controller places a music load onto
+    a card that then crashes partway through a render instead of failing cleanly at placement.
+    None (CPU / ROCm / no GPU) is bf16-incapable for this pipeline -> False; ROCm additionally
+    never installs acestep (torchaudio ABI clash), so it was already can_t2a=False."""
+    try:
+        return cuda_sm is not None and (int(cuda_sm[0]), int(cuda_sm[1])) >= (8, 0)
+    except Exception:
+        return False
+
+
 def build_registration(args: argparse.Namespace) -> dict:
     device, device_name, _dev_total = detect_device()
     # Report what this worker will actually use: 'cpu' forces CPU even if a GPU
@@ -519,6 +538,18 @@ def build_registration(args: argparse.Namespace) -> dict:
     }
     if _using_gpu(args):
         reg["vram_total_gb"] = round(_gpu_mem_gb()[1], 2)
+    # #t2a-bf16-gate + #sm-probe: read the CUDA compute capability ONCE here — it gates can_t2a
+    # (bf16-only ACE-Step needs >= (8, 0), see _t2a_bf16_capable) AND is reported as compute_cap
+    # further down. None on CPU / ROCm / no GPU. ROCm returns the gfx arch pair (not an SM
+    # version), so it is deliberately excluded — HIP is handled by its own kernels and the number
+    # would only mislead both consumers.
+    _cuda_sm = None
+    if _using_gpu(args):
+        with contextlib.suppress(Exception):
+            import torch as _torch_cc
+            if not getattr(_torch_cc.version, "hip", None):
+                _s = _torch_cc.cuda.get_device_capability(_torch_cc.cuda.current_device())
+                _cuda_sm = (int(_s[0]), int(_s[1]))
     # #media-anywhere: advertise which MEDIA runtimes are installed on THIS worker so the
     # controller can place a t2a/t2i model on ANY capable GPU, not only the co-located box.
     # find_spec is a cheap, import-free probe (no heavy acestep/diffusers import at register).
@@ -528,7 +559,9 @@ def build_registration(args: argparse.Namespace) -> dict:
             return _ilu.find_spec(_pkg) is not None
         except Exception:
             return False
-    reg["can_t2a"] = _has("acestep")
+    # #t2a-bf16-gate: acestep importable AND a bf16-capable (Ampere+) CUDA GPU. A Pascal card that
+    # merely has the package would crash mid-render — see _t2a_bf16_capable.
+    reg["can_t2a"] = _has("acestep") and _t2a_bf16_capable(_cuda_sm)
     reg["can_t2i"] = _has("diffusers")
     # #media-anywhere: Kokoro needs the kokoro+misaki pair (installed --no-deps, phonemizing via
     # misaki.espeak — see worker_tts's header) plus espeakng_loader for the bundled voice data and
@@ -582,12 +615,10 @@ def build_registration(args: argparse.Namespace) -> dict:
     # an SM version — classify_device tests is_hip first and HIP has the project's own Triton w4a16
     # kernel, so the number could only mislead. Guarded by _using_gpu so a --device cpu worker on a
     # GPU box advertises no capability for a GPU it will not touch.
-    if _using_gpu(args):
-        with contextlib.suppress(Exception):
-            import torch as _torch_cc
-            if not getattr(_torch_cc.version, "hip", None):
-                _sm = _torch_cc.cuda.get_device_capability(_torch_cc.cuda.current_device())
-                reg["compute_cap"] = [int(_sm[0]), int(_sm[1])]
+    # (computed once above as _cuda_sm, shared with the #t2a-bf16-gate; see that block. Absent
+    # when unknown so a pre-probe worker keeps classify_device's "assume modern" default.)
+    if _cuda_sm is not None:
+        reg["compute_cap"] = [_cuda_sm[0], _cuda_sm[1]]
     reg["can_stt"] = _has("transformers") and _has("soundfile")   # #stt-serve: Whisper ASR leaf
     # #t2music-serve: MusicGen ships inside transformers and needs NO torchaudio (soundfile writes
     # the WAV) — so any Whisper-capable worker is also MusicGen-capable. Runs on AMD/NVIDIA/CPU.

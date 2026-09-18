@@ -2576,6 +2576,24 @@ class EngineLoadMixin:
         def _need_gb() -> float:
             return _T2A_OFFLOAD_VRAM_GB if offload else max(all_b / GB + _MARGIN_GB,
                                                             _T2A_RENDER_FLOOR_GB)
+        def _t2a_capable(_n) -> bool:
+            # #t2a-bf16-gate backstop: a modern worker already withholds can_t2a on a pre-Ampere
+            # card (worker_hw._t2a_bf16_capable), but an OLD worker still in the self-update
+            # convergence window advertises can_t2a=True on Pascal — and placing an ACE-Step
+            # (bf16-only M1 pipeline) load there crashes MID-RENDER with cuDNN "unable to find an
+            # engine to execute this computation", because sm < (8, 0) has no bf16 engine (found on
+            # amdcomp's GTX 1070, 2026-09-18). So don't trust the flag alone: reject a can_t2a node
+            # whose reported compute_cap is KNOWN and < (8, 0). Unknown cap (a worker predating
+            # #sm-probe) -> trust can_t2a, the same "never slander an absent field" rule
+            # perf_profile.classify_device uses (absent capability == assume modern). Same (8, 0)
+            # bf16 threshold as worker_hw._t2a_bf16_capable / worker_quant's tinygemm gate.
+            if not getattr(_n, "can_t2a", False):
+                return False
+            _cc = getattr(_n, "compute_cap", None)
+            try:
+                return not (_cc and len(_cc) >= 2 and (int(_cc[0]), int(_cc[1])) < (8, 0))
+            except Exception:
+                return True
         await self.ensure_data_listener()
         # #media-pin: static predicate -> validate before the destructive unload (see
         # _load_t2i_locked); the loop below re-derives and re-filters for the actual ranking.
@@ -2584,7 +2602,7 @@ class EngineLoadMixin:
             [n for n in registry.alive_sorted()
              if n.can_infer and (cpu_only or n.vram_total_gb > 0)
              and (n.hostname == _ch or str(n.data_host).startswith(("127.", "::1"))
-                  or str(n.data_host) in _LOCAL_IPS or getattr(n, "can_t2a", False))],
+                  or str(n.data_host) in _LOCAL_IPS or _t2a_capable(n))],
             pin_host, exclude_nodes, "t2a (ACE-Step) model")
         if reg_key in self.models:
             await self._unload_model_locked(reg_key, "reload (t2a)")
@@ -2608,7 +2626,7 @@ class EngineLoadMixin:
             # the GPU is usable); only the both-off state is an opt-out.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and (cpu_only or n.vram_total_gb > 0)
-                    and (_is_colo(n) or getattr(n, "can_t2a", False))]
+                    and (_is_colo(n) or _t2a_capable(n))]
             cand = self._place_filter(cand, pin_host, exclude_nodes, "t2a (ACE-Step) model")
             # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
             _res_ram_b, _res_vram_b = self._reserved_bytes(exclude_key=reg_key)
@@ -2645,7 +2663,7 @@ class EngineLoadMixin:
                     f"{h} short {need - have:.2f} GB of {res} (needs {need:.1f}, has {have:.1f})"
                     for h, res, need, have in rows)
 
-            for n in sorted(cand, key=lambda _n: (bool(getattr(_n, "can_t2a", False)),
+            for n in sorted(cand, key=lambda _n: (_t2a_capable(_n),
                                                    _is_colo(_n), _t2a_free(_n)), reverse=True):
                 if cpu_only:
                     # #t2a-cpu: budget against RAM only (VRAM ignored) — whole pipeline + margin in RAM.
