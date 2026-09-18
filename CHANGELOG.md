@@ -4,7 +4,7 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2)
+## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.40
 
 ### Added
 
