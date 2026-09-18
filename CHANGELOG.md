@@ -30,6 +30,10 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   accepts `int4` as a t2a tier and sizes the offload VRAM gate for it (`_T2A_OFFLOAD_VRAM_GB` 4.0 for
   int4 vs 8.0 for bf16). bf16 stays the better-quality default on cards with room; int4 is opt-in for
   the small-GPU tier. `loaded_params` is now captured before quant (int4 turns weights into buffers).
+- **`scratch_t2a_int4_test.py`** exercises the shipped `_quantize_dit_int4` on a synthetic
+  ACE-Step-shaped block: the 1x1-conv FF + attention `nn.Linear` become int4 (`QuantLinear4`), the
+  depthwise conv (k=3, groups=C) stays bf16, forward parity holds within int4 error (~6.6%), weights
+  shrink ~3.7x. Skips cleanly where torch is absent (the controller box).
 
 ## 2026-09-18 — `can_t2a` now requires bf16 hardware, not just the package (`#t2a-bf16-gate`)
 
