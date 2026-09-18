@@ -2570,7 +2570,7 @@ class EngineLoadMixin:
         # RESIDENT (~2.7 GB measured), NOT the whole bf16 pipeline. So the offload RAM budget is ~half
         # the bf16 one; the old all_b+4 (~11.7 GB) falsely refused a 7 GB-free 3060 for a load that
         # actually needs ~3 GB.
-        _offload_ram_gb = (all_b / GB * 0.5 + 2.0) if quant == "int4" else (all_b / GB + 4.0)
+        _offload_ram_gb = (all_b / GB * 0.35 + 0.8) if quant == "int4" else (all_b / GB + 4.0)
         # #t2a-render-peak: size a GPU-RESIDENT placement to the diffusion RENDER peak, not the
         # load footprint. ACE-Step's whole pipeline RESTS at ~8.3 GB, but a render climbs ~3+ GB
         # higher (denoising activations + audio latents). An 11.55 GB card (RTX 3060) passed the
