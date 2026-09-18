@@ -2565,6 +2565,12 @@ class EngineLoadMixin:
                          meas_layer_w=max(1, dit_b // 24), meas_embed=0, meas_head=0,
                          meas_norm=0, meas_params=max(1, all_b // 2))
         _T2A_OFFLOAD_VRAM_GB = 4.0 if quant == "int4" else 8.0   # int4 DiT ~2 GB + activations vs bf16 6.67
+        # #t2a-int4: an int4 DiT loads via mmap + per-tensor quant (the bf16 source stays reclaimable
+        # page cache, never fully committed — measured load RAM peak ~1.9 GB), and rests at the int4
+        # RESIDENT (~2.7 GB measured), NOT the whole bf16 pipeline. So the offload RAM budget is ~half
+        # the bf16 one; the old all_b+4 (~11.7 GB) falsely refused a 7 GB-free 3060 for a load that
+        # actually needs ~3 GB.
+        _offload_ram_gb = (all_b / GB * 0.5 + 2.0) if quant == "int4" else (all_b / GB + 4.0)
         # #t2a-render-peak: size a GPU-RESIDENT placement to the diffusion RENDER peak, not the
         # load footprint. ACE-Step's whole pipeline RESTS at ~8.3 GB, but a render climbs ~3+ GB
         # higher (denoising activations + audio latents). An 11.55 GB card (RTX 3060) passed the
@@ -2682,7 +2688,7 @@ class EngineLoadMixin:
                 free = _t2a_free(n)
                 if offload:
                     # never evicts (its point): needs only the transient VRAM + RAM for the weights
-                    _need_ram = all_b / GB + 4.0
+                    _need_ram = _offload_ram_gb
                     if free >= _T2A_OFFLOAD_VRAM_GB and _free_ram(n) >= _need_ram:
                         node = n
                         break
@@ -2729,7 +2735,7 @@ class EngineLoadMixin:
                     log_activity(f"{_ollama_name(friendly)}: bf16 GPU-resident won't fit "
                                  f"(~{_need_gb():.1f} GB, nothing evictable) — falling back to RAM "
                                  f"offload (~{_T2A_OFFLOAD_VRAM_GB:.0f} GB transient + "
-                                 f"~{all_b / GB + 4.0:.0f} GB RAM, never evicts)")
+                                 f"~{_offload_ram_gb:.0f} GB RAM, never evicts)")
                     offload = True
                     _refreshed = False
                     continue
@@ -2745,7 +2751,7 @@ class EngineLoadMixin:
                     " — t2a serves on the co-located GPU or any worker advertising the acestep "
                     "runtime (can_t2a)"
                     + (f"; or use offload (t2i_offload=1): ~{_T2A_OFFLOAD_VRAM_GB:.0f} GB transient "
-                       f"+ ~{all_b / GB + 4.0:.0f} GB RAM, never evicts" if not offload else ""))
+                       f"+ ~{_offload_ram_gb:.0f} GB RAM, never evicts" if not offload else ""))
             await self._unload_model_locked(victim, "evict idle LRU: music model needs VRAM")
             await self._await_free_refresh()
         self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
@@ -2760,7 +2766,7 @@ class EngineLoadMixin:
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
         self._reservations[reg_key] = {node.node_id: {
             "ram": int(all_b + _MARGIN_GB * GB) if cpu_only
-                   else int((all_b + 4 * GB) if offload else 2 * GB),
+                   else int((_offload_ram_gb * GB) if offload else 2 * GB),
             "vram": 0 if cpu_only
                     else int((_T2A_OFFLOAD_VRAM_GB if offload else _need_gb()) * GB)}}
         # #node-optout: the link lookup every load already did, plus the off-limits check it never

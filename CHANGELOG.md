@@ -4,7 +4,20 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.40
+## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.41
+
+### Changed (fleet-serve fit — memory-efficient int4 load)
+
+- **The int4 DiT is now quantized DURING load, so the fleet load fits a RAM-constrained 3060.**
+  ACE-Step's `load_checkpoint` loads the DiT first (via `from_pretrained`, which mmaps the
+  safetensors) and the small DCAE/UMT5 after. `worker_t2a` scopes a patch of
+  `ACEStepTransformer2DModel.from_pretrained` that int4s the DiT before it returns — so the bf16
+  weights stay reclaimable page cache and only the int4 output is committed. **Measured load RAM
+  peak dropped from ~7.7 GB (whole bf16 pipeline) to ~1.9 GB.** A post-hoc safety net re-quantizes
+  if the patch ever fails to fire.
+- **int4-aware offload RAM budget in `_load_t2a_locked`** (`_offload_ram_gb` = `all_b×0.5 + 2` for
+  int4 vs `all_b + 4` for bf16). The old bf16 budget (~11.7 GB) was falsely refusing a 7 GB-free
+  3060 for a load that actually needs ~3 GB.
 
 ### Added
 

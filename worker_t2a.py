@@ -156,7 +156,35 @@ class T2APipeline:
             self.pipe.device = _torch.device("cpu")
         # Eager-load so `loaded` reflects reality and the first request isn't a cold load;
         # get_checkpoint_path uses model_dir as-is (has the 4 component subfolders).
-        self.pipe.load_checkpoint(model_dir)
+        # #t2a-int4 (M2): quantize the DiT DURING load. ACE-Step's load_checkpoint loads the DiT
+        # FIRST (ACEStepTransformer2DModel.from_pretrained) and the small DCAE/UMT5 after, so the
+        # bf16 DiT (~6.6 GB) is the RAM peak of the WHOLE load. Patching from_pretrained to int4 the
+        # DiT before it returns caps the peak at the DiT's own bf16 size instead of the whole bf16
+        # pipeline (~7.7 GB) — that ~1 GB is what lets the int4 load fit a ~7 GB-free box (a 3060
+        # laptop also running a desktop). The `.to(self.dtype)` load_checkpoint runs next is safe:
+        # nn.Module.to(dtype) casts only floating tensors, leaving QuantLinear4's uint8 qweight
+        # buffers untouched. `loaded_params` is captured pre-quant here (weights become buffers).
+        self.loaded_params = 0
+        _int4_done = {"v": False}
+        if self.quant == "int4":
+            from acestep.models.ace_step_transformer import ACEStepTransformer2DModel as _DiTCls
+            _orig_fp = _DiTCls.from_pretrained.__func__
+
+            def _fp_int4(cls, *a, **k):
+                _m = _orig_fp(cls, *a, **k)
+                self.loaded_params = sum(p.numel() for p in _m.parameters())
+                _tq = time.time()
+                _quantize_dit_int4(_m)
+                _int4_done["v"] = True
+                print(f"[t2a] int4 DiT quantized during load in {time.time() - _tq:.1f}s", flush=True)
+                return _m
+            _DiTCls.from_pretrained = classmethod(_fp_int4)
+            try:
+                self.pipe.load_checkpoint(model_dir)
+            finally:
+                _DiTCls.from_pretrained = classmethod(_orig_fp)
+        else:
+            self.pipe.load_checkpoint(model_dir)
 
         def _module_bytes(mod) -> int:
             if mod is None:
@@ -167,17 +195,14 @@ class T2APipeline:
         dit = getattr(self.pipe, "ace_step_transformer", None)
         dcae = getattr(self.pipe, "music_dcae", None)
         te = getattr(self.pipe, "text_encoder_model", None)
-        # DiT logical param count BEFORE any quant — int4 turns weights into uint8 BUFFERS, so a
-        # post-quant p.numel() sum would under-report (the count itself is unchanged by quant).
-        self.loaded_params = sum(p.numel() for p in dit.parameters()) if dit is not None else 0
-        # #t2a-int4 (M2): shrink the DiT ~4x so it fits a bf16-capable 6 GB card (RTX 3060). Done
-        # AFTER load_checkpoint (weights present) and BEFORE the byte census below so gpu_bytes/
-        # loaded_bytes report the int4 footprint. Under offload the DiT is in RAM here, so the
-        # transient bf16+int4 peak is paid in RAM (freed layer-by-layer as QuantLinear4 replaces).
-        if self.quant == "int4" and dit is not None:
-            _tq = time.time()
+        # Safety net: if the load-time patch never fired (e.g. from_pretrained signature changed),
+        # int4 the DiT post-hoc so quant is still correct — it just pays the higher bf16 RAM peak.
+        if self.quant == "int4" and dit is not None and not _int4_done["v"]:
+            self.loaded_params = sum(p.numel() for p in dit.parameters())
             _quantize_dit_int4(dit)
-            print(f"[t2a] int4 DiT quantized in {time.time() - _tq:.1f}s", flush=True)
+            print("[t2a] int4 DiT quantized post-load (from_pretrained patch did not fire)", flush=True)
+        elif self.quant != "int4":
+            self.loaded_params = sum(p.numel() for p in dit.parameters()) if dit is not None else 0
         dit_b = _module_bytes(dit)
         self.gpu_bytes = 0 if self.offload else (
             (dit_b + _module_bytes(dcae)) if str(self.device).startswith("cuda") else 0)
