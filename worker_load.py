@@ -382,7 +382,7 @@ class WorkerLoadMixin:
                 try:
                     eng = await asyncio.to_thread(
                         worker_t2a.T2APipeline, mdir, device,
-                        "none", bool(a.get("t2a_offload", False)))
+                        a.get("quant", "none"), bool(a.get("t2a_offload", False)))  # #t2a-int4
                     self.shards[model_id] = eng
                 finally:
                     self._building -= 1

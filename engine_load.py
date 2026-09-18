@@ -2776,7 +2776,7 @@ class EngineLoadMixin:
         fut = asyncio.get_event_loop().create_future()
         link.pending_loads[target_id] = fut
         await link.send({"type": "load", "kind": "t2a", "model_id": target_id,
-                         "model_dir": model_dir, "quant": "none",
+                         "model_dir": model_dir, "quant": quant,   # #t2a-int4: "int4" or "none"
                          "t2a_offload": bool(offload),
                          "controller_http_port": ARGS.http_port,
                          "next_host": None, "next_port": ARGS.data_port,

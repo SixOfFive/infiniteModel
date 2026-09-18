@@ -4,7 +4,16 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.41
+## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.42
+
+### Fixed (fleet-serve: thread `quant` through the load handoff)
+
+- **The t2a load message + worker construction both hardcoded `quant="none"`**, so a fleet
+  `POST /load?model=ace-step&quant=int4` accepted int4 in placement but always loaded bf16.
+  `engine_load` now sends the real `quant` in the `{"type":"load","kind":"t2a",…}` message, and
+  `worker_load` passes `a.get("quant")` into `T2APipeline` (was `"none"`). Verified: a fleet int4
+  load now quantizes (worker logs "int4 DiT quantized during load") and rests at ~2.7 GB.
+
 
 ### Changed (fleet-serve fit — memory-efficient int4 load)
 
