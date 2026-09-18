@@ -2804,7 +2804,7 @@ class EngineLoadMixin:
         stage0_writer = await self._connect_retry(*_dial)
         now = time.time()
         lm = LoadedModel(reg_key, target_id, spec, 0, plan, [node.node_id], None, set(), now,
-                         quant="none", stage0_writer=stage0_writer, last_used=now,
+                         quant=quant, stage0_writer=stage0_writer, last_used=now,
                          stage0_dial=_dial, last_send_ts=now)
         lm.base, lm.replica_idx = friendly, replica_idx
         lm.plan_basis = "t2a: single-node" + (" (CPU)" if cpu_only else "")
