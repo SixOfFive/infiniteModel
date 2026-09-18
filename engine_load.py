@@ -2543,11 +2543,17 @@ class EngineLoadMixin:
         GPU-hop concept) and never falls back to GPU. v1 co-location constraint for the
         co-located fast path (shared FS: model dir read + WAV path back). MUST hold self.lock."""
         model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
-        if quant and quant not in ("none", ""):
-            log_activity(f"{_ollama_name(friendly)}: {quant} is not a t2a tier (M1 bf16-only) — using bf16")
-        quant = "none"
+        quant = (quant or "none")
+        if quant not in ("none", "int4"):
+            log_activity(f"{_ollama_name(friendly)}: {quant} is not a t2a tier (bf16 / int4) — using bf16")
+            quant = "none"
+        # #t2a-int4 (M2): int4 quantizes the DiT ~4x (attention Linear + GLUMBConv 1x1-conv FF, see
+        # worker_t2a._quantize_dit_int4) so ACE-Step fits a bf16-capable 6 GB card (RTX 3060). It
+        # needs bf16-capable hardware (QuantLinear4), which #t2a-bf16-gate already guarantees for any
+        # can_t2a node; on a big card bf16 stays the better-quality default (int4 is opt-in).
         if cpu_only:
             offload = False   # #t2a-cpu: CPU compute is RAM-resident; offload is a GPU-hop concept
+            quant = "none"    # CPU t2a is a bf16 RAM-resident diagnostic; int4 targets a bf16 GPU
             log_activity(f"{_ollama_name(friendly)}: CPU-only t2a requested — EXPERIMENTAL and very "
                          f"slow (diffusion on CPU), no GPU/offload fallback")
         dit_b = await asyncio.to_thread(_tree_weight_bytes,
@@ -2558,7 +2564,7 @@ class EngineLoadMixin:
                          vocab_size=0, tie_embeddings=True, max_ctx=0, arch="t2a",
                          meas_layer_w=max(1, dit_b // 24), meas_embed=0, meas_head=0,
                          meas_norm=0, meas_params=max(1, all_b // 2))
-        _T2A_OFFLOAD_VRAM_GB = 8.0   # M0 whole-DiT-hop peak 6.67 GB + decode/activation margin
+        _T2A_OFFLOAD_VRAM_GB = 4.0 if quant == "int4" else 8.0   # int4 DiT ~2 GB + activations vs bf16 6.67
         # #t2a-render-peak: size a GPU-RESIDENT placement to the diffusion RENDER peak, not the
         # load footprint. ACE-Step's whole pipeline RESTS at ~8.3 GB, but a render climbs ~3+ GB
         # higher (denoising activations + audio latents). An 11.55 GB card (RTX 3060) passed the

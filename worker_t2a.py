@@ -57,6 +57,51 @@ def _install_soundfile_save() -> None:
     torchaudio.save = _save
 
 
+def _quantize_dit_int4(dit) -> None:
+    """#t2a-int4 (M2): in-place group-wise int4 of the ACE-Step DiT's big weight layers, reusing
+    worker_quant's QuantLinear4. Covers BOTH the attention/embedder nn.Linear AND the 1x1 nn.Conv1d
+    that GLUMBConv's FF is built from — a 1x1 conv is a pointwise Linear over channels, and the FF
+    is the MAJORITY of each block (mlp_ratio 4), so quantizing only nn.Linear would leave most of
+    the DiT bf16 and miss the fit. Measured ~3.75x on the FF / ~3.7x on Linear -> DiT ~6.6 GB down
+    to ~2 GB, which fits a bf16-capable 6 GB card (RTX 3060) with headroom. Left bf16 (tiny or not
+    a pointwise matmul): the depthwise conv (k=3, groups=C), the Conv2d patch-embed, RMSNorm,
+    embeddings/rotary. prepare_fused is deliberately NOT called: ACE-Step's cpu_offload hops
+    modules CPU<->GPU per render, and QuantLinear4's naive dequant path (forward with _fused unset)
+    is device-agnostic; the int4-packed weights still cut resident + per-render transfer VRAM ~4x.
+    (int4 needs a bf16-capable card anyway — the caller/placement gates t2a on compute cap >= (8,0),
+    see #t2a-bf16-gate — so this tier never reaches a Pascal card.)"""
+    import types
+    from torch import nn
+    import worker_quant as wq
+
+    class _Conv1x1Int4(nn.Module):
+        """A 1x1 Conv1d (pointwise, groups=1) served as int4 over channels: [B,C,L] -> [B,L,C] ->
+        QuantLinear4 -> [B,L,C'] -> [B,C',L]. Identical I/O contract to the conv, so ConvLayer's
+        norm/act and GLUMBConv's downstream gating are untouched."""
+        def __init__(self, q):
+            super().__init__()
+            self.q = q
+
+        def forward(self, x):
+            return self.q(x.transpose(1, 2)).transpose(1, 2)
+
+    def _conv_to_int4(conv):
+        W = conv.weight.data.squeeze(-1).contiguous()          # [out, in, 1] -> [out, in]
+        lin = types.SimpleNamespace(weight=types.SimpleNamespace(data=W), bias=conv.bias)
+        return _Conv1x1Int4(wq._quantize_linear4(lin))
+
+    def _walk_convs(module):
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.Conv1d) and tuple(child.kernel_size) == (1,) \
+                    and child.groups == 1:
+                setattr(module, name, _conv_to_int4(child))
+            else:
+                _walk_convs(child)
+
+    wq._quantize_int4_(dit)   # every nn.Linear -> QuantLinear4 (DiT has no MoE router to skip)
+    _walk_convs(dit)          # every 1x1 Conv1d -> int4 pointwise
+
+
 class T2APipeline:
     """One resident text-to-audio (ACE-Step) model on this worker. Stored in
     worker.shards[model_id] like a T2IPipeline / EmbeddingModel; `kind` lets dispatchers
@@ -80,7 +125,7 @@ class T2APipeline:
         if not _dv or "gpu" in _dv:
             _dv = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = _dv
-        self.quant = "none"          # M1: bf16 only (edge-int4 is M2)
+        self.quant = "int4" if str(quant).lower() == "int4" else "none"   # M2: edge-int4 DiT; else bf16
         self.offload = bool(offload)
         self._gen_lock = threading.Lock()
         self._doomed = False
@@ -122,11 +167,21 @@ class T2APipeline:
         dit = getattr(self.pipe, "ace_step_transformer", None)
         dcae = getattr(self.pipe, "music_dcae", None)
         te = getattr(self.pipe, "text_encoder_model", None)
+        # DiT logical param count BEFORE any quant — int4 turns weights into uint8 BUFFERS, so a
+        # post-quant p.numel() sum would under-report (the count itself is unchanged by quant).
+        self.loaded_params = sum(p.numel() for p in dit.parameters()) if dit is not None else 0
+        # #t2a-int4 (M2): shrink the DiT ~4x so it fits a bf16-capable 6 GB card (RTX 3060). Done
+        # AFTER load_checkpoint (weights present) and BEFORE the byte census below so gpu_bytes/
+        # loaded_bytes report the int4 footprint. Under offload the DiT is in RAM here, so the
+        # transient bf16+int4 peak is paid in RAM (freed layer-by-layer as QuantLinear4 replaces).
+        if self.quant == "int4" and dit is not None:
+            _tq = time.time()
+            _quantize_dit_int4(dit)
+            print(f"[t2a] int4 DiT quantized in {time.time() - _tq:.1f}s", flush=True)
         dit_b = _module_bytes(dit)
         self.gpu_bytes = 0 if self.offload else (
             (dit_b + _module_bytes(dcae)) if str(self.device).startswith("cuda") else 0)
         self.loaded_bytes = dit_b + _module_bytes(dcae) + _module_bytes(te)
-        self.loaded_params = sum(p.numel() for p in dit.parameters()) if dit is not None else 0
         self.last_gen_s = 0.0
         print(f"[t2a] ready on {self.device}"
               f"{' OFFLOAD (components in RAM, whole DiT hops per gen)' if self.offload else ''} "

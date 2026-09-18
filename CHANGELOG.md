@@ -4,7 +4,34 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-18 (latest) — `can_t2a` now requires bf16 hardware, not just the package (`#t2a-bf16-gate`)
+## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2)
+
+### Added
+
+- **ACE-Step music now fits a bf16-capable 6 GB GPU (e.g. an RTX 3060) via an int4 DiT** — so the
+  fleet can serve music without the big cards (beast's 4070 Ti Super / furnace's 5090). The DiT is
+  quantized in place after load with the project's own `QuantLinear4` (group-wise int4), covering
+  BOTH the attention/embedder `nn.Linear` **and** the 1x1 `nn.Conv1d` that ACE-Step's `GLUMBConv`
+  FF is built from — a 1x1 conv is a pointwise Linear over channels, and the FF (mlp_ratio 4) is
+  the majority of each block, so quantizing only the linears would miss the fit. Left bf16: the
+  depthwise conv (k=3), the Conv2d patch-embed, norms, embeddings. `prepare_fused` is deliberately
+  skipped — ACE-Step's `cpu_offload` hops modules CPU↔GPU per render, and `QuantLinear4`'s naive
+  dequant path is device-agnostic; the int4-packed weights still cut resident + per-render transfer
+  VRAM ~4x.
+- **Measured on MOBILE's RTX 3060 (sm_86, 5.79 GB):** pipeline loads at **2.68 GB** (from ~8 GB
+  bf16), **0 GB resident** under offload, and a 10 s render **peaks at 2.09 GB** (vs the ~6.7–7 GB
+  bf16 peak) — valid 48 kHz stereo audio. int4 targets the bf16-capable-but-small tier only; it does
+  NOT help a pre-Ampere card (int4 still computes in bf16), and placement still gates t2a on
+  compute cap ≥ (8, 0) per `#t2a-bf16-gate`.
+
+### Changed
+
+- **`worker_t2a.T2APipeline`** honors `quant="int4"` (was bf16-only); **`engine_load._load_t2a_locked`**
+  accepts `int4` as a t2a tier and sizes the offload VRAM gate for it (`_T2A_OFFLOAD_VRAM_GB` 4.0 for
+  int4 vs 8.0 for bf16). bf16 stays the better-quality default on cards with room; int4 is opt-in for
+  the small-GPU tier. `loaded_params` is now captured before quant (int4 turns weights into buffers).
+
+## 2026-09-18 — `can_t2a` now requires bf16 hardware, not just the package (`#t2a-bf16-gate`)
 
 ### Fixed
 
