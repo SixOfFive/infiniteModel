@@ -33,7 +33,12 @@ fi
 
 mkdir -p "$DIST"
 echo "== nfpm: building .deb and .rpm (infinitemodel $VERSION) =="
-( cd "$PKG" && nfpm pkg -f nfpm.yaml -p deb -t "$DIST/" && nfpm pkg -f nfpm.yaml -p rpm -t "$DIST/" )
+# Render ${VERSION}/${MAINTAINER} ourselves — nfpm does not expand env vars in
+# contents globs. Render inside $PKG so the relative contents paths still resolve.
+RENDERED="$PKG/.nfpm.rendered.yaml"
+trap 'rm -f "$RENDERED"' EXIT
+sed -e "s|\${VERSION}|$VERSION|g" -e "s|\${MAINTAINER}|$MAINTAINER|g" "$PKG/nfpm.yaml" > "$RENDERED"
+( cd "$PKG" && nfpm pkg -f "$RENDERED" -p deb -t "$DIST/" && nfpm pkg -f "$RENDERED" -p rpm -t "$DIST/" )
 
 echo "== done =="
 ls -lh "$DIST"/infinitemodel*_all.deb "$DIST"/infinitemodel-*.noarch.rpm 2>/dev/null | sed 's/^/   /'

@@ -27,11 +27,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   `espeak-ng`, `libsndfile1`); rpm `python3` (venv is in-stdlib there). Maintainer scripts are shared
   and portable across dpkg/rpm arg conventions; a plain remove keeps `/var/lib` state and models, deb
   `purge` removes them and the service account.
-- **Built + validated** on MOBILE: `build_deb.sh` → `dist/infinitemodel_0.3.44_all.deb` (arch `all`,
-  916 KiB); `dpkg-deb -I/-c` confirm the control metadata, layout, the preserved `/usr/bin` symlink,
-  and postinst/prerm/postrm; every shell script passes `bash -n`/`sh -n`; `systemd-analyze verify`
-  passes (only the expected "venv not built yet" note). **Not yet done:** the `.rpm` artifact (needs
-  `nfpm` or an rpm toolchain — none installed on this Debian box) and a root `dpkg -i` install test.
+- **Both formats built + validated** on MOBILE. `.deb` via `build_deb.sh` (native `dpkg-deb`):
+  `dpkg-deb -I/-c` confirm control metadata, layout, the preserved `/usr/bin` symlink, and
+  postinst/prerm/postrm. `.deb` **and** `.rpm` via `build_pkgs.sh` + `nfpm` v2.47.0 (single static
+  binary, checksum-verified download): `dist/infinitemodel_0.3.44_all.deb` (897 KiB) and
+  `dist/infinitemodel-0.3.44-1.noarch.rpm` (901 KiB), both `all`/`noarch`, both installing the same 7
+  paths (rpm payload cpio-listed to confirm; lead magic + gzip payload valid). Every shell script
+  passes `bash -n`/`sh -n`; `systemd-analyze verify` passes (only the expected "venv not built yet"
+  note). One nfpm gotcha handled: it does **not** expand `${VERSION}`/`${MAINTAINER}` in `contents`
+  globs, so `build_pkgs.sh` sed-renders the yaml first. **Not yet done:** a root install test on live
+  hosts (`dpkg -i` on Debian, `dnf install` on Fedora) — only build-time validation was run here.
 
 ## 2026-09-19 — feat: packaging foundation — pip extras, wheel, and a bootstrap installer (`#packaging`)
 
