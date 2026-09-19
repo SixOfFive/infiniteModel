@@ -1,0 +1,25 @@
+[Unit]
+Description=InfiniteModel worker (model execution; auto-discovers controller)
+Documentation=https://github.com/SixOfFive/infiniteModel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=infinitemodel
+Group=infinitemodel
+Environment=INFINITEMODEL_HOME=/var/lib/infinitemodel
+# The worker auto-discovers the controller by UDP broadcast (config.json
+# controller_host=auto). Pin one for cross-subnet setups by editing this unit
+# (append --controller <ip>) or config.json in the app home. One worker serves
+# one GPU; for a second GPU add a drop-in with CUDA_VISIBLE_DEVICES + --name +
+# --data-port (see docs/nodes/4070-ti-super.md §3.1).
+ExecStart=/opt/infinitemodel/venv/bin/infinitemodel-worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/infinitemodel
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+[Unit]
+Description=InfiniteModel controller (HTTP API + dashboard)
+Documentation=https://github.com/SixOfFive/infiniteModel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=infinitemodel
+Group=infinitemodel
+# The app treats INFINITEMODEL_HOME as its writable root (state, models, cache,
+# and self-update rewrites its own .py there). The venv (read-only exec) is
+# separate under /opt; run `infinitemodel-setup` once to build it before start.
+Environment=INFINITEMODEL_HOME=/var/lib/infinitemodel
+ExecStart=/opt/infinitemodel/venv/bin/infinitemodel-controller
+Restart=on-failure
+RestartSec=5
+# Mild hardening. ProtectSystem=full keeps /usr /boot /etc read-only but leaves
+# /opt (venv) and /dev (GPU nodes) alone; the writable home is whitelisted.
+# Do NOT add PrivateDevices/DeviceAllow restrictions — CUDA/ROCm workers need
+# /dev/nvidia* etc. (the controller is CPU-side but shares this policy).
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/infinitemodel
+
+[Install]
+WantedBy=multi-user.target

@@ -4,7 +4,36 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-19 (latest) — feat: packaging foundation — pip extras, wheel, and a bootstrap installer (`#packaging`)
+## 2026-09-19 (latest) — feat: `#packaging` — .deb/.rpm system packages (systemd + venv-on-setup)
+
+### Added (`packaging/linux-pkg/` — Debian/RPM packages)
+
+- **A `.deb` (built) and `.rpm` (spec ready) that install the code + systemd units and defer the
+  hardware-specific venv to a one-time `infinitemodel-setup`.** Layout: wheel → `/opt/infinitemodel/
+  wheel/`, `infinitemodel-setup` → `/opt/infinitemodel/bin` (symlinked to `/usr/bin`), units →
+  `/usr/lib/systemd/system/{infinitemodel-controller,infinitemodel-worker}.service`. Post-install
+  creates the `infinitemodel` system user and the writable app home `/var/lib/infinitemodel` (the
+  launcher's `INFINITEMODEL_HOME`; self-update writes there), reloads systemd, and prints the next
+  step. It deliberately does **not** build the venv or start services — the venv install is
+  CPU/CUDA/ROCm-specific and can pull gigabytes of torch, which is wrong inside a dpkg/rpm transaction.
+- **`infinitemodel-setup`** (run as root after install) builds `/opt/infinitemodel/venv`, installs the
+  torch flavour (`--cpu`/`--cuda cuNNN`/`--rocm`), then the packaged wheel with chosen `--extras`,
+  handles the Kokoro-TTS `--no-deps` step and the ACE-Step guidance, symlinks the console scripts onto
+  PATH, and can `--start` the chosen services. Same venv-build mechanism proven for `bootstrap.sh`.
+- **One canonical spec, two emitters.** `nfpm.yaml` produces BOTH formats (`build_pkgs.sh`; needs the
+  `nfpm` binary — no root, no rpmbuild). For boxes without nfpm, `build_deb.sh` builds the `.deb`
+  natively with `dpkg-deb` (staged on local disk, because the CIFS repo mount cannot create the
+  `/usr/bin` symlink — Input/output error). Per-format deps: deb `python3, python3-venv` (Recommends
+  `espeak-ng`, `libsndfile1`); rpm `python3` (venv is in-stdlib there). Maintainer scripts are shared
+  and portable across dpkg/rpm arg conventions; a plain remove keeps `/var/lib` state and models, deb
+  `purge` removes them and the service account.
+- **Built + validated** on MOBILE: `build_deb.sh` → `dist/infinitemodel_0.3.44_all.deb` (arch `all`,
+  916 KiB); `dpkg-deb -I/-c` confirm the control metadata, layout, the preserved `/usr/bin` symlink,
+  and postinst/prerm/postrm; every shell script passes `bash -n`/`sh -n`; `systemd-analyze verify`
+  passes (only the expected "venv not built yet" note). **Not yet done:** the `.rpm` artifact (needs
+  `nfpm` or an rpm toolchain — none installed on this Debian box) and a root `dpkg -i` install test.
+
+## 2026-09-19 — feat: packaging foundation — pip extras, wheel, and a bootstrap installer (`#packaging`)
 
 ### Added (`packaging/` — distributable packages, foundation layer)
 

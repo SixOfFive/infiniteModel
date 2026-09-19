@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# ===========================================================================
+#  infinitemodel-setup — build the runtime venv for this machine (deb/rpm).
+#
+#  Installed by the infinitemodel package. Run ONCE after install (and again to
+#  change hardware/backends). Builds /opt/infinitemodel/venv, installs the torch
+#  build for this box, then the packaged wheel + chosen backend extras, wires
+#  the console scripts onto PATH, and optionally enables the systemd services.
+#
+#  Examples:
+#    sudo infinitemodel-setup --role worker --cuda cu128 --extras worker,vision --start
+#    sudo infinitemodel-setup --role both --cpu --extras controller,worker
+#    sudo infinitemodel-setup --role controller --no-torch --extras controller
+#    sudo infinitemodel-setup --role worker --cuda cu128 --extras worker,tts   # Kokoro TTS
+# ===========================================================================
+set -euo pipefail
+
+PREFIX=/opt/infinitemodel
+VENV="$PREFIX/venv"
+WHEEL_DIR="$PREFIX/wheel"
+HOME_DIR=/var/lib/infinitemodel
+USER_NAME=infinitemodel
+
+ROLE=both
+FLAVOR=""
+ROCM_ARCH=""
+EXTRAS=""
+WITH_ACESTEP=0
+NO_TORCH=0
+DO_START=0
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role)         ROLE="$2"; shift ;;          # controller | worker | both
+    --cpu)          FLAVOR="cpu" ;;
+    --cuda)         FLAVOR="$2"; shift ;;         # cu128, cu126, ...
+    --rocm)         FLAVOR="rocm"; ROCM_ARCH="${2:-gfx1151}"; shift ;;
+    --extras)       EXTRAS="$2"; shift ;;
+    --with-acestep) WITH_ACESTEP=1 ;;
+    --no-torch)     NO_TORCH=1 ;;
+    --start)        DO_START=1 ;;
+    -h|--help)      usage 0 ;;
+    *) echo "[ERROR] unknown option: $1"; usage 1 ;;
+  esac
+  shift
+done
+
+[ "$(id -u)" -eq 0 ] || { echo "[ERROR] run as root (sudo infinitemodel-setup ...)"; exit 1; }
+WHEEL="$(ls "$WHEEL_DIR"/infinitemodel-*.whl 2>/dev/null | head -1)"
+[ -f "$WHEEL" ] || { echo "[ERROR] no wheel in $WHEEL_DIR — is the package installed?"; exit 1; }
+
+echo "== infinitemodel-setup =="
+echo "   role=$ROLE  torch=${NO_TORCH:+skip}${FLAVOR:-?}  extras=${EXTRAS:-none}  venv=$VENV"
+
+# --- venv -------------------------------------------------------------------
+PY="$(command -v python3)"
+[ -n "$PY" ] || { echo "[ERROR] python3 not found"; exit 1; }
+[ -x "$VENV/bin/python" ] || "$PY" -m venv "$VENV"
+VPY="$VENV/bin/python"
+"$VPY" -m pip install --upgrade pip >/dev/null
+
+# --- torch (flavor-specific, first) -----------------------------------------
+if [ "$NO_TORCH" -eq 0 ]; then
+  case "$FLAVOR" in
+    cpu)  "$VPY" -m pip install torch --index-url https://download.pytorch.org/whl/cpu ;;
+    cu*)  "$VPY" -m pip install torch --index-url "https://download.pytorch.org/whl/$FLAVOR" ;;
+    rocm) echo "[ERROR] ROCm ($ROCM_ARCH): install AMD's arch-matched TheRock torch into"
+          echo "        $VENV first (see docs/ROCM.md), then re-run with --no-torch."; exit 1 ;;
+    "")   echo "[ERROR] choose torch: --cpu | --cuda cuNNN | --rocm gfxNNNN | --no-torch"; exit 1 ;;
+    *)    echo "[ERROR] bad torch flavor: $FLAVOR"; exit 1 ;;
+  esac
+fi
+
+# --- wheel + extras ---------------------------------------------------------
+if [ -n "$EXTRAS" ]; then "$VPY" -m pip install "${WHEEL}[${EXTRAS}]"; else "$VPY" -m pip install "$WHEEL"; fi
+
+case ",$EXTRAS," in
+  *,tts,*) echo "== Kokoro TTS: kokoro+misaki (--no-deps) =="
+           "$VPY" -m pip install --no-deps kokoro misaki
+           echo "   NOTE: also install the system 'espeak-ng' package (apt/dnf).";;
+esac
+if [ "$WITH_ACESTEP" -eq 1 ]; then
+  echo "== ACE-Step (t2a): NOT auto-installed — needs a --no-deps source install under"
+  echo "   a constraints file + torchaudio + a bf16-capable Ampere+ GPU. Follow"
+  echo "   docs/T2A.md, installing into $VENV."
+fi
+
+# --- app home ownership + PATH launchers ------------------------------------
+mkdir -p "$HOME_DIR"; chown "$USER_NAME":"$USER_NAME" "$HOME_DIR" 2>/dev/null || true
+ln -sf "$VENV/bin/infinitemodel-controller" /usr/bin/infinitemodel-controller
+ln -sf "$VENV/bin/infinitemodel-worker"     /usr/bin/infinitemodel-worker
+
+# --- optionally enable services ---------------------------------------------
+enable_svc() {
+  systemctl enable ${DO_START:+--now} "$1" 2>/dev/null \
+    && echo "   $1: enabled${DO_START:+ + started}" \
+    || echo "   $1: (systemctl unavailable — enable by hand)"
+}
+if command -v systemctl >/dev/null 2>&1; then
+  case "$ROLE" in
+    controller) enable_svc infinitemodel-controller ;;
+    worker)     enable_svc infinitemodel-worker ;;
+    both)       enable_svc infinitemodel-controller; enable_svc infinitemodel-worker ;;
+  esac
+fi
+
+echo
+echo "== ready =="
+echo "   Controller dashboard: http://<this-host>:21434"
+echo "   State + models:       $HOME_DIR"
+[ "$DO_START" -eq 1 ] || echo "   Start now:  sudo systemctl start infinitemodel-<controller|worker>"

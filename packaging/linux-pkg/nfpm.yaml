@@ -1,0 +1,60 @@
+# nfpm config — ONE spec, both .deb and .rpm. Canonical package definition.
+#   VERSION=$(grep -oE 'VERSION = "[^"]+"' ../../server.py | head -1 | sed -E 's/.*"([^"]+)".*/\1/') \
+#   nfpm pkg -f nfpm.yaml -p deb -t ../../dist/
+#   nfpm pkg -f nfpm.yaml -p rpm -t ../../dist/
+# (build_pkgs.sh does this and builds the wheel first.) The native build_deb.sh
+# mirrors this for boxes without nfpm; keep the two in sync — this file leads.
+name: infinitemodel
+arch: all                    # pure-python + wheel; nfpm emits deb 'all' / rpm 'noarch'
+platform: linux
+version: ${VERSION}
+section: science
+priority: optional
+maintainer: ${MAINTAINER}
+homepage: https://github.com/SixOfFive/infiniteModel
+license: MIT
+description: |
+  Distributed LLM and multimodal inference across mixed CPU/GPU nodes.
+  Pipeline-parallel serving of large language models plus vision, speech-to-text,
+  text-to-speech, text-to-image and music backends across a fleet of mixed
+  hardware. This package installs the code and systemd units; run
+  infinitemodel-setup to build the hardware-specific Python venv (torch, chosen
+  for CPU/CUDA/ROCm, is not bundled).
+
+# Distro-packaged prerequisites only. torch/transformers/etc. go in the venv
+# that infinitemodel-setup builds (hardware-specific, not distro packages).
+depends:
+  - python3
+  - python3-venv
+overrides:
+  rpm:
+    depends:
+      - python3               # venv ships inside python3 on RPM distros
+  deb:
+    recommends:
+      - espeak-ng             # only for the tts backend
+      - libsndfile1           # only for stt / audio-in / music backends
+
+contents:
+  - src: ../../dist/infinitemodel-${VERSION}-py3-none-any.whl
+    dst: /opt/infinitemodel/wheel/infinitemodel-${VERSION}-py3-none-any.whl
+  - src: ./infinitemodel-setup
+    dst: /opt/infinitemodel/bin/infinitemodel-setup
+    file_info:
+      mode: 0755
+  - src: /opt/infinitemodel/bin/infinitemodel-setup
+    dst: /usr/bin/infinitemodel-setup
+    type: symlink
+  - src: ./systemd/infinitemodel-controller.service
+    dst: /usr/lib/systemd/system/infinitemodel-controller.service
+  - src: ./systemd/infinitemodel-worker.service
+    dst: /usr/lib/systemd/system/infinitemodel-worker.service
+  - src: ../../LICENSE
+    dst: /usr/share/doc/infinitemodel/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/infinitemodel/README.md
+
+scripts:
+  postinstall: ./scripts/postinstall.sh
+  preremove: ./scripts/preremove.sh
+  postremove: ./scripts/postremove.sh
