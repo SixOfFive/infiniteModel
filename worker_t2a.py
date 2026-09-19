@@ -227,9 +227,22 @@ class T2APipeline:
         self._free_now()
 
     def _free_now(self) -> None:
+        # #t2a-rss-leak: OFFLOAD keeps the DiT/DCAE/text-encoder in CPU RAM (~2.7 GB int4) and hops
+        # only the DiT to the GPU per render, so at unload the BULK of this pipeline's bytes are
+        # CPU-resident, not CUDA. The old pass emptied ONLY cuda tensors, so _unload_model's
+        # malloc_trim (which DOES run on Linux) found nothing free to hand back — the CPU storages
+        # were still alive, kept by any lingering ref until the pipeline object itself was GC'd. And
+        # the DEFERRED post-render free (generate()'s finally) never re-enters _unload_model, so it
+        # got no trim at all. Net effect: the worker's RSS climbed ~2-3 GB per load/unload cycle
+        # (measured to 4.9 GB) and starved the box until a restart. Fix: empty BOTH cuda and cpu
+        # storages IN PLACE (releases the bytes regardless of who still holds the module — the same
+        # lesson as _release_shard_vram), then trim the glibc arena HERE so the RAM returns to the OS
+        # on this path too (covering the deferred free). Render-safe: release_vram() defers to render
+        # end while a gen holds _gen_lock, so by the time we run the model is idle.
         import contextlib as _cl
         import torch
         seen: set = set()
+        n_cuda = n_cpu = 0
         for mod in (getattr(self.pipe, "ace_step_transformer", None),
                     getattr(self.pipe, "music_dcae", None),
                     getattr(self.pipe, "text_encoder_model", None)):
@@ -237,11 +250,18 @@ class T2APipeline:
                 continue
             with _cl.suppress(Exception):
                 for t in list(mod.parameters(recurse=True)) + list(mod.buffers(recurse=True)):
-                    if t is None or getattr(t, "device", None) is None or t.device.type != "cuda":
+                    if t is None:
                         continue
+                    dev = getattr(t, "device", None)
+                    if dev is None or dev.type not in ("cuda", "cpu"):
+                        continue   # skip meta/other; only real storages have bytes to release
                     if id(t) in seen:
                         continue
                     seen.add(id(t))
+                    if dev.type == "cuda":
+                        n_cuda += 1
+                    else:
+                        n_cpu += 1
                     with _cl.suppress(Exception):
                         t.data = torch.empty(0, dtype=t.dtype, device=t.device)
         with _cl.suppress(Exception):
@@ -249,8 +269,19 @@ class T2APipeline:
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
-        print(f"[t2a] {os.path.basename(self.model_dir)}: GPU storages released "
-              f"({len(seen)} tensors emptied)", flush=True)
+        # Return the freed CPU heap to the OS (glibc holds freed arenas until malloc_trim). Self-
+        # contained so the DEFERRED post-render free trims too — that path never reaches
+        # _unload_model's _release_ram. malloc_trim(0) only reclaims FREE arena, never in-use
+        # allocations, so it can't disturb another model still resident in this worker.
+        with _cl.suppress(Exception):
+            import gc as _gc
+            _gc.collect()
+            import ctypes
+            import sys as _sys
+            if _sys.platform != "win32":
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+        print(f"[t2a] {os.path.basename(self.model_dir)}: storages released "
+              f"({n_cuda} cuda + {n_cpu} cpu tensors emptied, heap trimmed)", flush=True)
 
     # -- generation ---------------------------------------------------------------------
 

@@ -6,6 +6,21 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 
 ## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.43
 
+### Fixed (`#t2a-rss-leak` — worker RSS climbed each t2a load/unload cycle)
+
+- **`T2APipeline._free_now` emptied only CUDA tensors, so the OFFLOAD pipeline's CPU-resident
+  bytes leaked.** ACE-Step runs `cpu_offload` — the DiT/DCAE/UMT5 live in CPU RAM (~2.7 GB int4)
+  and only the DiT hops to the GPU per render — so at unload the bulk of the pipeline is CPU, not
+  VRAM. The unload pass reset just the `cuda` storages; the CPU storages stayed allocated (held by
+  some lingering ref) until the pipeline object was itself GC'd. `_unload_model`'s `malloc_trim`
+  runs *before* that, so it found nothing free to return to the OS, and the **deferred** post-render
+  free (`generate()`'s `finally`) never re-enters `_unload_model` at all — no trim on that path. The
+  worker's RSS grew ~2–3 GB per load/unload cycle (observed to 4.9 GB) and starved MOBILE's free RAM
+  until a restart. `_free_now` now empties **both** cuda and cpu storages in place (releasing the
+  bytes regardless of who still references the module) and trims the glibc arena itself, so the RAM
+  returns to the OS on both the immediate and deferred paths. `malloc_trim(0)` only reclaims free
+  arena, so it can't disturb another model resident in the same worker.
+
 ### Fixed (fleet-serve: thread `quant` through the load handoff)
 
 - **The t2a load message + worker construction both hardcoded `quant="none"`**, so a fleet
