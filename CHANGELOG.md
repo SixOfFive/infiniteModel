@@ -4,7 +4,35 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-19 (latest) — feat: `#packaging` — Windows installer (NSIS) + launcher self-update supervisor
+## 2026-09-19 (latest) — fix: `#packaging` — infinitemodel-setup no longer starts services without --start; live .deb install test
+
+### Fixed (`packaging/linux-pkg/infinitemodel-setup`)
+
+- **`enable_svc` used `${DO_START:+--now}`, which expands to `--now` even when `DO_START=0`** — the
+  `:+` operator tests set-and-non-empty, not truthiness, and `"0"` is non-empty. So
+  `infinitemodel-setup --role controller` (no `--start`) both **enabled AND started** the service.
+  Replaced with an explicit `[ "$DO_START" = "1" ]` test: selecting a role enables its unit (starts on
+  boot) but only `--start` starts it immediately. Found by the live install test below; deb + rpm
+  rebuilt with the fix.
+
+### Verified — live `dpkg -i` install test on MOBILE (Debian 13)
+
+- `sudo dpkg -i` installs cleanly; postinst creates the `infinitemodel` system user + `/var/lib/
+  infinitemodel` (0750, owned) and registers both units (`dpkg -L` / `getent` / `systemctl
+  list-unit-files` all correct). `infinitemodel-setup --role controller --no-torch --extras controller`
+  built `/opt/infinitemodel/venv` and pip-installed the controller stack (fastapi/uvicorn/pillow/
+  python-multipart) with no torch pulled. Purged cleanly afterwards; box returned to its prior state.
+- **⚠ Gotcha (a deployment note, not a package defect): unit-name collision on a node that already runs
+  a worker.** MOBILE is itself a fleet worker via a hand-rolled `/etc/systemd/system/
+  infinitemodel-worker.service`; the package uses the same unit name. The install is safe (the
+  package's unit lands in `/usr/lib/systemd/system`, shadowed by the `/etc` copy, so the running worker
+  is untouched), but `apt remove` / `dpkg -r` would run the package prerm's `systemctl stop/disable
+  infinitemodel-worker` and thus stop the hand-rolled worker too. On a normal target (no pre-existing
+  same-named unit) that is correct; when co-installing on a node that already hand-rolls
+  `infinitemodel-worker.service`, stop/rename that unit first. For this test the package was purged with
+  its maintainer scripts neutralised, so the live worker was never touched.
+
+## 2026-09-19 — feat: `#packaging` — Windows installer (NSIS) + launcher self-update supervisor
 
 ### Added (`packaging/windows/` — Windows installer)
 

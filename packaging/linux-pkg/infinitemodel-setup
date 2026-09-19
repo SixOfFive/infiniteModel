@@ -93,10 +93,24 @@ ln -sf "$VENV/bin/infinitemodel-controller" /usr/bin/infinitemodel-controller
 ln -sf "$VENV/bin/infinitemodel-worker"     /usr/bin/infinitemodel-worker
 
 # --- optionally enable services ---------------------------------------------
+# NOTE: use an explicit test, not ${DO_START:+--now} — the default DO_START=0 is
+# a NON-EMPTY string, so `${DO_START:+--now}` expands to --now even without
+# --start (it tests set-and-non-empty, not truthiness) and would START the
+# service unintentionally. Enable-on-role is intended; STARTING needs --start.
 enable_svc() {
-  systemctl enable ${DO_START:+--now} "$1" 2>/dev/null \
-    && echo "   $1: enabled${DO_START:+ + started}" \
-    || echo "   $1: (systemctl unavailable — enable by hand)"
+  if [ "$DO_START" = "1" ]; then
+    if systemctl enable --now "$1" 2>/dev/null; then
+      echo "   $1: enabled + started"
+    else
+      echo "   $1: (systemctl unavailable — enable by hand)"
+    fi
+  else
+    if systemctl enable "$1" 2>/dev/null; then
+      echo "   $1: enabled (not started; run 'sudo systemctl start $1', or re-run with --start)"
+    else
+      echo "   $1: (systemctl unavailable — enable by hand)"
+    fi
+  fi
 }
 if command -v systemctl >/dev/null 2>&1; then
   case "$ROLE" in
