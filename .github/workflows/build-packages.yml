@@ -1,0 +1,107 @@
+name: Build packages
+
+# Builds every distributable in one Ubuntu job (all four reuse the same wheel):
+#   - Python wheel + sdist + installer tarball   (packaging/build.sh)
+#   - .deb + .rpm                                 (packaging/linux-pkg/build_pkgs.sh, nfpm)
+#   - Windows installer .exe                      (packaging/windows/build_installer.sh, makensis)
+#
+# Triggers: a v* tag (full build + GitHub Release), a PR that touches packaging/
+# (build validation, artifacts uploaded), or manual dispatch. Pushing to main
+# does not build — tag it to cut a release.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - 'server.py'
+      - '.github/workflows/build-packages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed only by the tag Release step
+
+env:
+  NFPM_VERSION: '2.47.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve version from server.py
+        id: ver
+        run: |
+          VER="$(grep -oE 'VERSION = "[^"]+"' server.py | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$VER" ] || { echo "::error::could not read VERSION from server.py"; exit 1; }
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "InfiniteModel version: $VER"
+
+      - name: Tag must match server.py VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$TAG" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::tag '$TAG' != server.py VERSION '${{ steps.ver.outputs.version }}'"
+            exit 1
+          fi
+
+      - name: Python build frontend
+        run: python3 -m pip install --upgrade pip build
+
+      - name: Build wheel + sdist + installer tarball
+        run: bash packaging/build.sh
+
+      - name: Install nfpm (pinned, checksum-verified)
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}"
+          curl -fsSL -O "$base/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSL -O "$base/checksums.txt"
+          grep " nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz$" checksums.txt | sha256sum -c -
+          mkdir -p nfpm && tar -xzf "nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" -C nfpm nfpm
+          sudo install nfpm/nfpm /usr/local/bin/nfpm
+          nfpm --version
+
+      - name: Build .deb + .rpm
+        run: bash packaging/linux-pkg/build_pkgs.sh
+
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: Build Windows installer (.exe)
+        run: bash packaging/windows/build_installer.sh
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: infinitemodel-${{ steps.ver.outputs.version }}-packages
+          if-no-files-found: error
+          path: |
+            dist/infinitemodel-*.tar.gz
+            dist/infinitemodel-*.whl
+            dist/infinitemodel_*_all.deb
+            dist/infinitemodel-*.noarch.rpm
+            dist/infinitemodel-*-setup.exe
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "InfiniteModel ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/infinitemodel-*.tar.gz \
+            dist/infinitemodel-*.whl \
+            dist/infinitemodel_*_all.deb \
+            dist/infinitemodel-*.noarch.rpm \
+            dist/infinitemodel-*-setup.exe

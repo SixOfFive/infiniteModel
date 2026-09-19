@@ -61,6 +61,20 @@ Then: `infinitemodel-controller` (dashboard on :21434) or `infinitemodel-worker`
 (auto-discovers the controller by UDP broadcast). Override the app home with
 `INFINITEMODEL_HOME` or `--prefix`.
 
+## CI / releasing
+
+`.github/workflows/build-packages.yml` builds all four artifacts (wheel/sdist +
+installer tarball, `.deb`, `.rpm`, Windows `.exe`) in one `ubuntu-latest` job.
+It runs on a PR that touches `packaging/`, on manual dispatch, and on a `v*` tag
+— where it also publishes a GitHub Release with the artifacts attached.
+
+To cut a release: bump `VERSION` in `server.py`, then push a matching tag (the
+workflow fails fast if the tag and `server.py` disagree):
+
+```bash
+git tag v0.3.44 && git push origin v0.3.44
+```
+
 ## Files here
 
 - `pyproject.toml` — package metadata, extras, entry points.
@@ -69,3 +83,4 @@ Then: `infinitemodel-controller` (dashboard on :21434) or `infinitemodel-worker`
 - `tools/closure.py` — recomputes that allowlist from the import graph.
 - `build.sh` — assembles the staging tree and builds the artifacts.
 - `bootstrap.sh` — the end-user installer shipped inside the tarball.
+- `linux-pkg/`, `windows/` — the `.deb`/`.rpm` and Windows installer layers.

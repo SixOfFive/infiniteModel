@@ -4,7 +4,21 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-19 (latest) — fix: `#packaging` — infinitemodel-setup no longer starts services without --start; live .deb install test
+## 2026-09-19 (latest) — ci: `#packaging` — GitHub Actions build for all four artifacts
+
+### Added (`.github/workflows/build-packages.yml`)
+
+- **One `ubuntu-latest` job builds every distributable off the shared wheel:** the wheel/sdist +
+  installer tarball (`packaging/build.sh`), `.deb` + `.rpm` (`build_pkgs.sh` with a pinned,
+  checksum-verified nfpm 2.47.0), and the Windows `.exe` (`build_installer.sh` with apt `nsis`). Runs on
+  a PR touching `packaging/`, on manual dispatch, and on a `v*` tag. The version is read from
+  `server.py`'s `VERSION`; a tag build **fails fast if the tag ≠ VERSION**. On a tag it uploads the
+  artifacts and publishes a **GitHub Release** (`contents: write`, via `gh`); pushing to `main` does not
+  build (tag to release). Cut a release with `git tag v0.3.44 && git push origin v0.3.44`. Validated the
+  YAML locally (pyyaml); the three build scripts it orchestrates are each already proven on MOBILE with
+  the same tools (nfpm 2.47.0, makensis). Not yet exercised on GitHub — needs a tag/PR to run.
+
+## 2026-09-19 — fix: `#packaging` — infinitemodel-setup no longer starts services without --start; live .deb install test
 
 ### Fixed (`packaging/linux-pkg/infinitemodel-setup`)
 
