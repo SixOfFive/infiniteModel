@@ -203,6 +203,37 @@ together (via `state.py`):
 
 ## Installation
 
+There are two ways to install: **prebuilt packages** (recommended) or **from source** (pip).
+
+### Packaged install (recommended)
+
+Every [GitHub Release](https://github.com/SixOfFive/infiniteModel/releases/latest) ships a `.deb`, a
+`.rpm`, a portable `.tar.gz`, and a Windows installer. Each installs the code + launchers, then builds
+a Python venv for **your** hardware (torch is not bundled — you choose CPU/CUDA/ROCm) with only the
+model backends you pick. Optional backends map to install-time components/extras: `vision`, `stt`,
+`tts`, `t2i`, `music`, `kimi`, and ACE-Step (`t2a`, NVIDIA Ampere+ only).
+
+```bash
+# Debian/Ubuntu
+sudo apt install ./infinitemodel_<ver>_all.deb
+sudo infinitemodel-setup --role worker --cuda cu128 --extras worker,vision    # build the venv
+
+# Fedora/RHEL/openSUSE
+sudo dnf install ./infinitemodel-<ver>.noarch.rpm
+
+# Any Linux, no root — portable tarball
+tar -xzf infinitemodel-<ver>-installer.tar.gz && cd infinitemodel-<ver>
+./bootstrap.sh --cpu --extras controller,worker
+
+# Windows — run infinitemodel-<ver>-setup.exe (component + CPU/CUDA choices in the wizard)
+```
+
+Then launch `infinitemodel-controller` (dashboard on :21434) or `infinitemodel-worker` (auto-discovers
+the controller by UDP broadcast). Package design and how to build them yourself:
+[`packaging/`](packaging/).
+
+### From source (manual pip)
+
 **The server and the worker need different dependencies** — install only what each machine's role
 requires. Both need Python **3.13**; a CUDA GPU is optional (CPU-only workers are fully supported).
 

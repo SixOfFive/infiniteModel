@@ -4,7 +4,17 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-19 (latest) — ci: `#packaging` — GitHub Actions build for all four artifacts
+## 2026-09-19 (latest) — docs: `#packaging` — README documents the packaged install + release
+
+### Changed (`README.md`)
+
+- **`## Installation` now leads with a "Packaged install (recommended)" subsection.** Points at the
+  GitHub Release's `.deb` / `.rpm` / portable `.tar.gz` / Windows installer, the `infinitemodel-setup`
+  (deb/rpm) and `bootstrap.sh` (tarball) venv step, and the backend extras
+  (`vision/stt/tts/t2i/music/kimi` + ACE-Step). The existing per-role pip commands are reframed as
+  "From source (manual pip)", and it links to `packaging/` for build details. No behaviour change.
+
+## 2026-09-19 — ci: `#packaging` — GitHub Actions build for all four artifacts
 
 ### Added (`.github/workflows/build-packages.yml`)
 
