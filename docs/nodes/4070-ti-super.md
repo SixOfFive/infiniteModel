@@ -31,13 +31,13 @@ this box, but the cross-platform reference).
 | | |
 |---|---|
 | **Host** | `beast` |
-| **GPU** | RTX 4070 Ti SUPER — Ada Lovelace, **sm_89** |
-| **VRAM** | 16 GB |
+| **GPU** | RTX 4070 Ti SUPER (GPU 0) — Ada Lovelace, **sm_89**. beast also has a second card, an **RTX 3060 (GPU 1, 12 GB, Ampere sm_86)**, served by its own worker — see [§3.1](#31-second-worker-for-the-rtx-3060-gpu-1) and [3060.md](3060.md) |
+| **VRAM** | 16 GB (4070 Ti SUPER) + 12 GB (3060) |
 | **Mem bandwidth** | ~672 GB/s (per ACCELERATION.md sweep) |
 | **OS** | **Proxmox VE 9 / Debian 13 (trixie)** — the worker runs bare-metal on the PVE host, not in a guest ([../PROXMOX9_NVIDIA.md](../PROXMOX9_NVIDIA.md)) |
 | **Role** | **GPU worker.** Not the controller — but the controller VM and the model store live on this same physical host |
 | **Install dir** | `/root/infinitemodel` (venv `/root/imenv`) |
-| **Worker unit** | `im-worker.service` |
+| **Worker unit** | `im-worker.service` (GPU 0, 4070 Ti SUPER) · `im-worker-3060.service` (GPU 1, 3060) |
 
 > The install dir / venv / unit name are the ones the [../T2A.md](../T2A.md) enablement recipe
 > uses for this box (`/root/imenv/bin/pip`, `systemctl restart im-worker`) and the ones the
@@ -128,12 +128,52 @@ systemctl daemon-reload && systemctl restart im-worker
 The fused forward installs at **load time**, so a restart alone is not enough — reload the model
 too, or the running resident keeps the old path.
 
-Run **exactly one** worker per box (two workers sharing a hostname fight over controller
-registration).
+Run **one worker per GPU** — beast has two cards, so it runs two workers; see
+[§3.1](#31-second-worker-for-the-rtx-3060-gpu-1). The registration collision is by *hostname*, so
+a second worker on the same box needs a distinct `--name`.
 
-> (verify) the unit's exact `ExecStart` line on this box — `--device`, `--name`, `--attn`, and
-> whether a `--controller` flag survives from before the fleet moved to discovery. The unit file
-> is not in this repo, so the launch shown above is the documented shape, not a transcript.
+> **Confirmed `ExecStart` (2026-09-19).** The primary unit runs
+> `/root/imenv/bin/python client.py --device cpu+gpu` from `WorkingDirectory=/root/infinitemodel`
+> with `Restart=always` — **no** `--name`, `--attn`, or legacy `--controller` flag (discovery is
+> in use). This resolves the older "(verify) the exact ExecStart" note.
+
+### 3.1 Second worker for the RTX 3060 (GPU 1)
+
+beast has **two** GPUs, but a worker process serves exactly **one** — `worker_hw.detect_device()`
+returns `torch.cuda.current_device()` (GPU 0) and `_gpu_mem_gb()` hardcodes device 0. So the
+primary `im-worker` uses only the 4070 Ti SUPER; the 3060 sits idle until a **second worker** is
+pinned to it. Established 2026-09-19 — beast is the fleet's first 2-worker host. The second unit:
+
+```ini
+# /etc/systemd/system/im-worker-3060.service
+[Service]
+WorkingDirectory=/root/infinitemodel
+Environment=CUDA_VISIBLE_DEVICES=1
+ExecStart=/root/imenv/bin/python client.py --device gpu --name beast-3060 --data-port 50201
+Restart=always
+RestartSec=5
+```
+
+Four settings are load-bearing:
+
+- **`CUDA_VISIBLE_DEVICES=1`** pins the process to the physical 3060, which torch then sees as its
+  *own* `cuda:0`. Both workers therefore print `cuda:0` — confirm the pin against the GPU **UUID**
+  (`nvidia-smi --query-compute-apps=gpu_uuid,pid`), not the device string.
+- **`--name beast-3060`** gives it a distinct fleet identity. The collision is by hostname, so a
+  co-located second worker **must** rename or the two fight over registration.
+- **`--data-port 50201`** is **mandatory**. The worker binds a *fixed* local data-plane port
+  `50200` (the `--data-port` default) for inter-stage tensors; a second worker left on 50200 fails
+  to bind. Give each co-located worker its own port.
+- **`--device gpu`** (not `cpu+gpu`) keeps the second worker from re-advertising beast's single
+  ~125 GB RAM pool as a second CPU-worker pool — the primary already offers CPU spill.
+
+`systemctl enable --now im-worker-3060` starts it and persists it across reboot. Result: node
+`beast-3060`, GPU 1 RTX 3060 (~11.6 GB usable), device-mode `gpu`. The 3060 tier guidance (int4; a
+few layers in a split, or a small model) is in [3060.md](3060.md).
+
+**Caveats — beast is the first 2-worker box, so these are unexercised.** Both workers run the
+self-updater against the same `/root/infinitemodel/client.py` (a self-update could restart them
+over each other); and TP rendezvous root-port assignment with two co-located workers is untested.
 
 ---
 
@@ -217,8 +257,11 @@ card's ~672 GB/s peak. So enable it for MoE workloads; it's optional polish for 
   If you ever unpin, confirm `dkms status` shows the module built for the new kernel **before**
   rebooting; a remote reboot into a failed build is a headless black box. Recovery and the full
   matrix are in [../PROXMOX9_NVIDIA.md](../PROXMOX9_NVIDIA.md) §8.
-- **One worker per box.** Two workers sharing the `beast` hostname fight over controller
-  registration.
+- **One worker per *GPU*, each with a distinct `--name`.** The registration collision is by
+  *hostname*, not by box: two workers both named `beast` fight over it. beast runs two workers —
+  GPU 0 (4070 Ti SUPER) is `beast`, GPU 1 (3060) is `beast-3060` — see
+  [§3.1](#31-second-worker-for-the-rtx-3060-gpu-1). A co-located second worker also needs its own
+  `--data-port` (the default `50200` is a fixed bind).
 - **Perf-only kernel changes carry no VERSION bump.** A self-update *stages* the new code but
   does **not** auto-restart the worker — `systemctl restart im-worker` (or the controller's
   `POST /restart?workers=1`) to pick up a kernel change.
