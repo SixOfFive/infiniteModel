@@ -4,7 +4,40 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-19 (latest) — feat: `#packaging` — .deb/.rpm system packages (systemd + venv-on-setup)
+## 2026-09-19 (latest) — feat: `#packaging` — Windows installer (NSIS) + launcher self-update supervisor
+
+### Added (`packaging/windows/` — Windows installer)
+
+- **A per-user NSIS installer built on Linux** (no Windows/Wine — `makensis`, from Debian's `nsis`
+  package). `win-installer.nsi` (MUI2) installs into `%LOCALAPPDATA%\Programs\InfiniteModel`: the
+  wheel, `bootstrap.ps1`, the two `.cmd` launchers, README, LICENSE. **Components page** = roles
+  (Controller, Worker) + optional backends (Vision, STT, TTS, T2I, MusicGen, Kimi-Linear, ACE-Step),
+  each mapping to a pip extra; a **custom compute page** picks CUDA 12.8 / 12.6 / CPU. ACE-Step warns +
+  is skipped on the CPU build (needs an NVIDIA Ampere+ GPU). Post-install runs
+  `bootstrap.ps1 -Flavor <…> -Extras <ticked>` to build the venv (torch flavour → `wheel[extras]`,
+  Kokoro `kokoro`/`misaki` `--no-deps`), then drops Start Menu shortcuts. The `.cmd` launchers set
+  `INFINITEMODEL_HOME=%LOCALAPPDATA%\InfiniteModel` (writable app home) and run the venv console scripts.
+- **`bootstrap.ps1`** — the Windows twin of `packaging/bootstrap.sh` (find Python 3.10+, venv, torch by
+  index-url, `wheel[extras]`, tts/acestep handling). Prerequisite: Python 3.10+ on PATH (installer
+  reports clearly if missing). Bundling a standalone CPython is a possible later enhancement.
+- **Built + validated** on MOBILE: `build_installer.sh` → `dist/infinitemodel-0.3.44-setup.exe` (1.1 MiB),
+  which `file` confirms is a "Nullsoft Installer self-extracting archive" and `7z` shows packs the wheel
+  + both launchers + `bootstrap.ps1` + docs. **Not validated on Linux** (needs a real Windows run): the
+  install-time component→extras mapping, the compute page, and `bootstrap.ps1` itself (no `pwsh` on this
+  box, so it was reviewed by hand, not interpreter-checked).
+
+### Changed (`packaging/src/infinitemodel/_launch.py` — launcher is now a self-update supervisor)
+
+- **The console-script launcher runs `server.py`/`client.py` as a CHILD in a loop** — relaunching on
+  exit 42 (the runtime's self-update signal) and propagating any other exit code — instead of
+  `os.execv`. `os.execv` cannot propagate a child's exit code to a parent `.cmd` on Windows, which
+  would silently break the 42-relaunch that the Windows launchers and the existing `.bat` supervisors
+  depend on. The loop also makes interactive (tgz) self-update work and lets the **systemd** service
+  ride through a self-update without a restart (only a real crash trips `Restart=on-failure`). Verified
+  the 42→relaunch→final-exit-code path with a stub. The wheel — and thus the .deb/.rpm/.exe/installer
+  tarball — were rebuilt on the new launcher so all artifacts match.
+
+## 2026-09-19 — feat: `#packaging` — .deb/.rpm system packages (systemd + venv-on-setup)
 
 ### Added (`packaging/linux-pkg/` — Debian/RPM packages)
 

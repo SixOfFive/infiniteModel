@@ -96,7 +96,21 @@ def _run(script: str) -> None:
 
     # Run in the app home so any cwd-relative behaviour also lands there.
     os.chdir(home)
-    os.execv(sys.executable, argv)
+
+    # Supervisor loop. server.py / client.py exit with code 42 when they
+    # self-update their own files in `home`; relaunch to pick up the new code.
+    # Any other exit code is final and is propagated to our caller. We run a
+    # CHILD process rather than os.execv on purpose: os.execv cannot propagate
+    # the child's exit code to a parent launcher on Windows, which would break
+    # the 42-relaunch and the .cmd / systemd supervisors layered on it. On a
+    # clean service stop the manager kills the whole process group, so the
+    # child receives the signal directly — no forwarding needed here.
+    import subprocess
+    while True:
+        rc = subprocess.run(argv).returncode
+        if rc == 42:
+            continue
+        sys.exit(rc)
 
 
 def controller() -> None:
