@@ -4,7 +4,28 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-18 (latest) — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.43
+## 2026-09-19 (latest) — docs: beast is the fleet's first 2-worker (2-GPU) host (`#beast-2gpu`)
+
+### Changed (docs — node guides)
+
+- **`docs/nodes/4070-ti-super.md` + `docs/nodes/3060.md` now document beast running two workers,
+  one per GPU.** A worker process serves exactly one GPU (`worker_hw.detect_device()` returns
+  `torch.cuda.current_device()` = GPU 0; `_gpu_mem_gb()` hardcodes device 0), so the single
+  `im-worker` used only the 4070 Ti SUPER (GPU 0) and the RTX 3060 (GPU 1) sat idle — the
+  controller saw beast as one GPU. The 3060 was brought online as a co-located second worker
+  `im-worker-3060.service` (`CUDA_VISIBLE_DEVICES=1`, `--name beast-3060`, `--data-port 50201`,
+  `--device gpu`), registering as node `beast-3060` / GPU 1 (~11.6 GB). New **§3.1** in the 4070
+  doc carries the recipe and the four load-bearing settings: the CVD pin (both workers still print
+  `cuda:0` — verify by GPU UUID); `--name` to dodge the by-hostname registration collision;
+  `--data-port` because the `50200` data-plane bind is fixed; `--device gpu` so the second worker
+  doesn't re-advertise beast's shared ~125 GB RAM. The §6 "one worker per box" gotcha is corrected
+  to "one worker per GPU", the overview table lists both cards + units, and the stale "(verify)
+  exact ExecStart" note is resolved with the confirmed primary launch line (no `--name` /
+  `--controller` — discovery). 3060 doc: two → three fleet 3060s + a beast row. Docs-only, no code
+  change. Flagged as unexercised (beast is the first 2-worker box): both workers self-update the
+  same `client.py`, and TP root-port assignment with two co-located workers.
+
+## 2026-09-18 — int4 DiT tier for ACE-Step music (`#t2a-int4`, M2) — controller `server.py` 0.3.43
 
 ### Fixed (`#t2a-rss-leak` — worker RSS climbed each t2a load/unload cycle)
 
