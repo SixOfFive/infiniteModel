@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infinitemodel"
+dynamic = ["version"]          # stamped from server.py VERSION by build.sh
+description = "Distributed LLM and multimodal inference across mixed CPU/GPU nodes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "sixoffive" }]
+keywords = ["llm", "inference", "distributed", "pipeline-parallel", "multimodal"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# --- Base runtime -----------------------------------------------------------
+# psutil is needed by BOTH roles (worker hardware probe; controller node stats).
+# fastapi/uvicorn drive the controller's HTTP + dashboard. Everything heavier is
+# opt-in below. NOTE: `torch` is deliberately NOT listed anywhere in this file —
+# its build is hardware- and version-specific (CPU / CUDA cuNNN / ROCm) and must
+# be installed from the matching index URL BEFORE these extras. bootstrap.sh does
+# that first; the `worker`/media extras below assume torch is already present.
+dependencies = ["psutil"]
+
+[project.optional-dependencies]
+# Controller (server.py): HTTP API + dashboard. python-multipart is required
+# only for Whisper STT file uploads; pillow for ANY vision model (decode happens
+# controller-side). Both are cheap, so they ride with the controller base.
+controller = ["fastapi", "uvicorn", "python-multipart", "pillow"]
+
+# Worker (client.py) LLM execution. torch installed separately (see above).
+worker = ["transformers", "safetensors", "huggingface_hub", "numpy"]
+
+# --- Optional model backends (each pulls only its own extra requirements) ---
+vision   = ["pillow"]                                   # image inputs
+stt      = ["python-multipart", "soundfile"]            # Whisper transcription
+audio-in = ["soundfile"]                                # WAV/FLAC/OGG decode
+music    = ["transformers", "soundfile"]                # MusicGen (clean; in transformers)
+t2i      = ["diffusers", "accelerate"]                  # text-to-image (GPU worker)
+kimi     = ["fla-core==0.4.0", "triton"]                # Kimi-Linear (GPU + triton)
+
+# Kokoro TTS: kokoro+misaki must be installed with --no-deps (they over-pin),
+# so bootstrap.sh handles those two specially. This extra covers only the LEAF
+# deps that are safe to resolve normally.
+tts = ["loguru", "espeakng-loader", "phonemizer-fork", "num2words", "regex", "scipy", "soundfile"]
+
+# ACE-Step (t2a music) is intentionally absent as an extra: it needs a --no-deps
+# source install under a constraints file (a plain `pip install acestep` drags
+# transformers back and breaks every LLM on the node), hard-depends on torchaudio
+# (no ROCm build), and is bf16-only (Ampere+ GPU). bootstrap.sh --with-acestep
+# performs the guarded install; see docs/T2A.md.
+
+# Convenience: everything that resolves cleanly from PyPI (no torch, no acestep).
+all-clean = ["fastapi", "uvicorn", "python-multipart", "pillow", "transformers",
+             "safetensors", "huggingface_hub", "numpy", "soundfile", "diffusers",
+             "accelerate", "loguru", "espeakng-loader", "phonemizer-fork",
+             "num2words", "regex", "scipy"]
+
+[project.urls]
+Homepage = "https://github.com/SixOfFive/infiniteModel"
+Repository = "https://github.com/SixOfFive/infiniteModel"
+
+[project.scripts]
+infinitemodel-controller = "infinitemodel._launch:controller"
+infinitemodel-worker = "infinitemodel._launch:worker"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["infinitemodel"]
+
+[tool.setuptools.dynamic]
+version = { attr = "infinitemodel.__version__" }
+
+[tool.setuptools.package-data]
+# The runtime source tree, bundled as data and materialised at first run.
+infinitemodel = ["_payload/*.py", "_payload/*.json"]

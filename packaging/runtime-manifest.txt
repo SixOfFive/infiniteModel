@@ -1,0 +1,80 @@
+# InfiniteModel runtime payload manifest — the AUTHORITATIVE allowlist of files
+# that ship inside a package. build.sh copies ONLY these into _payload/.
+#
+# An allowlist (not a blacklist) is deliberate: it is the safety boundary that
+# keeps secrets and dev cruft out of a PUBLIC package. Nothing here may be a
+# secret, a fleet-specific preset, or generated state. Specifically NEVER add:
+#   hf_token.txt                (HF API token — a secret; git-ignored anyway)
+#   im_*.json                   (personal fleet model-load presets)
+#   *_history.json, *_state.json, node_config.json, engine_config.json,
+#     deleted_models.json, custom_gguf.json, .last_update.json  (runtime state)
+#   scratch_*.py, test_*.py, bench_*.py, *_e2e.py, tp_bench.py, replica_bench.py,
+#     diag_net.py, load_verify.py, validate_vram_plan.py       (dev/bench tools)
+#   *.wav, *.png, *.log, __pycache__, .venv, cache/, models/
+#
+# How this list was derived: the static import closure of server.py (controller)
+# and client.py (worker) over the repo's own modules, PLUS the two converter
+# scripts invoked as subprocesses (gguf_convert.py, mxfp4_convert.py), which the
+# runtime hard-errors without. Recompute with: packaging/tools/closure.py.
+#
+# config.json ships as the public default (no secrets; controller_host=auto).
+# custom_models.json is SEEDED EMPTY ({}) by build.sh, never copied from the
+# repo (the repo copy carries a personal entry) — so it is not listed here.
+
+# --- data ---
+config.json
+
+# --- shared runtime modules (controller + worker) ---
+gptq_pack.py
+kv_quant.py
+shard_compile.py
+shard_forward.py
+shards.py
+state.py
+wire.py
+
+# --- controller (server.py) closure ---
+control_plane.py
+dashboard_html.py
+downloads.py
+engine_gen.py
+engine_lifecycle.py
+engine_load.py
+formats.py
+graphs.py
+media_encode.py
+model_store.py
+mtp_core.py
+multimodal.py
+peers.py
+perf_profile.py
+placement.py
+routes_api.py
+routes_dashboard.py
+routes_diag.py
+routes_lifecycle.py
+routes_peers.py
+routes_shards.py
+server.py
+serving.py
+serving_anthropic.py
+status.py
+
+# --- worker (client.py) closure ---
+client.py
+shard_build.py
+worker_hw.py
+worker_load.py
+worker_net.py
+worker_quant.py
+worker_stt.py
+worker_t2a.py
+worker_t2i.py
+worker_t2music.py
+worker_tts.py
+worker_update.py
+worker_vision.py
+
+# --- converter tools invoked as subprocesses by the runtime ---
+gguf_convert.py
+mxfp4_convert.py

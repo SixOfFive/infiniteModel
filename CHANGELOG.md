@@ -4,7 +4,55 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-19 (latest) — docs: beast is the fleet's first 2-worker (2-GPU) host (`#beast-2gpu`)
+## 2026-09-19 (latest) — feat: packaging foundation — pip extras, wheel, and a bootstrap installer (`#packaging`)
+
+### Added (`packaging/` — distributable packages, foundation layer)
+
+- **The run-from-a-folder project can now be built into a wheel + a self-contained installer tarball**
+  — the shared base every future `.deb`/`.rpm`/Windows installer will reuse, so there is one source of
+  truth for dependencies and layout. New `packaging/` dir: `pyproject.toml` (metadata + per-backend
+  extras + console entry points), a launcher package (`src/infinitemodel/_launch.py`),
+  `runtime-manifest.txt` (the shipped-file allowlist), `tools/closure.py` (recomputes it from the import
+  graph), `build.sh`, `bootstrap.sh`, `README.md`.
+- **Why a launcher instead of installing the modules into site-packages.** The runtime treats
+  `dirname(__file__)` as a *writable root* — it stores `node_config.json`/`engine_config.json`/history/
+  `models/`/`cache/` there, and self-update *rewrites its own `.py` files in place* (e.g. `server.py`
+  overwrites `control_plane.py`). site-packages is the wrong home for that. So the ~45-module runtime
+  ships as **payload data** inside the wheel and is materialised into a writable app home
+  (`$INFINITEMODEL_HOME`, default `~/.local/share/infinitemodel`) on first launch; the
+  `infinitemodel-controller`/`-worker` console scripts then `exec` the venv Python on
+  `<home>/server.py`/`client.py`. Running a script file puts its dir on `sys.path[0]`, so `import wire`,
+  the subprocess converters, and every `dirname(__file__)` path resolve to the app home exactly as a
+  git checkout would — **zero source edits to the runtime**.
+- **torch is deliberately absent from the wheel.** Its build is hardware/version-specific (CPU /
+  CUDA cuNNN / ROCm TheRock), so `bootstrap.sh` installs the matching flavour first (`--cpu` /
+  `--cuda cu128` / `--rocm gfxNNNN`), then `pip install`s `infinitemodel[extras]`. Optional model
+  backends map to extras: `controller worker vision stt audio-in music t2i tts kimi`. The two "dirty"
+  backends can't be plain extras and are handled explicitly: **Kokoro TTS** installs `kokoro`/`misaki`
+  `--no-deps` (+ the system `espeak-ng` lib); **ACE-Step (t2a)** is gated behind `--with-acestep` and
+  points at `docs/T2A.md` (source install under a constraints file — a plain `pip install acestep`
+  drags transformers back and breaks every LLM on the node — plus torchaudio and a bf16-capable
+  Ampere+ GPU).
+- **Public-safety allowlist.** `build.sh` copies only the files in `runtime-manifest.txt` — the static
+  import closure of `server.py`+`client.py` over the repo's own modules, plus the two
+  subprocess-invoked converters (`gguf_convert.py`, `mxfp4_convert.py`) — and runs a secret/cruft scan
+  before building. The 42 `scratch_*/test_*/bench_*` dev files, the `im_*.json` fleet presets, and the
+  untracked `hf_token.txt` are all excluded; `config.json` ships as the public default
+  (`controller_host: auto`, no secrets) and `custom_models.json` is seeded empty. Verified: the built
+  wheel has **0** forbidden entries.
+- **Proven end-to-end** on MOBILE: `build.sh` → `infinitemodel-0.3.44` sdist + wheel + installer
+  tarball (version stamped from `server.py`'s `VERSION`); a clean-venv `pip install` of the wheel yields
+  both console scripts; a dry-run launch materialises the 48-file payload into the app home and targets
+  `<home>/server.py`/`client.py` with argv passthrough; the synced torch-free modules (`state`, `wire`)
+  import from the home. Caught and fixed one bug in the process — pip byte-compiles the payload `.py`,
+  creating a `__pycache__/` dir the sync must skip (now copies only the shipped `*.py`/`*.json`).
+- **Scope / not yet done:** this is the foundation only. The `.deb`/`.rpm` (thin package → `/opt`,
+  systemd units, postinst venv build) and the Windows installer (Inno Setup, component checkboxes incl.
+  ACE-Step behind the Ampere+ gate) build on this wheel + bootstrap and are the next step. A full
+  torch-backed end-to-end launch (a real controller boot) was **not** run here — only the
+  packaging/launch plumbing was exercised, deliberately avoiding a multi-GB torch pull.
+
+## 2026-09-19 — docs: beast is the fleet's first 2-worker (2-GPU) host (`#beast-2gpu`)
 
 ### Changed (docs — node guides)
 
