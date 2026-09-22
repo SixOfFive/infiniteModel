@@ -1,8 +1,10 @@
 """worker_t2i: the worker-side text-to-image engine (#t2i-serve, task #37).
 
-Serves a DIFFUSERS-layout checkpoint (Qwen-Image class: model_index.json +
-transformer//text_encoder//vae//tokenizer/ component subfolders) as a single-node
-image generator, the diffusion sibling of worker_load's `kind:"embedding"` path:
+Serves a DIFFUSERS-layout checkpoint as a single-node image generator. Two variants, picked
+from the checkpoint's model_index.json _class_name (#t2i-qwen21): Qwen-Image v1 (QwenImagePipeline
++ Qwen2.5-VL text encoder + a tokenizer/) and Qwen-Image-2.1 (QwenImage21Pipeline + a full Qwen3-VL
+text encoder + a processor/; the 2.1 classes require a diffusers built from git main). It is the
+diffusion sibling of worker_load's `kind:"embedding"` path:
 the WHOLE pipeline lives on ONE worker, requests arrive over the control link
 (`t2i_gen`), per-step progress mirrors back (`t2i_step`), and the finished PNG is
 written to LOCAL disk with its path returned (`t2i_done`) — v1 serves t2i only on
@@ -50,15 +52,38 @@ class T2IPipeline:
 
     def __init__(self, model_dir: str, device: str, quant: str = "int4", edge: int = 2,
                  offload: bool = False):
+        import json as _json
+        import torch
+        # #t2i-qwen21: ONE worker serves either Qwen-Image (v1) or Qwen-Image-2.1. They differ in
+        # the diffusers pipeline/transformer/VAE class, the text encoder (Qwen2.5-VL vs a full
+        # Qwen3-VL), and the prompt tokenizer subfolder (tokenizer/ vs a Qwen3-VL processor/).
+        # Read the checkpoint's OWN model_index.json _class_name so the branch is data-driven, not
+        # name-guessed. (2.1's QwenImage21* classes only exist in a diffusers built from git main.)
+        _is21 = False
         try:
-            from diffusers import (AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler,
-                                   QwenImagePipeline, QwenImageTransformer2DModel)
+            with open(os.path.join(model_dir, "model_index.json"), encoding="utf-8") as _fh:
+                _is21 = str(_json.load(_fh).get("_class_name") or "") == "QwenImage21Pipeline"
+        except Exception:
+            pass
+        self.variant = "qwenimage21" if _is21 else "qwenimage"
+        try:
+            if _is21:
+                from diffusers import (AutoencoderKLQwenImage21 as _Vae,
+                                       FlowMatchEulerDiscreteScheduler,
+                                       QwenImage21Pipeline as _Pipeline,
+                                       QwenImage21Transformer2DModel as _Transformer)
+            else:
+                from diffusers import (AutoencoderKLQwenImage as _Vae,
+                                       FlowMatchEulerDiscreteScheduler,
+                                       QwenImagePipeline as _Pipeline,
+                                       QwenImageTransformer2DModel as _Transformer)
         except Exception as exc:
             raise RuntimeError(
-                "t2i serving needs the `diffusers` package on this worker "
-                f"(pip install diffusers) — import failed: {exc!r}") from exc
-        import torch
-        from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
+                "t2i serving needs the `diffusers` package on this worker with the "
+                f"{'QwenImage21' if _is21 else 'QwenImage'} classes "
+                "(Qwen-Image-2.1 needs a diffusers build from git main) — "
+                f"import failed: {exc!r}") from exc
+        self._Pipeline = _Pipeline
 
         self.model_dir = model_dir
         # normalize fleet tier strings ('gpu', 'cpu+gpu') to a real torch device — torch.to()
@@ -76,16 +101,28 @@ class T2IPipeline:
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             os.path.join(model_dir, "scheduler"))
-        transformer = QwenImageTransformer2DModel.from_pretrained(
+        transformer = _Transformer.from_pretrained(
             os.path.join(model_dir, "transformer"), torch_dtype=torch.bfloat16)
-        vae = AutoencoderKLQwenImage.from_pretrained(
+        vae = _Vae.from_pretrained(
             os.path.join(model_dir, "vae"), torch_dtype=torch.bfloat16)
-        # Text encoder stays on CPU bf16 (encode-once per request; won't fit beside the DiT
-        # on a 16 GB card). Tokenizer from the repo's tokenizer/ subfolder.
-        text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            os.path.join(model_dir, "text_encoder"), torch_dtype=torch.bfloat16)
+        # Text encoder stays on CPU bf16 (encode-once per request; won't fit beside the DiT on a
+        # 16 GB card). v1: Qwen2.5-VL + a plain tokenizer/. 2.1: a full Qwen3-VL + a processor/
+        # (the pipeline builds its chat template through it and derives _drop_idx from it), so the
+        # processor is handed to BOTH pipeline views below (it is cheap; not a torch module, so it
+        # does not pull _execution_device onto CPU the way the text encoder would).
+        if _is21:
+            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+            text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                os.path.join(model_dir, "text_encoder"), torch_dtype=torch.bfloat16)
+            _tok_kw = {"processor": AutoProcessor.from_pretrained(
+                os.path.join(model_dir, "processor"))}
+        else:
+            from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
+            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                os.path.join(model_dir, "text_encoder"), torch_dtype=torch.bfloat16)
+            _tok_kw = {"tokenizer": AutoTokenizer.from_pretrained(
+                os.path.join(model_dir, "tokenizer"))}
         text_encoder.eval()
-        tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
 
         # Mixed-edge int4 (the gate-test recipe): quantize the middle blocks in place with the
         # fleet packer, keep `edge` blocks at each end bf16. quant="none" skips entirely (bf16
@@ -132,10 +169,14 @@ class T2IPipeline:
         # resolve to CPU — latents/timesteps then prepare on CPU and the cuda DiT crashes with
         # 'mat1 is on cpu'. The ENCODER view (TE+tokenizer, no transformer) encodes on CPU;
         # the RENDER view (transformer+VAE, no TE) resolves cuda and runs the denoise loop.
-        self.enc = QwenImagePipeline(scheduler=scheduler, vae=None, text_encoder=text_encoder,
-                                     tokenizer=tokenizer, transformer=None)
-        self.pipe = QwenImagePipeline(scheduler=scheduler, vae=vae, text_encoder=None,
-                                      tokenizer=None, transformer=transformer)
+        # ENCODER view carries the tokenizer/processor (v1) or processor (2.1). RENDER view drops
+        # the text encoder so _execution_device resolves to cuda, but 2.1's __init__ derives
+        # _drop_idx from the processor, so the render view keeps it (v1 kept tokenizer=None).
+        self.enc = _Pipeline(scheduler=scheduler, vae=None, text_encoder=text_encoder,
+                             transformer=None, **_tok_kw)
+        _render_tok_kw = _tok_kw if _is21 else {"tokenizer": None}
+        self.pipe = _Pipeline(scheduler=scheduler, vae=vae, text_encoder=None,
+                              transformer=transformer, **_render_tok_kw)
         if self.offload:
             try:
                 self.pipe.enable_sequential_cpu_offload(device=self.device)
@@ -240,9 +281,11 @@ class T2IPipeline:
             t0 = time.time()
             pipe = self.pipe
             dev = self.device
-            # Geometry must be divisible by vae_scale_factor*2 (=16); snap silently.
-            width = max(256, (int(width) // 16) * 16)
-            height = max(256, (int(height) // 16) * 16)
+            # Geometry must be divisible by vae_scale_factor*2 (v1 =16, 2.1 =32); snap silently
+            # to the render pipeline's own factor. 256 is a multiple of both, so the floor is safe.
+            _mult = max(16, int(getattr(pipe, "vae_scale_factor", 8)) * 2)
+            width = max(256, (int(width) // _mult) * _mult)
+            height = max(256, (int(height) // _mult) * _mult)
             steps = max(1, min(100, int(steps)))
             cfg = float(cfg)
             if seed in (None, ""):

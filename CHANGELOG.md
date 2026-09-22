@@ -4,7 +4,31 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-09-19 (latest) — docs: `#packaging` — README documents the packaged install + release
+## 2026-09-22 (latest) — feat: `#t2i-qwen21` — serve Qwen-Image-2.1 on the t2i path
+
+### Added (`worker_t2i.py`, `server.py`/`client.py` `VERSION`)
+
+- **`T2IPipeline` now serves Qwen-Image-2.1 alongside Qwen-Image v1, chosen from the checkpoint's
+  own `model_index.json` `_class_name`.** 2.1 (`QwenImage21Pipeline`) differs from v1 in the
+  diffusers pipeline/transformer/VAE class (`QwenImage21Pipeline` / `QwenImage21Transformer2DModel`
+  / `AutoencoderKLQwenImage21`), the text encoder (a **full Qwen3-VL**,
+  `Qwen3VLForConditionalGeneration`, vs Qwen2.5-VL), and the prompt tokenizer subfolder (a Qwen3-VL
+  `processor/` vs a plain `tokenizer/`). The `_is21` branch imports the right classes, loads the
+  processor, and hands it to **both** pipeline views (2.1's `__init__` derives `_drop_idx` from the
+  processor; the render view keeps it — it is not a torch module, so it does not pull
+  `_execution_device` onto CPU the way the text encoder would). The encoder/render two-view split,
+  the CPU text encoder, the offload/int4 recipes and the `_decode` tail are unchanged and shared.
+- **Geometry snap is now derived from the render pipeline's `vae_scale_factor`** (v1 → multiple of
+  16, 2.1 → multiple of 32) instead of a hardcoded 16, so 2.1's coarser latent grid is respected.
+- **2.1's classes require a `diffusers` built from git `main`** (no released `diffusers` — 0.40.0
+  included — ships `QwenImage21*`); the import error names that. transformers 5.12 already carries
+  Qwen3-VL. Registered as `qwen-image-2.1` → `Qwen/Qwen-Image-2.1`; first bring-up serves bf16 RAM
+  **offload** on beast (16 GB 4070 Ti Super + 125 GB RAM; the 17.5 GB Qwen3-VL encoder rides CPU RAM).
+- **Ops note:** before this deploy, the live controller (`iM:/root/infinitemodel`) was a stale git
+  ancestor with the running file-set applied on top uncommitted; it was fast-forwarded to
+  `origin/main` (`3be9148`, gitignored runtime catalog preserved) so the repos are reconciled.
+
+## 2026-09-19 — docs: `#packaging` — README documents the packaged install + release
 
 ### Changed (`README.md`)
 
